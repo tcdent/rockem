@@ -23,7 +23,7 @@ fn main() {
     let w = Weights::from_dense(dense);
     let ef = std::fs::File::open(bundle.join(layout::EXPERTS_FILE)).unwrap();
     let emm = unsafe { memmap2::Mmap::map(&ef).unwrap() };
-    let k = kfd::Kfd::new(&elf);
+    let k = kfd::Kfd::new(&elf, true);
     let rope = Rope::new(ctx);
     let mut attention = kfd::KfdModel::new(k.clone(), dense, &emm[..layout::STREAM], &rope, ctx);
 

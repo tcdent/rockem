@@ -476,7 +476,7 @@ fn main() {
     assert!(max_ctx > FIRST_POS, "rockem.ctx must leave room after BOS");
     let mut st = State::new(max_ctx);
     let mut model: Box<dyn Model> = if config("rockem.gpu").is_some() {
-        let k = kfd::Kfd::new(loader::load(&bundle.join(layout::KERNELS_FILE), loader::Mem::Anon));
+        let k = kfd::Kfd::new(loader::load(&bundle.join(layout::KERNELS_FILE), loader::Mem::Anon), false);
         Box::new(kfd::KfdModel::new(k, dense, &experts[..layout::STREAM], &st.rope, max_ctx))
     } else {
         Box::new(CpuModel { attention: CpuAttention::new(max_ctx), ffn: CpuFfn::new(CpuExperts::new(&experts[..layout::STREAM])) })

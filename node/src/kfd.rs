@@ -300,9 +300,13 @@ pub struct Kfd {
     /// dispatch acquires at system scope (an L2 invalidate); the ones after it
     /// at agent scope, since kernels only hand each other what the card wrote.
     host_wrote: Cell<bool>,
-    /// Every dispatch carries a signal from this ring, so the command
-    /// processor stamps its start and end (100 MHz): the token's timeline,
-    /// per launch, with nothing in any kernel — `timeline()` after a wait.
+    /// Instrumented, every dispatch carries a signal from this ring, so the
+    /// command processor stamps its start and end (100 MHz): the token's
+    /// timeline, per launch, with nothing in any kernel — `timeline()` after
+    /// a wait. The signal costs the processor 1.7 µs a launch (measured
+    /// 2026-09-19: 0.5 ms of a 7.9 ms token), so the node runs without it
+    /// and the benches with it.
+    instrument: bool,
     stamps: Mem,
     names: std::cell::RefCell<Vec<&'static str>>,
     grids: std::cell::RefCell<Vec<u32>>,
@@ -324,7 +328,7 @@ fn sysfs_prop(props: &str, key: &str) -> u64 {
 impl Kfd {
     /// Open the first gfx1100 node, bind the process to it, build the queue,
     /// and load the code object.
-    pub fn new(elf: &[u8]) -> std::rc::Rc<Kfd> {
+    pub fn new(elf: &[u8], instrument: bool) -> std::rc::Rc<Kfd> {
         let nodes = "/sys/class/kfd/kfd/topology/nodes";
         let mut found = None;
         for e in std::fs::read_dir(nodes).expect("KFD topology") {
@@ -369,6 +373,7 @@ impl Kfd {
             doorbell: std::ptr::null_mut(),
             write_index: Cell::new(0),
             host_wrote: Cell::new(true),
+            instrument,
             stamps: Mem { va: 0, size: 0 },
             names: std::cell::RefCell::new(vec![""; RING_PACKETS]),
             grids: std::cell::RefCell::new(vec![0; RING_PACKETS]),
@@ -655,11 +660,13 @@ impl Kfd {
             kernel_object: k.object,
             kernarg_address: ka as u64,
             reserved2: 0,
-            completion_signal: self.stamps.at(slot * size_of::<Signal>()) as u64,
+            completion_signal: if self.instrument { self.stamps.at(slot * size_of::<Signal>()) as u64 } else { 0 },
         };
         // acquire at system scope only when the host wrote since the last launch (an L2
-        // invalidate, once per token in practice); agent scope between kernels. Release at
-        // agent scope always: the barrier's system-scope release publishes to the host.
+        // invalidate, once per token in practice); agent scope between kernels — the
+        // agent acquire (L0/GL1/K$ invalidates) costs the processor 1.1 µs a launch, and
+        // without it the step gate fails on stale reads (2026-09-19). Release at agent
+        // scope always: the barrier's system-scope release publishes to the host.
         let acquire = if self.host_wrote.replace(false) { FENCE_SYSTEM } else { FENCE_AGENT };
         self.post(idx, pkt, PACKET_KERNEL_DISPATCH | (acquire << HEADER_ACQUIRE_SHIFT) | (FENCE_AGENT << HEADER_RELEASE_SHIFT) | if barrier { HEADER_BARRIER } else { 0 });
     }
@@ -703,6 +710,7 @@ impl Kfd {
     /// The launches since the previous wait, in order: name, start and end
     /// on the card's 100 MHz clock. Valid after `sync`, until the ring wraps.
     pub fn timeline(&self) -> Vec<(&'static str, u64, u64)> {
+        assert!(self.instrument, "timeline: the launcher was opened without instrumentation");
         let (from, to) = self.last_span.get();
         assert!(to - from <= RING_PACKETS as u64, "timeline: more launches than the ring holds");
         let names = self.names.borrow();
@@ -823,9 +831,7 @@ impl Kfd {
 /// — the kernels mirror into host memory as they go, read after that wait.
 pub struct KfdModel {
     k: Rc<Kfd>,
-    norm: Kernel,
     proj: Kernel,
-    kv: Kernel,
     absorb: Kernel,
     mla: Kernel,
     merge: Kernel,
@@ -834,7 +840,6 @@ pub struct KfdModel {
     dense_down: Kernel,
     shared_down: Kernel,
     route: Kernel,
-    group: Kernel,
     up: Kernel,
     down: Kernel,
     sample: Kernel,
@@ -846,7 +851,6 @@ pub struct KfdModel {
     d_sin: Mem,
     // per-step buffers, TOKENS deep
     d_h: Mem,  // [T][H], the residual; host-visible for the embedding write
-    d_xn: Mem, // [T][H], the normed residual every rows kernel reads
     d_q: Mem,
     d_kva: Mem,
     d_heads: Mem,
@@ -857,7 +861,7 @@ pub struct KfdModel {
     d_xs: Mem,
     d_xg: Mem,
     d_expert: Mem, // [T][TOP_K] u32, for `group`
-    d_count: Mem,  // [E] u32
+    d_count: Mem,  // COUNT_WORDS u32: counts, the active experts, the arrival word
     d_list: Mem,   // [E][T] u32
     d_egu: Mem,    // [T][TOP_K][2·D_FF]
     d_eout: Mem,   // [T][TOP_K][H]
@@ -886,10 +890,10 @@ impl KfdModel {
         k.upload(&d_sin, 0, raw(&rope.sin));
         println!("gpu      : attention cache for {max_ctx} positions in VRAM, steps of up to {TOKENS} tokens");
         const T: usize = TOKENS;
+        let d_count = k.vram_visible(ffn::gfx11_consts::COUNT_WORDS * 4);
+        k.upload(&d_count, 0, &vec![0u8; ffn::gfx11_consts::COUNT_WORDS * 4]); // the arrival word starts at zero
         KfdModel {
-            norm: k.kernel("norm"),
             proj: k.kernel("attn_proj"),
-            kv: k.kernel("attn_kv"),
             absorb: k.kernel("attn_absorb"),
             mla: k.kernel("attn_mla"),
             merge: k.kernel("attn_merge"),
@@ -898,7 +902,6 @@ impl KfdModel {
             dense_down: k.kernel("dense_down"),
             shared_down: k.kernel("shared_down"),
             route: k.kernel("route"),
-            group: k.kernel("group"),
             up: k.kernel("experts_up"),
             down: k.kernel("experts_down"),
             sample: k.kernel("sample"),
@@ -909,7 +912,6 @@ impl KfdModel {
             d_cos,
             d_sin,
             d_h: k.vram_visible(T * H * 4),
-            d_xn: k.vram(T * H * 4),
             d_q: k.vram(T * Q_DIM * 4),
             d_kva: k.vram(T * KVA_DIM * 4),
             d_heads: k.vram(T * O_IN_DIM * 4),
@@ -920,7 +922,7 @@ impl KfdModel {
             d_xs: k.vram(T * 4 * H / GROUP),
             d_xg: k.vram(T * 4 * H / GROUP),
             d_expert: k.vram(T * TOP_K * 4),
-            d_count: k.vram(ffn::gfx11_consts::COUNT_WORDS * 4),
+            d_count,
             d_list: k.vram(N_ROUTED_EXPERTS * T * 4),
             d_egu: k.vram(T * TOP_K * 2 * D_FF * 4),
             d_eout: k.vram(T * TOP_K * H * 4),
@@ -953,16 +955,11 @@ impl KfdModel {
         self.k.stats()
     }
     /// `xn = rmsnorm(h) ⊙ ln` for the step's `n` tokens: what every rows kernel reads.
-    fn norm(&self, ln: usize, n: usize) {
+    /// `out[n][m] = W[m][H] · (rmsnorm(h[n]) ⊙ ln)`, posted; `free` lets it launch alongside the dispatch before it.
+    fn rows(&self, ln: usize, w: usize, out: &Mem, m: usize, n: usize, free: bool) {
         let mut a = Args::new();
-        a.ptr(self.d_h.va).ptr(ln).ptr(self.d_xn.va);
-        self.k.launch(&self.norm, n as u32, WG, ffn::gfx11_consts::NORM_LDS as u32, &a);
-    }
-    /// `out[n][m] = W[m][H] · xn[n]`, posted; `free` lets it launch alongside the dispatch before it.
-    fn rows(&self, w: usize, out: &Mem, m: usize, n: usize, free: bool) {
-        let mut a = Args::new();
-        a.ptr(self.d_xn.va).ptr(w).ptr(out.va).u32(m as u32).u32(n as u32);
-        let lds = ffn::gfx11_consts::rows_lds(H, n) as u32;
+        a.ptr(self.d_h.va).ptr(ln).ptr(w).ptr(out.va).u32(m as u32).u32(n as u32);
+        let lds = ffn::gfx11_consts::normed_rows_lds(H, n) as u32;
         if free {
             self.k.launch_free(&self.rows, ffn::gfx11_consts::rows_grid(m), WG, lds, &a);
         } else {
@@ -1000,17 +997,13 @@ impl Attention for KfdModel {
         let cos = self.d_cos.at(pos * QK_ROPE_HEAD_DIM * 4);
         let sin = self.d_sin.at(pos * QK_ROPE_HEAD_DIM * 4);
         let max_splits = attn::gfx11_consts::max_splits(self.max_ctx) as u32;
-        self.norm(ln, n);
         let mut a1 = Args::new();
-        a1.ptr(self.d_xn.va).ptr(wq).ptr(wkva).ptr(self.d_q.va).ptr(self.d_kva.va).u32(n as u32);
-        self.k.launch(&self.proj, attn::gfx11_consts::PROJ_GRID, WG, attn::gfx11_consts::rows_lds(H, n) as u32, &a1);
-        let mut ak = Args::new();
-        ak.ptr(self.d_kva.va).ptr(kvaln).ptr(cache).u32(pos as u32).ptr(cos).ptr(sin).ptr(self.d_mirror.at(l * KV_ROW * 4));
-        self.k.launch(&self.kv, n as u32, WG, attn::gfx11_consts::KV_LDS as u32, &ak);
-        // the absorbed queries need only q: free to launch alongside the rows
+        a1.ptr(self.d_h.va).ptr(ln).ptr(wq).ptr(wkva).ptr(self.d_q.va).ptr(self.d_kva.va).u32(n as u32);
+        self.k.launch(&self.proj, attn::gfx11_consts::PROJ_GRID, WG, attn::gfx11_consts::normed_rows_lds(H, n) as u32, &a1);
+        // the absorbed queries and the cache rows, one launch after the projections
         let mut ab = Args::new();
-        ab.ptr(self.d_q.va).ptr(kvb).ptr(self.d_qabs.va);
-        self.k.launch_free(&self.absorb, (n * HEADS) as u32, WG, attn::gfx11_consts::ABSORB_LDS as u32, &ab);
+        ab.ptr(self.d_q.va).ptr(kvb).ptr(self.d_qabs.va).u32(n as u32).ptr(self.d_kva.va).ptr(kvaln).ptr(cache).u32(pos as u32).ptr(cos).ptr(sin).ptr(self.d_mirror.at(l * KV_ROW * 4));
+        self.k.launch(&self.absorb, attn::gfx11_consts::absorb_grid(n), WG, attn::gfx11_consts::ABSORB_LDS as u32, &ab);
         let mut a2 = Args::new();
         a2.ptr(self.d_qabs.va).ptr(cache).u32(pos as u32).ptr(self.d_q.va).ptr(cos).ptr(sin).f32(scale).ptr(self.d_part.va).u32(max_splits);
         self.k.launch(&self.mla, attn::gfx11_consts::mla_grid(pos, n), WG, attn::gfx11_consts::MLA_LDS as u32, &a2);
@@ -1027,8 +1020,7 @@ impl FeedForward for KfdModel {
     fn dense(&mut self, l: usize, _w: &ffn::Dense, _h: &mut [f32], n: usize, _tr: &mut dyn Trace) {
         let b = dl::layer(l);
         let (ln, gate, down) = (self.dense_at(b + dl::POST_LN), self.dense_at(b + dl::DENSE_GATE), self.dense_at(b + dl::DENSE_DOWN));
-        self.norm(ln, n);
-        self.rows(gate, &self.d_gu, 2 * INTERMEDIATE_SIZE, n, false); // gate rows then up rows, contiguous in the file
+        self.rows(ln, gate, &self.d_gu, 2 * INTERMEDIATE_SIZE, n, false); // gate rows then up rows, contiguous in the file
         let mut a2 = Args::new();
         a2.ptr(self.d_gu.va).ptr(down).ptr(self.d_h.va).ptr(self.d_layers.at(l * TOKENS * H * 4)).u32(n as u32);
         self.k.launch(&self.dense_down, ffn::gfx11_consts::rows_grid(H), WG, ffn::gfx11_consts::rows_lds(INTERMEDIATE_SIZE, n) as u32, &a2);
@@ -1040,17 +1032,14 @@ impl FeedForward for KfdModel {
         let (ln, router, sg, sd) = (self.dense_at(b + dl::POST_LN), self.dense_at(b + dl::ROUTER), self.dense_at(b + dl::SHARED_GATE), self.dense_at(b + dl::SHARED_DOWN));
         let base = layout::record(l, 0).start as u64;
         let mut ar = Args::new();
-        ar.ptr(self.d_h.va).ptr(ln).ptr(router).ptr(self.d_xn.va).ptr(self.d_wt.va).ptr(self.d_xq.va).ptr(self.d_xs.va).ptr(self.d_xg.va).ptr(self.d_expert.va).ptr(self.d_topk.at(l * TOKENS * TOP_K * 4));
+        ar.ptr(self.d_h.va).ptr(ln).ptr(router).ptr(self.d_wt.va).ptr(self.d_xq.va).ptr(self.d_xs.va).ptr(self.d_xg.va).ptr(self.d_expert.va).ptr(self.d_topk.at(l * TOKENS * TOP_K * 4)).u32(n as u32).ptr(self.d_count.va).ptr(self.d_list.va);
         self.k.launch(&self.route, n as u32, WG, ffn::gfx11_consts::ROUTE_LDS as u32, &ar);
-        let mut ag = Args::new();
-        ag.ptr(self.d_expert.va).u32(n as u32).ptr(self.d_count.va).ptr(self.d_list.va);
-        self.k.launch(&self.group, 1, WG, ffn::gfx11_consts::GROUP_LDS as u32, &ag);
         let mut au = Args::new();
         au.ptr(self.d_stream.va).u64(base).ptr(self.d_count.va).ptr(self.d_list.va).ptr(self.d_xq.va).ptr(self.d_xs.va).ptr(self.d_xg.va).ptr(self.d_egu.va);
         self.k.launch(&self.up, ex::up_grid(n), WG, ex::experts_lds(H, n) as u32, &au);
-        // the shared experts' rows need only the normed residual, complete since the router
+        // the shared experts' rows need only the residual, complete since the router
         // launched: free to overlap the routed experts' up
-        self.rows(sg, &self.d_gu, 2 * SHARED_FF, n, true);
+        self.rows(ln, sg, &self.d_gu, 2 * SHARED_FF, n, true);
         let mut ad = Args::new();
         ad.ptr(self.d_stream.va).u64(base).ptr(self.d_count.va).ptr(self.d_list.va).ptr(self.d_egu.va).ptr(self.d_eout.va);
         self.k.launch(&self.down, ex::down_grid(n), WG, ex::experts_lds(D_FF, n) as u32, &ad);
@@ -1064,8 +1053,7 @@ impl Head for KfdModel {
     /// Posts the head for every token of the step; `logits` is filled on the card, row per token.
     fn logits(&mut self, _norm: &[f32], _lm_head: &[u16], _h: &[f32], n: usize, _logits: &mut [f32]) {
         let (ln, w) = (self.dense_at(dl::NORM), self.dense_at(dl::LM_HEAD));
-        self.norm(ln, n);
-        self.rows(w, &self.d_logits, VOCAB_SIZE, n, false);
+        self.rows(ln, w, &self.d_logits, VOCAB_SIZE, n, false);
     }
 }
 

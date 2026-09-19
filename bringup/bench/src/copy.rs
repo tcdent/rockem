@@ -17,7 +17,7 @@ fn main() {
     let n = mb << 20;
     let src: Vec<u8> = (0..n).map(|i| (i * 2654435761usize >> 13) as u8).collect();
     let mut dram = vec![0u8; n];
-    let k = flag("--bar").then(|| kfd::Kfd::new(&std::fs::read(arg("--bundle").expect("--bar needs --bundle").join("kernels.gfx1100.elf")).unwrap()));
+    let k = flag("--bar").then(|| kfd::Kfd::new(&std::fs::read(arg("--bundle").expect("--bar needs --bundle").join("kernels.gfx1100.elf")).unwrap(), false));
     let bar = k.as_ref().map(|k| k.vram_visible(n));
     let dsts: Vec<(&str, *mut u8)> = [Some(("dram", dram.as_mut_ptr())), bar.as_ref().map(|m| ("bar", m.ptr() as *mut u8))].into_iter().flatten().collect();
     for (name, dst) in dsts {

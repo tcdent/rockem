@@ -199,8 +199,7 @@ pub mod gfx11_consts {
     /// Launch-sized LDS: proj/out = a staged step of TOKENS activations (`gemv::gfx11`) + 8 partials;
     /// kv = 8 partials; mla = q_abs (R) + q_pe (P) + scores (CHUNK_MAX) + 8 per-wave outputs (R each) + 8 partials;
     /// merge = o_lat (R) + 8 partials.
-    pub use crate::ffn::gfx11_consts::rows_lds;
-    pub const KV_LDS: usize = 4 * 8;
+    pub use crate::ffn::gfx11_consts::{normed_rows_lds, rows_lds};
     /// Rows a workgroup stages in LDS at a time: read from memory once, then
     /// every wave's two heads work on them. Four is 9 KB; with the rope
     /// queries, four workgroups a CU, whose waves hide each other's LDS
@@ -215,18 +214,23 @@ pub mod gfx11_consts {
     pub const MLA_STATS: [&str; 4] = ["prologue_ticks", "loop_ticks", "stage_ticks", "compute_ticks"];
     /// merge = 8 waves' partial outputs (R each) + 8 partials.
     pub const MERGE_LDS: usize = 4 * (8 * KV_LORA_RANK + 8);
-    /// absorb = 8 partials (none needed; the launch takes the minimum).
+    /// absorb = the cache rows' 8 partials.
     pub const ABSORB_LDS: usize = 4 * 8;
+    /// `attn_absorb`'s grid: a workgroup per (token, head), then one per token.
+    pub const fn absorb_grid(n: usize) -> u32 {
+        (n * (HEADS + 1)) as u32
+    }
 }
 
 #[cfg(target_arch = "amdgpu")]
 pub mod gfx11 {
     //! The GPU realization of `step` for `n` tokens at once, five launches
     //! split at the grid-wide dependencies: `attn_proj` (the q and kv
-    //! projections over the normed residual, one wave per row, every token's
-    //! activation staged a step at a time — `gemv::gfx11`), `attn_kv` (a
-    //! workgroup per token: latent norm, rope, the cache row and its mirror),
-    //! `attn_mla` (a workgroup per (token, head, chunk of that token's
+    //! projections over the residual, normed as it is staged a step at a
+    //! time, one wave per row — `gemv::gfx11`), `attn_absorb` (a workgroup
+    //! per (token, head) for the absorbed query, and one per token for the
+    //! latent norm, rope, the cache row and its mirror), `attn_mla` (a
+    //! workgroup per (token, head, chunk of that token's
     //! positions): absorbed scores over its chunk from the cache, a local
     //! softmax and latent output kept unnormalized with its max and sum),
     //! `attn_merge` (a workgroup per (token, head): the flash-decoding
@@ -240,7 +244,7 @@ pub mod gfx11 {
     //! are bf16 straight from the bundle's dense file; norms are widened on
     //! the fly.
     use crate::*;
-    use common::gemv::gfx11::{bf16_row, rows_over, slot};
+    use common::gemv::gfx11::{bf16_row, rows_over};
     const _: () = assert!(TOKENS == common::gemv::gfx11::TOKENS);
     use common::gemv::widen;
     use common::gfx11::{lds, workgroup_max, workgroup_sum, workgroup_sync};
@@ -249,23 +253,26 @@ pub mod gfx11 {
 
     pub use super::gfx11_consts::*;
 
-    /// `q[i] = W_q · xn[i]`, `kva[i] = W_kva · xn[i]` for `n` normed tokens
-    /// (`xn` is `[n][H]`, from `norm`): the rows of the two matrices as one
-    /// `[PROJ_ROWS][H]` matrix through the rows skeleton. Grid: PROJ_GRID × 256.
+    /// `q[i] = W_q · xn[i]`, `kva[i] = W_kva · xn[i]` for `n` tokens, `xn[i]`
+    /// the residual `h[i]` normed with `ln` on the way (`rows_over` with
+    /// NORM): the rows of the two matrices as one `[PROJ_ROWS][H]` matrix
+    /// through the rows skeleton. Grid: PROJ_GRID × 256.
     #[no_mangle]
-    pub extern "gpu-kernel" fn attn_proj(xn: *const f32, w_q: *const u16, w_kva: *const u16, q: *mut f32, kva: *mut f32, n: u32) {
+    pub extern "gpu-kernel" fn attn_proj(h: *const f32, ln: *const u16, w_q: *const u16, w_kva: *const u16, q: *mut f32, kva: *mut f32, n: u32) {
         unsafe {
             let tid = workitem_id_x();
             let t = tid as usize;
             let row = workgroup_id_x() as usize * 8 + (tid / 32) as usize;
             // `rows_over` reads row `row` at `w + row · H`: point `w` so that lands in the matrix holding it
             let w: *const u16 = if row < Q_DIM { w_q } else { w_kva.sub(Q_DIM * H) };
-            rows_over::<H>(
+            rows_over::<H, true>(
                 tid,
                 w,
+                ln,
                 PROJ_ROWS,
                 n as usize,
-                |i, s, dst| *dst.add(slot(t)) = *xn.add(i * H + s * 256 + t),
+                RMS_NORM_EPS,
+                |i, s| *h.add(i * H + s * 256 + t),
                 |row, i, y| {
                     if row < Q_DIM {
                         *q.add(i * Q_DIM + row) = y;
@@ -277,16 +284,14 @@ pub mod gfx11 {
         }
     }
 
-    /// A workgroup per token: the latent norm of `kva[i]` and the rope of its
-    /// tail become cache row `pos + i` of this layer and the token's row of
-    /// `mirror` (`[n][layer][KV_ROW]`, this layer's slot). Grid: n × 256.
-    #[no_mangle]
-    pub extern "gpu-kernel" fn attn_kv(kva: *const f32, kv_a_ln: *const u16, cache: *mut f32, pos: u32, cos: *const f32, sin: *const f32, mirror: *mut f32) {
-        unsafe {
+    /// Workgroup `i` of the cache rows: the latent norm of `kva[i]` and the
+    /// rope of its tail become cache row `pos + i` of this layer and the
+    /// token's row of `mirror` (`[n][layer][KV_ROW]`, this layer's slot).
+    #[inline(always)]
+    unsafe fn kv_row(i: usize, tid: u32, kva: *const f32, kv_a_ln: *const u16, cache: *mut f32, pos: u32, cos: *const f32, sin: *const f32, mirror: *mut f32) {
+        {
             const R: usize = KV_LORA_RANK;
             const P: usize = QK_ROPE_HEAD_DIM;
-            let i = workgroup_id_x() as usize;
-            let tid = workitem_id_x();
             let t = tid as usize;
             let red: *mut f32 = lds();
             let kva = kva.add(i * KVA_DIM);
@@ -320,19 +325,28 @@ pub mod gfx11 {
         }
     }
 
-    /// A workgroup per (token, head): the absorbed query
-    /// `q_abs[i][hd][j] = Σ_k W_UK[hd][k][j] · q_nope[hd][k]`, threads owning
-    /// `j` and `j + 256`, for `attn_mla` to read once per chunk. One workgroup
-    /// per token did all sixteen heads at 108 µs a layer (2026-09-19): a
-    /// single workgroup streaming 2 MB. Grid: n · HEADS × 256.
+    /// What `attn_proj` leaves for `attn_mla`, one launch: a workgroup per
+    /// (token, head) for the absorbed query `q_abs[i][hd][j] = Σ_k
+    /// W_UK[hd][k][j] · q_nope[hd][k]`, threads owning `j` and `j + 256`, for
+    /// `attn_mla` to read once per chunk; then a workgroup per token for its
+    /// cache row (`kv_row`). Both need only the projections, so they were two
+    /// launches side by side; one launch is a launch and its gap fewer a
+    /// layer (2026-09-19). One workgroup per token did all sixteen heads at
+    /// 108 µs a layer (2026-09-19): a single workgroup streaming 2 MB.
+    /// Grid: n · (HEADS + 1) × 256.
     #[no_mangle]
-    pub extern "gpu-kernel" fn attn_absorb(q: *const f32, kv_b: *const u16, q_abs: *mut f32) {
+    pub extern "gpu-kernel" fn attn_absorb(q: *const f32, kv_b: *const u16, q_abs: *mut f32, n: u32, kva: *const f32, kv_a_ln: *const u16, cache: *mut f32, pos: u32, cos: *const f32, sin: *const f32, mirror: *mut f32) {
         unsafe {
             const R: usize = KV_LORA_RANK;
             const N: usize = QK_NOPE_HEAD_DIM;
             let wg = workgroup_id_x() as usize;
+            let tid = workitem_id_x();
+            if wg >= n as usize * HEADS {
+                kv_row(wg - n as usize * HEADS, tid, kva, kv_a_ln, cache, pos, cos, sin, mirror);
+                return;
+            }
             let (i, hd) = (wg / HEADS, wg % HEADS);
-            let t = workitem_id_x() as usize;
+            let t = tid as usize;
             let w_uk = kv_b.add(hd * KVB_HEAD_DIM * R);
             let q_nope = q.add(i * Q_DIM + hd * Q_HEAD_DIM);
             let (mut a0, mut a1) = (0f32, 0f32);
@@ -666,12 +680,14 @@ pub mod gfx11 {
         unsafe {
             let tid = workitem_id_x();
             let t = tid as usize;
-            rows_over::<O_IN_DIM>(
+            rows_over::<O_IN_DIM, false>(
                 tid,
                 w_o,
+                core::ptr::null(),
                 H,
                 n as usize,
-                |i, s, dst| *dst.add(slot(t)) = *heads.add(i * O_IN_DIM + s * 256 + t),
+                0.0,
+                |i, s| *heads.add(i * O_IN_DIM + s * 256 + t),
                 |row, i, y| *h.add(i * H + row) += y,
             );
         }

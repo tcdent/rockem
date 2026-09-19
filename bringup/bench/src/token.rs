@@ -27,7 +27,7 @@ fn main() {
     let ef = std::fs::File::open(bundle.join(layout::EXPERTS_FILE)).unwrap();
     let emm = unsafe { memmap2::Mmap::map(&ef).unwrap() };
     let w = Weights::from_dense(dense);
-    let k = kfd::Kfd::new(&elf);
+    let k = kfd::Kfd::new(&elf, true);
     let max_ctx = 2048;
     let rope = Rope::new(max_ctx);
     let mut m = kfd::KfdModel::new(k.clone(), dense, &emm[..layout::STREAM], &rope, max_ctx);

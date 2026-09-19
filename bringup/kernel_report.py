@@ -8,7 +8,7 @@ ELF (llvm-readobj notes, llvm-objdump) and keeps the last report beside the ELF 
 `<elf>.report.json`. Prints nothing when nothing changed and every kernel is within
 bounds; otherwise one line per kernel that moved, and what moved. Fails the build on
 scratch (the node's loader refuses it anyway; better here), on more registers than the
-occupancy bound, or on a barrier count that changed — the duplicated-barrier bug of
+occupancy bound, or on a barrier count that changed (the run records the new counts, so a second run accepts an intended change) — the duplicated-barrier bug of
 2026-09-19 would have printed here. `--show` prints the whole table regardless."""
 import argparse, glob, json, os, re, subprocess, sys
 

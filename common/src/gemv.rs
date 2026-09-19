@@ -237,36 +237,86 @@ pub mod gfx11 {
 
     /// The rows kernel skeleton: the workgroup's 8 rows (a wave each) of a
     /// `[m][K]` bf16 matrix over `n` activations, a pass of PASS tokens at a
-    /// time, each pass staged from `stage(token, s, slab)` (each thread its
-    /// element of step `s` of token `token` into `slab` at `slot(thread)`) a
-    /// round of steps at a time; `emit(row, token, y)` receives every (row,
+    /// time, each pass staged a round of steps at a time from `stage(token,
+    /// s)` — each thread returns element `s · 256 + thread` of that token's
+    /// activation (anything past `K`; the row primitive masks it) and the
+    /// skeleton owns the slab; `emit(row, token, y)` receives every (row,
     /// token) sum from lane 0. Every rows kernel is this with its own stage
     /// and emit.
+    ///
+    /// With `NORM` the activations are rms-normed on the way, `ln` the norm's
+    /// weight (read only then): the staged element is `ln[j] · x[j]`, the
+    /// sum of squares of the raw elements rides along on the staging each
+    /// thread already does, and the row sum is scaled once at the emit, `y ·
+    /// rsqrt(mean(x²) + eps)`. That is `W · (ln ⊙ x) · r` where the CPU
+    /// computes `W · (ln ⊙ (x · r))`: the same value to a rounding per
+    /// element, on top of the summation order that already parts the card's
+    /// stream from the CPU's (2026-09-19, tcdent). A norm launch per rows
+    /// launch was 28 launches a token; norming in a prologue of every
+    /// workgroup, bit for bit, cost more than the launches (each workgroup
+    /// re-read its activations and waited on the reads before its first
+    /// weights: +12 µs a launch).
     #[inline(always)]
-    pub unsafe fn rows_over<const K: usize>(tid: u32, w: *const u16, m: usize, n: usize, stage: impl Fn(usize, usize, *mut f32), emit: impl Fn(usize, usize, f32)) {
+    pub unsafe fn rows_over<const K: usize, const NORM: bool>(tid: u32, w: *const u16, ln: *const u16, m: usize, n: usize, eps: f32, stage: impl Fn(usize, usize) -> f32, emit: impl Fn(usize, usize, f32)) {
         let mut p0 = 0;
         while p0 < n {
             let np = if n - p0 < PASS { n - p0 } else { PASS };
             // the pass runs at a constant width so its token loop has nothing predicated
             match width(np) {
-                1 => rows_pass::<K, 1>(tid, w, m, p0, np, &stage, &emit),
-                _ => rows_pass::<K, PASS>(tid, w, m, p0, np, &stage, &emit),
+                1 => rows_pass::<K, 1, NORM>(tid, w, ln, m, p0, np, eps, &stage, &emit),
+                _ => rows_pass::<K, PASS, NORM>(tid, w, ln, m, p0, np, eps, &stage, &emit),
             }
             p0 += PASS;
+        }
+    }
+
+    /// LDS a pass at width `NP` over `[m][K]` uses for its slab, in floats.
+    pub const fn slab_floats(k: usize, np: usize) -> usize {
+        let steps = k.div_ceil(256);
+        let slots = if np <= 1 { if steps < FLIGHT { steps } else { FLIGHT } } else { 2 * PASS };
+        slots * STEP
+    }
+
+    /// Step `s` of the pass's NP tokens from `p0` staged at `slab`
+    /// (`[NP][STEP]`), this thread's element of each at `slot(t)`. All NP,
+    /// not the `np` real ones: the trip count is a constant, so the loads
+    /// issue together and `ss[i]` stays in registers (a runtime count put it
+    /// in scratch, a predicate cost 10 % at 32 tokens, 2026-09-19). The
+    /// tokens past `np` read stale rows of the TOKENS-deep buffers (`p0 + NP
+    /// ≤ TOKENS`) and are never emitted. With NORM the norm weight is read
+    /// once for the step.
+    #[inline(always)]
+    unsafe fn stage_round<const K: usize, const NP: usize, const NORM: bool>(t: usize, ln: *const u16, p0: usize, s: usize, slab: *mut f32, stage: &impl Fn(usize, usize) -> f32, ss: &mut [f32; PASS]) {
+        const { assert!(TOKENS % PASS == 0) };
+        let dst = slab.add(slot(t));
+        let j = s * 256 + t;
+        let wl = if NORM && j < K { super::widen(*ln.add(j)) } else { 1.0 };
+        let mut i = 0;
+        while i < NP {
+            let v = stage(p0 + i, s);
+            if NORM {
+                ss[i] += v * v;
+                *dst.add(i * STEP) = wl * v;
+            } else {
+                *dst.add(i * STEP) = v;
+            }
+            i += 1;
         }
     }
 
     /// One pass of `np` tokens (from `p0`) at width `NP`: rounds of staged
     /// steps, the row sums, the emits for the `np` real tokens.
     #[inline(always)]
-    unsafe fn rows_pass<const K: usize, const NP: usize>(tid: u32, w: *const u16, m: usize, p0: usize, np: usize, stage: &impl Fn(usize, usize, *mut f32), emit: &impl Fn(usize, usize, f32)) {
+    unsafe fn rows_pass<const K: usize, const NP: usize, const NORM: bool>(tid: u32, w: *const u16, ln: *const u16, m: usize, p0: usize, np: usize, eps: f32, stage: &impl Fn(usize, usize) -> f32, emit: &impl Fn(usize, usize, f32)) {
         const { assert!(K.div_ceil(256) * 4 * 256 <= 60 * 1024) };
         let (lane, wave) = (tid % 32, (tid / 32) as usize);
         let slab: *mut f32 = crate::gfx11::lds();
+        let red = slab.add(slab_floats(K, NP)); // 8 wave partials per token, the norm's
         let row = core::arch::amdgpu::workgroup_id_x() as usize * 8 + wave;
         let steps = K.div_ceil(256);
         let r = round(NP, steps);
         let mut acc = [0f32; PASS];
+        let mut ss = [0f32; PASS];
         let live = row < m;
         let wr = w.add(row * K);
         // full rounds carry no guards, so their loads hoist; one guarded round takes the tail
@@ -274,11 +324,7 @@ pub mod gfx11 {
         while s0 + r <= steps {
             let mut k = 0;
             while k < r {
-                let mut i = 0;
-                while i < np {
-                    stage(p0 + i, s0 + k, slab.add((k * NP + i) * STEP));
-                    i += 1;
-                }
+                stage_round::<K, NP, NORM>(tid as usize, ln, p0, s0 + k, slab.add(k * NP * STEP), stage, &mut ss);
                 k += 1;
             }
             crate::gfx11::workgroup_sync();
@@ -297,11 +343,7 @@ pub mod gfx11 {
         if tail > 0 {
             let mut k = 0;
             while k < tail {
-                let mut i = 0;
-                while i < np {
-                    stage(p0 + i, s0 + k, slab.add((k * NP + i) * STEP));
-                    i += 1;
-                }
+                stage_round::<K, NP, NORM>(tid as usize, ln, p0, s0 + k, slab.add(k * NP * STEP), stage, &mut ss);
                 k += 1;
             }
             crate::gfx11::workgroup_sync();
@@ -314,11 +356,36 @@ pub mod gfx11 {
             }
             crate::gfx11::workgroup_sync();
         }
+        // the norm's scales: each thread's sum of squares over what it staged, the wave's,
+        // the eight waves' in order (`workgroup_sum`'s order); one barrier
+        let mut rr = [1f32; PASS];
+        if NORM {
+            let mut i = 0;
+            while i < NP {
+                let s = crate::gfx11::wave_sum(lane, ss[i]);
+                if lane == 0 {
+                    *red.add(i * 8 + wave) = s;
+                }
+                i += 1;
+            }
+            crate::gfx11::workgroup_sync();
+            let mut i = 0;
+            while i < NP {
+                let mut total = 0f32;
+                let mut w = 0;
+                while w < 8 {
+                    total += *red.add(i * 8 + w);
+                    w += 1;
+                }
+                rr[i] = crate::math::rsqrt(total / K as f32 + eps);
+                i += 1;
+            }
+        }
         let mut i = 0;
         while i < NP {
             let y = crate::gfx11::wave_sum(lane, acc[i]);
             if lane == 0 && row < m && i < np {
-                emit(row, p0 + i, y);
+                emit(row, p0 + i, if NORM { y * rr[i] } else { y });
             }
             i += 1;
         }

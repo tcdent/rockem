@@ -22,7 +22,7 @@ fn main() {
     let w = Weights::from_dense(dense);
     let max_ctx = 256;
     let rope = Rope::new(max_ctx);
-    let k = kfd::Kfd::new(&elf);
+    let k = kfd::Kfd::new(&elf, true);
     let mut m = kfd::KfdModel::new(k, dense, &experts[..deepseek_v2_lite::layout::STREAM], &rope, max_ctx);
     let mut rng = common::testing::Rng::new(1);
     let mut h: Vec<f32> = (0..n * deepseek_v2_lite::H).map(|_| rng.unit()).collect();

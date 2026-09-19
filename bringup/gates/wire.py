@@ -24,7 +24,9 @@ async def main():
         if t1 is None: t1 = time.time()
         out.append(t)
         if len(out) >= cap: break
+    t2 = time.time()
     c.close()
-    print(f"prompt {len(ids)} ids, first token after {t1 - t0:.3f}s; tokens: {out}")
+    rate = f", then {(len(out) - 1) / (t2 - t1):.1f} tok/s" if len(out) > 1 else ""
+    print(f"prompt {len(ids)} ids, first token after {t1 - t0:.3f}s{rate}; tokens: {out}")
 
 asyncio.run(main())

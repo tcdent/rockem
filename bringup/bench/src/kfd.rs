@@ -30,7 +30,7 @@ fn main() {
     QAct { q: &mut xq, scale: &mut xs, gsum: &mut xg }.quantize(&x);
     let bytes = |v: &[f32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, 4 * v.len()) };
 
-    let k = kfd::Kfd::new(&elf);
+    let k = kfd::Kfd::new(&elf, true);
     let (up, down) = (k.kernel("experts_up"), k.kernel("experts_down"));
     let d_stream = k.vram_visible(records.len());
     k.upload(&d_stream, 0, records);

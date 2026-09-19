@@ -108,3 +108,15 @@ passed = 42
 n = 164
 ids_per_s = 195
 results = "bringup/evals/results/humaneval-6eeec6e508315114-2026-09-19T13-04-25.jsonl"
+
+[[humaneval.runs]]
+date = "2026-09-19"
+bundle = "v2lite-q4gptq"
+identity = "ab397d309854d3c8"
+recipe = "experts:q4g128-a8-gptq"
+node = "lasenora.local:7332"
+pass_at_1 = 26.8
+passed = 44
+n = 164
+ids_per_s = 214
+results = "bringup/evals/results/humaneval-ab397d309854d3c8-2026-09-19T16-51-40.jsonl"

@@ -14,7 +14,7 @@ use harness::{arg, arg_required};
 
 fn main() {
     let elf = std::fs::read(arg_required("--elf")).unwrap();
-    let k = kfd::Kfd::new(&elf);
+    let k = kfd::Kfd::new(&elf, true);
     let sample = k.kernel("sample");
     let d_logits = k.vram_visible(VOCAB_SIZE * 4);
     let d_out = k.host(64);

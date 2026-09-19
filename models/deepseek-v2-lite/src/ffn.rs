@@ -147,15 +147,17 @@ pub mod gfx11_consts {
         let slots = if n <= 1 { if steps < flight { steps } else { flight } } else { 2 * 8 };
         4 * (slots * common::gemv::STEP + 8)
     }
-    /// norm = 8 partials.
-    pub const NORM_LDS: usize = 4 * 8;
+    /// A rows kernel that norms its input (`bf16_rows`, `attn_proj`): the slab,
+    /// then 8 wave partials per token of the pass (`gemv::gfx11::rows_over`).
+    pub const fn normed_rows_lds(k: usize, n: usize) -> usize {
+        rows_lds(k, n) + 4 * 8 * common::gemv::PASS
+    }
     /// route = normed input (H) + probabilities (N_ROUTED_EXPERTS) + 256 row partials + 8 partials.
     pub const ROUTE_LDS: usize = 4 * (H + N_ROUTED_EXPERTS + 256 + 8);
-    /// group = per-expert counts.
-    pub const GROUP_LDS: usize = 4 * N_ROUTED_EXPERTS;
-    /// `group`'s `count` buffer: a count per expert, then the number of active experts,
-    /// then the active experts in index order (what the expert kernels' grids walk).
-    pub const COUNT_WORDS: usize = 2 * N_ROUTED_EXPERTS + 1;
+    /// `route`'s `count` buffer: a count per expert, then the number of active experts,
+    /// then the active experts in index order (what the expert kernels' grids walk),
+    /// then the launch's arrival word (zero between launches).
+    pub const COUNT_WORDS: usize = 2 * N_ROUTED_EXPERTS + 2;
     /// The statistics each instrumented kernel writes, by slot (`common::stats`).
     pub const ROUTE_STATS: [&str; 4] = ["rows_ticks", "softmax_ticks", "pick_ticks", "quant_ticks"];
     pub const DOWN_STATS: [&str; 4] = ["h_abs", "", "", ""];
@@ -172,20 +174,20 @@ pub mod gfx11_consts {
 #[cfg(target_arch = "amdgpu")]
 pub mod gfx11 {
     //! The GPU realization of the FFN half and the head, for `n` tokens at
-    //! once: `norm` (a workgroup per token: rmsnorm with a weight, written
-    //! out — every rows kernel reads it, so the norm is computed once, not
-    //! once per workgroup), `bf16_rows` (rows of a bf16 matrix over `n`
-    //! activations staged a step at a time — `gemv::gfx11`; the dense layer's
-    //! gate/up, the shared experts' gate/up, the LM head), `dense_down` and
+    //! once: `bf16_rows` (rows of a bf16 matrix over `n` activations, each
+    //! normed with a weight as it is staged a step at a time — `gemv::gfx11`;
+    //! the dense layer's gate/up, the shared experts' gate/up, the LM head;
+    //! every workgroup computes the rms scales itself, a norm launch per
+    //! rows launch having been 28 launches a token), `dense_down` and
     //! `shared_down` (the same rows over SwiGLU, folded into the staging,
     //! with the residual add as epilogue; the MoE one adds the routed
-    //! experts' outputs in slot order), `route` (a workgroup per token: the
-    //! router, the pick, the INT8 activation) and `group` (the tokens each
-    //! expert serves, for the expert kernels). One token is n = 1 through
-    //! the same kernels.
+    //! experts' outputs in slot order) and `route` (a workgroup per token:
+    //! the router, the pick, the INT8 activation; the last workgroup to
+    //! finish groups the tokens by expert for the expert kernels). One token
+    //! is n = 1 through the same kernels.
     pub use super::gfx11_consts::*;
     use crate::*;
-    use common::gemv::gfx11::{rows_over, slot};
+    use common::gemv::gfx11::rows_over;
     use common::gemv::widen;
     use common::gfx11::{lds, wave_max, wave_sum, workgroup_max, workgroup_sum, workgroup_sync};
     use common::math::{exp, ln, round, rsqrt};
@@ -193,57 +195,29 @@ pub mod gfx11 {
     use core::arch::amdgpu::{workgroup_id_x, workitem_id_x};
     const _: () = assert!(TOKENS == common::gemv::gfx11::TOKENS);
 
-    /// `xn[i] = rmsnorm(x[i]) ⊙ ln` for a workgroup per token. Grid: n × 256.
+    /// `out[i][row] = W[row] · rmsnorm_ln(x[i])` for `m` rows of a `[m][H]`
+    /// bf16 matrix and `n` activations `x` (`[n][H]`), the norm on the way
+    /// (`rows_over` with NORM). Grid: rows_grid(m).
     #[no_mangle]
-    pub extern "gpu-kernel" fn norm(x: *const f32, ln: *const u16, xn: *mut f32) {
-        unsafe {
-            let i = workgroup_id_x() as usize;
-            let tid = workitem_id_x();
-            let red: *mut f32 = lds();
-            let (x, xn) = (x.add(i * H), xn.add(i * H));
-            let mut ss = 0f32;
-            let mut j = tid as usize;
-            while j < H {
-                let v = *x.add(j);
-                ss += v * v;
-                j += 256;
-            }
-            let r = rsqrt(workgroup_sum(tid, ss, red) / H as f32 + RMS_NORM_EPS);
-            let mut j = tid as usize;
-            while j < H {
-                *xn.add(j) = widen(*ln.add(j)) * (*x.add(j) * r);
-                j += 256;
-            }
-        }
-    }
-
-    /// `out[i][row] = W[row] · x[i]` for `m` rows of a `[m][H]` bf16 matrix
-    /// and `n` activations `x` (`[n][H]`, already normed). Grid: rows_grid(m).
-    #[no_mangle]
-    pub extern "gpu-kernel" fn bf16_rows(x: *const f32, w: *const u16, out: *mut f32, m: u32, n: u32) {
+    pub extern "gpu-kernel" fn bf16_rows(x: *const f32, ln: *const u16, w: *const u16, out: *mut f32, m: u32, n: u32) {
         unsafe {
             let tid = workitem_id_x();
             let (m, n) = (m as usize, n as usize);
             let t = tid as usize;
-            rows_over::<H>(
-                tid,
-                w,
-                m,
-                n,
-                |i, s, dst| *dst.add(slot(t)) = *x.add(i * H + s * 256 + t),
-                |row, i, y| *out.add(i * m + row) = y,
-            );
+            rows_over::<H, true>(tid, w, ln, m, n, RMS_NORM_EPS, |i, s| *x.add(i * H + s * 256 + t), |row, i, y| *out.add(i * m + row) = y);
         }
     }
 
-    /// Step `s` of `swiglu(gu[i])` for one token into `dst` (256 f32): `gu` is
-    /// `[n][2·N]` (gate then up); element `k` is `silu(gate[k]) · up[k]`, as the CPU's.
+    /// This thread's element of step `s` of `swiglu(gu[i])`: `gu` is `[n][2·N]`
+    /// (gate then up); element `k` is `silu(gate[k]) · up[k]`, as the CPU's.
     #[inline(always)]
-    unsafe fn stage_swiglu<const N: usize>(t: usize, gu: *const f32, i: usize, s: usize, dst: *mut f32) {
+    unsafe fn stage_swiglu<const N: usize>(t: usize, gu: *const f32, i: usize, s: usize) -> f32 {
         let k = s * 256 + t;
         if k < N {
             let g = gu.add(i * 2 * N);
-            *dst.add(slot(t)) = silu(*g.add(k)) * *g.add(N + k);
+            silu(*g.add(k)) * *g.add(N + k)
+        } else {
+            0.0
         }
     }
 
@@ -255,12 +229,14 @@ pub mod gfx11 {
             const N: usize = INTERMEDIATE_SIZE;
             let tid = workitem_id_x();
             let t = tid as usize;
-            rows_over::<N>(
+            rows_over::<N, false>(
                 tid,
                 w,
+                core::ptr::null(),
                 H,
                 n as usize,
-                |i, s, dst| stage_swiglu::<N>(t, gu, i, s, dst),
+                0.0,
+                |i, s| stage_swiglu::<N>(t, gu, i, s),
                 |row, i, y| {
                     let v = *h.add(i * H + row) + y;
                     *h.add(i * H + row) = v;
@@ -279,12 +255,14 @@ pub mod gfx11 {
             const N: usize = SHARED_FF;
             let tid = workitem_id_x();
             let t = tid as usize;
-            rows_over::<N>(
+            rows_over::<N, false>(
                 tid,
                 w,
+                core::ptr::null(),
                 H,
                 n as usize,
-                |i, s, dst| stage_swiglu::<N>(t, gu, i, s, dst),
+                0.0,
+                |i, s| stage_swiglu::<N>(t, gu, i, s),
                 |row, i, y| {
                     let mut a = y;
                     let mut k = 0;
@@ -302,8 +280,8 @@ pub mod gfx11 {
     }
 
     /// The router, a workgroup per token, nothing serial: `xn = rmsnorm(h)`,
-    /// kept in LDS and written out (`[n][H]`, what the shared experts' rows
-    /// read — the norm is this kernel's, not a launch of its own); the
+    /// kept in LDS (the shared experts' rows norm `h` again themselves, the
+    /// same bits, `rms_scales`); the
     /// N_ROUTED_EXPERTS router rows with every thread streaming a quarter of
     /// a row at once (one wave per row was latency-bound: 49 µs a layer,
     /// 2026-09-18); softmax in one wave, two logits a lane; the greedy top-k
@@ -312,9 +290,21 @@ pub mod gfx11 {
     /// their own slot: the scaled weight and the expert (for `group` and the
     /// trace); and `xn` quantized to INT8, `QAct::quantize` op for op, so the
     /// integers match the CPU path bit for bit (quantizing in the expert
-    /// kernels instead measured a net loss, 2026-09-18). Grid: n × 256.
+    /// kernels instead measured a net loss, 2026-09-18). Then the grouping
+    /// for the expert kernels, by the last workgroup to finish: `count[e]`
+    /// and `list[e][..]` of `(token << 3) | slot` from `expert` (`[n][TOP_K]`),
+    /// then the active experts compacted in index order after the counts
+    /// (`COUNT_WORDS`), so the expert kernels' grids cover only experts with
+    /// tokens — at one token, six of sixty-four. Each workgroup counts itself
+    /// in on the arrival word (`count[COUNT_WORDS - 1]`, an atomic after a
+    /// release of its writes); the one that sees `n - 1` acquires and does
+    /// the grouping, and leaves the word at zero for the next launch. A
+    /// launch of its own was a launch and its gap a layer (2026-09-19). The
+    /// order within a list is the LDS atomics' and changes nothing, every
+    /// entry being computed on its own. Grid: n × 256.
     #[no_mangle]
-    pub extern "gpu-kernel" fn route(h: *const f32, ln: *const u16, w: *const u16, xn_out: *mut f32, wt: *mut f32, xq: *mut i8, xs: *mut f32, xg: *mut i32, expert: *mut u32, topk_out: *mut u32) {
+    pub extern "gpu-kernel" fn route(h: *const f32, ln: *const u16, w: *const u16, wt: *mut f32, xq: *mut i8, xs: *mut f32, xg: *mut i32, expert: *mut u32, topk_out: *mut u32, n: u32, count: *mut u32, list: *mut u32) {
+        use core::sync::atomic::{fence, AtomicU32, Ordering};
         unsafe {
             const E: usize = N_ROUTED_EXPERTS;
             const G: usize = common::q4::GROUP;
@@ -327,7 +317,7 @@ pub mod gfx11 {
             let prob = xn.add(H);
             let part = prob.add(E);
             let red = part.add(256);
-            let (h, xn_out) = (h.add(i * H), xn_out.add(i * H));
+            let h = h.add(i * H);
             let (wt, xq, xs, xg, expert, topk_out) = (wt.add(i * TOP_K), xq.add(i * H), xs.add(i * (H / G)), xg.add(i * (H / G)), expert.add(i * TOP_K), topk_out.add(i * TOP_K));
             let mut ss = 0f32;
             let mut k = t;
@@ -339,9 +329,7 @@ pub mod gfx11 {
             let r = rsqrt(workgroup_sum(tid, ss, red) / H as f32 + RMS_NORM_EPS);
             let mut k = t;
             while k < H {
-                let v = widen(*ln.add(k)) * (*h.add(k) * r);
-                *xn.add(k) = v;
-                *xn_out.add(k) = v;
+                *xn.add(k) = widen(*ln.add(k)) * (*h.add(k) * r);
                 k += 256;
             }
             workgroup_sync();
@@ -437,29 +425,30 @@ pub mod gfx11 {
             }
             common::stat!(3, (common::stat_clock!().wrapping_sub(t3)) & common::stats::CLOCK_MASK);
             const _: () = assert!(E == 64 && 4 * E == 256 && Q % 8 == 0 && H / G == 16 && G == 4 * 32);
-        }
-    }
 
-    /// The tokens each expert serves this step: `count[e]` and `list[e][..]`
-    /// of `(token << 3) | slot` from `expert` (`[n][TOP_K]`), then the active
-    /// experts compacted in index order after the counts (`COUNT_WORDS`), so
-    /// the expert kernels' grids cover only experts with tokens — at one
-    /// token, six of sixty-four. One workgroup; the order within a list is
-    /// the atomics' and changes nothing, every entry being computed on its
-    /// own. Grid: 1 × 256.
-    #[no_mangle]
-    pub extern "gpu-kernel" fn group(expert: *const u32, n: u32, count: *mut u32, list: *mut u32) {
-        unsafe {
-            const E: usize = N_ROUTED_EXPERTS;
-            let t = workitem_id_x() as usize;
-            let cnt: *mut u32 = lds();
+            // the grouping by the last workgroup: this one's writes to L2 (release), then one
+            // arrival; `last` reaches the workgroup through LDS
+            fence(Ordering::Release);
+            workgroup_sync();
+            let last = red as *mut u32;
+            if t == 0 {
+                let arrived = AtomicU32::from_ptr(count.add(COUNT_WORDS - 1)).fetch_add(1, Ordering::AcqRel);
+                *last = (arrived == n - 1) as u32;
+            }
+            workgroup_sync();
+            if *last == 0 {
+                return;
+            }
+            fence(Ordering::Acquire); // the other workgroups' `expert` from L2, not this CU's caches
+            let cnt = prob as *mut u32; // the probabilities are done with
             if t < E {
                 *cnt.add(t) = 0;
             }
             workgroup_sync();
+            let expert = expert.sub(i * TOP_K); // every token's, from the first
             if t < n as usize * TOP_K {
                 let e = *expert.add(t) as usize;
-                let slot = core::sync::atomic::AtomicU32::from_ptr(cnt.add(e)).fetch_add(1, core::sync::atomic::Ordering::Relaxed) as usize;
+                let slot = AtomicU32::from_ptr(cnt.add(e)).fetch_add(1, Ordering::Relaxed) as usize;
                 *list.add(e * TOKENS + slot) = ((t / TOP_K) << 3 | (t % TOP_K)) as u32;
             }
             workgroup_sync();
@@ -477,6 +466,7 @@ pub mod gfx11 {
                     e += 1;
                 }
                 *count.add(E) = k as u32;
+                *count.add(COUNT_WORDS - 1) = 0;
             }
             const _: () = assert!(TOKENS * TOP_K <= 256);
         }

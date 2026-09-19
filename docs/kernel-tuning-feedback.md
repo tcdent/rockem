@@ -135,7 +135,7 @@ feeling. Theirs: "Prefill + KV Transfer within 5 % of Prefill alone." Ours:
 | placement | the placement matrix reads 0 in every cell for every realization on every tier | integer: in force; float: pending the order contract |
 | recipe quality | teacher-forced KL below a stated bound on the wide golden set (≥ 400 positions, ≥ 4 domains) before a recipe gets a name | measured, bound not yet chosen |
 | kernel performance | ≥ 0.85 of the bandwidth ceiling on a working set larger than the last cache, batched launches | in force for the expert kernels |
-| end-to-end | tok/s on the node, real prompt, each placement | measured, no bound |
+| end-to-end | tok/s on the node, real prompt, each placement (`bringup/gates/wire.py` prints the decode rate over the wire) | measured, no bound; 132 tok/s at ctx 100000 (2026-09-19) |
 | steps | a prompt fed in steps of 32 produces every position's dumps byte-identical to the same prompt fed one id at a time (`make gate-dump`: `bringup/gates/dump_diff.sh` on the GPU box, two `rockem.debug` runs, `cmp` per position; refuses to run while a stray wire client is on the box) | in force, 162/162 |
 | benchmark | a published benchmark, run against a served node through the edge's own client under the model's recipe, within its noise of the published number (`bringup/evals`, kept in `models/<name>/evals.toml`) | HumanEval in force |
 | build hygiene | no scratch, no runtime `cfg`, no retyped constants across the Python boundary; the code object's static report (`make kernels` → `bringup/kernel_report.py`: registers, scratch, LDS, instruction/barrier/load counts per kernel, diffed against the last build's report) prints only what moved and fails on scratch, on more than 192 VGPRs, or on a barrier count that changed | in force |
@@ -222,6 +222,12 @@ is on our unmeasured list; theirs is in production.
 
 ## To incorporate, and when
 
+- **Launch accounting.** *Measured 2026-09-19:* a barrier launch's gap is 3.6 µs —
+  the completion signal 1.7 (now an instrument the node runs without), the agent
+  acquire 1.1 (required: the step gate fails on stale reads without it), the rest the
+  processor's turnaround. 348 → 267 launches a token by folding the norm into the
+  rows kernels' staging, the cache rows into the absorb grid, and the grouping into
+  the router's last workgroup (an arrival counter). Token 7.64 → 6.97 ms.
 - **Timelines.** *Done 2026-09-18* (see Observation): per-launch device timestamps
   from the launcher's own signals. Still to do: the node reporting its own token, bytes
   declared per launch, the ceiling measured at boot.
