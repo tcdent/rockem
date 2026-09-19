@@ -1,0 +1,110 @@
+# Published benchmarks and what this stack measures on them. The tasks live in
+# bringup/evals/ and run against a served node over the wire, through the edge's own
+# client, under the model's sampling recipe; a bundle never carries this file. Each run
+# names the bundle, its identity and recipe, so a kernel or recipe change shows against
+# the anchor the paper used. Resolution: one HumanEval problem is 0.6 points and the
+# binomial noise at this pass rate is ~3.6 points; the exact prompt and stop rules also
+# move published scores by a point or two between harnesses.
+
+[humaneval]
+published = 29.9
+source = "DeepSeek-V2-Lite model card, base model (paper's decoding, not stated)"
+protocol = "zero-shot, one sample per problem under the model's recipe, stops at the next top-level statement, 512 tokens at most"
+
+[[humaneval.runs]]
+date = "2026-09-19"
+bundle = "v2lite-q4gptq"
+identity = "6eeec6e508315114"
+recipe = "experts:q4g128-a8-gptq"
+node = "192.168.88.4:7332"
+pass_at_1 = 25.6
+passed = 42
+n = 164
+ids_per_s = 140
+results = "bringup/evals/results/humaneval-6eeec6e508315114-2026-09-19T08-01-25.jsonl"
+
+[[humaneval.runs]]
+date = "2026-09-19"
+bundle = "v2lite-q4rtn"
+identity = "fc2637a39b95fc2d"
+recipe = "experts:q4g128-a8-rtn"
+node = "192.168.88.4:7332"
+pass_at_1 = 27.4
+passed = 45
+n = 164
+ids_per_s = 140
+results = "bringup/evals/results/humaneval-fc2637a39b95fc2d-2026-09-19T08-11-23.jsonl"
+
+[[mmlu.runs]]
+date = "2026-09-19"
+bundle = "v2lite-q4gptq"
+identity = "6eeec6e508315114"
+recipe = "experts:q4g128-a8-gptq"
+node = "192.168.88.4:7332"
+subset = "abstract_algebra"
+accuracy = 33.0
+passed = 33
+n = 100
+ids_per_s = 698
+results = "bringup/evals/results/mmlu-6eeec6e508315114-2026-09-19T08-57-16.jsonl"
+
+[[humaneval.runs]]
+date = "2026-09-19"
+bundle = "v2lite-q4gptq"
+identity = "6eeec6e508315114"
+recipe = "experts:q4g128-a8-gptq"
+node = "192.168.88.4:7332"
+pass_at_1 = 25.6
+passed = 42
+n = 164
+ids_per_s = 194
+results = "bringup/evals/results/humaneval-6eeec6e508315114-2026-09-19T10-22-13.jsonl"
+
+[[gsm8k.runs]]
+date = "2026-09-19"
+bundle = "v2lite-q4gptq"
+identity = "6eeec6e508315114"
+recipe = "experts:q4g128-a8-gptq"
+node = "192.168.88.4:7332"
+accuracy = 38.1
+passed = 503
+n = 1319
+ids_per_s = 776
+results = "bringup/evals/results/gsm8k-6eeec6e508315114-2026-09-19T10-27-32.jsonl"
+
+[[mmlu.runs]]
+date = "2026-09-19"
+bundle = "v2lite-q4gptq"
+identity = "6eeec6e508315114"
+recipe = "experts:q4g128-a8-gptq"
+node = "192.168.88.4:7332"
+subset = "college_computer_science"
+accuracy = 50.0
+passed = 50
+n = 100
+ids_per_s = 1718
+results = "bringup/evals/results/mmlu-6eeec6e508315114-2026-09-19T10-52-32.jsonl"
+
+[[mmlu.runs]]
+date = "2026-09-19"
+bundle = "v2lite-q4gptq"
+identity = "6eeec6e508315114"
+recipe = "experts:q4g128-a8-gptq"
+node = "192.168.88.4:7332"
+accuracy = 57.5
+passed = 8072
+n = 14042
+ids_per_s = 1800
+results = "bringup/evals/results/mmlu-6eeec6e508315114-2026-09-19T11-12-55.jsonl"
+
+[[humaneval.runs]]
+date = "2026-09-19"
+bundle = "v2lite-q4gptq"
+identity = "6eeec6e508315114"
+recipe = "experts:q4g128-a8-gptq"
+node = "192.168.88.4:7332"
+pass_at_1 = 25.6
+passed = 42
+n = 164
+ids_per_s = 195
+results = "bringup/evals/results/humaneval-6eeec6e508315114-2026-09-19T13-04-25.jsonl"

@@ -1,0 +1,29 @@
+# Every external input to a release, pinned. The manifest of a built release records the
+# hashes of what was actually used; this file is what those hashes are checked against.
+
+[kernel]
+version = "7.2.6"
+tarball = "https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.2.6.tar.xz"
+sha256  = "039aef84f2b0994aeda3f4fcfc3d02ec9d7a9bbb9020ea264c43f446c860f606"
+policy  = "current stable, pinned by tag at each release build; no LTS preference"
+
+[config.baseline]
+source  = "lasenora:/boot/config-6.12.101+deb13-amd64 (Debian 13), carried forward with olddefconfig"
+lsmod   = "lasenora /proc/modules, 2026-09-16, 141 modules -> localyesconfig"
+
+[firmware]
+source  = "lasenora:/lib/firmware/amdgpu, Debian firmware-amd-graphics 20250410-2 (known to bring up the RX 7900 XT on 6.12.101)"
+files   = "os/firmware/amdgpu/*.bin, hashes in os/baseline/firmware-lasenora.txt"
+upstream = "https://gitlab.com/kernel-firmware/linux-firmware — refresh from here once the 7.2 driver's dmesg is read"
+
+[builder]
+containerfile = "os/builder/Containerfile"
+base_image    = "docker.io/library/debian@sha256:abc9cb88a5587630d7f915f47b23b0668fe250fbfc6457aa4d52b534c1bbf73f"  # trixie-slim, pulled 2026-09-16
+image_id      = "75e5559b024b37b56c772a67b07f9f591154d1db9a6acc6983e10d6acff40db7"  # built 2026-09-16
+policy        = "the host needs podman and nothing else; every build step runs in the image via os/run.sh"
+
+[toolchain]
+rust_stable   = "1.98.0"                      # host binary, x86_64-unknown-linux-musl, static
+rust_nightly  = "nightly-2026-06-22"          # amdgcn-amd-amdhsa kernels; rust-src + llvm-tools
+busybox       = "1.37.0"
+busybox_sha256 = "3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b837043a4"

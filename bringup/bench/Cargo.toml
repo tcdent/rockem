@@ -1,0 +1,58 @@
+[package]
+name = "bench"
+version = "0.0.0"
+edition = "2021"
+description = "Per-op benches on real bundle bytes: every realization against the reference, timed against a streaming ceiling measured in the same run. Dev box only."
+
+[dependencies]
+harness = { path = "../harness" }
+common = { path = "../../common", features = ["std"] }
+deepseek_v2_lite = { path = "../../models/deepseek-v2-lite", features = ["std"] }
+memmap2 = "0.9"
+
+[[bin]]
+name = "bench-experts"
+path = "src/experts.rs"
+
+[[bin]]
+name = "dump-expert"
+path = "src/dump_expert.rs"
+
+[profile.release]
+opt-level = 3
+
+[[bin]]
+name = "bench-gptq"
+path = "src/gptq.rs"
+
+[[bin]]
+name = "bench-kfd"
+path = "src/kfd.rs"
+
+[[bin]]
+name = "bench-dram"
+path = "src/dram.rs"
+
+[[bin]]
+name = "bench-copy"
+path = "src/copy.rs"
+
+[[bin]]
+name = "bench-attn"
+path = "src/attn.rs"
+
+[[bin]]
+name = "bench-sample"
+path = "src/sample.rs"
+
+[[bin]]
+name = "bench-token"
+path = "src/token.rs"
+
+[[bin]]
+name = "bench-draw"
+path = "src/draw.rs"
+
+[[bin]]
+name = "bench-step"
+path = "src/step.rs"

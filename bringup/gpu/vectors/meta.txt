@@ -1,0 +1,13 @@
+layer 5
+n 6
+record_offset 1176502272
+record_bytes 4595712
+layer_records 64
+H 2048
+D_FF 1408
+wg 256
+up_tiles 704
+down_tiles 512
+up_lds 2176
+down_lds 1496
+vram_ceiling_gbps 760

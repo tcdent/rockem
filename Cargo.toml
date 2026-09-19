@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["common", "models/deepseek-v2-lite", "node"]
+exclude = ["bringup", "bundle", "models/deepseek-v2-lite/gpu"]
+
+[profile.release]
+opt-level = 3
+lto = true
+panic = "abort"
+codegen-units = 1
+strip = true

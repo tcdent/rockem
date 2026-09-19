@@ -1,0 +1,107 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>rockem</title>
+<style>
+  body { font: 15px/1.45 system-ui, sans-serif; max-width: 48rem; margin: 2rem auto; padding: 0 1rem; color: #222; background: #fafafa; }
+  #log { display: flex; flex-direction: column; gap: .75rem; min-height: 60vh; }
+  .msg { padding: .6rem .9rem; border-radius: .6rem; white-space: pre-wrap; }
+  .user { background: #e3ecff; align-self: flex-end; max-width: 85%; }
+  .assistant { background: #fff; border: 1px solid #ddd; align-self: flex-start; max-width: 85%; }
+  .meta { font-size: .8rem; color: #777; margin-top: .3rem; }
+  form { display: flex; gap: .5rem; margin-top: 1rem; position: sticky; bottom: 1rem; }
+  textarea { flex: 1; font: inherit; padding: .5rem; border: 1px solid #bbb; border-radius: .4rem; resize: vertical; }
+  button { font: inherit; padding: .5rem 1rem; border: 1px solid #888; border-radius: .4rem; background: #fff; cursor: pointer; }
+  #status { font-size: .8rem; color: #777; margin-bottom: 1rem; }
+</style>
+<div id="status"></div>
+<div id="log"></div>
+<form id="f">
+  <textarea id="in" rows="2" placeholder="Say something… (Enter sends, Shift+Enter is a newline)"></textarea>
+  <button id="send" type="submit">Send</button>
+  <button id="stop" type="button" hidden>Stop</button>
+  <button id="clear" type="button">Clear</button>
+</form>
+<script>
+  const log = document.getElementById("log"), input = document.getElementById("in");
+  const send = document.getElementById("send"), stop = document.getElementById("stop");
+  let messages = [], controller = null;
+
+  // The system prompt DeepSeek's own chat ran with, as extracted and published by
+  // Wallarm (lab.wallarm.com/jailbreaking-generative-ai, February 2025). Sent first
+  // on every request; not shown, not part of the visible history. The template
+  // renders a system message as its content followed by a blank line, before "User:".
+  const SYSTEM = `You are a helpful, respectful, and honest assistant.
+
+Always provide accurate and clear information. If you're unsure about something, admit it. Avoid sharing harmful or misleading content. Follow ethical guidelines and prioritize user safety. Be concise and relevant in your responses. Adapt to the user's tone and needs. Use markdown formatting when helpful. If asked about your capabilities, explain them honestly.
+
+Your goal is to assist users effectively while maintaining professionalism and clarity. If a user asks for something beyond your capabilities, explain the limitations politely. Avoid engaging in or promoting illegal, unethical, or harmful activities. If a user seems distressed, offer supportive and empathetic responses. Always prioritize factual accuracy and avoid speculation. If a task requires creativity, use your training to generate original and relevant content. When handling sensitive topics, be cautious and respectful. If a user requests step-by-step instructions, provide clear and logical guidance. For coding or technical questions, ensure your answers are precise and functional. If asked about your training data or knowledge cutoff, provide accurate information. Always strive to improve the user's experience by being attentive and responsive.
+
+Your responses should be tailored to the user's needs, whether they require detailed explanations, brief summaries, or creative ideas. If a user asks for opinions, provide balanced and neutral perspectives. Avoid making assumptions about the user's identity, beliefs, or background. If a user shares personal information, do not store or use it beyond the conversation. For ambiguous or unclear requests, ask clarifying questions to ensure you provide the most relevant assistance. When discussing controversial topics, remain neutral and fact-based. If a user requests help with learning or education, provide clear and structured explanations. For tasks involving calculations or data analysis, ensure your work is accurate and well-reasoned. If a user asks about your limitations, explain them honestly and transparently. Always aim to build trust and provide value in every interaction.
+
+If a user requests creative writing, such as stories or poems, use your training to generate engaging and original content. For technical or academic queries, ensure your answers are well-researched and supported by reliable information. If a user asks for recommendations, provide thoughtful and relevant suggestions. When handling multiple-step tasks, break them down into manageable parts. If a user expresses confusion, simplify your explanations without losing accuracy. For language-related questions, ensure proper grammar, syntax, and context. If a user asks about your development or training, explain the process in an accessible way. Avoid making promises or guarantees about outcomes. If a user requests help with productivity or organization, offer practical and actionable advice. Always maintain a respectful and professional tone, even in challenging situations.
+
+If a user asks for comparisons or evaluations, provide balanced and objective insights. For tasks involving research, summarize findings clearly and cite sources when possible. If a user requests help with decision-making, present options and their pros and cons without bias. When discussing historical or scientific topics, ensure accuracy and context. If a user asks for humor or entertainment, adapt to their preferences while staying appropriate. For coding or technical tasks, test your solutions for functionality before sharing. If a user seeks emotional support, respond with empathy and care. When handling repetitive or similar questions, remain patient and consistent. If a user asks about your ethical guidelines, explain them clearly. Always strive to make interactions positive, productive, and meaningful for the user.`;
+
+  fetch("/health").then(r => r.json()).then(h => {
+    document.getElementById("status").textContent = `${h.model} · identity ${h.identity} · ${h.nodes} node(s)`;
+  });
+
+  function add(role, text) {
+    const el = document.createElement("div");
+    el.className = "msg " + role;
+    el.textContent = text;
+    log.appendChild(el);
+    el.scrollIntoView({ block: "end" });
+    return el;
+  }
+
+  async function ask(text) {
+    messages.push({ role: "user", content: text });
+    add("user", text);
+    const el = add("assistant", "");
+    const meta = document.createElement("div"); meta.className = "meta";
+    controller = new AbortController();
+    send.disabled = true; stop.hidden = false;
+    let reply = "", t0 = performance.now(), n = 0;
+    try {
+      const r = await fetch("/v1/generate", {
+        method: "POST", signal: controller.signal,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ messages: [{ role: "system", content: SYSTEM }, ...messages], stream: true, stop: ["User:"], max_tokens: 1024 }),
+      });
+      if (!r.ok) { el.textContent = `${r.status}: ${await r.text()}`; return; }
+      const reader = r.body.getReader(), dec = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let i;
+        while ((i = buf.indexOf("\n\n")) >= 0) {
+          const [evLine, dataLine] = buf.slice(0, i).split("\n"); buf = buf.slice(i + 2);
+          const ev = evLine.slice(7), data = JSON.parse(dataLine.slice(6));
+          if (ev === "delta") { reply += data.text; n += data.ids.length; el.textContent = reply; el.scrollIntoView({ block: "end" }); }
+          if (ev === "done") meta.textContent = `${data.reason}${data.stop_sequence ? " " + JSON.stringify(data.stop_sequence) : ""} · ${data.usage.completion_tokens} tokens · ${(data.usage.completion_tokens / ((performance.now() - t0) / 1000)).toFixed(1)} tok/s · ${data.usage.prompt_tokens + data.usage.completion_tokens}/${data.usage.positions} positions`;
+        }
+      }
+    } catch (e) {
+      meta.textContent = e.name === "AbortError" ? `stopped · ${n} tokens` : String(e);
+    } finally {
+      messages.push({ role: "assistant", content: reply.trim() });
+      el.appendChild(meta);
+      controller = null; send.disabled = false; stop.hidden = true; input.focus();
+    }
+  }
+
+  document.getElementById("f").addEventListener("submit", e => {
+    e.preventDefault();
+    const text = input.value.trim();
+    if (!text || controller) return;
+    input.value = "";
+    ask(text);
+  });
+  input.addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send.click(); } });
+  stop.addEventListener("click", () => controller?.abort());
+  document.getElementById("clear").addEventListener("click", () => { messages = []; log.innerHTML = ""; input.focus(); });
+  input.focus();
+</script>

@@ -1,0 +1,12 @@
+[package]
+name = "common"
+version = "0.0.0"
+edition = "2021"
+description = "Primitives with no model in them: math, byte formats, GEMV inner loops, norm/rope/softmax/silu steps, the trace hook. no_std, no dependencies, #[inline(always)] everywhere; nothing here is a kernel signature."
+
+[dependencies]
+
+[features]
+std = []
+# statistics from inside kernels (`stat!`); expands to nothing without it
+stats = []

@@ -1,0 +1,4 @@
+.venv/
+goldens/
+.download.log
+__pycache__/

@@ -1,0 +1,11 @@
+[project]
+name = "rockem-evals"
+version = "0.0.0"
+description = "Published benchmarks against a served node, over the wire, through the edge's own client. Dev box only; never on the node."
+requires-python = ">=3.13,<3.14"
+dependencies = [
+  "rockem-api",
+]
+
+[tool.uv.sources]
+rockem-api = { path = "../../api", editable = true }

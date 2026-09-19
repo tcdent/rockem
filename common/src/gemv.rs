@@ -1,0 +1,342 @@
+//! `y[m] = Σ_k W[m][k] · x[k]` with bf16 weights, row-major `[M][K]`, f32
+//! activations. The inner loop of every dense projection; the unpack is a
+//! shift. `bf16` picks the fast realization for the target; `bf16_scalar`
+//! is always there to diff against.
+
+#[inline(always)]
+pub fn widen(w: u16) -> f32 {
+    f32::from_bits((w as u32) << 16)
+}
+
+#[inline(always)]
+pub fn bf16_scalar<const M: usize, const K: usize>(w: &[u16], x: &[f32], out: &mut [f32]) {
+    for m in 0..M {
+        let row = &w[m * K..(m + 1) * K];
+        let mut acc = 0f32;
+        for k in 0..K {
+            acc += widen(row[k]) * x[k];
+        }
+        out[m] = acc;
+    }
+}
+
+/// The realization this target ships. AVX2+FMA presence is asserted once at
+/// construction by the harness, never probed here.
+#[inline(always)]
+pub fn bf16<const M: usize, const K: usize>(w: &[u16], x: &[f32], out: &mut [f32]) {
+    debug_assert!(w.len() >= M * K && x.len() >= K && out.len() >= M);
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        avx2::bf16::<M, K>(w.as_ptr(), x.as_ptr(), out.as_mut_ptr())
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    bf16_scalar::<M, K>(w, x, out)
+}
+
+#[cfg(target_arch = "x86_64")]
+pub mod avx2 {
+    //! Sixteen bf16 per load, widened by zero-extend and a 16-bit shift,
+    //! four FMA chains per row. Bandwidth-bound.
+    use core::arch::x86_64::*;
+
+    #[inline(always)]
+    pub unsafe fn hsum(v: __m256) -> f32 {
+        let lo = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps::<1>(v));
+        let s = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
+        let s = _mm_add_ss(s, _mm_shuffle_ps::<1>(s, s));
+        _mm_cvtss_f32(s)
+    }
+
+    #[inline(always)]
+    unsafe fn widen8(p: __m128i) -> __m256 {
+        _mm256_castsi256_ps(_mm256_slli_epi32::<16>(_mm256_cvtepu16_epi32(p)))
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn bf16<const M: usize, const K: usize>(w: *const u16, x: *const f32, out: *mut f32) {
+        const { assert!(K % 32 == 0) };
+        for m in 0..M {
+            let row = w.add(m * K);
+            let mut a0 = _mm256_setzero_ps();
+            let mut a1 = _mm256_setzero_ps();
+            let mut a2 = _mm256_setzero_ps();
+            let mut a3 = _mm256_setzero_ps();
+            let mut k = 0;
+            while k < K {
+                let p = _mm256_loadu_si256(row.add(k) as *const __m256i);
+                let q = _mm256_loadu_si256(row.add(k + 16) as *const __m256i);
+                a0 = _mm256_fmadd_ps(widen8(_mm256_castsi256_si128(p)), _mm256_loadu_ps(x.add(k)), a0);
+                a1 = _mm256_fmadd_ps(widen8(_mm256_extracti128_si256::<1>(p)), _mm256_loadu_ps(x.add(k + 8)), a1);
+                a2 = _mm256_fmadd_ps(widen8(_mm256_castsi256_si128(q)), _mm256_loadu_ps(x.add(k + 16)), a2);
+                a3 = _mm256_fmadd_ps(widen8(_mm256_extracti128_si256::<1>(q)), _mm256_loadu_ps(x.add(k + 24)), a3);
+                k += 32;
+            }
+            *out.add(m) = hsum(_mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3)));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::vec::Vec;
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn avx2_matches_scalar() {
+        const M: usize = 37;
+        const K: usize = 2048;
+        let mut rng = crate::testing::Rng::new(0x1234_5678_9abc_def1);
+        let w: Vec<u16> = (0..M * K).map(|_| (rng.unit().to_bits() >> 16) as u16).collect();
+        let x: Vec<f32> = (0..K).map(|_| rng.unit()).collect();
+        let mut a = std::vec![0f32; M];
+        let mut b = std::vec![0f32; M];
+        bf16_scalar::<M, K>(&w, &x, &mut a);
+        bf16::<M, K>(&w, &x, &mut b);
+        for i in 0..M {
+            assert!((a[i] - b[i]).abs() <= 1e-4 * a[i].abs().max(1.0), "{i}: {} vs {}", a[i], b[i]);
+        }
+    }
+}
+
+/// Launch geometry of the gfx11 rows kernels, visible to hosts that launch them.
+/// The most tokens one launch carries: sized by LDS, a step of 256 f32 per
+/// token staged for the workgroup's rows is `TOKENS · 1 KB`, and the slab
+/// holds `TOKENS` token-steps however they split between tokens and steps.
+pub const TOKENS: usize = 32;
+/// Tokens a wave accumulates at once: its weights are read once per pass of
+/// PASS tokens (again from L2 for the next pass), and PASS accumulators keep
+/// the registers few enough for the memory-bound kernels' occupancy (32
+/// accumulators measured 30 % slower on one token, 2026-09-19).
+pub const PASS: usize = 8;
+/// Steps per round at most: a round is unrolled with every load hoisted, so
+/// its depth is the registers it takes — forty-three steps of a 10,944-wide
+/// row put 190 registers and scratch in a kernel that needs 23 (2026-09-19).
+/// Eight is the old row primitive's depth; a compiler fence between steps did
+/// not hold the hoisting back.
+pub const FLIGHT: usize = 8;
+/// Floats per staged token-step (`gfx11::STEP`): 32 lanes at a stride of 10.
+pub const STEP: usize = 320;
+
+#[cfg(target_arch = "amdgpu")]
+pub mod gfx11 {
+    //! The bf16 GEMV row on gfx11: a wave reads one row in 512-byte
+    //! contiguous steps (lane `l` takes elements `l·8..l·8+8` of each
+    //! 256-element step), dots them against an f32 vector — usually staged in
+    //! LDS by the workgroup — and reduces across the wave.
+    use crate::gfx11::wave_sum;
+
+    /// `y = Σ_k W[k] · x[k]` for one `K`-wide bf16 row (`K % 8 == 0`; a
+    /// last partial step is masked per lane); every lane returns the sum.
+    #[inline(always)]
+    pub unsafe fn bf16_row<const K: usize>(lane: u32, w: *const u16, x: *const f32) -> f32 {
+        const { assert!(K % 8 == 0) };
+        let l = lane as usize;
+        let mut acc = 0f32;
+        let mut s = 0;
+        while s < K.div_ceil(256) {
+            let base = s * 256 + l * 8;
+            if base < K {
+                let p = w.add(base) as *const u64;
+                let (a, b) = (core::ptr::read_unaligned(p), core::ptr::read_unaligned(p.add(1)));
+                let mut j = 0;
+                while j < 4 {
+                    acc += super::widen((a >> (16 * j)) as u16) * *x.add(base + j);
+                    acc += super::widen((b >> (16 * j)) as u16) * *x.add(base + 4 + j);
+                    j += 1;
+                }
+            }
+            s += 1;
+        }
+        wave_sum(lane, acc)
+    }
+
+
+    /// Steps staged per round for a pass at width `np` over `steps` steps:
+    /// FLIGHT at most, TOKENS / np at most (the slab), the whole matrix if
+    /// shorter. A constant of the pass, so the step loops have constant trip
+    /// counts and unroll with their loads hoisted — a runtime bound measured
+    /// as every weight load waited on in turn, twice the time (2026-09-19).
+    #[inline(always)]
+    pub const fn round(np: usize, steps: usize) -> usize {
+        // a pass of PASS tokens: two steps a round — a round's LDS reads unroll and hoist
+        // per token per step, and four steps of eight tokens spilled (2026-09-19)
+        let r = if np == 1 { FLIGHT } else { 2 };
+        if r < steps { r } else { steps }
+    }
+
+    /// A staged step in LDS: lane `l`'s eight elements of the step at
+    /// `l · STRIDE`, ten floats apart, so a wave's reads of them are
+    /// conflict-free across the 32 banks (at eight apart, lanes 0, 4, 8, …
+    /// share banks: an 8-way conflict that cost the multi-token rows kernels
+    /// 20× their weight-streaming time, 2026-09-19). `STEP` floats per token-step.
+    pub const STRIDE: usize = 10;
+    pub const STEP: usize = super::STEP;
+    const _: () = assert!(STEP == 32 * STRIDE);
+    /// Where element `t` of a step (0..256) sits in a staged token-step.
+    #[inline(always)]
+    pub const fn slot(t: usize) -> usize {
+        (t / 8) * STRIDE + t % 8
+    }
+
+    /// Stage step `s` (elements `s·256..s·256+256`) of `n` activation vectors
+    /// `x[i]` (each `K` wide, stride `K`) into LDS at `slab` as `[n][STEP]`,
+    /// cooperatively over the 256 threads; the caller barriers after its
+    /// round. Elements past `K` are not read (the row primitive masks them).
+    #[inline(always)]
+    pub unsafe fn stage_step<const K: usize>(tid: u32, x: *const f32, n: usize, s: usize, slab: *mut f32) {
+        let t = tid as usize;
+        let base = s * 256;
+        if base + t < K {
+            let mut i = 0;
+            while i < n {
+                *slab.add(i * STEP + slot(t)) = *x.add(i * K + base + t);
+                i += 1;
+            }
+        }
+    }
+
+    /// One step of `bf16_row` for `NP` tokens: the lane's 8 weights of step
+    /// `s` once, then for each token the same 8 products in the same order
+    /// into `acc[i]`, from the step's activations staged at `slab`
+    /// (`[NP][STEP]`). Summing the steps in order and `wave_sum`ing at the
+    /// end gives, per token, exactly `bf16_row`'s bits: the one-token path is
+    /// this with NP = 1. `NP` is a constant so the token loop unrolls with
+    /// nothing predicated: a runtime count measured as every block executed
+    /// under masks, twice the time on one token (2026-09-19). `w` is the row.
+    #[inline(always)]
+    pub unsafe fn bf16_row_step<const K: usize, const NP: usize>(lane: u32, w: *const u16, s: usize, slab: *const f32, acc: &mut [f32; PASS]) {
+        const { assert!(K % 8 == 0 && NP <= PASS) };
+        let l = lane as usize;
+        let base = s * 256 + l * 8;
+        if base < K {
+            let p = w.add(base) as *const u64;
+            let (a, b) = (core::ptr::read_unaligned(p), core::ptr::read_unaligned(p.add(1)));
+            // the eight weights widened once, not once per token
+            let mut wa = [0f32; 4];
+            let mut wb = [0f32; 4];
+            let mut j = 0;
+            while j < 4 {
+                wa[j] = super::widen((a >> (16 * j)) as u16);
+                wb[j] = super::widen((b >> (16 * j)) as u16);
+                j += 1;
+            }
+            let mut i = 0;
+            while i < NP {
+                let x = slab.add(i * STEP + l * STRIDE);
+                let mut j = 0;
+                while j < 4 {
+                    acc[i] += wa[j] * *x.add(j);
+                    acc[i] += wb[j] * *x.add(4 + j);
+                    j += 1;
+                }
+                i += 1;
+            }
+        }
+    }
+
+    /// The rows kernel skeleton: the workgroup's 8 rows (a wave each) of a
+    /// `[m][K]` bf16 matrix over `n` activations, a pass of PASS tokens at a
+    /// time, each pass staged from `stage(token, s, slab)` (each thread its
+    /// element of step `s` of token `token` into `slab` at `slot(thread)`) a
+    /// round of steps at a time; `emit(row, token, y)` receives every (row,
+    /// token) sum from lane 0. Every rows kernel is this with its own stage
+    /// and emit.
+    #[inline(always)]
+    pub unsafe fn rows_over<const K: usize>(tid: u32, w: *const u16, m: usize, n: usize, stage: impl Fn(usize, usize, *mut f32), emit: impl Fn(usize, usize, f32)) {
+        let mut p0 = 0;
+        while p0 < n {
+            let np = if n - p0 < PASS { n - p0 } else { PASS };
+            // the pass runs at a constant width so its token loop has nothing predicated
+            match width(np) {
+                1 => rows_pass::<K, 1>(tid, w, m, p0, np, &stage, &emit),
+                _ => rows_pass::<K, PASS>(tid, w, m, p0, np, &stage, &emit),
+            }
+            p0 += PASS;
+        }
+    }
+
+    /// One pass of `np` tokens (from `p0`) at width `NP`: rounds of staged
+    /// steps, the row sums, the emits for the `np` real tokens.
+    #[inline(always)]
+    unsafe fn rows_pass<const K: usize, const NP: usize>(tid: u32, w: *const u16, m: usize, p0: usize, np: usize, stage: &impl Fn(usize, usize, *mut f32), emit: &impl Fn(usize, usize, f32)) {
+        const { assert!(K.div_ceil(256) * 4 * 256 <= 60 * 1024) };
+        let (lane, wave) = (tid % 32, (tid / 32) as usize);
+        let slab: *mut f32 = crate::gfx11::lds();
+        let row = core::arch::amdgpu::workgroup_id_x() as usize * 8 + wave;
+        let steps = K.div_ceil(256);
+        let r = round(NP, steps);
+        let mut acc = [0f32; PASS];
+        let live = row < m;
+        let wr = w.add(row * K);
+        // full rounds carry no guards, so their loads hoist; one guarded round takes the tail
+        let mut s0 = 0;
+        while s0 + r <= steps {
+            let mut k = 0;
+            while k < r {
+                let mut i = 0;
+                while i < np {
+                    stage(p0 + i, s0 + k, slab.add((k * NP + i) * STEP));
+                    i += 1;
+                }
+                k += 1;
+            }
+            crate::gfx11::workgroup_sync();
+            if live {
+                let mut k = 0;
+                while k < r {
+                    bf16_row_step::<K, NP>(lane, wr, s0 + k, slab.add(k * NP * STEP), &mut acc);
+                    k += 1;
+                }
+            }
+            crate::gfx11::workgroup_sync();
+            s0 += r;
+        }
+        // the tail, a runtime trip count so it stays a loop and not another unrolled round
+        let tail = steps - s0;
+        if tail > 0 {
+            let mut k = 0;
+            while k < tail {
+                let mut i = 0;
+                while i < np {
+                    stage(p0 + i, s0 + k, slab.add((k * NP + i) * STEP));
+                    i += 1;
+                }
+                k += 1;
+            }
+            crate::gfx11::workgroup_sync();
+            if live {
+                let mut k = 0;
+                while k < tail {
+                    bf16_row_step::<K, NP>(lane, wr, s0 + k, slab.add(k * NP * STEP), &mut acc);
+                    k += 1;
+                }
+            }
+            crate::gfx11::workgroup_sync();
+        }
+        let mut i = 0;
+        while i < NP {
+            let y = crate::gfx11::wave_sum(lane, acc[i]);
+            if lane == 0 && row < m && i < np {
+                emit(row, p0 + i, y);
+            }
+            i += 1;
+        }
+    }
+
+    pub use super::{FLIGHT, PASS, TOKENS};
+
+    /// The pass width a pass of `np` tokens runs at: one token runs at 1
+    /// (the decode path, its registers and code its own), any more at PASS,
+    /// the tokens past `np` computed on stale slab entries and never
+    /// written. Four widths measured as one kernel carrying four copies:
+    /// 192 registers and scratch (2026-09-19).
+    #[inline(always)]
+    pub const fn width(np: usize) -> usize {
+        if np <= 1 {
+            1
+        } else {
+            PASS
+        }
+    }
+}

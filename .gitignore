@@ -1,0 +1,26 @@
+# external sources and build products — pinned by os/pins.toml, never committed
+os/kernel/src/
+os/kernel/dl/
+os/release/staging/
+os/initramfs/stage/
+os/initramfs/*.cpio*
+target/
+Cargo.lock
+bringup/.venv/
+bringup/goldens/
+bringup/.download.log
+bundles/
+bundle/target/
+bringup/forward/target/
+bringup/bench/target/
+bringup/harness/target/
+models/deepseek-v2-lite/gpu/target/
+models/deepseek-v2-lite/gpu/target-stats/
+api/.venv/
+__pycache__/
+bringup/evals/results/
+bringup/evals/.venv/
+bringup/evals/data/mmlu/
+bringup/evals/data/gsm8k/
+*.report.json
+bringup/*.log

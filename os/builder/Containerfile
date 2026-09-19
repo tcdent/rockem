@@ -1,0 +1,37 @@
+# rockem builder — everything a release is built with, pinned. The repo mounts at /work.
+# Rebuild with os/builder/build-image.sh; the resulting image digest goes in os/pins.toml.
+FROM docker.io/library/debian@sha256:abc9cb88a5587630d7f915f47b23b0668fe250fbfc6457aa4d52b534c1bbf73f
+
+# The image digest above pins the apt world; these are the packages drawn from it.
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      build-essential flex bison bc libelf-dev libssl-dev dwarves kmod \
+      cpio zstd xz-utils bzip2 curl ca-certificates git file rsync python3 \
+      qemu-system-x86 ovmf \
+    && rm -rf /var/lib/apt/lists/*
+
+# busybox: built here, static, from a hashed tarball — the initramfs's only userland besides /node.
+ARG BUSYBOX_VER=1.37.0
+ARG BUSYBOX_SHA256=3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b837043a4
+RUN set -eux; cd /tmp; \
+    curl -sSfLo bb.tar.bz2 https://busybox.net/downloads/busybox-${BUSYBOX_VER}.tar.bz2; \
+    echo "${BUSYBOX_SHA256}  bb.tar.bz2" | sha256sum -c -; \
+    tar xjf bb.tar.bz2; cd busybox-${BUSYBOX_VER}; \
+    make defconfig >/dev/null; \
+    sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config; \
+    sed -i 's/^CONFIG_TC=y/# CONFIG_TC is not set/' .config; \
+    make -j"$(nproc)" >/dev/null 2>&1; \
+    mkdir -p /opt/busybox; cp busybox /opt/busybox/busybox; \
+    file /opt/busybox/busybox | grep -q 'statically linked'; \
+    cd /; rm -rf /tmp/busybox-${BUSYBOX_VER} /tmp/bb.tar.bz2
+
+# Rust: pinned stable for the host binary (musl, static) and the pinned nightly for amdgcn.
+ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
+ARG RUST_STABLE=1.98.0
+ARG RUST_NIGHTLY=nightly-2026-06-22
+RUN set -eux; \
+    curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain ${RUST_STABLE}; \
+    rustup target add x86_64-unknown-linux-musl --toolchain ${RUST_STABLE}; \
+    rustup toolchain install ${RUST_NIGHTLY} --profile minimal -c rust-src -c llvm-tools; \
+    chmod -R a+rwX /opt/cargo /opt/rustup
+
+WORKDIR /work

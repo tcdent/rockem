@@ -1,0 +1,11 @@
+#!/bin/sh
+# rockem /init — mount what the node binary needs, then become it.
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+mount -t proc     proc     /proc
+mount -t sysfs    sysfs    /sys
+mkdir -p /dev/hugepages /dev/shm /tmp
+mount -t hugetlbfs -o pagesize=1G hugetlbfs /dev/hugepages 2>/dev/null || mount -t hugetlbfs hugetlbfs /dev/hugepages 2>/dev/null
+mount -t tmpfs tmpfs /tmp
+# dev profile: a bundle shared in by QEMU over virtio-9p (see os/qemu.sh); production pulls over the network
+for t in $(cat /proc/cmdline); do case $t in rockem.bundle9p=*) mkdir -p /bundle; mount -t 9p -o trans=virtio,version=9p2000.L,msize=1048576 "${t#rockem.bundle9p=}" /bundle;; esac; done
+exec /node

@@ -1,0 +1,16 @@
+[package]
+name = "forward"
+version = "0.0.0"
+edition = "2021"
+description = "Bring-up driver: runs the transcribed forward on the mmap'd checkpoint (optionally with a bundle's packed experts) and diffs every edge against the oracle goldens. Dev box only."
+
+[dependencies]
+harness = { path = "../harness" }
+common = { path = "../../common" }
+deepseek_v2_lite = { path = "../../models/deepseek-v2-lite", features = ["std"] }
+memmap2 = "0.9"
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+debug = 1
