@@ -56,3 +56,11 @@ path = "src/draw.rs"
 [[bin]]
 name = "bench-step"
 path = "src/step.rs"
+
+[[bin]]
+name = "bench-repeat"
+path = "src/repeat.rs"
+
+[[bin]]
+name = "bench-memtest"
+path = "src/memtest.rs"

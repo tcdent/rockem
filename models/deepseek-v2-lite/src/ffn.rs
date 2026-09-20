@@ -415,10 +415,14 @@ pub mod gfx11 {
             if t == 0 {
                 *count.add(ARRIVE + i) = 0; // nothing else touches it until the next launch
             }
-            // the tail: softmax over the 64 logits in wave 0, two a lane, wave reductions only
+            // the tail: softmax over the 64 logits in wave 0, two a lane, wave reductions only.
+            // The logits are read past the CU's caches (atomic loads): read plainly after
+            // the acquire, one in ~15 gate runs came back stale — the softmax's sum moved
+            // by a rounding with the picks unchanged (2026-09-19, cause in the caches not found)
             if wave == 0 {
                 let l = lane as usize;
-                let (la, lb) = (*logit.add(l), *logit.add(l + 32));
+                let at = |j: usize| f32::from_bits(AtomicU32::from_ptr(logit.add(j) as *mut u32).load(Ordering::Relaxed));
+                let (la, lb) = (at(l), at(l + 32));
                 let m = wave_max(lane, if la > lb { la } else { lb });
                 let (ea, eb) = (exp(la - m), exp(lb - m));
                 let inv = 1.0 / wave_sum(lane, ea + eb);
@@ -467,7 +471,7 @@ pub mod gfx11 {
             workgroup_sync();
             let expert = expert.sub(i * TOP_K); // every token's, from the first
             if t < n as usize * TOP_K {
-                let e = *expert.add(t) as usize;
+                let e = AtomicU32::from_ptr(expert.add(t) as *mut u32).load(Ordering::Relaxed) as usize; // past the caches, as the logits
                 let slot = AtomicU32::from_ptr(cnt.add(e)).fetch_add(1, Ordering::Relaxed) as usize;
                 *list.add(e * TOKENS + slot) = ((t / TOP_K) << 3 | (t % TOP_K)) as u32;
             }

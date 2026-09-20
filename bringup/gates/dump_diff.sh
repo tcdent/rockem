@@ -6,14 +6,11 @@
 # for the run and not restarted — the caller decides what serves afterwards.
 set -u
 cd "$(dirname "$0")/../.."
-B=${1:?bundle dir}; NODE=target/release/node; IDS=$(cat bringup/gates/prompt.ids); W=/tmp/rockem-gate
-# the node loads the bundle's code object: install the built one there, with its hash in the manifest
-ELF=models/deepseek-v2-lite/gpu/target/amdgcn-amd-amdhsa/release/deepseek_v2_lite_gpu.elf
-if ! cmp -s $ELF $B/kernels.gfx1100.elf; then
-  cp $ELF $B/kernels.gfx1100.elf
-  sed -i "s|\"kernels.gfx1100.elf\" = \"sha256:[0-9a-f]*\"|\"kernels.gfx1100.elf\" = \"sha256:$(sha256sum $ELF | cut -c1-64)\"|" $B/manifest.toml
-  echo "installed the built code object into $B"
-fi
+B=${1:?bundle dir}; IDS=$(cat bringup/gates/prompt.ids); W=/tmp/rockem-gate
+# NODE and ELF: the node binary and code object under test (defaults: the tree's builds; set both to gate another build)
+NODE=${NODE:-target/release/node}
+ELF=${ELF:-models/deepseek-v2-lite/gpu/target/amdgcn-amd-amdhsa/release/deepseek_v2_lite_gpu.elf}
+bringup/gates/install_elf.sh $ELF $B
 systemctl --user stop rockem-node 2>/dev/null; pkill -x node 2>/dev/null; sleep 1
 pgrep -x python3 -a | grep -E "wire.py|client.*\.py" && { echo "stray wire clients above: the host is not quiet"; exit 1; }
 for mode in batch seq; do
@@ -27,4 +24,16 @@ done
 same=0; bad=0
 for f in $W/batch/pos*.f32; do b=$(basename $f .f32); case $b in *.layers) continue;; esac; p=${b#pos}; if cmp -s $f $W/seq/$b.f32 && cmp -s $W/batch/$b.layers.f32 $W/seq/$b.layers.f32 && cmp -s $W/batch/$b.topk.u32 $W/seq/$b.topk.u32; then same=$((same+3)); else bad=$((bad+1)); python3 bringup/gates/dump_where.py $W/batch $W/seq $p; fi; done
 echo "dump diff: $same files identical, $bad positions differ"
+# a reference from the first identical run; on a failure keep both dumps and say which side left the reference
+if [ $bad = 0 ] && [ $same -gt 0 ] && [ ! -d $W/ref ]; then cp -r $W/batch $W/ref; fi
+if [ $bad != 0 ]; then
+  K=$W/fail-$(date +%H%M%S); mkdir -p $K; cp -r $W/batch $W/seq $K/
+  if [ -d $W/ref ]; then
+    for side in batch seq; do
+      off=0; for f in $W/ref/pos*; do cmp -s $f $W/$side/$(basename $f) || off=$((off+1)); done
+      echo "  $side vs the reference: $off files differ"
+    done
+  fi
+  echo "  dumps kept in $K"
+fi
 [ $bad = 0 ] && [ $same -gt 0 ]
