@@ -242,7 +242,9 @@ pub mod gfx11 {
     /// activation (anything past `K`; the row primitive masks it) and the
     /// skeleton owns the slab; `emit(row, token, y)` receives every (row,
     /// token) sum from lane 0. Every rows kernel is this with its own stage
-    /// and emit.
+    /// and emit. `ready` runs in every thread after the rows are summed and
+    /// before the emits: a kernel whose emit needs data that may not have
+    /// landed yet waits there, with the rows already behind it.
     ///
     /// With `NORM` the activations are rms-normed on the way, `ln` the norm's
     /// weight (read only then): the staged element is `ln[j] · x[j]`, the
@@ -257,14 +259,14 @@ pub mod gfx11 {
     /// re-read its activations and waited on the reads before its first
     /// weights: +12 µs a launch).
     #[inline(always)]
-    pub unsafe fn rows_over<const K: usize, const NORM: bool>(tid: u32, w: *const u16, ln: *const u16, m: usize, n: usize, eps: f32, stage: impl Fn(usize, usize) -> f32, emit: impl Fn(usize, usize, f32)) {
+    pub unsafe fn rows_over<const K: usize, const NORM: bool>(tid: u32, w: *const u16, ln: *const u16, m: usize, n: usize, eps: f32, stage: impl Fn(usize, usize) -> f32, ready: impl Fn(), emit: impl Fn(usize, usize, f32)) {
         let mut p0 = 0;
         while p0 < n {
             let np = if n - p0 < PASS { n - p0 } else { PASS };
             // the pass runs at a constant width so its token loop has nothing predicated
             match width(np) {
-                1 => rows_pass::<K, 1, NORM>(tid, w, ln, m, p0, np, eps, &stage, &emit),
-                _ => rows_pass::<K, PASS, NORM>(tid, w, ln, m, p0, np, eps, &stage, &emit),
+                1 => rows_pass::<K, 1, NORM>(tid, w, ln, m, p0, np, eps, &stage, &ready, &emit),
+                _ => rows_pass::<K, PASS, NORM>(tid, w, ln, m, p0, np, eps, &stage, &ready, &emit),
             }
             p0 += PASS;
         }
@@ -307,7 +309,7 @@ pub mod gfx11 {
     /// One pass of `np` tokens (from `p0`) at width `NP`: rounds of staged
     /// steps, the row sums, the emits for the `np` real tokens.
     #[inline(always)]
-    unsafe fn rows_pass<const K: usize, const NP: usize, const NORM: bool>(tid: u32, w: *const u16, ln: *const u16, m: usize, p0: usize, np: usize, eps: f32, stage: &impl Fn(usize, usize) -> f32, emit: &impl Fn(usize, usize, f32)) {
+    unsafe fn rows_pass<const K: usize, const NP: usize, const NORM: bool>(tid: u32, w: *const u16, ln: *const u16, m: usize, p0: usize, np: usize, eps: f32, stage: &impl Fn(usize, usize) -> f32, ready: &impl Fn(), emit: &impl Fn(usize, usize, f32)) {
         const { assert!(K.div_ceil(256) * 4 * 256 <= 60 * 1024) };
         let (lane, wave) = (tid % 32, (tid / 32) as usize);
         let slab: *mut f32 = crate::gfx11::lds();
@@ -381,6 +383,7 @@ pub mod gfx11 {
                 i += 1;
             }
         }
+        ready();
         let mut i = 0;
         while i < NP {
             let y = crate::gfx11::wave_sum(lane, acc[i]);

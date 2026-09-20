@@ -64,3 +64,4 @@ path = "src/repeat.rs"
 [[bin]]
 name = "bench-memtest"
 path = "src/memtest.rs"
+

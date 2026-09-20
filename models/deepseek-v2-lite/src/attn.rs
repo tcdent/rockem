@@ -273,6 +273,7 @@ pub mod gfx11 {
                 n as usize,
                 RMS_NORM_EPS,
                 |i, s| *h.add(i * H + s * 256 + t),
+                || {},
                 |row, i, y| {
                     if row < Q_DIM {
                         *q.add(i * Q_DIM + row) = y;
@@ -688,6 +689,7 @@ pub mod gfx11 {
                 n as usize,
                 0.0,
                 |i, s| *heads.add(i * O_IN_DIM + s * 256 + t),
+                || {},
                 |row, i, y| *h.add(i * H + row) += y,
             );
         }

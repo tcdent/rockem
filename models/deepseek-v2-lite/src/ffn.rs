@@ -209,7 +209,7 @@ pub mod gfx11 {
             let tid = workitem_id_x();
             let (m, n) = (m as usize, n as usize);
             let t = tid as usize;
-            rows_over::<H, true>(tid, w, ln, m, n, RMS_NORM_EPS, |i, s| *x.add(i * H + s * 256 + t), |row, i, y| *out.add(i * m + row) = y);
+            rows_over::<H, true>(tid, w, ln, m, n, RMS_NORM_EPS, |i, s| *x.add(i * H + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
         }
     }
 
@@ -242,6 +242,7 @@ pub mod gfx11 {
                 n as usize,
                 0.0,
                 |i, s| stage_swiglu::<N>(t, gu, i, s),
+                || {},
                 |row, i, y| {
                     let v = *h.add(i * H + row) + y;
                     *h.add(i * H + row) = v;
@@ -253,13 +254,33 @@ pub mod gfx11 {
     }
 
     /// MoE layer: `h[i] += shared_down · swiglu(gu[i]) + Σ_k wt[i][k] · expert_out[i][k]`,
-    /// the new residual also to `out`. Grid: rows_grid(H).
+    /// the new residual also to `out`. A slot's expert output is on the card
+    /// (`expert_out`, written by `experts_down`) or in the host's memory
+    /// (`expert_out_h`, written by the host for the experts `place` puts
+    /// there); the host marks each of its slots done by writing `epoch` to
+    /// its word of `valid` after the rows. The kernel does the shared
+    /// experts' rows first, then waits for the host's slots: workgroup 0
+    /// polls the valid words (host memory, over the link — one poller, not
+    /// two hundred), then publishes `epoch` in `ready` (VRAM, through L2),
+    /// which every other workgroup spins on locally; then the emits read the
+    /// slots. Nothing waits when no slot is the host's. The card waiting for
+    /// data, in the kernel that needs it: no packet, no signal, and the
+    /// launch's own latency spent before the wait (2026-09-20). Grid: rows_grid(H).
     #[no_mangle]
-    pub extern "gpu-kernel" fn shared_down(gu: *const f32, w: *const u16, expert_out: *const f32, wt: *const f32, h: *mut f32, out: *mut f32, n: u32) {
+    pub extern "gpu-kernel" fn shared_down(gu: *const f32, w: *const u16, expert_out: *const f32, expert_out_h: *const f32, wt: *const f32, h: *mut f32, out: *mut f32, n: u32, place: *const u32, expert: *const u32, valid: *const u32, ready: *mut u32, epoch: u32) {
+        use core::sync::atomic::{fence, AtomicU32, Ordering};
         unsafe {
             const N: usize = SHARED_FF;
             let tid = workitem_id_x();
             let t = tid as usize;
+            let slots = n as usize * TOP_K;
+            // does any slot of the step come from the host? (uniform: every thread reads the same words)
+            let mut host = false;
+            let mut j = 0;
+            while j < slots {
+                host |= *place.add(*expert.add(j) as usize) == 1;
+                j += 1;
+            }
             rows_over::<N, false>(
                 tid,
                 w,
@@ -268,11 +289,37 @@ pub mod gfx11 {
                 n as usize,
                 0.0,
                 |i, s| stage_swiglu::<N>(t, gu, i, s),
+                || {
+                    if host {
+                        if workgroup_id_x() == 0 {
+                            if t == 0 {
+                                let mut j = 0;
+                                while j < slots {
+                                    if *place.add(*expert.add(j) as usize) == 1 {
+                                        while AtomicU32::from_ptr(valid.add(j) as *mut u32).load(Ordering::Relaxed) != epoch {
+                                            fence(Ordering::Acquire);
+                                        }
+                                    }
+                                    j += 1;
+                                }
+                                AtomicU32::from_ptr(ready).store(epoch, Ordering::Release);
+                            }
+                        } else if t == 0 {
+                            while AtomicU32::from_ptr(ready).load(Ordering::Relaxed) != epoch {
+                                fence(Ordering::Acquire);
+                            }
+                        }
+                        workgroup_sync();
+                        fence(Ordering::Acquire); // the slots from memory, not this CU's caches
+                    }
+                },
                 |row, i, y| {
                     let mut a = y;
                     let mut k = 0;
                     while k < TOP_K {
-                        a += *wt.add(i * TOP_K + k) * *expert_out.add((i * TOP_K + k) * H + row);
+                        let j = i * TOP_K + k;
+                        let src = if *place.add(*expert.add(j) as usize) == 1 { expert_out_h } else { expert_out };
+                        a += *wt.add(j) * *src.add(j * H + row);
                         k += 1;
                     }
                     let v = *h.add(i * H + row) + a;
@@ -315,9 +362,11 @@ pub mod gfx11 {
     /// holds only its own, the host builds its list from the picks; the
     /// integers go to the host's mirrors (`xq_m`, `xs_m`, `xg_m`, this
     /// layer's slots) as well, so both tiers' experts take the same
-    /// activation. Grid: n · ROUTE_WGS × 256.
+    /// activation. Last of all, the last tail writes `epoch` to `done` (host
+    /// memory): the host's word that this layer's routing and integers are
+    /// there — no packet. Grid: n · ROUTE_WGS × 256.
     #[no_mangle]
-    pub extern "gpu-kernel" fn route(h: *const f32, ln: *const u16, w: *const u16, logit: *mut f32, wt: *mut f32, xq: *mut i8, xs: *mut f32, xg: *mut i32, expert: *mut u32, topk_out: *mut u32, n: u32, count: *mut u32, list: *mut u32, place: *const u32, xq_m: *mut i8, xs_m: *mut f32, xg_m: *mut i32) {
+    pub extern "gpu-kernel" fn route(h: *const f32, ln: *const u16, w: *const u16, logit: *mut f32, wt: *mut f32, xq: *mut i8, xs: *mut f32, xg: *mut i32, expert: *mut u32, topk_out: *mut u32, n: u32, count: *mut u32, list: *mut u32, place: *const u32, xq_m: *mut i8, xs_m: *mut f32, xg_m: *mut i32, done: *mut u32, epoch: u32) {
         use core::sync::atomic::{fence, AtomicU32, Ordering};
         unsafe {
             const E: usize = N_ROUTED_EXPERTS;
@@ -500,6 +549,12 @@ pub mod gfx11 {
                 }
                 *count.add(E) = k as u32;
                 *count.add(LAUNCH_ARRIVE) = 0;
+            }
+            // every tail's writes were released before its arrival; this one's now, then the word
+            fence(Ordering::Release);
+            workgroup_sync();
+            if t == 0 {
+                AtomicU32::from_ptr(done).store(epoch, Ordering::Release);
             }
             common::stat!(3, (common::stat_clock!().wrapping_sub(t3)) & common::stats::CLOCK_MASK);
             const _: () = assert!(TOKENS * TOP_K <= 256);
