@@ -7,7 +7,7 @@
 //! (the first position and layer where, the largest difference) and the tally. Found for: one step in ~15 gate runs
 //! parting from its twin at one token, one layer, by ~1e-3 (2026-09-19).
 //!
-//!   bench-repeat --bundle <dir> --elf <kernels.gfx1100.elf> [--tokens 32] [--positions 54] [--repeat 200 | --against <k>] [--idle-ms 0] [--prompt <ids file>]
+//!   bench-repeat --bundle <dir> --elf <kernels.gfx1100.elf> [--tokens 32] [--positions 54] [--repeat 200 | --against <k>] [--idle-ms 0] [--prompt <ids file>] [--ctx 256] [--mirror] [--dump <dir>]
 #[path = "../../../node/src/kfd.rs"]
 #[allow(dead_code)]
 mod kfd;
@@ -24,7 +24,12 @@ fn main() {
     let (p, dense, q) = unsafe { dense_b.align_to::<u16>() };
     assert!(p.is_empty() && q.is_empty());
     let w = Weights::from_dense(dense);
-    let max_ctx = 256;
+    // `--ctx`: the attention cache's positions on the card (the node's default is 2048)
+    let max_ctx: usize = arg("--ctx").map(|p| p.to_str().unwrap().parse().unwrap()).unwrap_or(256);
+    // `--mirror`: read every token's mirrored cache rows after the step, as the node does for the store
+    let mirror = std::env::args_os().any(|a| a == "--mirror");
+    // `--dump <dir>`: every position's traces written to files as the node's rockem.debug does
+    let dump = arg("--dump");
     let rope = Rope::new(max_ctx);
     let k = kfd::Kfd::new(&elf, false);
     let mut m = kfd::KfdModel::new(k, dense, &experts[..deepseek_v2_lite::layout::STREAM], &rope, max_ctx);
@@ -84,9 +89,20 @@ fn main() {
                 st.run(&w, &ids[at..at + k], pos, m, &mut common::trace::NoTrace);
                 let u = common::sample::uniform_at(1, (pos + k - 1) as u64);
                 let _ = m.draw(k - 1, &deepseek_v2_lite::SAMPLING, u, &st.logits[(k - 1) * VOCAB_SIZE..k * VOCAB_SIZE]);
+                if mirror {
+                    let mut rows = vec![0f32; deepseek_v2_lite::layout::POSITION];
+                    for i in 0..k {
+                        m.rows(i, &mut rows);
+                    }
+                }
                 for i in 0..k {
                     let (mut layers, mut topk, mut l) = (vec![0f32; NUM_HIDDEN_LAYERS * H], vec![0u32; NUM_HIDDEN_LAYERS * TOP_K], vec![0f32; VOCAB_SIZE]);
                     m.token_trace(i, &mut layers, &mut topk, &mut l);
+                    if let Some(d) = &dump {
+                        let raw = |v: &[f32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, 4 * v.len()) }.to_vec();
+                        std::fs::write(d.join(format!("pos{}.layers.f32", pos + i)), raw(&layers)).unwrap();
+                        std::fs::write(d.join(format!("pos{}.f32", pos + i)), raw(&l)).unwrap();
+                    }
                     out.push((layers, topk, l));
                 }
                 pos += k;
