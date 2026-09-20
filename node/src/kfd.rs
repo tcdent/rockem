@@ -861,7 +861,8 @@ pub struct KfdModel {
     d_xs: Mem,
     d_xg: Mem,
     d_expert: Mem, // [T][TOP_K] u32, for `group`
-    d_count: Mem,  // COUNT_WORDS u32: counts, the active experts, the arrival word
+    d_count: Mem,  // COUNT_WORDS u32: counts, the active experts, the arrival words
+    d_logit: Mem,  // [T][E], the router rows' dots
     d_list: Mem,   // [E][T] u32
     d_egu: Mem,    // [T][TOP_K][2·D_FF]
     d_eout: Mem,   // [T][TOP_K][H]
@@ -923,6 +924,7 @@ impl KfdModel {
             d_xg: k.vram(T * 4 * H / GROUP),
             d_expert: k.vram(T * TOP_K * 4),
             d_count,
+            d_logit: k.vram(T * N_ROUTED_EXPERTS * 4),
             d_list: k.vram(N_ROUTED_EXPERTS * T * 4),
             d_egu: k.vram(T * TOP_K * 2 * D_FF * 4),
             d_eout: k.vram(T * TOP_K * H * 4),
@@ -1032,8 +1034,8 @@ impl FeedForward for KfdModel {
         let (ln, router, sg, sd) = (self.dense_at(b + dl::POST_LN), self.dense_at(b + dl::ROUTER), self.dense_at(b + dl::SHARED_GATE), self.dense_at(b + dl::SHARED_DOWN));
         let base = layout::record(l, 0).start as u64;
         let mut ar = Args::new();
-        ar.ptr(self.d_h.va).ptr(ln).ptr(router).ptr(self.d_wt.va).ptr(self.d_xq.va).ptr(self.d_xs.va).ptr(self.d_xg.va).ptr(self.d_expert.va).ptr(self.d_topk.at(l * TOKENS * TOP_K * 4)).u32(n as u32).ptr(self.d_count.va).ptr(self.d_list.va);
-        self.k.launch(&self.route, n as u32, WG, ffn::gfx11_consts::ROUTE_LDS as u32, &ar);
+        ar.ptr(self.d_h.va).ptr(ln).ptr(router).ptr(self.d_logit.va).ptr(self.d_wt.va).ptr(self.d_xq.va).ptr(self.d_xs.va).ptr(self.d_xg.va).ptr(self.d_expert.va).ptr(self.d_topk.at(l * TOKENS * TOP_K * 4)).u32(n as u32).ptr(self.d_count.va).ptr(self.d_list.va);
+        self.k.launch(&self.route, (n * ffn::gfx11_consts::ROUTE_WGS) as u32, WG, ffn::gfx11_consts::ROUTE_LDS as u32, &ar);
         let mut au = Args::new();
         au.ptr(self.d_stream.va).u64(base).ptr(self.d_count.va).ptr(self.d_list.va).ptr(self.d_xq.va).ptr(self.d_xs.va).ptr(self.d_xg.va).ptr(self.d_egu.va);
         self.k.launch(&self.up, ex::up_grid(n), WG, ex::experts_lds(H, n) as u32, &au);

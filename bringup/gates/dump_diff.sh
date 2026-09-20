@@ -20,10 +20,11 @@ for mode in batch seq; do
   rm -rf $W/$mode; mkdir -p $W/$mode
   $NODE rockem.bundle=$B rockem.mem=anon rockem.gpu=1 rockem.debug=$W/$mode rockem.listen=127.0.0.1:7332 > $W/$mode.log 2>&1 < /dev/null & PID=$!
   timeout 180 bash -c 'until ss -ltn | grep -q :7332; do sleep 1; done' || { echo "node did not come up"; tail -5 $W/$mode.log; exit 1; }
-  if [ $mode = seq ]; then SLOW=0.05 CAP=8 python3 bringup/gates/wire.py 127.0.0.1 $IDS; else CAP=8 python3 bringup/gates/wire.py 127.0.0.1 $IDS; fi
+  # SEQ_SLOW: the pause between ids in the sequential run; 0.05 is one id a step, less makes the node batch whatever arrived
+  if [ $mode = seq ]; then SLOW=${SEQ_SLOW:-0.05} CAP=8 python3 bringup/gates/wire.py 127.0.0.1 $IDS; else CAP=8 python3 bringup/gates/wire.py 127.0.0.1 $IDS; fi
   kill $PID; wait 2>/dev/null
 done
 same=0; bad=0
-for f in $W/batch/pos*; do b=$(basename $f); if cmp -s $f $W/seq/$b; then same=$((same+1)); else bad=$((bad+1)); echo "DIFF $b"; fi; done
-echo "dump diff: $same files identical, $bad differ"
+for f in $W/batch/pos*.f32; do b=$(basename $f .f32); case $b in *.layers) continue;; esac; p=${b#pos}; if cmp -s $f $W/seq/$b.f32 && cmp -s $W/batch/$b.layers.f32 $W/seq/$b.layers.f32 && cmp -s $W/batch/$b.topk.u32 $W/seq/$b.topk.u32; then same=$((same+3)); else bad=$((bad+1)); python3 bringup/gates/dump_where.py $W/batch $W/seq $p; fi; done
+echo "dump diff: $same files identical, $bad positions differ"
 [ $bad = 0 ] && [ $same -gt 0 ]

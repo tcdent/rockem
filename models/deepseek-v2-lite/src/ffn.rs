@@ -152,14 +152,19 @@ pub mod gfx11_consts {
     pub const fn normed_rows_lds(k: usize, n: usize) -> usize {
         rows_lds(k, n) + 4 * 8 * common::gemv::PASS
     }
-    /// route = normed input (H) + probabilities (N_ROUTED_EXPERTS) + 256 row partials + 8 partials.
-    pub const ROUTE_LDS: usize = 4 * (H + N_ROUTED_EXPERTS + 256 + 8);
+    /// Workgroups per token of `route`: eight router rows each, a wave a row.
+    pub const ROUTE_WGS: usize = 8;
+    /// route = probabilities (N_ROUTED_EXPERTS) + the `last` word.
+    pub const ROUTE_LDS: usize = 4 * (N_ROUTED_EXPERTS + 8);
     /// `route`'s `count` buffer: a count per expert, then the number of active experts,
     /// then the active experts in index order (what the expert kernels' grids walk),
-    /// then the launch's arrival word (zero between launches).
-    pub const COUNT_WORDS: usize = 2 * N_ROUTED_EXPERTS + 2;
+    /// then the launch's arrival word, then a token's arrival word each (all zero
+    /// between launches).
+    pub const LAUNCH_ARRIVE: usize = 2 * N_ROUTED_EXPERTS + 1;
+    pub const ARRIVE: usize = LAUNCH_ARRIVE + 1;
+    pub const COUNT_WORDS: usize = ARRIVE + TOKENS;
     /// The statistics each instrumented kernel writes, by slot (`common::stats`).
-    pub const ROUTE_STATS: [&str; 4] = ["rows_ticks", "softmax_ticks", "pick_ticks", "quant_ticks"];
+    pub const ROUTE_STATS: [&str; 4] = ["rows_ticks", "quant_ticks", "tail_ticks", "group_ticks"];
     pub const DOWN_STATS: [&str; 4] = ["h_abs", "", "", ""];
     /// `sample` phases: the max pass, θ₀ (rank over the maxima), count + scan + gather, order + masses + walk.
     pub const SAMPLE_STATS: [&str; 4] = ["max_ticks", "theta0_ticks", "gather_ticks", "order_walk_ticks"];
@@ -279,84 +284,141 @@ pub mod gfx11 {
         }
     }
 
-    /// The router, a workgroup per token, nothing serial: `xn = rmsnorm(h)`,
-    /// kept in LDS (the shared experts' rows norm `h` again themselves, the
-    /// same bits, `rms_scales`); the
-    /// N_ROUTED_EXPERTS router rows with every thread streaming a quarter of
-    /// a row at once (one wave per row was latency-bound: 49 µs a layer,
-    /// 2026-09-18); softmax in one wave, two logits a lane; the greedy top-k
-    /// as a rank — each expert counts the ones that beat it, ties to the
-    /// lowest index, exactly `softmax::topk`'s order — so the k chosen write
-    /// their own slot: the scaled weight and the expert (for `group` and the
-    /// trace); and `xn` quantized to INT8, `QAct::quantize` op for op, so the
-    /// integers match the CPU path bit for bit (quantizing in the expert
-    /// kernels instead measured a net loss, 2026-09-18). Then the grouping
-    /// for the expert kernels, by the last workgroup to finish: `count[e]`
-    /// and `list[e][..]` of `(token << 3) | slot` from `expert` (`[n][TOP_K]`),
-    /// then the active experts compacted in index order after the counts
-    /// (`COUNT_WORDS`), so the expert kernels' grids cover only experts with
-    /// tokens — at one token, six of sixty-four. Each workgroup counts itself
-    /// in on the arrival word (`count[COUNT_WORDS - 1]`, an atomic after a
-    /// release of its writes); the one that sees `n - 1` acquires and does
-    /// the grouping, and leaves the word at zero for the next launch. A
-    /// launch of its own was a launch and its gap a layer (2026-09-19). The
-    /// order within a list is the LDS atomics' and changes nothing, every
-    /// entry being computed on its own. Grid: n × 256.
+    /// The router, `ROUTE_WGS` workgroups per token, the serial tail as
+    /// short as it gets. Each workgroup takes eight of the N_ROUTED_EXPERTS
+    /// router rows, a wave a row, every lane eight elements a step: the
+    /// row's dot with `ln ⊙ h`, and alongside it the sum of squares of `h`
+    /// every wave needs for the norm's scale `r` (the same elements in the
+    /// same order in every wave, so every wave's `r` is the same bits). The
+    /// logit is `r · (W · (ln ⊙ h))` for the CPU's `W · (ln ⊙ (h · r))`, a
+    /// rounding apart. One workgroup over all sixty-four rows was one latency
+    /// round after another, 13 µs a layer for 256 KB (2026-09-19). Waves 0
+    /// and 1 of each workgroup then quantize one group of `xn = ln ⊙ (h ·
+    /// r)` each to INT8, `QAct::quantize` op for op (the sixteen groups over
+    /// the eight workgroups; in the tail they were 7 µs of one workgroup's
+    /// time). The last of a token's workgroups to arrive (an arrival word
+    /// per token in `count`) is the tail: softmax in one wave, two logits a
+    /// lane; the greedy top-k as a rank — each expert counts the ones that
+    /// beat it, ties to the lowest index, exactly `softmax::topk`'s order —
+    /// so the k chosen write their own slot: the scaled weight and the
+    /// expert (for the grouping and the trace). Then the grouping for the
+    /// expert kernels, by the last tail of the launch (the launch's arrival
+    /// word): `count[e]` and `list[e][..]` of `(token << 3) | slot` from
+    /// `expert` (`[n][TOP_K]`), then the active experts compacted in index
+    /// order after the counts, so the expert kernels' grids cover only
+    /// experts with tokens — at one token, six of sixty-four. Every arrival
+    /// is a release of the workgroup's writes then an atomic; the last
+    /// acquires; each word is left at zero for the next launch. The order
+    /// within a list is the LDS atomics' and changes nothing, every entry
+    /// being computed on its own. Grid: n · ROUTE_WGS × 256.
     #[no_mangle]
-    pub extern "gpu-kernel" fn route(h: *const f32, ln: *const u16, w: *const u16, wt: *mut f32, xq: *mut i8, xs: *mut f32, xg: *mut i32, expert: *mut u32, topk_out: *mut u32, n: u32, count: *mut u32, list: *mut u32) {
+    pub extern "gpu-kernel" fn route(h: *const f32, ln: *const u16, w: *const u16, logit: *mut f32, wt: *mut f32, xq: *mut i8, xs: *mut f32, xg: *mut i32, expert: *mut u32, topk_out: *mut u32, n: u32, count: *mut u32, list: *mut u32) {
         use core::sync::atomic::{fence, AtomicU32, Ordering};
         unsafe {
             const E: usize = N_ROUTED_EXPERTS;
             const G: usize = common::q4::GROUP;
-            const Q: usize = H / 4; // a thread's quarter row
+            const PER: usize = E / ROUTE_WGS;
+            const QW: usize = (H / G) / ROUTE_WGS; // groups a workgroup quantizes, a wave each
             let t0 = common::stat_clock!();
-            let i = workgroup_id_x() as usize;
+            let wg = workgroup_id_x() as usize;
+            let (i, g) = (wg / ROUTE_WGS, wg % ROUTE_WGS);
             let tid = workitem_id_x();
             let (t, lane, wave) = (tid as usize, tid % 32, (tid / 32) as usize);
-            let xn: *mut f32 = lds();
-            let prob = xn.add(H);
-            let part = prob.add(E);
-            let red = part.add(256);
+            let prob: *mut f32 = lds();
+            let last = prob.add(E) as *mut u32;
             let h = h.add(i * H);
+            let logit = logit.add(i * E);
             let (wt, xq, xs, xg, expert, topk_out) = (wt.add(i * TOP_K), xq.add(i * H), xs.add(i * (H / G)), xg.add(i * (H / G)), expert.add(i * TOP_K), topk_out.add(i * TOP_K));
-            let mut ss = 0f32;
-            let mut k = t;
-            while k < H {
-                let v = *h.add(k);
-                ss += v * v;
-                k += 256;
-            }
-            let r = rsqrt(workgroup_sum(tid, ss, red) / H as f32 + RMS_NORM_EPS);
-            let mut k = t;
-            while k < H {
-                *xn.add(k) = widen(*ln.add(k)) * (*h.add(k) * r);
-                k += 256;
-            }
-            workgroup_sync();
-            // rows: thread t takes quarter t % 4 of row t / 4, eight bf16 per load
-            let (row, q) = (t / 4, t % 4);
-            let wr = w.add(row * H + q * Q) as *const [u16; 8];
-            let xq4 = xn.add(q * Q);
-            let (mut a0, mut a1) = (0f32, 0f32);
-            let mut k = 0;
-            while k < Q / 8 {
-                let v = *wr.add(k);
-                let x = xq4.add(k * 8);
-                a0 += widen(v[0]) * *x + widen(v[1]) * *x.add(1) + widen(v[2]) * *x.add(2) + widen(v[3]) * *x.add(3);
-                a1 += widen(v[4]) * *x.add(4) + widen(v[5]) * *x.add(5) + widen(v[6]) * *x.add(6) + widen(v[7]) * *x.add(7);
-                k += 1;
-            }
-            *part.add(t) = a0 + a1;
-            workgroup_sync();
+            // this wave's row: expert g · PER + wave; lane `lane` elements lane · 8 + k · 256 —
+            // eight weights, eight norm weights, eight activations a step, every step's
+            // loads independent of the last; the squares of the activations alongside
+            let r = {
+                let e = g * PER + wave;
+                let wr = w.add(e * H) as *const [u16; 8];
+                let lr = ln as *const [u16; 8];
+                let (mut acc, mut sq) = (0f32, 0f32);
+                let mut k = 0;
+                while k < H / 256 {
+                    let j = k * 256 + lane as usize * 8;
+                    let (v, l) = (*wr.add(j / 8), *lr.add(j / 8));
+                    let x = h.add(j);
+                    let mut m = 0;
+                    while m < 8 {
+                        let xv = *x.add(m);
+                        acc += widen(v[m]) * (widen(l[m]) * xv);
+                        sq += xv * xv;
+                        m += 1;
+                    }
+                    k += 1;
+                }
+                let d = wave_sum(lane, acc);
+                let r = rsqrt(wave_sum(lane, sq) / H as f32 + RMS_NORM_EPS);
+                if lane == 0 {
+                    *logit.add(e) = d * r;
+                }
+                r
+            };
             let t1 = common::stat_clock!();
             common::stat!(0, (t1.wrapping_sub(t0)) & common::stats::CLOCK_MASK);
-            // softmax over the 64 logits in wave 0, two a lane: wave reductions only
+            // the INT8 activation: waves 0 and 1 a group of G each, a lane four elements, the
+            // four integers packed into one store (four byte stores a lane were 2.7 µs a group)
+            if wave < QW {
+                let gq = g * QW + wave;
+                let b = gq * G + lane as usize * 4;
+                let mut xn = [0f32; 4];
+                let mut amax = 0f32;
+                let mut j = 0;
+                while j < 4 {
+                    let v = widen(*ln.add(b + j)) * (*h.add(b + j) * r);
+                    xn[j] = v;
+                    let a = if v < 0.0 { -v } else { v };
+                    if a > amax {
+                        amax = a;
+                    }
+                    j += 1;
+                }
+                let amax = wave_max(lane, amax);
+                let s = amax / 127.0;
+                let inv = if s > 0.0 { 1.0 / s } else { 0.0 };
+                let mut sum = 0i32;
+                let mut packed = 0u32;
+                let mut j = 0;
+                while j < 4 {
+                    let r = round(xn[j] * inv);
+                    let r = if r > 127.0 { 127.0 } else if r < -127.0 { -127.0 } else { r };
+                    let q = r as i8;
+                    packed |= (q as u8 as u32) << (8 * j);
+                    sum += q as i32;
+                    j += 1;
+                }
+                *(xq.add(b) as *mut u32) = packed;
+                let sum = wave_sum(lane, sum as f32);
+                if lane == 0 {
+                    *xs.add(gq) = s;
+                    *xg.add(gq) = sum as i32;
+                }
+            }
+            let t2 = common::stat_clock!();
+            common::stat!(1, (t2.wrapping_sub(t1)) & common::stats::CLOCK_MASK);
+            // the token's arrival: this workgroup's writes to L2, one atomic, `last` through LDS
+            fence(Ordering::Release);
+            workgroup_sync();
+            if t == 0 {
+                let arrived = AtomicU32::from_ptr(count.add(ARRIVE + i)).fetch_add(1, Ordering::AcqRel);
+                *last = (arrived == ROUTE_WGS as u32 - 1) as u32;
+            }
+            workgroup_sync();
+            if *last == 0 {
+                return;
+            }
+            fence(Ordering::Acquire);
+            if t == 0 {
+                *count.add(ARRIVE + i) = 0; // nothing else touches it until the next launch
+            }
+            // the tail: softmax over the 64 logits in wave 0, two a lane, wave reductions only
             if wave == 0 {
                 let l = lane as usize;
-                let (la, lb) = (
-                    *part.add(l * 4) + *part.add(l * 4 + 1) + *part.add(l * 4 + 2) + *part.add(l * 4 + 3),
-                    *part.add((l + 32) * 4) + *part.add((l + 32) * 4 + 1) + *part.add((l + 32) * 4 + 2) + *part.add((l + 32) * 4 + 3),
-                );
+                let (la, lb) = (*logit.add(l), *logit.add(l + 32));
                 let m = wave_max(lane, if la > lb { la } else { lb });
                 let (ea, eb) = (exp(la - m), exp(lb - m));
                 let inv = 1.0 / wave_sum(lane, ea + eb);
@@ -364,8 +426,6 @@ pub mod gfx11 {
                 *prob.add(l + 32) = eb * inv;
             }
             workgroup_sync();
-            let t2 = common::stat_clock!();
-            common::stat!(1, (t2.wrapping_sub(t1)) & common::stats::CLOCK_MASK);
             // the pick, as a rank
             if t < E {
                 let p = *prob.add(t);
@@ -386,60 +446,20 @@ pub mod gfx11 {
             }
             let t3 = common::stat_clock!();
             common::stat!(2, (t3.wrapping_sub(t2)) & common::stats::CLOCK_MASK);
-            // the INT8 activation: a wave per two groups of G, a lane per four elements, the
-            // four integers packed into one store (four byte stores a lane were 2.7 µs a group)
-            let mut g = wave * 2;
-            while g < wave * 2 + 2 {
-                let b = g * G + lane as usize * 4;
-                let mut amax = 0f32;
-                let mut j = 0;
-                while j < 4 {
-                    let v = *xn.add(b + j);
-                    let a = if v < 0.0 { -v } else { v };
-                    if a > amax {
-                        amax = a;
-                    }
-                    j += 1;
-                }
-                let amax = wave_max(lane, amax);
-                let s = amax / 127.0;
-                let inv = if s > 0.0 { 1.0 / s } else { 0.0 };
-                let mut sum = 0i32;
-                let mut packed = 0u32;
-                let mut j = 0;
-                while j < 4 {
-                    let r = round(*xn.add(b + j) * inv);
-                    let r = if r > 127.0 { 127.0 } else if r < -127.0 { -127.0 } else { r };
-                    let q = r as i8;
-                    packed |= (q as u8 as u32) << (8 * j);
-                    sum += q as i32;
-                    j += 1;
-                }
-                *(xq.add(b) as *mut u32) = packed;
-                let sum = wave_sum(lane, sum as f32);
-                if lane == 0 {
-                    *xs.add(g) = s;
-                    *xg.add(g) = sum as i32;
-                }
-                g += 1;
-            }
-            common::stat!(3, (common::stat_clock!().wrapping_sub(t3)) & common::stats::CLOCK_MASK);
-            const _: () = assert!(E == 64 && 4 * E == 256 && Q % 8 == 0 && H / G == 16 && G == 4 * 32);
+            const _: () = assert!(E == 64 && E % ROUTE_WGS == 0 && PER == 8 && QW == 2 && H % 256 == 0 && H / G == 16 && G == 4 * 32);
 
-            // the grouping by the last workgroup: this one's writes to L2 (release), then one
-            // arrival; `last` reaches the workgroup through LDS
+            // the launch's arrival: the grouping by the last tail
             fence(Ordering::Release);
             workgroup_sync();
-            let last = red as *mut u32;
             if t == 0 {
-                let arrived = AtomicU32::from_ptr(count.add(COUNT_WORDS - 1)).fetch_add(1, Ordering::AcqRel);
+                let arrived = AtomicU32::from_ptr(count.add(LAUNCH_ARRIVE)).fetch_add(1, Ordering::AcqRel);
                 *last = (arrived == n - 1) as u32;
             }
             workgroup_sync();
             if *last == 0 {
                 return;
             }
-            fence(Ordering::Acquire); // the other workgroups' `expert` from L2, not this CU's caches
+            fence(Ordering::Acquire); // the other tails' `expert` from L2, not this CU's caches
             let cnt = prob as *mut u32; // the probabilities are done with
             if t < E {
                 *cnt.add(t) = 0;
@@ -466,8 +486,9 @@ pub mod gfx11 {
                     e += 1;
                 }
                 *count.add(E) = k as u32;
-                *count.add(COUNT_WORDS - 1) = 0;
+                *count.add(LAUNCH_ARRIVE) = 0;
             }
+            common::stat!(3, (common::stat_clock!().wrapping_sub(t3)) & common::stats::CLOCK_MASK);
             const _: () = assert!(TOKENS * TOP_K <= 256);
         }
     }
