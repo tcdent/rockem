@@ -228,10 +228,14 @@ is on our unmeasured list; theirs is in production.
   processor's turnaround. 348 → 267 launches a token by folding the norm into the
   rows kernels' staging, the cache rows into the absorb grid, and the grouping into
   the router's last workgroup (an arrival counter). Token 7.64 → 6.97 ms.
-- **The hybrid handshake.** *Built 2026-09-20:* marks and gates (barrier packets on
-  signals) let the host run its share of the experts behind the card, layer by layer,
-  with the combine on the card; the timeline stamps both (a gate's span is the wait).
-  Always posted: 0.2 ms a token when the host has no share.
+- **The hybrid handshake.** *Built 2026-09-20:* the host runs its share of the
+  experts behind the card, layer by layer, and the card waits for data rather than
+  for the host: the router's last workgroup writes a done word the host spins on,
+  the host writes a valid word per slot, and the combine kernel polls the valid
+  words in-kernel after its own rows. No packets. The packet form (a mark and a
+  gate per layer) was built first and measured: 0.2 ms a token with nothing to wait
+  for, a 10 µs wake on release; a late-written packet wakes the processor in 40 µs,
+  and the ring in VRAM hangs it. The combine's span on the timeline is the wait.
 - **Timelines.** *Done 2026-09-18* (see Observation): per-launch device timestamps
   from the launcher's own signals. Still to do: the node reporting its own token, bytes
   declared per launch, the ceiling measured at boot.
