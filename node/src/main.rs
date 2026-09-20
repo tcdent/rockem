@@ -10,6 +10,7 @@
 //!   rockem.bundle=/bundle      directory with dense.bf16.bin, experts.q4g128.bin, vocab.bin
 //!   rockem.mem=anon            dev: anonymous memory instead of hugetlbfs
 //!   rockem.gpu=1               the whole model on the card, the router and the draw included: one wait per token
+//!   rockem.experts=host        with rockem.gpu=1: the routed experts in this host's DRAM, the card waiting at each layer
 //!   rockem.ctx=2048            positions of attention cache on the card or in the CPU model (default 2048): the
 //!                              node's memory budget, not the bundle's, so the wire's header reports it
 //!   rockem.listen=0.0.0.0:7332 serve the wire on this address; otherwise the console
@@ -477,7 +478,10 @@ fn main() {
     let mut st = State::new(max_ctx);
     let mut model: Box<dyn Model> = if config("rockem.gpu").is_some() {
         let k = kfd::Kfd::new(loader::load(&bundle.join(layout::KERNELS_FILE), loader::Mem::Anon), false);
-        Box::new(kfd::KfdModel::new(k, dense, &experts[..layout::STREAM], &st.rope, max_ctx))
+        // the placement table: every routed expert on the card, or every one in this host's
+        // DRAM (rockem.experts=host) — the manifest's table replaces this once there is one
+        let place = vec![if config("rockem.experts").as_deref() == Some("host") { 1u32 } else { 0 }; deepseek_v2_lite::N_ROUTED_EXPERTS];
+        Box::new(kfd::KfdModel::new(k, dense, &experts[..layout::STREAM], &st.rope, max_ctx, &place))
     } else {
         Box::new(CpuModel { attention: CpuAttention::new(max_ctx), ffn: CpuFfn::new(CpuExperts::new(&experts[..layout::STREAM])) })
     };

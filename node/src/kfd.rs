@@ -211,6 +211,20 @@ const _: () = assert!(size_of::<Packet>() == 64);
 const PACKET_INVALID: u16 = 1;
 const PACKET_KERNEL_DISPATCH: u16 = 2;
 const PACKET_BARRIER_AND: u16 = 3;
+/// The AQL barrier-AND packet: retires when every `dep_signal` reads zero.
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct BarrierPacket {
+    header: u16,
+    reserved0: u16,
+    reserved1: u32,
+    dep_signal: [u64; 5],
+    reserved2: u64,
+    completion_signal: u64,
+}
+const _: () = assert!(size_of::<BarrierPacket>() == 64);
+/// Signals in the signal page: 0 is the wait's, the rest a host's to name.
+pub const SIGNALS: usize = 64;
 const HEADER_BARRIER: u16 = 1 << 8;
 const FENCE_AGENT: u16 = 1;
 const FENCE_SYSTEM: u16 = 2;
@@ -428,8 +442,10 @@ impl Kfd {
             (*q).read_dispatch_id_field_base_byte_offset = 128;
             (*q).queue_properties = QUEUE_PROPERTIES_IS_PTR64 | QUEUE_PROPERTIES_ENABLE_PROFILING;
             let s = k.signal.ptr() as *mut Signal;
-            std::ptr::write_bytes(s as *mut u8, 0, size_of::<Signal>());
-            (*s).kind = SIGNAL_KIND_USER;
+            std::ptr::write_bytes(s as *mut u8, 0, SIGNALS * size_of::<Signal>());
+            for i in 0..SIGNALS {
+                (*s.add(i)).kind = SIGNAL_KIND_USER;
+            }
         }
         let mut cq = CreateQueueArgs {
             ring_base_address: k.ring.va as u64,
@@ -689,6 +705,58 @@ impl Kfd {
         self.last_span.set((self.token_start.get(), idx));
         self.token_start.set(idx + 1);
     }
+    fn sig(&self, i: usize) -> &Signal {
+        assert!(i > 0 && i < SIGNALS, "signal {i}");
+        unsafe { &*(self.signal.ptr() as *const Signal).add(i) }
+    }
+    /// A barrier packet with its ring slot's signal as completion, so the
+    /// processor stamps it like a launch: on the timeline a mark's span is
+    /// its own cost and a gate's span is the wait behind it. Returns the packet's index.
+    fn post_barrier(&self, mut pkt: BarrierPacket, header: u16, name: &'static str) -> u64 {
+        let idx = self.write_index.get();
+        let slot = (idx as usize) % RING_PACKETS;
+        let stamp = unsafe { &*(self.stamps.ptr() as *const Signal).add(slot) };
+        stamp.value.store(1, Ordering::Release);
+        self.names.borrow_mut()[slot] = name;
+        self.grids.borrow_mut()[slot] = 0;
+        pkt.completion_signal = self.stamps.at(slot * size_of::<Signal>()) as u64;
+        // the same 64 bytes as a dispatch packet; `post` writes the header word last
+        self.post(idx, unsafe { std::mem::transmute::<BarrierPacket, Packet>(pkt) }, header);
+        idx
+    }
+    /// A mark in the queue: its signal reads zero once everything posted
+    /// before it has completed and its writes are in memory (a system-scope
+    /// release) — `wait(mark)` on the host. What lets the host pick up a
+    /// layer's routing and integers while the card runs on.
+    pub fn mark(&self) -> u64 {
+        let pkt = BarrierPacket { header: PACKET_INVALID, reserved0: 0, reserved1: 0, dep_signal: [0; 5], reserved2: 0, completion_signal: 0 };
+        self.post_barrier(pkt, PACKET_BARRIER_AND | HEADER_BARRIER | (FENCE_SYSTEM << HEADER_RELEASE_SHIFT), "mark")
+    }
+    /// The host waits for a mark (its packet index; the ring must not have
+    /// wrapped since, which a token's worth of packets never does).
+    pub fn wait(&self, mark: u64) {
+        assert!(self.write_index.get() - mark < RING_PACKETS as u64, "wait: the ring has wrapped past mark {mark}");
+        let value = unsafe { &(*(self.stamps.ptr() as *const Signal).add((mark as usize) % RING_PACKETS)).value };
+        let t0 = std::time::Instant::now();
+        while value.load(Ordering::Acquire) != 0 {
+            unsafe { wait_on(value) };
+            assert!(t0.elapsed().as_secs() < 10, "gpu hang: mark {mark} never completed");
+        }
+    }
+    /// A gate in the queue on signal `i`: nothing posted after it runs until
+    /// the host `release(i)`s. The launch after the gate acquires at system
+    /// scope, since the host will have written by then.
+    pub fn gate(&self, i: usize) {
+        self.sig(i).value.store(1, Ordering::Release);
+        let pkt = BarrierPacket { header: PACKET_INVALID, reserved0: 0, reserved1: 0, dep_signal: [self.signal.at(i * size_of::<Signal>()) as u64, 0, 0, 0, 0], reserved2: 0, completion_signal: 0 };
+        self.post_barrier(pkt, PACKET_BARRIER_AND | HEADER_BARRIER, "gate");
+        self.host_wrote.set(true);
+    }
+    /// The host opens gate `i`: its writes before this are what the card sees after.
+    pub fn release(&self, i: usize) {
+        fence(Ordering::SeqCst);
+        self.sig(i).value.store(0, Ordering::Release);
+    }
     /// The last token's statistics, per launch in order: kernel name, then
     /// per slot the values every wave wrote (`common::gfx11` stats; empty
     /// without a stats code object). Valid after `sync`, until the ring wraps.
@@ -807,6 +875,9 @@ pub(crate) const WG: u32 = 256;
 fn raw<T>(v: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, size_of_val(v)) }
 }
+fn raw_u32(v: &[u32]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, 4 * v.len()) }
+}
 pub fn read<T: Copy>(m: &Mem, off: usize, out: &mut [T]) {
     unsafe { std::ptr::copy_nonoverlapping(m.at(off) as *const T, out.as_mut_ptr(), out.len()) }
 }
@@ -829,7 +900,7 @@ impl Kfd {
 /// in `logits`. What the host needs afterwards — the position's cache rows
 /// for the store, and under `rockem.debug` each layer's residual and routing
 /// — the kernels mirror into host memory as they go, read after that wait.
-pub struct KfdModel {
+pub struct KfdModel<'a> {
     k: Rc<Kfd>,
     proj: Kernel,
     absorb: Kernel,
@@ -873,11 +944,38 @@ pub struct KfdModel {
     d_logits: Mem, // VRAM, host-visible: [T][VOCAB_SIZE]
     d_next: Mem,   // host: the drawn token, or a score
     max_ctx: usize,
+    /// The placement table, a word per expert: 0 on the card, 1 in this host's DRAM
+    /// (`d_place` is its copy for the router). The host's share of the experts runs
+    /// from `stream` in this process's memory, on the card's integers mirrored to
+    /// `d_xq_m`/`d_xs_m`/`d_xg_m` (`[layer][T]…`), into its slots of `d_eout`
+    /// (host-visible), between a mark after each layer's router and a gate before
+    /// its combine (`host_experts`).
+    place: Vec<u32>,
+    d_place: Mem,
+    /// Layers whose gate is posted and not yet released: (layer, the step's token count, the mark to wait for).
+    pending: Vec<(usize, usize, u64)>,
+    /// The host's expert time this token: computing, and waiting for marks (seconds; `bench-token` reads and resets).
+    pub host_busy: f64,
+    pub host_wait: f64,
+    stream: &'a [u8],
+    scratch: deepseek_v2_lite::expert::ScratchBuf,
+    d_xq_m: Mem, // host: [layer][T][H] i8
+    d_xs_m: Mem, // host: [layer][T][H / GROUP] f32
+    d_xg_m: Mem, // host: [layer][T][H / GROUP] i32
 }
+/// The signal a layer's gate waits on (marks use their ring slot's signal).
+const fn gate_of(l: usize) -> usize {
+    1 + l
+}
+const _: () = assert!(gate_of(NUM_HIDDEN_LAYERS - 1) < SIGNALS);
 
-impl KfdModel {
-    pub fn new(k: Rc<Kfd>, dense: &[u16], stream: &[u8], rope: &Rope, max_ctx: usize) -> Self {
+impl<'a> KfdModel<'a> {
+    pub fn new(k: Rc<Kfd>, dense: &[u16], stream: &'a [u8], rope: &Rope, max_ctx: usize, place: &[u32]) -> Self {
         assert_eq!(stream.len(), layout::STREAM);
+        assert_eq!(place.len(), N_ROUTED_EXPERTS);
+        let d_place = k.vram_visible(N_ROUTED_EXPERTS * 4);
+        k.upload(&d_place, 0, raw_u32(place));
+        println!("experts  : {} of {} in this host's DRAM, the rest on the card", place.iter().filter(|&&p| p == 1).count(), N_ROUTED_EXPERTS);
         let d_dense = k.upload_dense(dense);
         let t0 = std::time::Instant::now();
         let d_stream = k.vram_visible(stream.len());
@@ -927,7 +1025,7 @@ impl KfdModel {
             d_logit: k.vram(T * N_ROUTED_EXPERTS * 4),
             d_list: k.vram(N_ROUTED_EXPERTS * T * 4),
             d_egu: k.vram(T * TOP_K * 2 * D_FF * 4),
-            d_eout: k.vram(T * TOP_K * H * 4),
+            d_eout: k.vram_visible(T * TOP_K * H * 4), // the host writes its slots
             d_gu: k.vram(T * 2 * INTERMEDIATE_SIZE * 4),
             d_mirror: k.host(T * layout::POSITION * 4),
             d_layers: k.host(NUM_HIDDEN_LAYERS * T * H * 4),
@@ -935,6 +1033,16 @@ impl KfdModel {
             d_logits: k.vram_visible(T * VOCAB_SIZE * 4), // the card draws from it; the host reads it only to trace
             d_next: k.host(4),
             max_ctx,
+            place: place.to_vec(),
+            d_place,
+            pending: Vec::new(),
+            host_busy: 0.0,
+            host_wait: 0.0,
+            stream,
+            scratch: deepseek_v2_lite::expert::ScratchBuf::new(),
+            d_xq_m: k.host(NUM_HIDDEN_LAYERS * T * H),
+            d_xs_m: k.host(NUM_HIDDEN_LAYERS * T * (H / GROUP) * 4),
+            d_xg_m: k.host(NUM_HIDDEN_LAYERS * T * (H / GROUP) * 4),
             k,
         }
     }
@@ -943,7 +1051,8 @@ impl KfdModel {
     }
     /// Wait for everything posted (benches; the node waits in `draw`).
     #[allow(dead_code)]
-    pub fn sync(&self) {
+    pub fn sync(&mut self) {
+        self.host_experts(); // the gates still posted, before waiting behind them
         self.k.sync()
     }
     /// The last token's launches with their card timestamps (see `Kfd::timeline`).
@@ -970,7 +1079,7 @@ impl KfdModel {
     }
 }
 
-impl Attention for KfdModel {
+impl Attention for KfdModel<'_> {
     fn seed(&mut self, rows: &[f32]) {
         assert_eq!(rows.len() % layout::POSITION, 0);
         // the store is position-major and the card layer-major: gather each layer's rows in
@@ -1018,7 +1127,7 @@ impl Attention for KfdModel {
     }
 }
 
-impl FeedForward for KfdModel {
+impl FeedForward for KfdModel<'_> {
     fn dense(&mut self, l: usize, _w: &ffn::Dense, _h: &mut [f32], n: usize, _tr: &mut dyn Trace) {
         let b = dl::layer(l);
         let (ln, gate, down) = (self.dense_at(b + dl::POST_LN), self.dense_at(b + dl::DENSE_GATE), self.dense_at(b + dl::DENSE_DOWN));
@@ -1035,7 +1144,9 @@ impl FeedForward for KfdModel {
         let base = layout::record(l, 0).start as u64;
         let mut ar = Args::new();
         ar.ptr(self.d_h.va).ptr(ln).ptr(router).ptr(self.d_logit.va).ptr(self.d_wt.va).ptr(self.d_xq.va).ptr(self.d_xs.va).ptr(self.d_xg.va).ptr(self.d_expert.va).ptr(self.d_topk.at(l * TOKENS * TOP_K * 4)).u32(n as u32).ptr(self.d_count.va).ptr(self.d_list.va);
+        ar.ptr(self.d_place.va).ptr(self.d_xq_m.at(l * TOKENS * H)).ptr(self.d_xs_m.at(l * TOKENS * (H / GROUP) * 4)).ptr(self.d_xg_m.at(l * TOKENS * (H / GROUP) * 4));
         self.k.launch(&self.route, (n * ffn::gfx11_consts::ROUTE_WGS) as u32, WG, ffn::gfx11_consts::ROUTE_LDS as u32, &ar);
+        let mark = self.k.mark(); // the host may pick up this layer's routing and integers
         let mut au = Args::new();
         au.ptr(self.d_stream.va).u64(base).ptr(self.d_count.va).ptr(self.d_list.va).ptr(self.d_xq.va).ptr(self.d_xs.va).ptr(self.d_xg.va).ptr(self.d_egu.va);
         self.k.launch(&self.up, ex::up_grid(n), WG, ex::experts_lds(H, n) as u32, &au);
@@ -1047,19 +1158,65 @@ impl FeedForward for KfdModel {
         self.k.launch(&self.down, ex::down_grid(n), WG, ex::experts_lds(D_FF, n) as u32, &ad);
         let mut a2 = Args::new();
         a2.ptr(self.d_gu.va).ptr(sd).ptr(self.d_eout.va).ptr(self.d_wt.va).ptr(self.d_h.va).ptr(self.d_layers.at(l * TOKENS * H * 4)).u32(n as u32);
+        self.k.gate(gate_of(l)); // the host's expert slots, before the combine
+        self.pending.push((l, n, mark));
         self.k.launch(&self.shared_down, ffn::gfx11_consts::rows_grid(H), WG, ffn::gfx11_consts::rows_lds(SHARED_FF, n) as u32, &a2);
     }
 }
 
-impl Head for KfdModel {
+impl KfdModel<'_> {
+    /// This host's share of the step's experts, layer by layer behind the card:
+    /// for every layer whose gate is posted, wait for its mark, run every
+    /// (token, slot) whose expert is placed here from the mirrored integers into
+    /// its slot of `d_eout`, open the gate. An empty share is an empty loop body
+    /// — the marks and gates are posted either way, one path. Runs once the
+    /// step is posted (`logits`), so the card is ahead the whole time, and
+    /// before any wait (`sync`), so a driver that posts layers alone cannot
+    /// deadlock on its own gates.
+    pub fn host_experts(&mut self) {
+        use deepseek_v2_lite::expert;
+        let mut out = vec![0f32; H];
+        for (l, n, mark) in std::mem::take(&mut self.pending) {
+            let t = std::time::Instant::now();
+            self.k.wait(mark);
+            self.host_wait += t.elapsed().as_secs_f64();
+            let t = std::time::Instant::now();
+            for i in 0..n {
+                for kk in 0..TOP_K {
+                    let mut e = [0u32; 1];
+                    read(&self.d_topk, ((l * TOKENS + i) * TOP_K + kk) * 4, &mut e);
+                    let e = e[0] as usize;
+                    if self.place[e] == 1 {
+                        let ew = expert::Weights::from_record(&self.stream[layout::record(l, e)]);
+                        let (xq, xs, xg) = unsafe {
+                            (
+                                std::slice::from_raw_parts(self.d_xq_m.at((l * TOKENS + i) * H) as *const i8, H),
+                                std::slice::from_raw_parts(self.d_xs_m.at((l * TOKENS + i) * (H / GROUP) * 4) as *const f32, H / GROUP),
+                                std::slice::from_raw_parts(self.d_xg_m.at((l * TOKENS + i) * (H / GROUP) * 4) as *const i32, H / GROUP),
+                            )
+                        };
+                        expert::forward_q(&ew, xq, xs, xg, &mut self.scratch.scratch(), &mut out);
+                        self.k.upload(&self.d_eout, (i * TOP_K + kk) * H * 4, raw(&out));
+                    }
+                }
+            }
+            self.host_busy += t.elapsed().as_secs_f64();
+            self.k.release(gate_of(l));
+        }
+    }
+}
+
+impl Head for KfdModel<'_> {
     /// Posts the head for every token of the step; `logits` is filled on the card, row per token.
     fn logits(&mut self, _norm: &[f32], _lm_head: &[u16], _h: &[f32], n: usize, _logits: &mut [f32]) {
         let (ln, w) = (self.dense_at(dl::NORM), self.dense_at(dl::LM_HEAD));
         self.rows(ln, w, &self.d_logits, VOCAB_SIZE, n, false);
+        // the step is posted: the host's experts follow the card through the layers
+        self.host_experts();
     }
 }
 
-impl Model for KfdModel {
+impl Model for KfdModel<'_> {
     fn token_trace(&self, i: usize, layers: &mut [f32], topk: &mut [u32], logits: &mut [f32]) {
         for l in 0..NUM_HIDDEN_LAYERS {
             read(&self.d_layers, (l * TOKENS + i) * H * 4, &mut layers[l * H..(l + 1) * H]);

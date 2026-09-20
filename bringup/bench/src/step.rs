@@ -23,7 +23,8 @@ fn main() {
     let max_ctx = 256;
     let rope = Rope::new(max_ctx);
     let k = kfd::Kfd::new(&elf, true);
-    let mut m = kfd::KfdModel::new(k, dense, &experts[..deepseek_v2_lite::layout::STREAM], &rope, max_ctx);
+    let place = vec![if harness::arg("--experts").map(|p| p.to_str().unwrap() == "host").unwrap_or(false) { 1u32 } else { 0 }; deepseek_v2_lite::N_ROUTED_EXPERTS];
+    let mut m = kfd::KfdModel::new(k, dense, &experts[..deepseek_v2_lite::layout::STREAM], &rope, max_ctx, &place);
     let mut rng = common::testing::Rng::new(1);
     let mut h: Vec<f32> = (0..n * deepseek_v2_lite::H).map(|_| rng.unit()).collect();
     let mut logits = vec![0f32; n * VOCAB_SIZE];

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The dump-diff gate, run on the GPU box: the same prompt prefilled in one batch and one
 # id at a time must leave byte-identical dumps (logits, per-layer traces, router top-k) at
-# every position. `dump_diff.sh <bundle dir>`; exit 1 on the first differing position.
+# every position. `dump_diff.sh <bundle dir> [node args...]`; exit 1 on the first differing position.
 # The node under test is target/release/node with the built code object; the serving unit is stopped
 # for the run and not restarted — the caller decides what serves afterwards.
 set -u
@@ -15,7 +15,7 @@ systemctl --user stop rockem-node 2>/dev/null; pkill -x node 2>/dev/null; sleep 
 pgrep -x python3 -a | grep -E "wire.py|client.*\.py" && { echo "stray wire clients above: the host is not quiet"; exit 1; }
 for mode in batch seq; do
   rm -rf $W/$mode; mkdir -p $W/$mode
-  $NODE rockem.bundle=$B rockem.mem=anon rockem.gpu=1 rockem.debug=$W/$mode rockem.listen=127.0.0.1:7332 > $W/$mode.log 2>&1 < /dev/null & PID=$!
+  $NODE rockem.bundle=$B rockem.mem=anon rockem.gpu=1 rockem.debug=$W/$mode rockem.listen=127.0.0.1:7332 "${@:2}" > $W/$mode.log 2>&1 < /dev/null & PID=$!
   timeout 180 bash -c 'until ss -ltn | grep -q :7332; do sleep 1; done' || { echo "node did not come up"; tail -5 $W/$mode.log; exit 1; }
   # SEQ_SLOW: the pause between ids in the sequential run; 0.05 is one id a step, less makes the node batch whatever arrived
   if [ $mode = seq ]; then SLOW=${SEQ_SLOW:-0.05} CAP=8 python3 bringup/gates/wire.py 127.0.0.1 $IDS; else CAP=8 python3 bringup/gates/wire.py 127.0.0.1 $IDS; fi

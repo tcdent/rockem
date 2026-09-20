@@ -310,9 +310,14 @@ pub mod gfx11 {
     /// is a release of the workgroup's writes then an atomic; the last
     /// acquires; each word is left at zero for the next launch. The order
     /// within a list is the LDS atomics' and changes nothing, every entry
-    /// being computed on its own. Grid: n · ROUTE_WGS × 256.
+    /// being computed on its own. `place` is the placement table, a word per
+    /// expert: 0 on the card, 1 in the host's DRAM — the card's active list
+    /// holds only its own, the host builds its list from the picks; the
+    /// integers go to the host's mirrors (`xq_m`, `xs_m`, `xg_m`, this
+    /// layer's slots) as well, so both tiers' experts take the same
+    /// activation. Grid: n · ROUTE_WGS × 256.
     #[no_mangle]
-    pub extern "gpu-kernel" fn route(h: *const f32, ln: *const u16, w: *const u16, logit: *mut f32, wt: *mut f32, xq: *mut i8, xs: *mut f32, xg: *mut i32, expert: *mut u32, topk_out: *mut u32, n: u32, count: *mut u32, list: *mut u32) {
+    pub extern "gpu-kernel" fn route(h: *const f32, ln: *const u16, w: *const u16, logit: *mut f32, wt: *mut f32, xq: *mut i8, xs: *mut f32, xg: *mut i32, expert: *mut u32, topk_out: *mut u32, n: u32, count: *mut u32, list: *mut u32, place: *const u32, xq_m: *mut i8, xs_m: *mut f32, xg_m: *mut i32) {
         use core::sync::atomic::{fence, AtomicU32, Ordering};
         unsafe {
             const E: usize = N_ROUTED_EXPERTS;
@@ -329,6 +334,7 @@ pub mod gfx11 {
             let h = h.add(i * H);
             let logit = logit.add(i * E);
             let (wt, xq, xs, xg, expert, topk_out) = (wt.add(i * TOP_K), xq.add(i * H), xs.add(i * (H / G)), xg.add(i * (H / G)), expert.add(i * TOP_K), topk_out.add(i * TOP_K));
+            let (xq_m, xs_m, xg_m) = (xq_m.add(i * H), xs_m.add(i * (H / G)), xg_m.add(i * (H / G)));
             // this wave's row: expert g · PER + wave; lane `lane` elements lane · 8 + k · 256 —
             // eight weights, eight norm weights, eight activations a step, every step's
             // loads independent of the last; the squares of the activations alongside
@@ -392,10 +398,13 @@ pub mod gfx11 {
                     j += 1;
                 }
                 *(xq.add(b) as *mut u32) = packed;
+                *(xq_m.add(b) as *mut u32) = packed;
                 let sum = wave_sum(lane, sum as f32);
                 if lane == 0 {
                     *xs.add(gq) = s;
                     *xg.add(gq) = sum as i32;
+                    *xs_m.add(gq) = s;
+                    *xg_m.add(gq) = sum as i32;
                 }
             }
             let t2 = common::stat_clock!();
@@ -483,7 +492,7 @@ pub mod gfx11 {
                 let mut k = 0;
                 let mut e = 0;
                 while e < E {
-                    if *cnt.add(e) > 0 {
+                    if *cnt.add(e) > 0 && *place.add(e) == 0 {
                         *count.add(E + 1 + k) = e as u32;
                         k += 1;
                     }

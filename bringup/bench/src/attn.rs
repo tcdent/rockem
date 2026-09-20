@@ -25,7 +25,8 @@ fn main() {
     let emm = unsafe { memmap2::Mmap::map(&ef).unwrap() };
     let k = kfd::Kfd::new(&elf, true);
     let rope = Rope::new(ctx);
-    let mut attention = kfd::KfdModel::new(k.clone(), dense, &emm[..layout::STREAM], &rope, ctx);
+    let place = vec![if harness::arg("--experts").map(|p| p.to_str().unwrap() == "host").unwrap_or(false) { 1u32 } else { 0 }; deepseek_v2_lite::N_ROUTED_EXPERTS];
+    let mut attention = kfd::KfdModel::new(k.clone(), dense, &emm[..layout::STREAM], &rope, ctx, &place);
 
     let mut rng = common::testing::Rng::new(3);
     let rows: Vec<f32> = (0..ctx * layout::POSITION).map(|_| rng.unit() * 0.1).collect();

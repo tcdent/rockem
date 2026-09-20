@@ -30,7 +30,8 @@ fn main() {
     let k = kfd::Kfd::new(&elf, true);
     let max_ctx = 2048;
     let rope = Rope::new(max_ctx);
-    let mut m = kfd::KfdModel::new(k.clone(), dense, &emm[..layout::STREAM], &rope, max_ctx);
+    let place = vec![if harness::arg("--experts").map(|p| p.to_str().unwrap() == "host").unwrap_or(false) { 1u32 } else { 0 }; deepseek_v2_lite::N_ROUTED_EXPERTS];
+    let mut m = kfd::KfdModel::new(k.clone(), dense, &emm[..layout::STREAM], &rope, max_ctx, &place);
     let mut rng = common::testing::Rng::new(3);
     let rows: Vec<f32> = (0..(pos + 1) * layout::POSITION).map(|_| rng.unit() * 0.1).collect();
     m.seed(&rows);
@@ -179,4 +180,8 @@ fn main() {
     m.draw(0, &SAMPLING, 0.5, &logits);
     account("head + draw alone", &m.timeline());
     println!("pos {pos}: attention {t_attn:.2} ms + ffn {t_ffn:.2} ms (interleaved as decode runs them: {t_layers:.2}); head + draw {t_tail:.2} ms (the draw alone {:.0} µs); decode {t_tok:.2} ms = {:.0} tok/s; posting a launch costs the host {post_us:.1} µs", t_draw * 1e3, 1e3 / t_tok);
+    let (busy, wait) = (m.host_busy, m.host_wait);
+    m.host_busy = 0.0;
+    m.host_wait = 0.0;
+    println!("host experts over the run: {:.1} ms computing, {:.1} ms waiting for marks", busy * 1e3, wait * 1e3);
 }

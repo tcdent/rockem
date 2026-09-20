@@ -32,7 +32,8 @@ fn main() {
     let dump = arg("--dump");
     let rope = Rope::new(max_ctx);
     let k = kfd::Kfd::new(&elf, false);
-    let mut m = kfd::KfdModel::new(k, dense, &experts[..deepseek_v2_lite::layout::STREAM], &rope, max_ctx);
+    let place = vec![if harness::arg("--experts").map(|p| p.to_str().unwrap() == "host").unwrap_or(false) { 1u32 } else { 0 }; deepseek_v2_lite::N_ROUTED_EXPERTS];
+    let mut m = kfd::KfdModel::new(k, dense, &experts[..deepseek_v2_lite::layout::STREAM], &rope, max_ctx, &place);
     let mut rng = common::testing::Rng::new(1);
     let fill: Vec<f32> = (0..32 * H).map(|_| rng.unit() * 0.1).collect();
     let mut h: Vec<f32> = (0..n * H).map(|_| rng.unit() * 0.1).collect();
