@@ -113,22 +113,72 @@ layers carry a cache, the rest a recurrent state.
 
 ## 5. Sinks
 
-Unknown. Nothing published on this model mentions massive activations. The first probe
-is position 0's residual and FFN-output magnitude per layer on the golden sets, and
-whether a shipped position-0 state is even meaningful when 34 layers carry a recurrent
-state rather than cache rows.
+Measured 2026-09-30 on the five passages (75–88 positions each, the passage's first
+token at position 0, no special prefix; `bringup/glm/measure.py ranges`): **position 0
+is a sink of moderate size from layer 3 to the mid-thirties.** Its residual is the
+largest of every position's by 4–6× at layers 3–9, **15–30× at layers 10–25** (legal
+peaks at 30× at layer 21), 6–13× through the twenties and 3–6× from layer 34 on; the
+absolute value is small (position 0's residual reaches 10–28 against the others' ~1,
+with the stream's rms at 0.05–1.4 — mHC keeps the stream small). The **last layer is a
+different phenomenon**: its residual reaches 70–185 on every passage, position 0 no
+larger than the rest, and it comes from the shared expert, whose output there is
+115–167 against ≈1 in every other layer (layer 43's is 9–14). That is the model
+shaping the final norm's input, on all positions, not a sink.
+
+What follows for the recipe: the V2-Lite sink trick (position 0 computed once at full
+precision and shipped) applies here in shape — one position, from the first MoE layer
+— but the sink is a factor of 30 over a stream of rms 0.3, not the thousands V2-Lite
+showed, so its share of INT4's cost is a measurement (§3), not a foregone conclusion.
+Whether the first token *is* the sink regardless of its identity, and whether the
+model's own prefix (`[gMASK]<sop>`) takes the role, is the next probe.
 
 ## 6. Activation ranges per layer
 
-To measure on a bf16 run over the golden sets: residual, normed input, expert input,
-expert output, the KDA state's range, and the indexer's scores.
+Measured 2026-09-30, max over the five passages (`measure.py ranges`; the full
+per-passage tables are in `bringup/goldens/glm/<set>/`):
+
+| layers | residual max | residual rms | FFN input max (post-norm) | routed experts' output max | shared expert's output max |
+|---|---|---|---|---|---|
+| 0–2 (dense) | 0.0–0.1 | 0.00–0.02 | 0.4–1.5 | — | — |
+| 3–9 | 1.2–1.5 | 0.05 | 1.3–2.6 | 0.7–3.4 (13.9 at layer 3) | 0.3–0.7 (9.5 at 3, 12.6 at 6, 4.4 at 7) |
+| 10–17 | 2.9–5.2 | 0.09–0.16 | 1.3–1.8 | 0.7–7.9 | 0.3–1.0 (9.3 at 10) |
+| 18–28 | 9.9–10.9 | 0.31–0.38 | 1.3–1.8 | 0.5–2.9, **37 at 18**, 16 at 21, 13 at 26 | 0.3–1.4 |
+| 29–33 | 16.2–17.2 | 0.41–0.48 | 1.9–2.2 | 1.2–12 (12 at 29) | 0.4–0.8 |
+| 34–43 | 20.6–28.5 | 0.62–1.04 | 2.0–4.2 | 1.1–7.2 | 0.6–3.8 (13.5 at 43) |
+| 44 | 185 | 1.41 | 5.6 | 34.5 | **167** |
+
+The residual grows in steps at layers 10, 16/18, 29 and 34, each a layer whose routed
+experts emit an outlier (7.7, 37, 12, 4.2) — the routed experts write the big values, the
+stream keeps them. The INT8 activation (absmax / 127 per group of 128) sees FFN inputs
+of 1.3–5.6: an ordinary range, no outlier channel at the input of the experts.
 
 ## 7. Routing: fragility and concentration
 
-To measure: the routing histogram per layer over the golden sets and a longer corpus,
-the margin of the eighth pick against the ninth, and how often INT4 experts flip a pick.
-The histogram is also the first input to expert placement between the cards and the
-sockets' DRAM.
+Measured 2026-09-30 over the five passages together, 395 positions, 8 picks each
+(`measure.py routing`, and the combined histogram saved as
+`bringup/goldens/glm/routing_hist.pt`):
+
+| layers | experts with any pick, of 288 | experts holding 50 % of picks | 90 % | largest single expert's share | positions whose 8th and 9th scores differ by < 1e-3 |
+|---|---|---|---|---|---|
+| 3–11 | 279–287 | 60–90 | 186–219 | 1–4 % | 5–12 % |
+| 12–17 | 255–268 | 37–56 | 145–175 | 3–5 % | 6–8 % |
+| 18–28 | 221–255 | 25–35 | 110–141 | 3–9 % | 4–8 % |
+| 29–44 | 248–265 | 30–45 | 142–158 | 3–6 % | 3–10 % |
+
+Three things to carry into the design:
+
+- **Concentration is real but layer-dependent.** Early layers spread picks over most of
+  the 288; the middle of the network routes half its traffic through 25–35 experts a
+  layer. A card-resident set of the 50 %-of-picks experts would be roughly 2,000 experts
+  across the 42 layers, about 25 GB at 4 bits — the first number for the placement table's
+  frequency axis. Five passages are too few to fix the set; the histogram wants a corpus.
+- **Picks are fragile.** The router's sigmoid scores sit close: 3–12 % of positions per
+  layer have their eighth and ninth candidates within 1e-3, and the median margin is
+  4e-3 to 1.6e-2. Noise of INT4's size on the residual will flip the last pick on a few
+  percent of positions per layer; §3 measures what that costs.
+- **The pick is a rank over sigmoid + bias, the weights the sigmoid alone, normalized.**
+  Our route kernel's rank-based selection carries over; the score and the weights are
+  new arithmetic.
 
 ## 8. What this decides
 
@@ -163,12 +213,14 @@ Nothing yet. The decisions the model forces, with what is known:
 In order:
 
 1. ~~The safetensors index read into a byte table by tensor class~~ — done, §0.
-2. An oracle that runs on hardware we have, for at least the first eight layers (three
-   dense, four KDA, one MLA): the transcription gate for the new kernels.
-3. Goldens: the five domain sets at this model's tokenizer, with per-layer edges.
-4. The routing histogram per layer (§7).
-5. Position-0 magnitudes per layer (§5).
-6. Activation ranges (§6), then the recipe sweeps of §2–§4.
+2. ~~An oracle that runs on hardware we have~~ — done, all 45 layers: `bringup/glm/oracle.py`,
+   the reference modeling code in f32 on the CPU, a layer at a time from the FP8
+   shards, about 18 minutes a passage on elsenor.
+3. ~~Goldens: the five domain sets at this model's tokenizer, with per-layer edges~~ — done,
+   `bringup/goldens/glm/<set>/`.
+4. ~~The routing histogram per layer (§7)~~ — done on five passages; a corpus next.
+5. ~~Position-0 magnitudes per layer (§5)~~ — done; the prefix-token probe next.
+6. ~~Activation ranges (§6)~~ — done; the recipe sweeps of §2–§4 are running.
 
 ## Regenerating
 

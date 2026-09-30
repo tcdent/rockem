@@ -177,6 +177,7 @@ def main():
     ap.add_argument("--q4-group", type=int, default=128)
     ap.add_argument("--threads", type=int, default=32)
     ap.add_argument("--no-edges", action="store_true", help="logits and routing only")
+    ap.add_argument("--prefix", default="", help="tokens to put before the passage, e.g. '[gMASK]<sop>' (the model's own prefix)")
     args = ap.parse_args()
     torch.set_num_threads(args.threads)
 
@@ -199,8 +200,8 @@ def main():
         if cont is None:
             cont = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "continuations", args.set + ".txt")).read()
         text = prompt + cont
-        ids = tok.encode(text).ids
-        meta.update(set=args.set, prompt=prompt, continuation=cont, text=text)
+        ids = tok.encode(args.prefix).ids + tok.encode(text).ids if args.prefix else tok.encode(text).ids
+        meta.update(set=args.set, prompt=prompt, continuation=cont, text=text, prefix=args.prefix)
     meta["ids"] = ids
     x = torch.tensor([ids])
     S = len(ids)
