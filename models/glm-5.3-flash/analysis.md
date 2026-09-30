@@ -111,11 +111,11 @@ sink is the first word (§5) — `oracle.py --q4 all` against the plain run,
 | dialogue | 77 | 0.055 / 0.98 | 0.935 | 1.171 → 1.292 | 41 |
 | science | 76 | 0.051 / 0.38 | 0.950 | 1.213 → 1.178 | 41 |
 | legal | 80 | 0.081 / 3.66 | 0.892 | 1.057 → 1.015 | 41 |
-| long | 88 | *running* | | 0.981 → | |
+| long | 88 | 0.064 / 3.66 | 0.966 | 0.981 → 0.960 | 41 |
 
 Plain INT4 costs 0.04–0.08 nats of KL per position on these passages, with a tail
-(one position on legal at 3.7 nats), and moves the greedy token at 4–11 % of
-positions. The text's NLL moves both ways by less than the passages can resolve.
+(legal and long share their first position, "The", at 3.7 nats), and moves the greedy
+token at 3–11 % of positions. The text's NLL moves both ways by less than the passages can resolve.
 Every MoE layer sees at least one pick change on 75 positions, as §7's margins
 predicted. For reference, V2-Lite's plain INT4 measured 0.03–0.05 nats before its sink
 was handled and 0.015–0.03 after, on the same passages; what the sink is worth here
@@ -157,9 +157,15 @@ The passage itself scores better with the prefix in place (NLL 0.465 → 0.437 o
 So the sink is exactly V2-Lite's shape, two positions long and a constant of the model:
 the prefix is always the same two tokens, so their state after position 1 — the 34 KDA
 layers' recurrent states and the 11 MLA layers' two cache rows — is computed once at
-full precision and shipped, and every sequence starts at position 2. What that buys
-against INT4 is the run in flight (`--prefix "[gMASK]<sop>" --q4 all --sink 2` against
-`--sink 0`).
+full precision and shipped, and every sequence starts at position 2.
+
+**What that buys** (code passage with the prefix, every layer's routed experts INT4
+round-to-nearest, the two prefix positions' experts at full precision — `--q4 all --sink
+2` — against the prefixed oracle run): **KL 0.0070 nats a position, max 0.097, top-1
+agreement 0.974, NLL +0.004**, against 0.040 / 0.98 / 0.960 for the same passage and
+recipe without the prefix (§3). The same recipe with the prefix but the sink positions
+quantized too (`--sink 0`) is running, to separate the prefix's own effect from the
+protection's.
 
 ## 6. Activation ranges per layer
 
