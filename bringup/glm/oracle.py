@@ -126,18 +126,21 @@ class LazyExperts:
     fewer): the same hit set in the same ascending order, the same F.linear, gate and
     index_add_, so the bits are the reference's. Holds the experts it has seen this layer."""
 
-    def __init__(self, module, src, names, q4_group=None):
-        self.m, self.src, self.names, self.q4 = module, src, names, q4_group
+    def __init__(self, module, src, names, q4_group=None, sink=0):
+        self.m, self.src, self.names, self.q4, self.sink = module, src, names, q4_group, sink
         self.cache = {}
 
-    def weights(self, e):
-        if e not in self.cache:
-            gu = torch.cat([self.src.get(self.names[(e, "gate_proj")]), self.src.get(self.names[(e, "up_proj")])], 0)
-            dn = self.src.get(self.names[(e, "down_proj")])
-            if self.q4:
-                gu, dn = q4_rtn(gu, self.q4), q4_rtn(dn, self.q4)
-            self.cache[e] = (gu, dn)
-        return self.cache[e]
+    def weights(self, e, quant):
+        key = (e, quant)
+        if key not in self.cache:
+            if quant:
+                gu, dn = self.weights(e, False)
+                self.cache[key] = (q4_rtn(gu, self.q4), q4_rtn(dn, self.q4))
+            else:
+                gu = torch.cat([self.src.get(self.names[(e, "gate_proj")]), self.src.get(self.names[(e, "up_proj")])], 0)
+                dn = self.src.get(self.names[(e, "down_proj")])
+                self.cache[key] = (gu, dn)
+        return self.cache[key]
 
     def __call__(self, hidden_states, top_k_index, top_k_weights):
         import torch.nn.functional as F
@@ -149,11 +152,21 @@ class LazyExperts:
             expert_idx = int(expert_idx[0])
             if expert_idx == m.num_experts:
                 continue
-            gu, dn = self.weights(expert_idx)
             top_k_pos, token_idx = torch.where(mask[expert_idx])
-            current = m._apply_gate(F.linear(hidden_states[token_idx], gu))
-            current = F.linear(current, dn) * top_k_weights[token_idx, top_k_pos, None]
-            final.index_add_(0, token_idx, current.to(final.dtype))
+            # the sink positions (the first `sink`) take the experts at full precision — what
+            # shipping their state buys; the rest the quantized ones
+            for quant, sel in ((False, token_idx < self.sink), (True, token_idx >= self.sink)):
+                if not sel.any() or (quant and not self.q4):
+                    continue
+                if not quant and not self.q4:
+                    sel = torch.ones_like(sel)
+                gu, dn = self.weights(expert_idx, quant)
+                ti, tp = token_idx[sel], top_k_pos[sel]
+                current = m._apply_gate(F.linear(hidden_states[ti], gu))
+                current = F.linear(current, dn) * top_k_weights[ti, tp, None]
+                final.index_add_(0, ti, current.to(final.dtype))
+                if not self.q4:
+                    break
         return final
 
 
@@ -175,6 +188,7 @@ def main():
     ap.add_argument("--layers", type=int, help="run only the first N layers, no head")
     ap.add_argument("--q4", default="", help="layers whose routed experts are INT4 RTN, e.g. 10,11 or all")
     ap.add_argument("--q4-group", type=int, default=128)
+    ap.add_argument("--sink", type=int, default=0, help="with --q4: the first N positions take the experts at full precision (a shipped sink)")
     ap.add_argument("--threads", type=int, default=32)
     ap.add_argument("--no-edges", action="store_true", help="logits and routing only")
     ap.add_argument("--prefix", default="", help="tokens to put before the passage, e.g. '[gMASK]<sop>' (the model's own prefix)")
@@ -238,7 +252,7 @@ def main():
         lazy = None
         if expert_names:
             # the experts stay unmaterialized; their forward dequantizes what the step touches
-            lazy = LazyExperts(layer.mlp.experts, src, expert_names, args.q4_group if l in q4 else None)
+            lazy = LazyExperts(layer.mlp.experts, src, expert_names, args.q4_group if l in q4 else None, args.sink)
             layer.mlp.experts.forward = lazy
             missing = [k for k in missing if not k.startswith("mlp.experts.")]
         assert not missing, missing
@@ -291,7 +305,7 @@ def main():
     save_file({k: v.contiguous() for k, v in edges.items()}, os.path.join(args.out, "edges.safetensors"))
     if result["routing"]:
         save_file({k: v.contiguous() for k, v in result["routing"].items()}, os.path.join(args.out, "routing.safetensors"))
-    meta.update(layers=L, q4=sorted(q4), q4_group=args.q4_group, seconds=time.time() - t0)
+    meta.update(layers=L, q4=sorted(q4), q4_group=args.q4_group, sink=args.sink, seconds=time.time() - t0)
     json.dump(meta, open(os.path.join(args.out, "meta.json"), "w"), indent=1)
     print(f"done in {time.time() - t0:.0f} s -> {args.out}", flush=True)
 

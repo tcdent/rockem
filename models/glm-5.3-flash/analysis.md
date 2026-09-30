@@ -99,11 +99,27 @@ To measure once the oracle runs. Prior from published measurements, marked:
 
 ## 3. Teacher-forced divergence from the oracle
 
-To measure on the golden sets. Published on the NVFP4-expert, FP8-dense recipe (repo,
-greedy, thinking off): GSM8K (250) 97.2 %, HumanEval 156/164, needle 12/12 to 507k,
-unchanged from their stock. Their speculative acceptance runs 88–97 % on structured
-text, 58–75 % on code, 24–38 % on prose: the speculation multiplier is a property of
-the domain, and the recipe's effect on it is a measurement of its own.
+Measured 2026-09-30, every layer's routed experts INT4 round-to-nearest, absmax/7 in
+groups of 128 along the input, no calibration, the shared experts and everything
+dense at the checkpoint's precision; the passages without the model's prefix, so the
+sink is the first word (§5) — `oracle.py --q4 all` against the plain run,
+`measure.py kl`:
+
+| passage | positions | KL(oracle‖INT4) mean / max, nats | top-1 agreement | NLL of the text, oracle → INT4 | layers where some pick changed |
+|---|---|---|---|---|---|
+| code | 75 | 0.040 / 0.98 | 0.960 | 0.465 → 0.460 | 41 of 42 |
+| dialogue | 77 | 0.055 / 0.98 | 0.935 | 1.171 → 1.292 | 41 |
+| science | 76 | 0.051 / 0.38 | 0.950 | 1.213 → 1.178 | 41 |
+| legal | 80 | 0.081 / 3.66 | 0.892 | 1.057 → 1.015 | 41 |
+| long | 88 | *running* | | 0.981 → | |
+
+Plain INT4 costs 0.04–0.08 nats of KL per position on these passages, with a tail
+(one position on legal at 3.7 nats), and moves the greedy token at 4–11 % of
+positions. The text's NLL moves both ways by less than the passages can resolve.
+Every MoE layer sees at least one pick change on 75 positions, as §7's margins
+predicted. For reference, V2-Lite's plain INT4 measured 0.03–0.05 nats before its sink
+was handled and 0.015–0.03 after, on the same passages; what the sink is worth here
+is the measurement running now (§5).
 
 ## 4. Per-layer sensitivity
 
@@ -113,24 +129,37 @@ layers carry a cache, the rest a recurrent state.
 
 ## 5. Sinks
 
-Measured 2026-09-30 on the five passages (75–88 positions each, the passage's first
-token at position 0, no special prefix; `bringup/glm/measure.py ranges`): **position 0
-is a sink of moderate size from layer 3 to the mid-thirties.** Its residual is the
-largest of every position's by 4–6× at layers 3–9, **15–30× at layers 10–25** (legal
-peaks at 30× at layer 21), 6–13× through the twenties and 3–6× from layer 34 on; the
-absolute value is small (position 0's residual reaches 10–28 against the others' ~1,
-with the stream's rms at 0.05–1.4 — mHC keeps the stream small). The **last layer is a
-different phenomenon**: its residual reaches 70–185 on every passage, position 0 no
-larger than the rest, and it comes from the shared expert, whose output there is
-115–167 against ≈1 in every other layer (layer 43's is 9–14). That is the model
-shaping the final norm's input, on all positions, not a sink.
+Measured 2026-09-30 on the five passages (`measure.py ranges`, and a probe with the
+model's own prefix).
 
-What follows for the recipe: the V2-Lite sink trick (position 0 computed once at full
-precision and shipped) applies here in shape — one position, from the first MoE layer
-— but the sink is a factor of 30 over a stream of rms 0.3, not the thousands V2-Lite
-showed, so its share of INT4's cost is a measurement (§3), not a foregone conclusion.
-Whether the first token *is* the sink regardless of its identity, and whether the
-model's own prefix (`[gMASK]<sop>`) takes the role, is the next probe.
+**Without the prefix** (the passage's first word at position 0): position 0 is a sink
+of moderate size from layer 3 to the mid-thirties — its residual is the largest of any
+position's by 4–6× at layers 3–9, 15–30× at layers 10–25, 3–6× from 34 on, with an
+absolute value of 10–28 over a stream whose rms is 0.05–1.4 (mHC keeps the stream
+small). The last layer is a different thing: its residual reaches 70–185 on every
+position, and it is the shared expert, whose output there is 115–167 against ≈1 in
+every other layer. That is the model shaping the final norm's input, not a sink.
+
+**With the prefix `[gMASK]<sop>`**, which every prompt to this model carries (the chat
+template opens with it), **the `<sop>` token is a massive sink and the first word is
+not**: its residual is 260 at layer 18, 1,050 at layer 25, 2,600 at layer 34, **5,114 at
+layer 44**, against 0.2–83 for the passage's positions; `[gMASK]` beside it reaches 196.
+The passage itself scores better with the prefix in place (NLL 0.465 → 0.437 on code).
+
+| layer | first word as position 0, plain | `[gMASK]` | `<sop>` | first word, with the prefix | the rest |
+|---|---|---|---|---|---|
+| 10 | 1.8 | 10.1 | 12.1 | 0.4 | 0.2 |
+| 18 | 5.2 | 9.7 | 260 | 0.5 | 0.4 |
+| 25 | 5.5 | 17.4 | 1,050 | 0.7 | 0.7 |
+| 34 | 6.2 | 35.3 | 2,592 | 1.8 | 3.4 |
+| 44 | 19.0 | 196 | 5,114 | 8.2 | 83 |
+
+So the sink is exactly V2-Lite's shape, two positions long and a constant of the model:
+the prefix is always the same two tokens, so their state after position 1 — the 34 KDA
+layers' recurrent states and the 11 MLA layers' two cache rows — is computed once at
+full precision and shipped, and every sequence starts at position 2. What that buys
+against INT4 is the run in flight (`--prefix "[gMASK]<sop>" --q4 all --sink 2` against
+`--sink 0`).
 
 ## 6. Activation ranges per layer
 
@@ -219,7 +248,7 @@ In order:
 3. ~~Goldens: the five domain sets at this model's tokenizer, with per-layer edges~~ — done,
    `bringup/goldens/glm/<set>/`.
 4. ~~The routing histogram per layer (§7)~~ — done on five passages; a corpus next.
-5. ~~Position-0 magnitudes per layer (§5)~~ — done; the prefix-token probe next.
+5. ~~Position-0 magnitudes per layer (§5)~~ — done, and the prefix probe: the sink is `<sop>`.
 6. ~~Activation ranges (§6)~~ — done; the recipe sweeps of §2–§4 are running.
 
 ## Regenerating
