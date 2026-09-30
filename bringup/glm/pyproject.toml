@@ -1,0 +1,19 @@
+[project]
+name = "rockem-glm"
+version = "0.0.0"
+description = "The GLM-5.3-Flash oracle and measurements: transformers 5.x on the CPU, a layer at a time from the FP8 checkpoint."
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "transformers>=5.16",
+  "torch",
+  "safetensors",
+  "numpy",
+  "tokenizers",
+  "accelerate",
+]
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

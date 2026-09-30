@@ -1,0 +1,5 @@
+ using a chemical process called refrigeration.
+User: What is refrigeration?
+Assistant: Refrigeration is the process of removing heat from a substance.
+User: How does a refrigerator remove heat from a substance?
+Assistant: A refrigerator uses a refrigerant, which is a chemical that absorbs heat

@@ -39,15 +39,30 @@ activation carries a clamp (`swiglu_limit` 10.0).
 **Checkpoints** (sizes from the safetensors indexes, repo): bf16 598.5 GiB; FP8 305.8;
 NVFP4 181.3 (routed experts at 4 bits, everything else bf16).
 
-**Bytes, from the config** — to be replaced by the index's own byte counts (§9):
+**Bytes, from the shards' headers** (`bringup/glm/bytes.py --md`, all 62 shards of the
+official FP8 checkpoint, 2026-09-30; the 4-bit column is parameters at 4 bits plus a
+scale per 128):
 
-| class | count | parameters | at rest |
-|---|---|---|---|
-| one routed expert | 3 × 2048 × 4096 | 25.2M | 12.6 MB at 4 bits |
-| routed experts | 42 layers × 288 = 12,096 | ≈305B | ≈152 GB at 4 bits |
-| a token's routed experts | 8 × 42 = 336 | ≈8.5B | **≈4.2 GB at 4 bits** |
-| shared experts | 42 | ≈1.1B | 0.5 GB at 4 bits, 2.1 GB bf16 |
-| everything else (KDA and MLA projections, indexer, dense FFNs, embeddings, head, mHC) | | ≈9B | **≈18 GB bf16** (the repo's ~4 GB a rank at four ranks agrees) |
+| class | tensors | parameters | at the checkpoint's dtypes | at 4 bits |
+|---|---|---|---|---|
+| routed experts (42 layers + the MTP layer's, 288 each) | 37,152 | 311.65B | 311.7 GB, FP8 | 160.7 GB |
+| KDA projections (34 layers) | 476 | 3.54B | 7.1 GB, bf16 (f32 gates) | 1.8 GB |
+| attention `o_proj`, KDA and MLA | 46 | 1.95B | 3.1 GB | 1.0 GB |
+| `lm_head` | 1 | 0.63B | 1.3 GB, bf16 | 0.3 GB |
+| embeddings | 1 | 0.63B | 1.3 GB, bf16 | 0.3 GB |
+| vision tower (not run) | 347 | 0.56B | 1.1 GB, bf16 | — |
+| shared experts | 129 | 1.08B | 1.1 GB, FP8 | 0.6 GB |
+| MLA projections (11 layers) | 72 | 0.60B | 0.8 GB | 0.3 GB |
+| dense FFNs (layers 0–2) | 9 | 0.45B | 0.5 GB, FP8 | 0.2 GB |
+| MLA indexer | 84 | 0.09B | 0.2 GB, bf16 | 0.0 GB |
+| router, mHC, MTP head, norms | 453 | 0.12B | 0.3 GB | — |
+| **total** | | **321.3B** | **328.3 GB** | |
+
+What a token reads: 8 routed experts in 42 layers = 336 experts, 25.2M parameters each,
+**8.5B parameters, 4.4 GB at 4 bits with scales**, plus the shared experts and every
+non-expert tensor (≈9B parameters without the vision tower, **≈18 GB at bf16**, 16 GB at
+the checkpoint's mix). The routed experts are 97 % of the parameters and none of the
+per-token latency except through the bus that streams them.
 
 ## 1. What "correct" means here, and against what
 
@@ -147,8 +162,7 @@ Nothing yet. The decisions the model forces, with what is known:
 
 In order:
 
-1. The safetensors index read into a byte table by tensor class — replaces §0's
-   arithmetic.
+1. ~~The safetensors index read into a byte table by tensor class~~ — done, §0.
 2. An oracle that runs on hardware we have, for at least the first eight layers (three
    dense, four KDA, one MLA): the transcription gate for the new kernels.
 3. Goldens: the five domain sets at this model's tokenizer, with per-layer edges.
