@@ -23,7 +23,7 @@ domains are the same; the ids are this model's tokenizer's.
 import argparse, glob, json, os, re, struct, sys, time
 import torch
 from safetensors import safe_open
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 
 torch.set_grad_enabled(False)
 
@@ -126,9 +126,11 @@ class LazyExperts:
     fewer): the same hit set in the same ascending order, the same F.linear, gate and
     index_add_, so the bits are the reference's. Holds the experts it has seen this layer."""
 
-    def __init__(self, module, src, names, q4_group=None, sink=0):
+    def __init__(self, module, src, names, q4_group=None, sink=0, calib=None, limit=10.0):
         self.m, self.src, self.names, self.q4, self.sink = module, src, names, q4_group, sink
+        self.calib, self.limit = calib, limit  # calib: this layer's FFN inputs [n][H] for GPTQ, else RTN
         self.cache = {}
+        self.U = None
 
     def weights(self, e, quant):
         key = (e, quant)
@@ -142,12 +144,40 @@ class LazyExperts:
                 self.cache[key] = (gu, dn)
         return self.cache[key]
 
+    def gptq_experts(self, experts, batch=16, down_positions=2048):
+        """GPTQ the given experts in batches, as bringup/quant.py does: one Hessian for every
+        expert's gate/up from the layer's calibration inputs, each expert's own for its down
+        projection from the clamped SwiGLU of those inputs (a subsample, for the matmul)."""
+        import gptq as G
+        X = self.calib
+        if self.U is None:
+            self.U = G.hinv((X.T @ X)[None])
+        Ugu, dead_gu = self.U
+        Xd = X[torch.randperm(X.shape[0], generator=torch.Generator().manual_seed(0))[:down_positions]] if X.shape[0] > down_positions else X
+        I = self.m.intermediate_dim
+        for b0 in range(0, len(experts), batch):
+            es = experts[b0:b0 + batch]
+            gu = torch.stack([self.weights(e, False)[0] for e in es])
+            dn = torch.stack([self.weights(e, False)[1] for e in es])
+            qgu = G.gptq(gu, Ugu, dead_gu)
+            h = Xd @ gu.transpose(1, 2)  # [E][n][2I]
+            gate, up = h[..., :I].clamp(max=self.limit), h[..., I:].clamp(-self.limit, self.limit)
+            hcal = torch.nn.functional.silu(gate) * up
+            Ud, dead_d = G.hinv(hcal.transpose(1, 2) @ hcal)
+            qdn = G.gptq(dn, Ud, dead_d)
+            for i, e in enumerate(es):
+                self.cache[(e, True)] = (qgu[i], qdn[i])
+
     def __call__(self, hidden_states, top_k_index, top_k_weights):
         import torch.nn.functional as F
         m = self.m
         final = torch.zeros_like(hidden_states)
         mask = F.one_hot(top_k_index, num_classes=m.num_experts + 1).permute(2, 1, 0)
         hit = torch.greater(mask.sum(dim=(-1, -2)), 0).nonzero()
+        if self.q4 and self.calib is not None:
+            need = [int(h[0]) for h in hit if int(h[0]) != m.num_experts and (int(h[0]), True) not in self.cache]
+            if need:
+                self.gptq_experts(need)
         for expert_idx in hit:
             expert_idx = int(expert_idx[0])
             if expert_idx == m.num_experts:
@@ -194,12 +224,11 @@ def dense_quant(sd, mode, group):
 
 
 def q4_rtn(w, group):
-    """INT4 round-to-nearest, absmax/7, along the last dim in groups."""
-    r, c = w.shape[-2], w.shape[-1]
-    g = w.reshape(*w.shape[:-1], c // group, group)
-    s = g.abs().amax(-1, keepdim=True) / 7.0
-    s = torch.where(s == 0, torch.ones_like(s), s)
-    return (torch.round(g / s).clamp(-7, 7) * s).reshape(w.shape)
+    """INT4 round-to-nearest as the bundle ships it (gptq.rtn): absmax/7 per group along the
+    input, half rounded away, integers in [-8, 7]. (Until 2026-10-01 this rounded half to
+    even into [-7, 7]; the measurements before then differ by ties only.)"""
+    from gptq import rtn
+    return rtn(w, group)
 
 
 def main():
@@ -214,6 +243,8 @@ def main():
     ap.add_argument("--q4-group", type=int, default=128)
     ap.add_argument("--sink", type=int, default=0, help="with --q4: the first N positions take the experts at full precision (a shipped sink)")
     ap.add_argument("--dense", choices=["fp8", "q4"], help="every layer's dense linears at FP8 (per-channel) or INT4 RTN (g128); experts as --q4 says")
+    ap.add_argument("--calib-out", help="write every MoE layer's FFN inputs (the calibration set) to this dir, one file a layer, and nothing else")
+    ap.add_argument("--gptq", help="with --q4: calibrated INT4 (GPTQ) from the FFN inputs a --calib-out run wrote to this dir")
     ap.add_argument("--threads", type=int, default=32)
     ap.add_argument("--no-edges", action="store_true", help="logits and routing only")
     ap.add_argument("--prefix", default="", help="tokens to put before the passage, e.g. '[gMASK]<sop>' (the model's own prefix)")
@@ -285,13 +316,16 @@ def main():
         lazy = None
         if expert_names:
             # the experts stay unmaterialized; their forward dequantizes what the step touches
-            lazy = LazyExperts(layer.mlp.experts, src, expert_names, args.q4_group if l in q4 else None, args.sink)
+            calib = load_file(os.path.join(args.gptq, f"l{l}.safetensors"))["ffn_in"] if args.gptq and l in q4 else None
+            lazy = LazyExperts(layer.mlp.experts, src, expert_names, args.q4_group if l in q4 else None, args.sink, calib, tc.swiglu_limit)
             layer.mlp.experts.forward = lazy
             missing = [k for k in missing if not k.startswith("mlp.experts.")]
         assert not missing, missing
         del sd
         hs = []
-        if not args.no_edges:
+        if args.calib_out and hasattr(layer.mlp, "experts"):
+            hs.append(layer.post_attention_layernorm.register_forward_hook(hook(f"l{l}.ffn_in")))
+        elif not args.no_edges:
             hs.append(layer.input_layernorm.register_forward_hook(hook(f"l{l}.attn_in")))
             hs.append(layer.self_attn.register_forward_hook(hook(f"l{l}.attn_out")))
             hs.append(layer.post_attention_layernorm.register_forward_hook(hook(f"l{l}.ffn_in")))
@@ -309,6 +343,9 @@ def main():
         h, topk = layer(h, attention_mask=mask, position_ids=pos, past_key_values=None, use_cache=False, position_embeddings=None, input_ids=x, prev_topk_indices=topk)
         for hk in hs:
             hk.remove()
+        if args.calib_out and f"l{l}.ffn_in" in edges:
+            os.makedirs(args.calib_out, exist_ok=True)
+            save_file({"ffn_in": edges.pop(f"l{l}.ffn_in").contiguous()}, os.path.join(args.calib_out, f"l{l}.safetensors"))
         touched = None
         if lazy is not None:
             del layer.mlp.experts.forward
@@ -338,7 +375,7 @@ def main():
     save_file({k: v.contiguous() for k, v in edges.items()}, os.path.join(args.out, "edges.safetensors"))
     if result["routing"]:
         save_file({k: v.contiguous() for k, v in result["routing"].items()}, os.path.join(args.out, "routing.safetensors"))
-    meta.update(layers=L, q4=sorted(q4), q4_group=args.q4_group, sink=args.sink, dense=args.dense, seconds=time.time() - t0)
+    meta.update(layers=L, q4=sorted(q4), q4_group=args.q4_group, sink=args.sink, dense=args.dense, gptq=args.gptq, seconds=time.time() - t0)
     json.dump(meta, open(os.path.join(args.out, "meta.json"), "w"), indent=1)
     print(f"done in {time.time() - t0:.0f} s -> {args.out}", flush=True)
 

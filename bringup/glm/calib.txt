@@ -1,0 +1,403 @@
+How a client talks to a node. The node's side is `node/src/wire.rs`, and this document
+and that file's header say the same thing; if they ever disagree, the code is wrong.
+> "What we're really doing is just streaming over TCP, and so I think building a protocol
+> on a byte stream that is oriented specifically towards streaming lets us keep this super
+One TCP connection carries one session at a time. Both directions are a stream of
+little-endian unsigned 32-bit words. There is no framing beyond TCP's own: no length
+fields, no delimiters, no escaping. A reader that started at the connection is always at a
+word boundary, and control values live above the vocabulary, so no value ever needs to be
+distinguished from data by anything but its size.
+The stream in is the transcript the model sees. The stream out is the transcript it
+produces. Nothing is transformed on either side, so a captured stream is a replay.
+BOS, EOS and the vocabulary size are constants of the model, and the bundle's manifest
+states them in its `[model]` table (`docs/bundle.md`) so a client reads them from the
+same directory the node loads. GENERATE and SCORE are constants of the protocol.
+After SCORE, every id the client feeds is answered, before it is fed, with one word
+holding an f32: ln p of that id given everything before it, under the model's own
+distribution (no temperature, no top-k, no top-p; the sampling recipe is for draws). The
+word is the f32's bits, little-endian, in the same four bytes an id would take; a client
+knows which it is reading because it sent SCORE. Ids fed before SCORE are context and are
+not scored. Scoring persists for the sequence: a GENERATE after it still streams ids, and
+ids fed after that are scored again. BOS ends it.
+client → node   BOS, id, id, …, SCORE, id, id, id
+node → client   f32, f32, f32                       (one per id after SCORE, as each is fed)
+This is what likelihood-scored benchmarks and rerankers need: the prompt fed unscored,
+then the candidate's ids scored and summed. A prompt shared by several candidates is
+served from the node's store on the second and later connections, with only its last
+position recomputed, so four choices cost four candidates and one prompt.
+At connect, framed by position: the first sixteen bytes the client writes, and the first
+Positions is the node's context budget: how many ids, prompt and generated together, a
+sequence can hold after its BOS. It is a property of the node, set at boot
+(`rockem.ctx`, 2,048 by default), not of the bundle, because it is a memory budget chosen
+per card; so the node reports it rather than the manifest. A client uses it to refuse a
+prompt that cannot fit before sending it, and to tell a full context from a dropped
+The identity is FNV-1a over the bytes of the bundle's `manifest.toml`, 64-bit, offset
+basis `0xcbf29ce484222325`, prime `0x100000001b3`. The manifest names the checkpoint
+revision, the recipe, the calibration text and the hash of every file, so equal
+identities mean the client's tokenizer and the node's weights came from the same
+checkpoint. A client sends `0` to accept any node. The node refuses a bad magic, a
+different version, or a nonzero identity that is not its own, by closing the connection
+without writing its header. Otherwise it writes its header and reads words.
+client → node   BOS, id, id, id, …, GENERATE
+node → client   id, id, id, …, EOS          (each word written the moment it is sampled)
+client → node   id, id, …, GENERATE          (optional: continue the same sequence)
+client → node   BOS, …                       (optional: a new sequence on the same connection)
+Prompt ids are fed to the model as they arrive, in whatever steps arrive: ids already in
+the socket's buffer go through the model together, up to 32 a step, and a trickle of
+single ids goes one at a time. A position's result does not depend on how many stepped
+with it (the node's own gate: every position's dumps byte-identical either way). On
+GENERATE the node samples, writes the id, feeds it back, and repeats until it writes EOS
+or the context is full. Every id that crosses the wire in either direction is in the
+cache, so a continuation after EOS is exactly the transcript so far plus the new ids.
+The node keeps the cache rows of every transcript it has computed, in host memory,
+keyed by a running hash of the ids. As a prompt's ids arrive they are matched against
+that store, and nothing is computed until the first id the node has not seen after that
+prefix; the card is then seeded from the longest match and computing resumes there. A
+client sees only that a repeated or extended transcript answers faster. The rows a hit
+installs are the bytes a miss would have produced, so this is invisible to the stream.
+The node does not read the socket while generating. Abort is closing the connection: the
+node's next write fails, it stops, and it returns to accepting. There is no stop verb and
+no token limit on the wire; the node runs to EOS or a full context (the header's
+positions), and a full context closes the connection, since the sequence cannot continue.
+A node serves one connection at a time, because it holds one attention cache. Nagle's
+algorithm is off on the node's socket, so a four-byte token leaves when it is sampled
+The stream is readable with nothing but netcat. The bytes below are the header with
+identity 0, then BOS, five prompt ids, and GENERATE:
+ sleep 2) | nc -q 1 <node> 7332 | xxd
+The first twenty bytes back are the node's header; every four after that are a token.
+The console is the same protocol in text, for a human at a serial port: decimal ids on a
+line, the newline is GENERATE, and the node writes token bytes instead of ids. It exists
+so the wire can be exercised by hand and is not the interface a client speaks.
+The edge's client is `api/rockem/wire.py`: a `Session` that is the protocol without a
+socket (bytes out, ids in, the budget mirrored), and a `Client` around it. A client in any
+language is small. In Python: open a socket, set `TCP_NODELAY`, send
+`b"rock" + struct.pack("<IQ", 3, 0)`, read twenty bytes (`struct.unpack("<4sIQI", …)`
+gives the magic, version, identity and positions), then `struct.pack("<I", w)` per word
+out and `struct.unpack("<I", sock.recv(4))` per word in until EOS. Encoding the chat
+template's output with the bundle's tokenizer yields BOS as the first id, and that id is
+the wire's BOS, so a client sends what the tokenizer produced.
+The version in the header covers the word alphabet and the header layout. Anything added
+later, a token limit, a seed override, a reference to a compiled grammar for structured
+output, is a new verb, a new header field, or both, under a new version. A node speaks
+exactly one version and refuses the others; the client decides what to do with that.
+Version 3 added SCORE and the f32 words it answers with. Version 2 added the positions
+field to the node's header; version 1 had sixteen bytes each way and no way for a client
+The one addition already sketched: structured output is a mask on the logits before the
+draw. The grammar is compiled at the edge, where the tokenizer is, into an automaton over
+token ids, and sent with the request or referenced by hash; the node holds a state, masks
+by lookup, samples, and advances by the id it drew. It never sees a character.
+
+Everything a node loads, and everything the edge needs to speak to it, in one directory.
+The layout is `models/deepseek-v2-lite/src/layout.rs`, the builder is `bundle/`, and this
+document and that module say the same thing; if they ever disagree, the code is wrong.
+A bundle is built once from a pinned checkpoint and never edited. Its contents are a
+function of the checkpoint revision, the recipe and the calibration text, and the
+manifest names all three plus the hash of every file, so the manifest's own bytes
+identify the bundle. That identity is what the wire checks at connect (`docs/wire.md`).
+Sizes are stated so a reader can check a file by `ls`; each one is a closed-form function
+of the model constants and is asserted where the file is read.
+Bundles on the dev host live under `bundles/`. Variants of one checkpoint that differ only
+in recipe (`v2lite-q4rtn`, `v2lite-q4gptq`, the calibration experiments) have identical
+dense weights, vocabulary, sink, tokenizer and kernels; only the experts file and the
+manifest differ. Each directory holds its own copy; a bundle is whatever its manifest
+**Identity.** FNV-1a, 64-bit, over the bytes of `manifest.toml` exactly as written
+(offset basis `0xcbf29ce484222325`, prime `0x100000001b3`). Because the manifest carries
+every file's hash, the tokenizer's included, and the checkpoint revision, two bundles with
+equal identities have the same weights, the same vocabulary, the same tokenizer and the
+same constants. The node computes it at start and the client sends the one it expects in
+the wire header. The node reads the manifest for nothing else; it opens each weight file
+**`experts.q4g128.bin`.** A stream of `experts` records of `record_bytes` each, one per
+routed expert, in (layer, expert) order for the MoE layers; the byte range of expert `e`
+in layer `l` is `layout::record(l, e)`. A record is four streams, each a multiple of 64
+bytes so the f32 scales stay aligned and records tile:
+The INT4 format is `common::q4`: symmetric, scale per group of 128 columns, nibbles
+stored biased by +8 and tiled four rows at a time in the order the AVX2 kernel loads them.
+The GPU kernels read the same bytes. Whether the integers came from RTN or GPTQ is the
+**`dense.bf16.bin`.** Every tensor that is not a routed expert, bf16, back to back in a
+fixed order: the embedding, the final norm, the LM head, then each layer's norms,
+attention projections and FFN (dense gate/up/down for the first `layers[0]` layers; the
+router and the shared experts after). Offsets are the constants in `layout::dense`, which
+the builder writes by and the loader reads by, so the file has one definition and no
+**`vocab.bin`.** `[u32; VOCAB_SIZE + 1]` little-endian byte offsets, then the concatenated
+UTF-8 bytes of every token in id order; token `i` is `bytes[off[i]..off[i+1]]`. The BPE
+vocabulary is byte-level, so entries are raw bytes and a single token can end inside a
+multi-byte character; a reader streaming text accumulates bytes and emits the complete
+prefix. The two added tokens (BOS, EOS) are their literal strings. Ids past the
+tokenizer's last (100,002 through 102,399 for V2-Lite) are empty: the model can in
+principle sample them, and they decode to nothing. This is a decode table only; it holds
+**`sink.f32`.** `[NUM_HIDDEN_LAYERS][KV_ROW]` f32: one attention-cache position, every
+layer's row, for the BOS token. BOS has no context, so its forward pass is a constant of
+the model, computed at bundle build through the bf16 model at full precision. Every
+sequence is seeded from it and computed from `FIRST_POS`; position 0 is never computed at
+runtime. Not a recipe choice (`analysis.md` §5).
+**`kernels.gfx1100.elf`.** The code object built from `models/deepseek-v2-lite/gpu`, with
+no relocations and no scratch. The node copies it into executable memory and dispatches
+its kernels through its own AQL queue. Named for the ISA it needs.
+**`tokenizer.json`, `tokenizer_config.json`.** The checkpoint's files, byte for byte,
+`layout::TOKENIZER_FILES`. The first is the byte-level BPE the edge encodes with, and the
+source `vocab.bin` is derived from. The second holds the chat template and the added
+tokens' definitions; the edge reads the `chat_template` string from it and renders it with
+a Jinja engine, the way the transformers library does, so nothing is extracted or
+rewritten at build. What the edge does not need in it (`add_bos_token`,
+`model_max_length`) it ignores: BOS is the wire's verb, and the context is the node's.
+The node reads the weight files, the sink, the vocabulary, the kernels, and the manifest
+for its identity; it never opens the tokenizer files. The console, the node's text twin,
+decodes with `vocab.bin`. The bring-up tools read the weight files against the reference.
+The API service at the edge is the bundle's second reader, in a second language
+the manifest (identity, computed the same way; `[model]` for the wire's constants),
+`tokenizer.json` to encode, `tokenizer_config.json` for the chat template, and `vocab.bin`
+or `tokenizer.json` to decode. Its package is the bundle minus its weights: those five
+files, about six megabytes, with the weight files still listed in the manifest but absent
+from the directory. A reader verifies the hash of whatever it opens. Because the wire's
+BOS is the token id 100000, encoding the rendered chat template with the tokenizer yields
+BOS as the first id and the client sends what the tokenizer produced.
+> "Being able to contain everything we need in a bundle, and then parse that with both
+> ends of the system is a good idea."
+bundle --snapshot <hf snapshot> --out bundles/v2lite-q4gptq --kernels <kernels.gfx1100.elf>
+GPTQ against `models/deepseek-v2-lite/calib.ids` (`--calib <file>` names another),
+`--rtn` for the round-to-nearest twin, `--experts-only` and `--dense-only` to rebuild one
+half (the dense half includes the tokenizer files and skips calibration). About twenty
+minutes on 32 cores for the calibrated build. The manifest is written last, after every
+
+An inference stack built from the checkpoint up, one model at a time, on hardware we
+own. Model zero is DeepSeek-V2-Lite. Everything between its weights and a token on a
+socket is in this tree: the transcribed forward, the kernels for the CPU and the card,
+the quantizer, the bundle format, the sampler, a purpose-built Linux image whose whole
+userland is the node, and the wire the node speaks.
+**Understand every number.** Each op has one shipped realization and a scalar twin
+written in the same form, and the two are compared byte for byte. Above that, the
+transcribed model is checked against the reference implementation's activations edge by
+edge, and every recipe is priced against the reference teacher-forced, in nats per
+position, on held-out text. Nothing ships on the strength of looking right; generated
+text is never the measurement, because a routing decision in a mixture of experts flips
+on a 1e-7 difference and the token stream diverges from there.
+**Hard-code the model.** `config.json` is transcribed into constants at build time, each
+model's fused per-layer kernels live next to the model rather than in a toolkit, and what
+we learn about a model becomes a constant of it: the first token's state is computed once
+at bundle build and shipped (`analysis.md` §5), the sampling recipe is the checkpoint's
+own (temperature, top-k, top-p, as transformers ran it), the calibration text is a file
+in the model's directory. There are no flags for these.
+> "This is a great example of us hard coding optimizations into our own flat
+**No frills.** The node has no runtime, no framework and no dependencies. Kernel launches
+happen only at synchronization points ("the GPU boundaries are wave level"). Every kernel
+takes a token count: a prompt goes through in steps of up to 32 and a generated token is
+a step of one, through the same code. The wire is a stream of 32-bit words with no
+framing of its own. The console is the same stream in text. When something is slow, the
+profile says where and the fix is usually loop order.
+**Text stays at the edge.** The node reads and writes token ids and nothing else, plus a
+log-probability per id when asked to score. The tokenizer, HTTP, chat templates and,
+later, grammar compilation for structured output live in an API service on the cluster;
+The dev host builds everything and runs the bring-up tools. QEMU boots the image with a
+bundle shared in, the proxy for a production node. lasenora holds the card, a 7900 XT,
+and runs the node with the whole model in VRAM through its own queue, one wait per token:
+115 tokens a second generating on V2-Lite at a short context, prompts at 480 a second in
+steps of 32, and a 100,000-position context (6.2 GB of cache beside the weights) that
+retrieves a fact planted 60,000 tokens back.
+make release PROFILE=dev                       # kernel + initramfs (the node) for a profile
+BUNDLE=bundles/v2lite-q4gptq make qemu         # boot it with a bundle shared in
+bundle --snapshot <hf snapshot> --out bundles/v2lite-q4gptq --kernels <kernels.gfx1100.elf>
+                                               # 20 minutes on 32 cores; --rtn for the round-to-nearest twin
+node rockem.bundle=bundles/v2lite-q4gptq rockem.mem=anon                       # console: ids in, text out
+node rockem.bundle=... rockem.listen=0.0.0.0:7332                              # the wire (docs/wire.md)
+cd api && ROCKEM_BUNDLE=../bundles/v2lite-q4gptq ROCKEM_NODES=<node>:7332 uv run uvicorn rockem.app:app
+                                               # the edge: HTTP in front of the nodes (api/rockem/app.py)
+node rockem.bundle=... rockem.gpu=1 rockem.ctx=100000                          # everything on the card; ctx = positions of cache
+forward --snapshot <hf snapshot> --goldens bringup/goldens/legal --bundle bundles/v2lite-q4gptq --q4-layers all --quiet
+cd bringup/evals && uv run python run.py humaneval --node <node>:7332 --bundle ../../bundles/v2lite-q4gptq
+                                               # a published benchmark against a served node; the number lands in models/<name>/evals.toml
+INT4 experts, calibrated by our own GPTQ against 257 positions of our own text, with the
+first token's state shipped at full precision: 0.015 nats per position from the f32
+reference on a held-out legal clause, 0.028 on Roman history. The expert kernels on the
+card run at 0.86 of the measured memory ceiling and are bit-identical to the CPU path.
+The numbers, how they were measured and what they decided are in
+
+# Kernel tuning as a feedback problem
+A topic note, not the project's root documentation. It sets down how this project
+tunes kernels — what we measure, what each measurement can and cannot decide, and the
+gates a change has to pass — next to the methodology Z.ai describes for the
+GLM-5.3-Flash inference stack ("Toward Recursive Self-Improvement: How GLM Built Its
+independently on very different systems (one user, one node, a handful of models,
+versus 100,000 accelerators serving 62 trillion tokens a week) and land on the same
+shape. Where they name something we do without naming, we take the name. Where they
+have an instrument we lack, it is listed at the end with a note on when we get to it.
+Their phrase is *dense feedback*, and "dense" does not mean more logs. It means every
+- **local** — tied to a kernel, an input condition, a code path, a launch parameter,
+  so it narrows the problem instead of describing it;
+- **cheap and timely** — answerable by a kernel test or a microbenchmark, not a full
+  deployment, so a wrong hypothesis costs minutes;
+- **objectively verifiable** — decided by a reference implementation, a test, or a
+  controlled experiment, never by a correlation in a log.
+And it comes in three kinds, each answering one question:
+The correspondence is close enough that their three example cases each have a
+counterpart in the story log. Their KDA context-parallel bug — `tl.dot` silently
+computing FP32 inputs in TF32, an error that only showed after accumulation over long
+context — is the class our equality rule exists to catch, and the per-position logits
+diff would have shown it growing with position. Their GIL-across-DeepEP finding is a
+timeline observation we currently cannot make. Their KDA decode kernel, redundant
+per-tile normalization merged into one block with a warp reduction, is the same
+transformation as the expert kernel's cell-per-lane rewrite.
+**What the 100k attention kernel taught (2026-09-19).** Three rewrites in an afternoon,
+each measured with the statistics channel before the next: absorbed queries for all
+heads in LDS (52 KB) left one workgroup per CU and nothing to hide row-load latency;
+heads in registers with every wave re-reading every row made the kernel L2-bound at
+twelve reads of the cache per token; staging rows in LDS with lanes owning sixteen
+consecutive floats was a 16-way bank conflict. The shape that works: rows staged once,
+lanes owning strided dims, two heads a wave with an online softmax, and the per-token
+work (absorbed queries) in its own launch rather than repeated per chunk or serialized
+in one workgroup. The phase stamps, not the timeline, distinguished each of these.
+**Four lessons the n-token kernels taught (2026-09-19).** A runtime token count in an
+unrolled loop became every block executed under masks, twice the one-token time: the
+width is a `const` and the kernel dispatches on it. Forty-three unrolled steps of a
+10,944-wide row put 190 registers and scratch in a kernel that needs 23: a round is eight
+steps at most. Lanes reading their eight activations eight floats apart hit the same
+banks four lanes at a time, an 8-way conflict that cost the multi-token rows kernels 20×
+their weight-streaming time: staged at a stride of ten. And the code object in host
+memory, fine at 48 KB of small kernels, cost every launch 8–14 µs of instruction fetch
+over the link once the kernels doubled and a token's weights had streamed through L2
+between launches: it lives in VRAM. Each was found with `bench-step` (an op at a time
+with a wait after each) and the timeline, not by reading the code.
+**A lesson the sampler gate taught (2026-09-18).** A workgroup barrier written as
+`asm!("s_barrier")` is not `convergent` to LLVM, and the compiler duplicated one into both
+arms of a divergent branch, so a wave with lanes on both sides barriered twice and the
+kernel read LDS slots before other waves had written them. The release build failed 28 of
+442 rows; a build with a few extra stores at the end passed all of them, which is how it
+was found. `common::gfx11::workgroup_sync` is now the LLVM intrinsic between two `asm!`
+compiler barriers. The gate that caught it is the shape every op gate should have: the
+realization against its twin on real inputs and on the inputs real data never produces.
+Three anchors, each with one job, none reducible to another. This is the part that
+took the longest to get straight and the part most worth keeping straight.
+> "our reference implementation is not the reference implementation; it's ours" — tcdent
+The oracle's bits are not canonical: its reduction orders differ from every order of
+ours by the same 1e-6 that ours differ from each other. The weights were trained under
+bf16 noise, so the model is robust to perturbations at that scale in *quality* and
+robust to nothing at all in *tokens*, because the router's top-k and the greedy decode
+are step functions. Token identity is therefore never a correctness measure; it is a
+determinism measure, and determinism is a contract about reduction order, not an
+accuracy property. Quality lives in the recipe and is measured teacher-forced.
+> "being able to reconcile what's happening in the transformation between those two
+> seams … we retain parity between CPU and GPU kernels, and then we can, in theory,
+> use them somewhat interchangeably" — tcdent
+Parity is bit-identity, and it is achievable: the integer expert path has it end to
+end today (zero difference at every position across tiers). The float kernels get it
+when each op's reduction order is written into its contract — tree-shaped, so it is
+parallel-friendly on any tier and more accurate than sequential against exact
+arithmetic — and every realization commits to it with no FMA contraction. That is a
+Every kernel number is a ratio to a ceiling measured in the same run on the same
+bytes: a plain streaming read for bandwidth-bound kernels. "Fast" has a denominator.
+Three instrument failures we made and fixed, each of which produced a number that was
+wrong in a way the number itself could not reveal:
+- a device synchronize around every launch pair measured the idle queue's wake-up,
+  not the kernel (three different kernels read a flat 40 µs) — batched launches inside
+  one sync window, which is also how the token loop issues them;
+- a six-record working set sat in the 80 MB infinity cache and read 1.09 of the VRAM
+  ceiling — rotate the working set past the cache;
+- a per-lane array the compiler would not fully unroll spilled to scratch and made a
+  "faster" version slower — check `.private_segment_fixed_size` on every build.
+The pattern in all three: measure something narrower than the number you care about
+(a probe, a batch, a rotation, a note in the ELF) until the number is explained.
+Stated before the experiment, so a miss is a defined discrepancy rather than a
+feeling. Theirs: "Prefill + KV Transfer within 5 % of Prefill alone." Ours:
+## Observation: four channels, none inside a kernel
+The question tcdent put on 2026-09-17 — "is there a way we can do that without
+interleaving anything into the kernels themselves … perhaps we incorporate some
+conventions or maps for memory that lets us pull from the card versus write anything in
+the loop? Or we make them all macros so debug/perf is a one-liner and gets interleaved
+and compiled out in release targets?" — has one structural answer: everything a GPU
+kernel produces is in a device buffer at a launch boundary, and launches happen only at
+synchronization points, so every observation can be made from outside the kernel. The
+kernel that ships is the kernel that was measured. Four channels, with where each stands:
+**On probes inside kernels.** tcdent's proposal (2026-09-18): "a protocol where you had
+an address space that you could write statistics into, and then inside kernels they could
+drop numbers into those registers … a statistic that exists inside of our own stack … just
+having some naming conventions for registers that we write to" — and, on sampling, that
+one wave is not representative, so keep a vector and average afterwards. That is the
+statistics channel above, and it replaced the earlier objection (a probe shapes register
+allocation) with a measurement: the stats build's timeline is compared with the release
+build's, and the cost is visible per kernel. The first clock was the real-time one the timeline
+uses, a returning send-message on gfx11 at about a microsecond a read, which made
+phases under a few microseconds unreadable and inflated any phase that held several
+stamps; `stat_clock!` now reads the shader cycle counter (`s_getreg`, one scalar
+instruction, 20 bits), and the report infers each kernel's clock rate from the timeline
+so cycles print as time with the assumption shown. The rule that keeps it honest: `stat!`
+is the one thing allowed to differ inside a kernel body between the two builds, and its
+body is a store; it never branches on what it wrote. What it answered first: the router's
+22 µs is rows 12.7, quantize 6.8, softmax 3.9, pick 2.4 — the rows latency-bound on one
+workgroup, the quantize a candidate to move into the expert kernels' prologue.
+**The rule that makes observation a property rather than a session.** Every launch site
+declares the bytes its kernel moves, the ceiling is measured on the box at startup, and
+the timeline reports each kernel as a fraction of that ceiling — the bench harness's rule
+("every number is a ratio to the bytes it had to move at a stated bandwidth") enforced
+by the launcher. With that, the node's own per-token account, printed on request from the
+shipped binary, is the system-behaviour feedback the table above calls missing. *Not yet
+Their name for a validated transformation kept with its applicability conditions,
+resource constraints and evidence, so the next kernel starts from it. Ours live in
+the story log as narrative; distilled, the expert kernel's ladder reads:
+Attention's ladder has one rung so far (three launches split at grid-wide
+dependencies; 0.85 of the ceiling at 2048 context) and one known next rung (read each
+They serve; we don't. Their system-behaviour feedback is mostly about concurrency
+between requests, transfers and compute across processes and threads. At batch 1 on
+one node the same question has a smaller shape: launch-to-launch bubbles on one queue,
+host round trips at the seams, and whether a tier's kernels are waiting on bytes or on
+each other. That is still a timeline question, and the answer is still "observe it,
+They trade compute for bandwidth (W8A8, ReplaySSM, mixed INT8/FP8/BF16 KV cache) and
+price it end to end. We have the pricing instrument (teacher-forced KL) and have used it
+to find that the INT4 recipe's cost is concentrated at the sink token and at three
+layers, which is the kind of result that decides where the bytes go. KV cache precision
+is on our unmeasured list; theirs is in production.
+- **Launch accounting.** *Measured 2026-09-19:* a barrier launch's gap is 3.6 µs —
+  the completion signal 1.7 (now an instrument the node runs without), the agent
+  acquire 1.1 (required: the step gate fails on stale reads without it), the rest the
+  processor's turnaround. 348 → 267 launches a token by folding the norm into the
+  rows kernels' staging, the cache rows into the absorb grid, and the grouping into
+  the router's last workgroup (an arrival counter). Token 7.64 → 6.97 ms.
+- **The hybrid handshake.** *Built 2026-09-20:* the host runs its share of the
+  experts behind the card, layer by layer, and the card waits for data rather than
+  for the host: the router's last workgroup writes a done word the host spins on,
+  the host writes a valid word per slot, and the combine kernel polls the valid
+  words in-kernel after its own rows. No packets. The packet form (a mark and a
+  gate per layer) was built first and measured: 0.2 ms a token with nothing to wait
+  for, a 10 µs wake on release; a late-written packet wakes the processor in 40 µs,
+  and the ring in VRAM hangs it. The combine's span on the timeline is the wait.
+- **Timelines.** *Done 2026-09-18* (see Observation): per-launch device timestamps
+  from the launcher's own signals. Still to do: the node reporting its own token, bytes
+  declared per launch, the ceiling measured at boot.
+- **Configuration → kernel mapping.** Their mapping from a parallelism strategy to the
+  kernels it involves. Ours is the placement matrix generalized: for each seam, which
+  realization runs on which tier, and the test that compares them on the same bytes.
+  *When: as the placement table in the node's construction report, once a third
+- **A skeleton library** as a file per kernel rather than narrative in the story log:
+  rung, transformation, applicability, evidence. *When: on the second model, when a
+- **Bounds on the recipe gate.** A KL bound and a golden set of ≥ 400 positions across
+  ≥ 4 domains as the precondition for a recipe string. *When: with the first
+- **One command that runs every gate** in the table above and prints pass/fail per
+  row — the twins at equality, the launchers within tolerance on a real layer state,
+  the store gate (fresh-run dumps against cache-hit dumps, today a shell loop retyped
+  each time), the forward against the goldens, no scratch in the code object, and the
+  performance rows against declared bounds. *When: before anything is committed.*
+  *Started 2026-09-19:* the Makefile holds `kernels` (build + static report) and
+  `gate-dump`; the remaining rows are still separate commands.
+- **Kept numbers.** A file per box — measured ceilings, per-kernel fractions, tok/s per
+  context length — that the gate command reads and compares against, so a fall past a
+  stated margin is a failure and not a feeling. *When: with the gate command.*
+- **Controlled experiments as first-class tools**: the noise probe (random and fixed),
+  the per-layer and per-position recipe switches, and the per-expert masks in the
+  forward driver are the start of a set that should be documented with what each can
+  and cannot decide. *When: with the analysis document's next revision.*
+
+    👋 Join our WeChat or Discord community.
+    📖 Check out the GLM-5.3-Flash blog and GLM-5 Technical report.
+    📍 Use GLM-5.3-Flash API services on Z.ai API Platform. 
+We introduce GLM-5.3-Flash, the first natively multimodal model in the GLM-5 series. With 320B total parameters and just 18B active parameters, it outperforms GLM-5.2 across benchmarks and real-world workloads at one-tenth the price, while approaching Claude Opus 4.8 on coding and agentic benchmarks.
+GLM-5.3-Flash starts from a newly trained base model, with its architecture and training recipe redesigned around capability and efficiency. For the first time in the GLM series, we introduce a hybrid architecture combining sparse and linear attention, sharply reducing long-context serving costs while preserving precise long-context capabilities. The model also adopts Manifold-Constrained Hyper-Connections (mHC) to further improve scaling efficiency. Together with our latest 30T-token multimodal pre-training corpus, these changes enable GLM-5.3-Flash to deliver more intelligence with less compute.
+GLM-5.3-Flash supports deployment with the following frameworks. Feel free to try them out:
+- GLM-5.3-Flash supports controlling the thinking budget through the `reasoning_effort` parameter, which accepts three levels: `low`, `high`, and `max`. It defaults to `max` if not passed (or if set to any other value). To use `low` or `high`, pass them explicitly. For benchmark and leaderboard reproduction, keep the default `max`.
+- In the chat template for GLM-5.3-Flash, `clear_thinking` defaults to `false` if not passed. For chat scenarios, explicitly pass `clear_thinking=true`.
+* **HLE w/ tools (full set)**: We use sampling parameters of `temperature=1.0` and `top_p=0.95` for evaluation, with a maximum generation length of `163,840` tokens. The evaluation is conducted with a maximum context length of `300,000` tokens, using a context management strategy. We use GPT-5.6-luna (medium) as the judge model.
+* **NL2Repo**: We evaluated NL2Repo with temperature=1.0, top_p=1.0, and max_new_tokens=64k under 1M context. To prevent hacking, we use rule-based and a LLM-based judgement to prevent malicious behaviors (e.g., unauthorized pip or curl operations).
+* **DeepSWE**: We run DeepSWE using the mini-swe-agent harness with `temperature=0.95`, `top_p=1.0`, `timeout=6h` and 400K context.
+* **Terminal-Bench 2.1**: We evaluate in Claude Code 2.1.207 with temperature=1.0, top_p=1, max_new_tokens=65536 with 6h timeout.
+* **Toolathlon Verified**: We obtain all results via the official evaluation service and report pass@1 averaged over 3 independent runs.
+* **AutomationBench**: We evaluate on AutomationBench **v1.0.6**, incorporating the fix for the `null`-type handling issue introduced in PR #13.
+* **GDPval-AA v2**: Models are evaluated by Artificial Analysis.
+* **BabyVision**: We use temperature=1.0, top_p=0.95, and a maximum context length of 164K tokens. We resize the input images such that their shorter side is at least 1.5K pixels, consistent with other baselines.
+If you find GLM-5.3-Flash useful in your research, please cite our technical report:
