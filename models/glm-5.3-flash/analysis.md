@@ -251,6 +251,54 @@ Nothing yet. The decisions the model forces, with what is known:
 - **Thinking off is outside the training** (repo, every checkpoint): long outputs
   corrupt; low reasoning effort is the substitute, and the chat template carries it.
 
+### A computed baseline for the production box (2026-09-30, arithmetic, unmeasured)
+
+Assumptions: dual 7R13 with eight DDR4-3200 channels a socket, 180 GB/s achievable a
+socket (Dell measured 90 % of the 205 theoretical; our expert kernel reaches 0.96–0.99
+of a measured ceiling); two 7900 XTs at 800 GB/s peak, of which bf16 row kernels reached
+0.6–0.75 on V2-Lite (600 GB/s used here); the handshake of the hybrid design at ≈0.1 ms
+a token; one sequence, no speculation. Bytes from §0.
+
+| phase | bytes a token | where | time |
+|---|---|---|---|
+| routed experts, 336 of 25.2M at 4 bits | 4.4 GB | DRAM, both sockets | **12 ms** |
+| everything dense, bf16 (KDA, MLA, indexer, shared experts, dense FFNs, head) | ≈15 GB | one card | **25 ms** |
+| the same at FP8 | ≈7.5 GB | one card | 12 ms |
+| the same at 4 bits | ≈3.8 GB | one card | 6 ms |
+| residual between the cards, if the layers split | 64 KB | PCIe | < 0.1 ms |
+
+Within a token the phases serialize (attention on the card, the router, the experts,
+the combine, the next layer), so a single stream sums them:
+
+| dense precision | token | tok/s | with speculation at ~1.6 accepted a step (MTP, the repo's code acceptance) |
+|---|---|---|---|
+| bf16 | 25 + 12 + 0.1 ≈ **37 ms** | 27 | ~43 |
+| FP8 | 12 + 12 + 0.1 ≈ **24 ms** | 41 | ~65 |
+| 4-bit | 6 + 12 + 0.1 ≈ **18 ms** | 55 | ~88 |
+
+Two things the arithmetic says that the earlier framing did not:
+
+- **DRAM is not the bottleneck at bf16 dense; the card is.** A 7900 XT's 800 GB/s is only
+  2.2× the two sockets' DRAM, while the dense bytes a token at bf16 (15 GB) are 3.4× the
+  expert bytes at 4 bits (4.4 GB). The precision of the dense weights decides the token
+  time on this model; the experts in DRAM are the smaller phase. The repo's measured
+  prices (FP8 dense +0.5 % NLL on prose, NVFP4 on selected dense layers about as much
+  again) are what that decision is bought with, and our own measurement of them is §9.
+- **Splitting the dense layers across the two cards does not shorten a token**, since a
+  token's layers run in order; it halves each card's share and only pays through a
+  second sequence in flight. Splitting by tensor (both cards every layer, half the rows
+  each) would halve the dense phase for one stream at the cost of an exchange per layer,
+  ≈45 × 2 small all-reduces, the shape the gx10 repo's `arx` serves in 13–27 µs each.
+
+**Experts on the second card.** With the dense weights on one card, the other holds
+≈18 GB of routed experts beside a cache: ≈1,400 of 12,384, which on the five passages'
+histogram (§7) is roughly 35–45 % of picks in the middle layers and less early. Those
+picks stream at 800 GB/s instead of 180–360, in parallel with the host's share, so the
+expert phase shrinks from ≈12 ms to ≈7–8 ms: **4–5 ms a token, 12–20 % of the token
+at FP8 dense, 10–13 % at bf16.** Real, second to the dense-precision decision, and
+contingent on the histogram holding on a corpus (§9). The simplest baseline is every
+routed expert in DRAM; promotion is measured against it on the box.
+
 ## 9. Not yet measured
 
 In order:
@@ -264,6 +312,11 @@ In order:
 4. ~~The routing histogram per layer (§7)~~ — done on five passages; a corpus next.
 5. ~~Position-0 magnitudes per layer (§5)~~ — done, and the prefix probe: the sink is `<sop>`.
 6. ~~Activation ranges (§6)~~ — done; the recipe sweeps of §2–§4 are running.
+7. **The dense layers at FP8 and at 4 bits, teacher-forced** (the oracle with the dense
+   linears quantized, as it does the experts): the price of the decision the baseline
+   turns on, measured here rather than taken from the repo.
+8. The 7900 XT's bf16 and FP8 row rates at this model's shapes (4096-wide, 8192-wide),
+   from the existing rows kernels: the 600 GB/s assumed above is V2-Lite's number.
 
 ## Regenerating
 
