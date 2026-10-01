@@ -97,13 +97,16 @@ for comparison, marked:
 | **dense linears FP8, e4m3, a scale per output channel** (KDA and MLA projections, indexer, shared experts, dense FFNs, `lm_head`) | **0.0018 / 0.040** | 0.987 | this run |
 | dense linears INT4 RTN, g128 | 0.0088 / 0.107 | 0.974 | this run |
 | **FP8 dense + INT4 experts together — the candidate recipe** | **0.0074 / 0.083** | 0.987 | this run |
+| INT4 dense + INT4 experts together — the all-INT4 recipe | 0.0136 / 0.161 | 0.974 | this run |
 | FP8 dense (repo, NLL on prose, their per-token activation scales) | +0.5 % NLL | | published |
 | NVFP4 on `in_proj`, `o_proj`, shared experts (repo) | about as much again | | published |
 | routing flips | every quantized block changes picks in every layer after it (§4) | | per-layer trace |
 
 FP8 on everything dense costs a quarter of what INT4 on the experts costs, and on top of
 the experts' INT4 it adds almost nothing (0.0070 → 0.0074). INT4 on the dense linears
-costs as much as INT4 on the experts, for a quarter of the bytes. Both INT4 numbers are
+costs as much as INT4 on the experts, for a quarter of the bytes, and the two together
+nearly add (0.0136): the all-INT4 recipe costs twice the candidate's for a token a
+quarter shorter (§8). Both INT4 numbers are
 round-to-nearest; calibration took V2-Lite's INT4 down by about a quarter.
 
 ## 3. Teacher-forced divergence from the oracle
@@ -351,8 +354,8 @@ In order:
 5. ~~Position-0 magnitudes per layer (§5)~~ — done, and the prefix probe: the sink is `<sop>`.
 6. ~~Activation ranges (§6)~~ — done; ~~the recipe sweeps of §3–§4~~ — done for plain INT4.
 7. ~~The dense layers at FP8 and at 4 bits, teacher-forced~~ — done, §2: FP8 0.0018, INT4 0.0088,
-   FP8 dense + INT4 experts 0.0074 nats on code. Next: INT4 dense + INT4 experts together,
-   and calibrated INT4 (GPTQ, as V2-Lite's) on both.
+   FP8 dense + INT4 experts 0.0074 nats on code, all INT4 0.0136. Next: calibrated INT4
+   (GPTQ, as V2-Lite's) on the experts and on the dense linears.
 8. The 7900 XT's bf16 and FP8 row rates at this model's shapes (4096-wide, 8192-wide),
    from the existing rows kernels: the 600 GB/s assumed above is V2-Lite's number.
 
