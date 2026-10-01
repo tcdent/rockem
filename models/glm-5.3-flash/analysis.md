@@ -85,17 +85,26 @@ divergence is what is measured.
 
 ## 2. Noise floors by source
 
-To measure once the oracle runs. Prior from published measurements, marked:
+Measured 2026-09-30 on the code passage with the prefix, against the prefixed oracle run
+(`oracle.py --dense fp8|q4`, `--q4 all --sink 2`, `measure.py kl`); the repo's numbers
+for comparison, marked:
 
-| source | magnitude | measured how |
-|---|---|---|
-| f32 reduction order | expected ~1e-7 a layer; 45 layers and mHC mixing the stream — to measure | `node rockem.debug=` logits/layer diff across placements |
-| INT8 activation, group 128 | ~1e-3 per element (absmax/127) | by construction |
-| INT4 routed experts, calibrated | to measure; the NVFP4 checkpoint is the public point of comparison | teacher-forced KL |
-| FP8 dense linears | +0.5 % NLL on prose (repo: per-channel weight scales, per-token activation scales) | their `quality/` |
-| NVFP4 on `in_proj`, `o_proj`, shared experts | about as much again (repo) | — |
-| NVFP4 on every dense layer | 2–3× the FP8 cost (repo) | — |
-| routing flips induced by the above | to measure | per-layer trace, first-flip layer per position |
+| source | KL mean / max, nats a position | top-1 agreement | measured how |
+|---|---|---|---|
+| f32 reduction order | expected ~1e-7 a layer — to measure on the card | | placement matrix |
+| INT8 activation, group 128 | ~1e-3 per element by construction | | — |
+| **routed experts INT4 RTN, g128, no calibration** | **0.0070 / 0.097** | 0.974 | §3 |
+| **dense linears FP8, e4m3, a scale per output channel** (KDA and MLA projections, indexer, shared experts, dense FFNs, `lm_head`) | **0.0018 / 0.040** | 0.987 | this run |
+| dense linears INT4 RTN, g128 | 0.0088 / 0.107 | 0.974 | this run |
+| **FP8 dense + INT4 experts together — the candidate recipe** | **0.0074 / 0.083** | 0.987 | this run |
+| FP8 dense (repo, NLL on prose, their per-token activation scales) | +0.5 % NLL | | published |
+| NVFP4 on `in_proj`, `o_proj`, shared experts (repo) | about as much again | | published |
+| routing flips | every quantized block changes picks in every layer after it (§4) | | per-layer trace |
+
+FP8 on everything dense costs a quarter of what INT4 on the experts costs, and on top of
+the experts' INT4 it adds almost nothing (0.0070 → 0.0074). INT4 on the dense linears
+costs as much as INT4 on the experts, for a quarter of the bytes. Both INT4 numbers are
+round-to-nearest; calibration took V2-Lite's INT4 down by about a quarter.
 
 ## 3. Teacher-forced divergence from the oracle
 
@@ -251,10 +260,13 @@ rank-based selection carries over, the score and the weights are new arithmetic.
 
 Nothing yet. The decisions the model forces, with what is known:
 
-- **Where the dense weights live.** ≈18 GB bf16 (§0) fits two 7900 XTs only split by
-  layer, with the residual crossing between the cards once per token; FP8 dense (≈9 GB)
-  fits one card at the published +0.5 % NLL. The rule that dense weights stay bf16 was
-  set on another model's numbers; here it has a measured price and is reopened.
+- **The dense weights at FP8 on one card.** Measured (§2): FP8 on every dense linear
+  costs 0.0018 nats a position on code, a quarter of INT4 experts' cost, and together
+  with INT4 experts 0.0074 against 0.0070 for the experts alone. At ≈7.5 GB it fits one
+  card beside a cache and halves the token's largest phase (below). INT4 dense would
+  halve it again for 0.0088 nats — as much again as the experts — and is the next
+  question once calibration exists. The rule that dense weights stay bf16 was set on
+  another model's numbers; here the price is measured and FP8 is the working choice.
 - **The routed experts stream from DRAM.** ≈4.2 GB a token at 4 bits. At the bandwidth
   the production box measures, the expert phase is on the order of 10 ms a token before
   speculation — arithmetic, unmeasured.
@@ -279,9 +291,11 @@ Nothing yet. The decisions the model forces, with what is known:
 
 Assumptions: dual 7R13 with eight DDR4-3200 channels a socket, 180 GB/s achievable a
 socket (Dell measured 90 % of the 205 theoretical; our expert kernel reaches 0.96–0.99
-of a measured ceiling); two 7900 XTs at 800 GB/s peak, of which bf16 row kernels reached
-0.6–0.75 on V2-Lite (600 GB/s used here); the handshake of the hybrid design at ≈0.1 ms
-a token; one sequence, no speculation. Bytes from §0.
+of a measured ceiling); two 7900 XTs at 800 GB/s peak, of which our bf16 row kernels
+reach 590 GB/s on 2048-wide 23 MB matrices and 770 GB/s on the 419 MB head (bench-token,
+V2-Lite) — 600 GB/s used here, so the dense times are conservative by up to a quarter;
+the handshake of the hybrid design at ≈0.1 ms a token; one sequence, no speculation.
+Bytes from §0.
 
 | phase | bytes a token | where | time |
 |---|---|---|---|
@@ -336,9 +350,9 @@ In order:
 4. ~~The routing histogram per layer (§7)~~ — done on five passages and a 2,606-token corpus.
 5. ~~Position-0 magnitudes per layer (§5)~~ — done, and the prefix probe: the sink is `<sop>`.
 6. ~~Activation ranges (§6)~~ — done; ~~the recipe sweeps of §3–§4~~ — done for plain INT4.
-7. **The dense layers at FP8 and at 4 bits, teacher-forced** (the oracle with the dense
-   linears quantized, as it does the experts): the price of the decision the baseline
-   turns on, measured here rather than taken from the repo.
+7. ~~The dense layers at FP8 and at 4 bits, teacher-forced~~ — done, §2: FP8 0.0018, INT4 0.0088,
+   FP8 dense + INT4 experts 0.0074 nats on code. Next: INT4 dense + INT4 experts together,
+   and calibrated INT4 (GPTQ, as V2-Lite's) on both.
 8. The 7900 XT's bf16 and FP8 row rates at this model's shapes (4096-wide, 8192-wide),
    from the existing rows kernels: the 600 GB/s assumed above is V2-Lite's number.
 
