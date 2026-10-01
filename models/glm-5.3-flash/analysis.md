@@ -123,9 +123,28 @@ is the measurement running now (§5).
 
 ## 4. Per-layer sensitivity
 
-To measure with the per-layer switch in the forward driver. Three dense layers first,
-then alternating blocks of three KDA layers and one MLA layer; only the eleven MLA
-layers carry a cache, the rest a recurrent state.
+Measured 2026-09-30 on the code passage with the prefix, blocks of layers with their
+routed experts at INT4 round-to-nearest and the rest at full precision, the two prefix
+positions always at full precision (`oracle.py --q4 <block> --sink 2`), against the
+prefixed oracle run:
+
+| block | MoE layers in it | KL mean / max, nats | per layer | top-1 agreement | layers downstream with a pick changed |
+|---|---|---|---|---|---|
+| 3–9 | 7 | 0.0030 / 0.073 | 0.00043 | 0.987 | 41 |
+| 10–17 | 8 | 0.0027 / 0.044 | 0.00034 | 0.974 | 34 |
+| 18–25 | 8 | 0.0026 / 0.039 | 0.00033 | 0.987 | 26 |
+| 26–33 | 8 | 0.0012 / 0.014 | 0.00015 | 0.987 | 18 |
+| 34–40 | 7 | 0.0007 / 0.016 | 0.00010 | 1.000 | 11 |
+| 41–44 | 4 | 0.0010 / 0.011 | 0.00025 | 1.000 | 4 |
+| all, for reference (§3) | 42 | 0.0070 / 0.097 | 0.00017 | 0.974 | 41 |
+
+The cost is diffuse and front-loaded: the first three blocks cost three to four times
+per layer what the last three do, and no block stands out the way V2-Lite's layer 3 did
+before its sink was handled. The blocks sum to 0.011 against 0.007 for all at once, so
+the errors partly cancel downstream. Every block's quantization changes picks in every
+layer after it (the routing is fragile, §7), and the pick changes, not the arithmetic,
+are what reaches the logits. No layer earns being kept wide on this evidence; the lever
+for the whole is calibration, as it was on V2-Lite.
 
 ## 5. Sinks
 
@@ -197,31 +216,36 @@ of 1.3–5.6: an ordinary range, no outlier channel at the input of the experts.
 
 ## 7. Routing: fragility and concentration
 
-Measured 2026-09-30 over the five passages together, 395 positions, 8 picks each
-(`measure.py routing`, and the combined histogram saved as
-`bringup/goldens/glm/routing_hist.pt`):
+Measured 2026-09-30 on the five passages together (395 positions, 8 picks each) and on
+a 2,606-token mixed corpus (the five passages, the model card's prose and a page of
+our own docs, with the prefix; `measure.py routing`, and `bringup/goldens/glm/routing_hist.pt`):
 
-| layers | experts with any pick, of 288 | experts holding 50 % of picks | 90 % | largest single expert's share | positions whose 8th and 9th scores differ by < 1e-3 |
-|---|---|---|---|---|---|
-| 3–11 | 279–287 | 60–90 | 186–219 | 1–4 % | 5–12 % |
-| 12–17 | 255–268 | 37–56 | 145–175 | 3–5 % | 6–8 % |
-| 18–28 | 221–255 | 25–35 | 110–141 | 3–9 % | 4–8 % |
-| 29–44 | 248–265 | 30–45 | 142–158 | 3–6 % | 3–10 % |
+| | five passages | corpus |
+|---|---|---|
+| experts with any pick, of 288, per layer | 221–287 | 281–288 |
+| experts holding 50 % of a layer's picks | 25–35 mid-network, 60–90 early | **39–110, median 55** |
+| experts holding 90 % | 110–219 | **150–240, median 171** |
+| largest single expert's share | 1–9 % | 1–9 % |
+| positions whose 8th and 9th scores differ by < 1e-3 | 3–12 % | 4–13 % |
 
-Three things to carry into the design:
+**The hot set does not travel.** The corpus' 32 most-picked experts in a layer overlap
+the passages' 32 by a median of 7, and the passages' top-32 catch only 16 % of the
+corpus' picks. Which experts are hot is a property of the text, not of the model. A
+card-sized static set from the corpus itself:
 
-- **Concentration is real but layer-dependent.** Early layers spread picks over most of
-  the 288; the middle of the network routes half its traffic through 25–35 experts a
-  layer. A card-resident set of the 50 %-of-picks experts would be roughly 2,000 experts
-  across the 42 layers, about 25 GB at 4 bits — the first number for the placement table's
-  frequency axis. Five passages are too few to fix the set; the histogram wants a corpus.
-- **Picks are fragile.** The router's sigmoid scores sit close: 3–12 % of positions per
-  layer have their eighth and ninth candidates within 1e-3, and the median margin is
-  4e-3 to 1.6e-2. Noise of INT4's size on the residual will flip the last pick on a few
-  percent of positions per layer; §3 measures what that costs.
-- **The pick is a rank over sigmoid + bias, the weights the sigmoid alone, normalized.**
-  Our route kernel's rank-based selection carries over; the score and the weights are
-  new arithmetic.
+| hot set | experts | at 4 bits | share of corpus picks it serves |
+|---|---|---|---|
+| top 16 a layer | 672 | 8.5 GB | 23 % (10–34 % by layer) |
+| top 24 | 1,008 | 12.7 GB | 30 % |
+| top 32 | 1,344 | 16.9 GB | 35 % (19–46 %) |
+| top 48 | 2,016 | 25.4 GB | 45 % |
+
+So promotion by frequency buys a third of the picks for the whole of a card, and a
+different third on different text. **Picks are fragile**: 4–13 % of positions a layer
+have their eighth and ninth sigmoid scores within 1e-3 (median margin 4e-3 to 1.6e-2),
+and every quantized block in §4 changed picks in every layer after it. The pick is a
+rank over sigmoid + bias, the weights the sigmoid alone, normalized: our route kernel's
+rank-based selection carries over, the score and the weights are new arithmetic.
 
 ## 8. What this decides
 
@@ -291,13 +315,13 @@ Two things the arithmetic says that the earlier framing did not:
   ≈45 × 2 small all-reduces, the shape the gx10 repo's `arx` serves in 13–27 µs each.
 
 **Experts on the second card.** With the dense weights on one card, the other holds
-≈18 GB of routed experts beside a cache: ≈1,400 of 12,384, which on the five passages'
-histogram (§7) is roughly 35–45 % of picks in the middle layers and less early. Those
-picks stream at 800 GB/s instead of 180–360, in parallel with the host's share, so the
-expert phase shrinks from ≈12 ms to ≈7–8 ms: **4–5 ms a token, 12–20 % of the token
-at FP8 dense, 10–13 % at bf16.** Real, second to the dense-precision decision, and
-contingent on the histogram holding on a corpus (§9). The simplest baseline is every
-routed expert in DRAM; promotion is measured against it on the box.
+≈17 GB of routed experts beside a cache: the top 32 a layer, which on the corpus serve
+35 % of picks (§7), a set that shifts with the text. Those picks stream at 800 GB/s
+instead of 180–360, in parallel with the host's share, so the expert phase shrinks from
+≈12 ms to ≈9 ms: **≈3 ms a token, 9–13 % of the token at FP8 dense, 8 % at bf16.** Real
+but third among the levers, and it needs the set chosen per deployment from that
+deployment's traffic. The baseline is every routed expert in DRAM (tcdent, 2026-09-30),
+and promotion is measured against it on the box.
 
 ## 9. Not yet measured
 
@@ -309,9 +333,9 @@ In order:
    shards, about 18 minutes a passage on elsenor.
 3. ~~Goldens: the five domain sets at this model's tokenizer, with per-layer edges~~ — done,
    `bringup/goldens/glm/<set>/`.
-4. ~~The routing histogram per layer (§7)~~ — done on five passages; a corpus next.
+4. ~~The routing histogram per layer (§7)~~ — done on five passages and a 2,606-token corpus.
 5. ~~Position-0 magnitudes per layer (§5)~~ — done, and the prefix probe: the sink is `<sop>`.
-6. ~~Activation ranges (§6)~~ — done; the recipe sweeps of §2–§4 are running.
+6. ~~Activation ranges (§6)~~ — done; ~~the recipe sweeps of §3–§4~~ — done for plain INT4.
 7. **The dense layers at FP8 and at 4 bits, teacher-forced** (the oracle with the dense
    linears quantized, as it does the experts): the price of the decision the baseline
    turns on, measured here rather than taken from the repo.

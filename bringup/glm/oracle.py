@@ -170,6 +170,29 @@ class LazyExperts:
         return final
 
 
+def fp8_e4m3(w):
+    """FP8 e4m3 with a scale per output channel (absmax / 448), as the repo's dense FP8."""
+    s = w.abs().amax(-1, keepdim=True) / 448.0
+    s = torch.where(s == 0, torch.ones_like(s), s)
+    return (w / s).to(torch.float8_e4m3fn).float() * s
+
+
+DENSE_LINEARS = ("self_attn.", "mlp.shared_experts.", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
+
+
+def dense_quant(sd, mode, group):
+    """The layer's dense linears (KDA and MLA projections, the indexer's, the shared experts, the
+    dense FFNs) at `mode` ('fp8' or 'q4'); norms, gates, conv taps, mHC and biases stay."""
+    for k, w in list(sd.items()):
+        if w.dim() != 2 or not k.endswith(".weight") or not k.startswith(DENSE_LINEARS) or "norm" in k or "conv1d" in k or "mlp.gate.weight" in k:
+            continue
+        if mode == "fp8":
+            sd[k] = fp8_e4m3(w)
+        elif mode == "q4" and w.shape[-1] % group == 0:
+            sd[k] = q4_rtn(w, group)
+    return sd
+
+
 def q4_rtn(w, group):
     """INT4 round-to-nearest, absmax/7, along the last dim in groups."""
     r, c = w.shape[-2], w.shape[-1]
@@ -190,6 +213,7 @@ def main():
     ap.add_argument("--q4", default="", help="layers whose routed experts are INT4 RTN, e.g. 10,11 or all")
     ap.add_argument("--q4-group", type=int, default=128)
     ap.add_argument("--sink", type=int, default=0, help="with --q4: the first N positions take the experts at full precision (a shipped sink)")
+    ap.add_argument("--dense", choices=["fp8", "q4"], help="every layer's dense linears at FP8 (per-channel) or INT4 RTN (g128); experts as --q4 says")
     ap.add_argument("--threads", type=int, default=32)
     ap.add_argument("--no-edges", action="store_true", help="logits and routing only")
     ap.add_argument("--prefix", default="", help="tokens to put before the passage, e.g. '[gMASK]<sop>' (the model's own prefix)")
@@ -253,6 +277,8 @@ def main():
         tl = time.time()
         layer = model.layers[l]
         sd, expert_names = layer_state(src, l, tc.n_routed_experts)
+        if args.dense:
+            sd = dense_quant(sd, args.dense, args.q4_group)
         layer.to_empty(device="cpu")
         missing, unexpected = layer.load_state_dict(sd, strict=False)
         assert not unexpected, unexpected
@@ -295,7 +321,7 @@ def main():
     result = {"routing": {k: v[0] if v.dim() == 3 else v for k, v in routing.items()}}
     if args.layers is None:
         head = torch.nn.Linear(tc.hidden_size, tc.vocab_size, bias=False)
-        head.weight.data = src.get("lm_head.weight")
+        head.weight.data = {"fp8": fp8_e4m3, "q4": lambda w: q4_rtn(w, args.q4_group), None: lambda w: w}[args.dense](src.get("lm_head.weight"))
         norm_w = src.get("model.language_model.norm.weight")
         hh = model.hc_head(h)
         v = hh.float()
@@ -312,7 +338,7 @@ def main():
     save_file({k: v.contiguous() for k, v in edges.items()}, os.path.join(args.out, "edges.safetensors"))
     if result["routing"]:
         save_file({k: v.contiguous() for k, v in result["routing"].items()}, os.path.join(args.out, "routing.safetensors"))
-    meta.update(layers=L, q4=sorted(q4), q4_group=args.q4_group, sink=args.sink, seconds=time.time() - t0)
+    meta.update(layers=L, q4=sorted(q4), q4_group=args.q4_group, sink=args.sink, dense=args.dense, seconds=time.time() - t0)
     json.dump(meta, open(os.path.join(args.out, "meta.json"), "w"), indent=1)
     print(f"done in {time.time() - t0:.0f} s -> {args.out}", flush=True)
 
