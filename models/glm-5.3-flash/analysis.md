@@ -159,13 +159,21 @@ the prefix is always the same two tokens, so their state after position 1 — th
 layers' recurrent states and the 11 MLA layers' two cache rows — is computed once at
 full precision and shipped, and every sequence starts at position 2.
 
-**What that buys** (code passage with the prefix, every layer's routed experts INT4
-round-to-nearest, the two prefix positions' experts at full precision — `--q4 all --sink
-2` — against the prefixed oracle run): **KL 0.0070 nats a position, max 0.097, top-1
-agreement 0.974, NLL +0.004**, against 0.040 / 0.98 / 0.960 for the same passage and
-recipe without the prefix (§3). The same recipe with the prefix but the sink positions
-quantized too (`--sink 0`) is running, to separate the prefix's own effect from the
-protection's.
+**What the prefix and the protection are each worth** (code passage, every layer's
+routed experts INT4 round-to-nearest, against the matching oracle run):
+
+| | KL mean / max, nats | top-1 agreement | NLL change |
+|---|---|---|---|
+| no prefix, first word the sink, quantized (§3) | 0.040 / 0.98 | 0.960 | −0.005 |
+| prefix in place, `<sop>` quantized like every position (`--sink 0`) | **0.0070** / 0.081 | 0.961 | −0.014 |
+| prefix in place, the two prefix positions at full precision (`--sink 2`) | **0.0070** / 0.097 | 0.974 | +0.004 |
+
+So the six-fold improvement is the prefix, not the protection: with the model's own
+prefix the sink is where the model expects it, and INT4 on the sink position's experts
+costs nothing measurable. Shipping the two positions' state stays the right design —
+it is a constant of the model and saves two positions of work on every sequence — but
+on this model it is not a precision lever, unlike V2-Lite's. The recipe's cost must be
+measured in-distribution, with the prefix: the no-prefix passages overstate it by 6×.
 
 ## 6. Activation ranges per layer
 

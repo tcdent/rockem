@@ -153,20 +153,20 @@ class LazyExperts:
             if expert_idx == m.num_experts:
                 continue
             top_k_pos, token_idx = torch.where(mask[expert_idx])
-            # the sink positions (the first `sink`) take the experts at full precision — what
-            # shipping their state buys; the rest the quantized ones
-            for quant, sel in ((False, token_idx < self.sink), (True, token_idx >= self.sink)):
-                if not sel.any() or (quant and not self.q4):
+            if not self.q4:
+                parts = [(False, torch.ones_like(token_idx, dtype=torch.bool))]
+            else:
+                # the sink positions (the first `sink`) take the experts at full precision — what
+                # shipping their state buys; the rest the quantized ones
+                parts = [(False, token_idx < self.sink), (True, token_idx >= self.sink)]
+            for quant, sel in parts:
+                if not sel.any():
                     continue
-                if not quant and not self.q4:
-                    sel = torch.ones_like(sel)
                 gu, dn = self.weights(expert_idx, quant)
                 ti, tp = token_idx[sel], top_k_pos[sel]
                 current = m._apply_gate(F.linear(hidden_states[ti], gu))
                 current = F.linear(current, dn) * top_k_weights[ti, tp, None]
                 final.index_add_(0, ti, current.to(final.dtype))
-                if not self.q4:
-                    break
         return final
 
 
@@ -184,6 +184,7 @@ def main():
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--set", choices=list(SETS))
     ap.add_argument("--ids", help="comma-separated ids instead of a set")
+    ap.add_argument("--text", help="a text file instead of a set (a corpus for routing statistics)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--layers", type=int, help="run only the first N layers, no head")
     ap.add_argument("--q4", default="", help="layers whose routed experts are INT4 RTN, e.g. 10,11 or all")
@@ -207,6 +208,12 @@ def main():
     meta = {"model": "zai-org/GLM-5.3-Flash", "ckpt": args.ckpt}
     if args.ids:
         ids = [int(x) for x in args.ids.split(",")]
+    elif args.text:
+        from tokenizers import Tokenizer
+        tok = Tokenizer.from_file(os.path.join(args.ckpt, "tokenizer.json"))
+        text = open(args.text).read()
+        ids = tok.encode(args.prefix).ids + tok.encode(text).ids if args.prefix else tok.encode(text).ids
+        meta.update(text_file=args.text, prefix=args.prefix, chars=len(text))
     else:
         from tokenizers import Tokenizer
         tok = Tokenizer.from_file(os.path.join(args.ckpt, "tokenizer.json"))

@@ -1,0 +1,121 @@
+def fibonacci(n):
+    """Return the n-th Fibonacci number using an iterative approach."""
+    if n < 2:
+        return n
+    a, b = 0, 1
+    for _ in range(n - 1):
+        a, b = b, a + b
+    return b
+
+
+def fibonacci_recursive(n):
+    """Return the n-th
+
+User: Can you explain how a refrigerator keeps food cold?
+Assistant: Sure. A refrigerator works by using a chemical process called refrigeration.
+User: What is refrigeration?
+Assistant: Refrigeration is the process of removing heat from a substance.
+User: How does a refrigerator remove heat from a substance?
+Assistant: A refrigerator uses a refrigerant, which is a chemical that absorbs heat
+
+The parties agree that, in the event of a material breach of this Agreement, the non-breaching party shall provide written notice to the breaching party of the nature of the breach and the steps taken to remedy the breach. The parties agree that the non-breaching party shall have the right to terminate this Agreement if the breach is not remedied within thirty (30) days of receipt of the notice.
+The parties
+
+Photosynthesis is the process by which green plants convert light energy into chemical energy. In the first st absorbs light energy and uses it to split water molecules into hydrogen and oxygen. The hydrogen is then used to produce glucose, which is the main source of energy for the plant. The oxygen is released into the atmosphere.
+Photosynthesis is the process by which plants convert light energy into chemical energy. In the
+
+The history of the Roman Empire begins with the founding of the city of Rome, traditionally dated to 753 BC. Over the following centuries, Rome expanded its territory and its influence, eventually becoming a republic and then an empire. The Roman Empire was one of the most powerful and influential empires in history, and its legacy can still be seen today in many parts of the world.
+The Roman Empire was founded in 753 BC,
+
+    👋 Join our WeChat or Discord community.
+    📖 Check out the GLM-5.3-Flash blog and GLM-5 Technical report.
+    📍 Use GLM-5.3-Flash API services on Z.ai API Platform. 
+We introduce GLM-5.3-Flash, the first natively multimodal model in the GLM-5 series. With 320B total parameters and just 18B active parameters, it outperforms GLM-5.2 across benchmarks and real-world workloads at one-tenth the price, while approaching Claude Opus 4.8 on coding and agentic benchmarks.
+GLM-5.3-Flash starts from a newly trained base model, with its architecture and training recipe redesigned around capability and efficiency. For the first time in the GLM series, we introduce a hybrid architecture combining sparse and linear attention, sharply reducing long-context serving costs while preserving precise long-context capabilities. The model also adopts Manifold-Constrained Hyper-Connections (mHC) to further improve scaling efficiency. Together with our latest 30T-token multimodal pre-training corpus, these changes enable GLM-5.3-Flash to deliver more intelligence with less compute.
+GLM-5.3-Flash supports deployment with the following frameworks. Feel free to try them out:
+- GLM-5.3-Flash supports controlling the thinking budget through the `reasoning_effort` parameter, which accepts three levels: `low`, `high`, and `max`. It defaults to `max` if not passed (or if set to any other value). To use `low` or `high`, pass them explicitly. For benchmark and leaderboard reproduction, keep the default `max`.
+- In the chat template for GLM-5.3-Flash, `clear_thinking` defaults to `false` if not passed. For chat scenarios, explicitly pass `clear_thinking=true`.
+* **HLE w/ tools (full set)**: We use sampling parameters of `temperature=1.0` and `top_p=0.95` for evaluation, with a maximum generation length of `163,840` tokens. The evaluation is conducted with a maximum context length of `300,000` tokens, using a context management strategy. We use GPT-5.6-luna (medium) as the judge model.
+* **NL2Repo**: We evaluated NL2Repo with temperature=1.0, top_p=1.0, and max_new_tokens=64k under 1M context. To prevent hacking, we use rule-based and a LLM-based judgement to prevent malicious behaviors (e.g., unauthorized pip or curl operations).
+* **DeepSWE**: We run DeepSWE using the mini-swe-agent harness with `temperature=0.95`, `top_p=1.0`, `timeout=6h` and 400K context.
+* **Terminal-Bench 2.1**: We evaluate in Claude Code 2.1.207 with temperature=1.0, top_p=1, max_new_tokens=65536 with 6h timeout.
+* **Toolathlon Verified**: We obtain all results via the official evaluation service and report pass@1 averaged over 3 independent runs.
+* **AutomationBench**: We evaluate on AutomationBench **v1.0.6**, incorporating the fix for the `null`-type handling issue introduced in PR #13.
+* **GDPval-AA v2**: Models are evaluated by Artificial Analysis.
+* **BabyVision**: We use temperature=1.0, top_p=0.95, and a maximum context length of 164K tokens. We resize the input images such that their shorter side is at least 1.5K pixels, consistent with other baselines.
+If you find GLM-5.3-Flash useful in your research, please cite our technical report:
+
+# Kernel tuning as a feedback problem
+A topic note, not the project's root documentation. It sets down how this project
+tunes kernels — what we measure, what each measurement can and cannot decide, and the
+gates a change has to pass — next to the methodology Z.ai describes for the
+GLM-5.3-Flash inference stack ("Toward Recursive Self-Improvement: How GLM Built Its
+independently on very different systems (one user, one node, a handful of models,
+versus 100,000 accelerators serving 62 trillion tokens a week) and land on the same
+shape. Where they name something we do without naming, we take the name. Where they
+have an instrument we lack, it is listed at the end with a note on when we get to it.
+Their phrase is *dense feedback*, and "dense" does not mean more logs. It means every
+- **local** — tied to a kernel, an input condition, a code path, a launch parameter,
+  so it narrows the problem instead of describing it;
+- **cheap and timely** — answerable by a kernel test or a microbenchmark, not a full
+  deployment, so a wrong hypothesis costs minutes;
+- **objectively verifiable** — decided by a reference implementation, a test, or a
+  controlled experiment, never by a correlation in a log.
+And it comes in three kinds, each answering one question:
+The correspondence is close enough that their three example cases each have a
+counterpart in the story log. Their KDA context-parallel bug — `tl.dot` silently
+computing FP32 inputs in TF32, an error that only showed after accumulation over long
+context — is the class our equality rule exists to catch, and the per-position logits
+diff would have shown it growing with position. Their GIL-across-DeepEP finding is a
+timeline observation we currently cannot make. Their KDA decode kernel, redundant
+per-tile normalization merged into one block with a warp reduction, is the same
+transformation as the expert kernel's cell-per-lane rewrite.
+**What the 100k attention kernel taught (2026-09-19).** Three rewrites in an afternoon,
+each measured with the statistics channel before the next: absorbed queries for all
+heads in LDS (52 KB) left one workgroup per CU and nothing to hide row-load latency;
+heads in registers with every wave re-reading every row made the kernel L2-bound at
+twelve reads of the cache per token; staging rows in LDS with lanes owning sixteen
+consecutive floats was a 16-way bank conflict. The shape that works: rows staged once,
+lanes owning strided dims, two heads a wave with an online softmax, and the per-token
+work (absorbed queries) in its own launch rather than repeated per chunk or serialized
+in one workgroup. The phase stamps, not the timeline, distinguished each of these.
+**Four lessons the n-token kernels taught (2026-09-19).** A runtime token count in an
+unrolled loop became every block executed under masks, twice the one-token time: the
+width is a `const` and the kernel dispatches on it. Forty-three unrolled steps of a
+10,944-wide row put 190 registers and scratch in a kernel that needs 23: a round is eight
+steps at most. Lanes reading their eight activations eight floats apart hit the same
+banks four lanes at a time, an 8-way conflict that cost the multi-token rows kernels 20×
+their weight-streaming time: staged at a stride of ten. And the code object in host
+memory, fine at 48 KB of small kernels, cost every launch 8–14 µs of instruction fetch
+over the link once the kernels doubled and a token's weights had streamed through L2
+between launches: it lives in VRAM. Each was found with `bench-step` (an op at a time
+with a wait after each) and the timeline, not by reading the code.
+**A lesson the sampler gate taught (2026-09-18).** A workgroup barrier written as
+`asm!("s_barrier")` is not `convergent` to LLVM, and the compiler duplicated one into both
+arms of a divergent branch, so a wave with lanes on both sides barriered twice and the
+kernel read LDS slots before other waves had written them. The release build failed 28 of
+442 rows; a build with a few extra stores at the end passed all of them, which is how it
+was found. `common::gfx11::workgroup_sync` is now the LLVM intrinsic between two `asm!`
+compiler barriers. The gate that caught it is the shape every op gate should have: the
+realization against its twin on real inputs and on the inputs real data never produces.
+Three anchors, each with one job, none reducible to another. This is the part that
+took the longest to get straight and the part most worth keeping straight.
+> "our reference implementation is not the reference implementation; it's ours" — tcdent
+The oracle's bits are not canonical: its reduction orders differ from every order of
+ours by the same 1e-6 that ours differ from each other. The weights were trained under
+bf16 noise, so the model is robust to perturbations at that scale in *quality* and
+robust to nothing at all in *tokens*, because the router's top-k and the greedy decode
+are step functions. Token identity is therefore never a correctness measure; it is a
+determinism measure, and determinism is a contract about reduction order, not an
+accuracy property. Quality lives in the recipe and is measured teacher-forced.
+> "being able to reconcile what's happening in the transformation between those two
+> seams … we retain parity between CPU and GPU kernels, and then we can, in theory,
+> use them somewhat interchangeably" — tcdent
+Parity is bit-identity, and it is achievable: the integer expert path has it end to
+end today (zero difference at every position across tiers). The float kernels get it
+when each op's reduction order is written into its contract — tree-shaped, so it is
+parallel-friendly on any tier and more accurate than sequential against exact
+arithmetic — and every realization commits to it with no FMA contraction. That is a
+Every kernel number is a ratio to a ceiling measured in the same run on the same
+bytes: a plain streaming read for bandwidth-bound kernels. "Fast" has a denominator.
+Three instrument failures we made and fixed, each of which produced a nu
