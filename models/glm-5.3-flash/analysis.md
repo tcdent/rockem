@@ -106,7 +106,31 @@ FP8 on everything dense costs a quarter of what INT4 on the experts costs, and o
 the experts' INT4 it adds almost nothing (0.0070 → 0.0074). INT4 on the dense linears
 costs as much as INT4 on the experts, for a quarter of the bytes, and the two together
 nearly add (0.0136): the all-INT4 recipe costs twice the candidate's for a token a
-quarter shorter (§8). Both INT4 numbers are
+quarter shorter (§8).
+
+**Calibration (GPTQ) does not help here.** Measured 2026-10-02 against the prefixed
+oracle runs, every layer's routed experts INT4, the two prefix positions at full
+precision, calibration on 8,477 held-out tokens of our docs and the model card
+(`oracle.py --gptq`, `bringup/glm/gptq.py` = `bringup/quant.py`'s algorithm):
+
+| recipe | code: KL mean / max | top-1 | legal: KL mean / max | top-1 |
+|---|---|---|---|---|
+| RTN, the shipped rounding (half away, [−8, 7]) | **0.0058 / 0.068** | 0.987 | **0.0170 / 0.256** | 0.941 |
+| GPTQ, one Hessian a layer over every position (V2-Lite's shape) | 0.0120 / 0.204 | 0.974 | 0.0211 / 0.150 | 0.941 |
+| GPTQ, each expert's Hessians from the positions routed to it — layers 3–9 only | 0.0027 / 0.045 | 0.974 | | |
+| RTN, layers 3–9 only, for that row's comparison | 0.0027 / 0.051 | 0.987 | | |
+
+The layer-wide Hessian makes INT4 twice as bad as rounding: 2.8 % of positions route to
+a given expert, so a layer's input distribution is not that expert's, and the error
+feedback optimizes each expert for inputs it never sees. Calibrating each expert on its
+own routed positions (a median of 140 at a middle layer) brings GPTQ back to exactly RTN
+on a block of seven layers — no better. The reason is in §4 and §7: what INT4 costs on
+this model is picks flipping downstream, and rounding the expert outputs more cleverly
+does not move a router that sits 1e-3 from its next choice. (The `<sop>` sink is not the
+cause: the FFN input is post-norm, and the prefix's two rows hold 0.0 % of the Hessian's
+trace.) The full-network per-expert run is in flight for the record; the lever for the
+INT4 cost, if one is wanted, is the router — its scores in higher precision, or a margin-
+aware pick — not the experts' rounding. Both INT4 numbers are
 round-to-nearest; calibration took V2-Lite's INT4 down by about a quarter.
 
 ## 3. Teacher-forced divergence from the oracle
@@ -354,8 +378,10 @@ In order:
 5. ~~Position-0 magnitudes per layer (§5)~~ — done, and the prefix probe: the sink is `<sop>`.
 6. ~~Activation ranges (§6)~~ — done; ~~the recipe sweeps of §3–§4~~ — done for plain INT4.
 7. ~~The dense layers at FP8 and at 4 bits, teacher-forced~~ — done, §2: FP8 0.0018, INT4 0.0088,
-   FP8 dense + INT4 experts 0.0074 nats on code, all INT4 0.0136. Next: calibrated INT4
-   (GPTQ, as V2-Lite's) on the experts and on the dense linears.
+   FP8 dense + INT4 experts 0.0074 nats on code, all INT4 0.0136. ~~Calibrated INT4~~ — measured,
+   §2: GPTQ does not beat RTN on this model; the full per-expert run is the last cell.
+9. The router at the INT4 recipe: how many picks flip a token, and what a higher-precision
+   score or a margin rule would recover — the lever §2 points at.
 8. The 7900 XT's bf16 and FP8 row rates at this model's shapes (4096-wide, 8192-wide),
    from the existing rows kernels: the 600 GB/s assumed above is V2-Lite's number.
 

@@ -126,9 +126,9 @@ class LazyExperts:
     fewer): the same hit set in the same ascending order, the same F.linear, gate and
     index_add_, so the bits are the reference's. Holds the experts it has seen this layer."""
 
-    def __init__(self, module, src, names, q4_group=None, sink=0, calib=None, limit=10.0):
+    def __init__(self, module, src, names, q4_group=None, sink=0, calib=None, limit=10.0, routed=None):
         self.m, self.src, self.names, self.q4, self.sink = module, src, names, q4_group, sink
-        self.calib, self.limit = calib, limit  # calib: this layer's FFN inputs [n][H] for GPTQ, else RTN
+        self.calib, self.limit, self.routed = calib, limit, routed  # calib: this layer's FFN inputs [n][H] for GPTQ (else RTN); routed: their picks [n][TOP_K]
         self.cache = {}
         self.U = None
 
@@ -144,27 +144,37 @@ class LazyExperts:
                 self.cache[key] = (gu, dn)
         return self.cache[key]
 
-    def gptq_experts(self, experts, batch=16, down_positions=2048):
-        """GPTQ the given experts in batches, as bringup/quant.py does: one Hessian for every
-        expert's gate/up from the layer's calibration inputs, each expert's own for its down
-        projection from the clamped SwiGLU of those inputs (a subsample, for the matmul)."""
+    def gptq_experts(self, experts, batch=8, min_rows=16):
+        """GPTQ the given experts in batches. With `routed` (the calibration run's picks), each
+        expert's Hessians come from the calibration positions routed to it — the inputs it
+        actually sees, gate/up from those rows of the FFN input, down from the clamped SwiGLU
+        of them — and an expert with fewer than `min_rows` such positions takes the layer's
+        Hessian over every position (bringup/quant.py's choice, which here scored worse than
+        RTN: 2.8 % of positions route to an expert, so the layer's distribution is not its)."""
         import gptq as G
         X = self.calib
         if self.U is None:
             self.U = G.hinv((X.T @ X)[None])
-        Ugu, dead_gu = self.U
-        Xd = X[torch.randperm(X.shape[0], generator=torch.Generator().manual_seed(0))[:down_positions]] if X.shape[0] > down_positions else X
         I = self.m.intermediate_dim
         for b0 in range(0, len(experts), batch):
             es = experts[b0:b0 + batch]
             gu = torch.stack([self.weights(e, False)[0] for e in es])
             dn = torch.stack([self.weights(e, False)[1] for e in es])
-            qgu = G.gptq(gu, Ugu, dead_gu)
-            h = Xd @ gu.transpose(1, 2)  # [E][n][2I]
-            gate, up = h[..., :I].clamp(max=self.limit), h[..., I:].clamp(-self.limit, self.limit)
-            hcal = torch.nn.functional.silu(gate) * up
-            Ud, dead_d = G.hinv(hcal.transpose(1, 2) @ hcal)
-            qdn = G.gptq(dn, Ud, dead_d)
+            Ugu, dead_gu, hcals = [], [], []
+            for i, e in enumerate(es):
+                rows = (self.routed == e).any(-1).nonzero().squeeze(-1) if self.routed is not None else torch.arange(0)
+                Xe = X[rows] if len(rows) >= min_rows else X
+                if len(rows) >= min_rows:
+                    U, dead = G.hinv((Xe.T @ Xe)[None])
+                else:
+                    U, dead = self.U
+                Ugu.append(U[0]); dead_gu.append(dead[0])
+                h = Xe @ gu[i].T
+                gate, up = h[:, :I].clamp(max=self.limit), h[:, I:].clamp(-self.limit, self.limit)
+                hcals.append(torch.nn.functional.silu(gate) * up)
+            qgu = G.gptq(gu, torch.stack(Ugu), torch.stack(dead_gu))
+            Ud, dead_d = zip(*[G.hinv((hc.T @ hc)[None]) for hc in hcals])
+            qdn = G.gptq(dn, torch.cat(Ud), torch.cat(dead_d))
             for i, e in enumerate(es):
                 self.cache[(e, True)] = (qgu[i], qdn[i])
 
@@ -316,8 +326,15 @@ def main():
         lazy = None
         if expert_names:
             # the experts stay unmaterialized; their forward dequantizes what the step touches
-            calib = load_file(os.path.join(args.gptq, f"l{l}.safetensors"))["ffn_in"] if args.gptq and l in q4 else None
-            lazy = LazyExperts(layer.mlp.experts, src, expert_names, args.q4_group if l in q4 else None, args.sink, calib, tc.swiglu_limit)
+            # the calibration inputs without the shipped sink positions: the prefix's two rows carry
+            # a norm thousands of times the others' and would own the Hessian (2026-10-02)
+            calib, routed = None, None
+            if args.gptq and l in q4:
+                calib = load_file(os.path.join(args.gptq, f"l{l}.safetensors"))["ffn_in"][args.sink:]
+                rp = os.path.join(args.gptq, "routing.safetensors")
+                if os.path.exists(rp):
+                    routed = load_file(rp)[f"l{l}.topk"][args.sink:].long()
+            lazy = LazyExperts(layer.mlp.experts, src, expert_names, args.q4_group if l in q4 else None, args.sink, calib, tc.swiglu_limit, routed)
             layer.mlp.experts.forward = lazy
             missing = [k for k in missing if not k.startswith("mlp.experts.")]
         assert not missing, missing
