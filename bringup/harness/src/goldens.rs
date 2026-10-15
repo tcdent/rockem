@@ -1,5 +1,5 @@
 //! One step's goldens as captured by `bringup/goldens.py`: f32 tensors and
-//! int64 index tensors, `[T, ...]`, looked up by HF key.
+//! int64 (or int32, widened) index tensors, `[T, ...]`, looked up by HF key.
 
 use safetensors::{Dtype, SafeTensors};
 use std::collections::HashMap;
@@ -22,6 +22,10 @@ impl Golden {
                 Dtype::F32 => {
                     let v = t.data().chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
                     g.f32s.insert(name, (shape, v));
+                }
+                Dtype::I32 => {
+                    let v = t.data().chunks_exact(4).map(|c| i32::from_le_bytes(c.try_into().unwrap()) as i64).collect();
+                    g.i64s.insert(name, (shape, v));
                 }
                 Dtype::I64 => {
                     let v = t.data().chunks_exact(8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect();

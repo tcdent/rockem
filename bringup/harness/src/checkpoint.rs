@@ -83,9 +83,12 @@ impl Checkpoint {
                 let sc = c.div_ceil(BLOCK);
                 let lut = e4m3_table();
                 let mut out = vec![0f32; r * c];
-                for (i, row) in t.data().chunks_exact(c).enumerate() {
-                    for (j, &b) in row.iter().enumerate() {
-                        out[i * c + j] = lut[b as usize] * s[(i / BLOCK) * sc + j / BLOCK];
+                for (i, (row, o)) in t.data().chunks_exact(c).zip(out.chunks_exact_mut(c)).enumerate() {
+                    for (jb, (bs, os)) in row.chunks(BLOCK).zip(o.chunks_mut(BLOCK)).enumerate() {
+                        let scale = s[(i / BLOCK) * sc + jb];
+                        for (&b, ov) in bs.iter().zip(os) {
+                            *ov = lut[b as usize] * scale;
+                        }
                     }
                 }
                 out

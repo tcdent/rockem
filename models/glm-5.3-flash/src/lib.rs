@@ -31,6 +31,20 @@ pub const KDA_DIM: usize = LINEAR_HEAD_DIM;
 pub const KDA_QKV: usize = KDA_HEADS * KDA_DIM;
 pub const CONV_DIM: usize = 3 * KDA_QKV;
 pub const CONV_TAPS: usize = LINEAR_CONV_KERNEL;
+/// MLA without rotary: a query head is all nope, `QK_NOPE_HEAD_DIM` wide; `kv_b_proj`
+/// emits, per head, that many key rows then `V_HEAD_DIM` value rows over the latent.
+pub const MLA_HEADS: usize = NUM_ATTENTION_HEADS;
+pub const Q_HEAD: usize = QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM;
+pub const KVB_HEAD: usize = QK_NOPE_HEAD_DIM + V_HEAD_DIM;
+/// Below this many positions the indexer selects every visible key (all
+/// `INDEX_TOPK / INDEX_KPOOL` pools plus the incomplete tail), so sparse
+/// attention is dense causal attention exactly.
+pub const DENSE_BELOW: usize = INDEX_TOPK + INDEX_KPOOL - 1;
+pub const TOP_K: usize = NUM_EXPERTS_PER_TOK;
+pub const E: usize = N_ROUTED_EXPERTS;
+pub const D_FF: usize = MOE_INTERMEDIATE_SIZE;
+
+const _: () = assert!(QK_ROPE_HEAD_DIM == 0);
 
 const _: () = assert!(LINEAR_ATTENTION.len() == NUM_HIDDEN_LAYERS);
 const _: () = assert!(DENSE_MLP.len() == NUM_HIDDEN_LAYERS);
