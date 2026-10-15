@@ -778,10 +778,6 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             let mix = hc::pre(&lw.hc_attn, &s.streams, &mut hcs, s.pool, &mut s.x);
             rmsnorm::<H>(&s.x, &lw.input_ln, RMS_NORM_EPS, &mut s.xn);
             tr.edge(l, "attn_in", &s.xn);
-            // under the attention block, the pool pulls the experts the previous token took at this layer into their CCDs' L3
-            if s.last_picks[l][0] != E {
-                s.routed.prefetch(l, s.last_picks[l]);
-            }
             lap(&mut p.hc);
             match (&lw.attn, &mut s.layers[l]) {
                 (Attn::Kda(_), _) if s.placed.as_ref().is_some_and(|p| p.kda(l)) => {

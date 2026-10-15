@@ -340,6 +340,46 @@ pub fn run(elf: Option<&[u8]>) {
     let huge_rate = dram_pages(&nodes[0], mb, iters, false, true);
     println!("dram     : node 0 local, threads a CCD — {}; every SMT sibling ({}) {smt_rate:.0}; 48 threads on 2 MiB pages {huge_rate:.0} GB/s ({} CCDs)", per_ccd.join(", "), smt.len(), ccds.len());
     println!("dimms    : {}", dimms());
+    // the L3 as a prefetch target: one CCD's cores touch a slice the size of its share of a layer's
+    // experts (11 MB), then stream it again: what the second pass runs at against the first
+    {
+        let ccd = &ccds[0];
+        let mb = 11;
+        let n = mb << 20;
+        let start = Barrier::new(ccd.len());
+        let rates: Vec<(f64, f64)> = std::thread::scope(|sc| {
+            let hs: Vec<_> = ccd
+                .iter()
+                .enumerate()
+                .map(|(t, &cpu)| {
+                    let start = &start;
+                    let per = n / ccd.len();
+                    sc.spawn(move || {
+                        pin(cpu);
+                        let mut buf = vec![0u8; per];
+                        for (i, b) in buf.iter_mut().enumerate().step_by(4096) {
+                            *b = (i + t) as u8;
+                        }
+                        // flush what the fill left: stream 64 MB of something else
+                        let other = vec![1u8; 64 << 20];
+                        std::hint::black_box(unsafe { stream_sum(other.as_ptr(), other.len()) });
+                        start.wait();
+                        let t0 = std::time::Instant::now();
+                        std::hint::black_box(unsafe { stream_sum(buf.as_ptr(), per) });
+                        let first = t0.elapsed().as_secs_f64();
+                        start.wait();
+                        let t1 = std::time::Instant::now();
+                        std::hint::black_box(unsafe { stream_sum(buf.as_ptr(), per) });
+                        let second = t1.elapsed().as_secs_f64();
+                        (per as f64 / first / 1e9, per as f64 / second / 1e9)
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let (a, b): (f64, f64) = rates.iter().fold((0.0, 0.0), |(a, b), (x, y)| (a + x, b + y));
+        println!("l3       : CCD 0's {} cores stream {mb} MB from DRAM at {a:.0} GB/s, then the same bytes again at {b:.0} GB/s", ccd.len());
+    }
     let pool = Threads::new(&all);
     println!("{}", gemv_rates(&pool, iters, nodes.len(), false));
     if nodes.len() > 1 {
