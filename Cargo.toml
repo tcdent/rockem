@@ -1,10 +1,12 @@
 [workspace]
 resolver = "2"
 members = ["common", "models/deepseek-v2-lite", "node"]
-exclude = ["bringup", "bundle", "models/deepseek-v2-lite/gpu"]
+exclude = ["api/client", "bringup", "bundle", "models/deepseek-v2-lite/gpu"]
 
 [profile.release]
 opt-level = 3
+# line tables, so a panic's backtrace names files and lines (RUST_BACKTRACE=1 in the image's init)
+debug = "line-tables-only"
 lto = true
 panic = "abort"
 codegen-units = 1
