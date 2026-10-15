@@ -25,6 +25,13 @@ pub trait Pool: Sync {
         let _ = ccd;
         self.run_at(n, at, f)
     }
+    /// Start `f` over `n` items (slotted as `run_at_ccd`) on the pool's threads and return at
+    /// once; the items are a hint — the next run abandons whatever has not been claimed. The
+    /// pool owns the closures until the job is gone. A pool without its own threads does nothing.
+    #[cfg(feature = "std")]
+    fn prefetch(&self, n: usize, at: std::boxed::Box<dyn Fn(usize) -> *const u8 + Send + Sync>, ccd: std::boxed::Box<dyn Fn(usize) -> usize + Send + Sync>, f: std::boxed::Box<dyn Fn(usize) + Send + Sync>) {
+        let _ = (n, at, ccd, f);
+    }
     /// Run `f` between the calling thread's own items of the runs until `tick(None)`: a
     /// heartbeat for a device that must not fall asleep while the pool works. `f` must
     /// outlive those runs. A pool without a calling thread's loop ignores it.

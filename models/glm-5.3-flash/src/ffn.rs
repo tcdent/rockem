@@ -26,6 +26,11 @@ pub struct Scratch<'a> {
 /// `idx` on `x` (`[H]`), each one's raw output to `out[k·H..]` in the order of `idx`.
 pub trait Routed {
     fn run(&mut self, l: usize, idx: &[usize; TOP_K], x: &[f32], out: &mut [f32]);
+    /// A hint, before `run`: these experts are likely layer `l`'s next; a realization may start
+    /// pulling them toward the cores that will stream them.
+    fn prefetch(&self, l: usize, idx: [usize; TOP_K]) {
+        let _ = (l, idx);
+    }
     /// Seconds spent in `run` since the last call of this (bring-up: the token's profile); 0 if unmeasured.
     fn elapsed(&mut self) -> f64 {
         0.0
@@ -38,6 +43,9 @@ impl<R: Routed + ?Sized> Routed for Box<R> {
     }
     fn elapsed(&mut self) -> f64 {
         (**self).elapsed()
+    }
+    fn prefetch(&self, l: usize, idx: [usize; TOP_K]) {
+        (**self).prefetch(l, idx)
     }
 }
 

@@ -65,6 +65,10 @@ struct Job {
     start: [usize; SLOTS + 1],
     next: [Counter; SLOTS],
     done: Counter,
+    /// Set when the job is abandoned (a prefetch the next run overtakes): no more items are claimed.
+    stop: std::sync::atomic::AtomicBool,
+    /// A prefetch's closure, owned by its job (the runs' closures are the caller's, alive through the run).
+    _owned: Option<Box<dyn Fn(usize) + Send + Sync>>,
 }
 /// A counter on its own cache line: a node's cores share its `next`, nothing else bounces with it.
 #[repr(align(64))]
@@ -123,6 +127,9 @@ unsafe fn work_ticking(job: *const Job, order: &[usize], tick: &dyn Fn()) {
     for &s in order {
         loop {
             tick();
+            if j.stop.load(Ordering::Relaxed) {
+                break;
+            }
             let i = j.next[s].0.fetch_add(1, Ordering::AcqRel);
             if i >= j.start[s + 1] {
                 break;
@@ -144,6 +151,9 @@ unsafe fn work(job: *const Job, order: &[usize]) {
     let mut mine = 0;
     for &s in order {
         loop {
+            if j.stop.load(Ordering::Relaxed) {
+                break;
+            }
             let i = j.next[s].0.fetch_add(1, Ordering::AcqRel);
             if i >= j.start[s + 1] {
                 break;
@@ -226,6 +236,22 @@ impl Threads {
             }
             return;
         }
+        let job = self.post(n, at, ccd, f, None);
+        let tick = *self.tick.lock().unwrap();
+        match tick {
+            Some(t) => unsafe { work_ticking(job, &self.order, &*t.0) },
+            None => unsafe { work(job, &self.order) },
+        }
+        while unsafe { (*job).done.0.load(Ordering::Acquire) } != n {
+            if let Some(t) = tick {
+                unsafe { (*t.0)() };
+            }
+            std::hint::spin_loop();
+        }
+    }
+    /// The job slotted and published: the workers take it up; the job before it is stopped
+    /// (a prefetch still running gives up its unclaimed items) and freed a generation late.
+    fn post(&self, n: usize, at: Option<&(dyn Fn(usize) -> *const u8 + Sync)>, ccd: Option<&(dyn Fn(usize) -> usize + Sync)>, f: &(dyn Fn(usize) + Sync), owned: Option<Box<dyn Fn(usize) + Send + Sync>>) -> *mut Job {
         let mut start = [0usize; SLOTS + 1];
         let mut order = vec![0u32; n];
         let mut item_slot = Vec::new();
@@ -259,28 +285,23 @@ impl Threads {
         }
         let sh = &*self.shared;
         sh.busy.store(true, Ordering::Relaxed);
+        // the job before this one stops handing out items (it finished, or it was a prefetch), then no worker is inside it
+        let current = sh.job.load(Ordering::Acquire);
+        if !current.is_null() {
+            unsafe { (*current).stop.store(true, Ordering::Relaxed) };
+        }
         while sh.active.load(Ordering::Acquire) != 0 {
             std::hint::spin_loop();
         }
         // no worker is inside any job: the one retired at the last publish can go
         let fp: *const (dyn Fn(usize) + Sync) = unsafe { std::mem::transmute(f) };
-        let job = Box::into_raw(Box::new(Job { f: fp, order, next: std::array::from_fn(|s| Counter(AtomicUsize::new(start[s]))), start, done: Counter(AtomicUsize::new(0)) }));
+        let job = Box::into_raw(Box::new(Job { f: fp, order, next: std::array::from_fn(|s| Counter(AtomicUsize::new(start[s]))), start, done: Counter(AtomicUsize::new(0)), stop: std::sync::atomic::AtomicBool::new(false), _owned: owned }));
         let old = sh.job.swap(job, Ordering::AcqRel);
         let older = self.retired.swap(old, Ordering::AcqRel);
         if !older.is_null() {
             drop(unsafe { Box::from_raw(older) });
         }
-        let tick = *self.tick.lock().unwrap();
-        match tick {
-            Some(t) => unsafe { work_ticking(job, &self.order, &*t.0) },
-            None => unsafe { work(job, &self.order) },
-        }
-        while unsafe { (*job).done.0.load(Ordering::Acquire) } != n {
-            if let Some(t) = tick {
-                unsafe { (*t.0)() };
-            }
-            std::hint::spin_loop();
-        }
+        job
     }
 }
 impl Drop for Threads {
@@ -294,6 +315,13 @@ impl Pool for Threads {
     }
     fn run_at_ccd(&self, n: usize, at: &(dyn Fn(usize) -> *const u8 + Sync), ccd: &(dyn Fn(usize) -> usize + Sync), f: &(dyn Fn(usize) + Sync)) {
         self.publish(n, Some(at), Some(ccd), f)
+    }
+    fn prefetch(&self, n: usize, at: Box<dyn Fn(usize) -> *const u8 + Send + Sync>, ccd: Box<dyn Fn(usize) -> usize + Send + Sync>, f: Box<dyn Fn(usize) + Send + Sync>) {
+        if n > 1 {
+            // the job owns `f`; `at` and `ccd` are needed only to slot the items here
+            let fr: &(dyn Fn(usize) + Sync) = unsafe { &*(&*f as *const (dyn Fn(usize) + Send + Sync)) };
+            self.post(n, Some(&*at), Some(&*ccd), fr, Some(f));
+        }
     }
     fn tick(&self, f: Option<&dyn Fn()>) {
         // only the calling thread ever runs it, between its own items
@@ -374,9 +402,61 @@ impl<'a> CpuExperts<'a> {
         CpuExperts { stream, pool, xq: vec![0; H], xs: vec![0.0; H / GROUP], xg: vec![0; H / GROUP], h: vec![0.0; TOP_K * D_FF], elapsed: 0.0 }
     }
 }
+fn raw_f32(v: &[f32]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+}
+/// Pull every cache line of `b` through this core: into its L2 and, as the core streams on, its CCD's L3.
+#[inline(always)]
+fn touch(b: &[u8]) {
+    let mut acc = 0u64;
+    let mut i = 0;
+    while i + 8 <= b.len() {
+        acc ^= u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+        i += 64;
+    }
+    std::hint::black_box(acc);
+}
 impl Routed for CpuExperts<'_> {
     fn elapsed(&mut self) -> f64 {
         std::mem::take(&mut self.elapsed)
+    }
+    fn prefetch(&self, l: usize, idx: [usize; TOP_K]) {
+        use common::q4::{GROUP, TILE};
+        // the stream lives as long as the process (the node leaks it; the gate's outlives every token):
+        // the job that owns these closures is gone within the token
+        let stream: &'static [u8] = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(self.stream) };
+        let n_gu = TOP_K * (D_FF / CHUNK);
+        let n_down = TOP_K * (H / DOWN_CHUNK);
+        // the gate/up slices and the down slices, exactly as `run` cuts them, on the same CCDs
+        let at = move |i: usize| {
+            if i < n_gu {
+                let (k, c) = (i / (D_FF / CHUNK), i % (D_FF / CHUNK));
+                expert::Weights::from_record(&stream[layout::record(l, idx[k])]).gate_up_w[c * CHUNK / TILE * 2 * H..].as_ptr()
+            } else {
+                let i = i - n_gu;
+                let (k, c) = (i / (H / DOWN_CHUNK), i % (H / DOWN_CHUNK));
+                expert::Weights::from_record(&stream[layout::record(l, idx[k])]).down_w[c * DOWN_CHUNK / TILE * 2 * D_FF..].as_ptr()
+            }
+        };
+        let ccd = move |i: usize| if i < n_gu { i } else { i - n_gu };
+        let f = move |i: usize| {
+            if i < n_gu {
+                let (k, c) = (i / (D_FF / CHUNK), i % (D_FF / CHUNK));
+                let w = expert::Weights::from_record(&stream[layout::record(l, idx[k])]);
+                for r0 in [c * CHUNK, D_FF + c * CHUNK] {
+                    touch(&w.gate_up_w[r0 / TILE * 2 * H..(r0 + CHUNK) / TILE * 2 * H]);
+                    touch(raw_f32(&w.gate_up_s[r0 / TILE * (H / GROUP) * TILE..(r0 + CHUNK) / TILE * (H / GROUP) * TILE]));
+                }
+            } else {
+                let i = i - n_gu;
+                let (k, c) = (i / (H / DOWN_CHUNK), i % (H / DOWN_CHUNK));
+                let w = expert::Weights::from_record(&stream[layout::record(l, idx[k])]);
+                let r0 = c * DOWN_CHUNK;
+                touch(&w.down_w[r0 / TILE * 2 * D_FF..(r0 + DOWN_CHUNK) / TILE * 2 * D_FF]);
+                touch(raw_f32(&w.down_s[r0 / TILE * (D_FF / GROUP) * TILE..(r0 + DOWN_CHUNK) / TILE * (D_FF / GROUP) * TILE]));
+            }
+        };
+        self.pool.prefetch(n_gu + n_down, Box::new(at), Box::new(ccd), Box::new(f));
     }
     fn run(&mut self, l: usize, idx: &[usize; TOP_K], x: &[f32], out: &mut [f32]) {
         use common::q4::{self, Act, QAct, GROUP, TILE};
@@ -698,6 +778,10 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             let mix = hc::pre(&lw.hc_attn, &s.streams, &mut hcs, s.pool, &mut s.x);
             rmsnorm::<H>(&s.x, &lw.input_ln, RMS_NORM_EPS, &mut s.xn);
             tr.edge(l, "attn_in", &s.xn);
+            // under the attention block, the pool pulls the experts the previous token took at this layer into their CCDs' L3
+            if s.last_picks[l][0] != E {
+                s.routed.prefetch(l, s.last_picks[l]);
+            }
             lap(&mut p.hc);
             match (&lw.attn, &mut s.layers[l]) {
                 (Attn::Kda(_), _) if s.placed.as_ref().is_some_and(|p| p.kda(l)) => {
