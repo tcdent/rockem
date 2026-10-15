@@ -5,7 +5,11 @@ use common::q4::GROUP;
 use std::fs;
 use std::io::{Read, Write};
 
-/// RTN: per (row, group) scale = absmax / 7; q = round(w / scale) in [-8, 7].
+/// RTN: per (row, group) scale = absmax / 7; q = round(w / scale) in [-8, 7], half
+/// away from zero — by division, as the oracle's `rtn` (bringup/glm/gptq.py) divides.
+/// Multiplying by the reciprocal instead moved 0.4 % of GLM-5.3-Flash's expert weights
+/// one step (2026-10-15): 4.4 % of FP8-grid weights over an absmax/7 scale land on exact
+/// halves, and the reciprocal product rounds a hair either side of them.
 pub fn quantize(m: usize, k: usize, w: &[f32]) -> (Vec<i8>, Vec<f32>) {
     let ng = k / GROUP;
     let mut q = vec![0i8; m * k];
@@ -15,9 +19,8 @@ pub fn quantize(m: usize, k: usize, w: &[f32]) -> (Vec<i8>, Vec<f32>) {
             let seg = &w[r * k + g * GROUP..r * k + (g + 1) * GROUP];
             let amax = seg.iter().fold(0f32, |a, v| a.max(v.abs()));
             let scale = amax / 7.0;
-            let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
             for (i, v) in seg.iter().enumerate() {
-                q[r * k + g * GROUP + i] = (v * inv).round().clamp(-8.0, 7.0) as i8;
+                q[r * k + g * GROUP + i] = if scale > 0.0 { (v / scale).round().clamp(-8.0, 7.0) as i8 } else { 0 };
             }
             s[r * ng + g] = scale;
         }
