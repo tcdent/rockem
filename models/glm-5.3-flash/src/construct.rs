@@ -164,6 +164,7 @@ pub struct CpuExperts<'a> {
     hq: Vec<i8>,  // [TOP_K][D_FF]
     hs: Vec<f32>, // [TOP_K][D_FF / GROUP]
     hg: Vec<i32>,
+    elapsed: f64,
 }
 /// Hidden channels an item takes: two INT8 groups, eight items an expert.
 const CHUNK: usize = 256;
@@ -175,13 +176,17 @@ impl<'a> CpuExperts<'a> {
     pub fn new(stream: &'a [u8], pool: &'a dyn Pool) -> Self {
         use common::q4::GROUP;
         assert_eq!(stream.len(), layout::STREAM);
-        CpuExperts { stream, pool, xq: vec![0; H], xs: vec![0.0; H / GROUP], xg: vec![0; H / GROUP], hq: vec![0; TOP_K * D_FF], hs: vec![0.0; TOP_K * D_FF / GROUP], hg: vec![0; TOP_K * D_FF / GROUP] }
+        CpuExperts { stream, pool, xq: vec![0; H], xs: vec![0.0; H / GROUP], xg: vec![0; H / GROUP], hq: vec![0; TOP_K * D_FF], hs: vec![0.0; TOP_K * D_FF / GROUP], hg: vec![0; TOP_K * D_FF / GROUP], elapsed: 0.0 }
     }
 }
 impl Routed for CpuExperts<'_> {
+    fn elapsed(&mut self) -> f64 {
+        std::mem::take(&mut self.elapsed)
+    }
     fn run(&mut self, l: usize, idx: &[usize; TOP_K], x: &[f32], out: &mut [f32]) {
         use common::q4::{self, Act, QAct, GROUP, TILE};
         use common::swiglu::swiglu_clamped;
+        let t0 = std::time::Instant::now();
         QAct { q: &mut self.xq, scale: &mut self.xs, gsum: &mut self.xg }.quantize(&x[..H]);
         let xa = Act { q: &self.xq, scale: &self.xs, gsum: &self.xg };
         let stream = self.stream;
@@ -218,6 +223,7 @@ impl Routed for CpuExperts<'_> {
             let o = unsafe { std::slice::from_raw_parts_mut((out_p as *mut f32).add(k * H + r0), DOWN_CHUNK) };
             q4::gemv::<D_FF>(DOWN_CHUNK, dw, ds, &ha, o);
         });
+        self.elapsed += t0.elapsed().as_secs_f64();
     }
 }
 
@@ -240,9 +246,33 @@ pub enum LayerState {
     Mla { cache: Vec<f32>, pools: Vec<f32> },
 }
 
+/// A token's time by phase, summed over steps until `take`n (bring-up and the node's
+/// `rockem.profile` line). The experts are the routed realization's own count.
+#[derive(Default, Clone, Copy)]
+pub struct Profile {
+    pub tokens: usize,
+    pub hc: f64,
+    pub kda_card: f64,
+    pub kda_cpu: f64,
+    pub mla: f64,
+    pub dense_ffn: f64,
+    pub router_shared: f64,
+    pub experts: f64,
+    pub head: f64,
+}
+impl Profile {
+    /// One line of milliseconds a token, the phases in order and their sum.
+    pub fn line(&self) -> String {
+        let n = self.tokens.max(1) as f64 / 1e3;
+        let sum = self.hc + self.kda_card + self.kda_cpu + self.mla + self.dense_ffn + self.router_shared + self.experts + self.head;
+        format!("{} tokens: hc {:.1}  kda card {:.1}  kda cpu {:.1}  mla {:.1}  dense ffn {:.1}  router+shared {:.1}  experts {:.1}  head {:.1}  = {:.1} ms a token", self.tokens, self.hc / n, self.kda_card / n, self.kda_cpu / n, self.mla / n, self.dense_ffn / n, self.router_shared / n, self.experts / n, self.head / n, sum / n)
+    }
+}
+
 pub struct CpuModel<'p, R: Routed> {
     pub routed: R,
     pub pool: &'p dyn Pool,
+    pub profile: Profile,
     /// KDA layers that run elsewhere; `None` runs every layer here.
     pub placed: Option<Box<dyn KdaPlaced>>,
     pub max_ctx: usize,
@@ -294,6 +324,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
         CpuModel {
             routed,
             pool,
+            profile: Profile::default(),
             placed: None,
             max_ctx,
             layers,
@@ -414,23 +445,35 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             }
         }
         tr.edge(NONE, "embed", &s.streams[..H]);
+        let mut t = std::time::Instant::now();
+        let mut lap = |acc: &mut f64| {
+            let now = std::time::Instant::now();
+            *acc += (now - t).as_secs_f64();
+            t = now;
+        };
+        let p = &mut s.profile;
+        p.tokens += 1;
         for l in 0..NUM_HIDDEN_LAYERS {
             let lw = &w.layers[l];
             let mut hcs = hc::Scratch { flat: &mut s.hc_flat, coef: &mut s.hc_coef };
             let mix = hc::pre(&lw.hc_attn, &s.streams, &mut hcs, s.pool, &mut s.x);
             rmsnorm::<H>(&s.x, &lw.input_ln, RMS_NORM_EPS, &mut s.xn);
             tr.edge(l, "attn_in", &s.xn);
+            lap(&mut p.hc);
             match (&lw.attn, &mut s.layers[l]) {
                 (Attn::Kda(_), _) if s.placed.as_ref().is_some_and(|p| p.placed(l)) => {
                     s.placed.as_mut().unwrap().step(l, &s.x, &mut s.y);
+                    lap(&mut p.kda_card);
                 }
                 (Attn::Kda(a), LayerState::Kda { window, mem }) => {
                     let mut ks = kda::Scratch { mixed: &mut s.k_mixed, conv: &mut s.k_conv, fa: &mut s.k_fa, f: &mut s.k_f, beta: &mut s.k_beta, ga: &mut s.k_ga, gate: &mut s.k_gate, normed: &mut s.k_normed, heads: &mut s.k_heads };
                     kda::step(l, a, &s.xn, window, mem, &mut ks, s.pool, tr, &mut s.y);
+                    lap(&mut p.kda_cpu);
                 }
                 (Attn::Mla(a), LayerState::Mla { cache, pools }) => {
                     let mut ms = mla::Scratch { qr: &mut s.m_qr, qa: &mut s.m_qa, q: &mut s.m_q, kva: &mut s.m_kva, ik: &mut s.m_ik, iq: &mut s.m_iq, iw: &mut s.m_iw, pscore: &mut s.m_pscore, sel: &mut s.m_sel, heads: &mut s.m_heads, hs: &mut s.m_hs };
                     mla::step(l, a, &s.xn, cache, pools, pos, &mut ms, s.pool, tr, &mut s.y);
+                    lap(&mut p.mla);
                 }
                 _ => unreachable!("a layer's state and weights disagree"),
             }
@@ -441,10 +484,20 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             let mix = hc::pre(&lw.hc_ffn, &s.streams, &mut hcs, s.pool, &mut s.x);
             rmsnorm::<H>(&s.x, &lw.post_ln, RMS_NORM_EPS, &mut s.xn);
             tr.edge(l, "ffn_in", &s.xn);
+            lap(&mut p.hc);
             let mut fs = ffn::Scratch { gu: &mut s.f_gu, h: &mut s.f_h, expert_out: &mut s.f_expert_out, shared: &mut s.f_shared, score: &mut s.f_score };
             match &lw.ffn {
-                Ffn::Dense(d) => ffn::dense(l, d, &s.xn, &mut fs, s.pool, tr, &mut s.y),
-                Ffn::Moe(m) => ffn::moe(l, m, &s.xn, &mut fs, s.pool, &mut s.routed, forced.map(|f| &f[l - FIRST_K_DENSE_REPLACE]), tr, &mut s.y),
+                Ffn::Dense(d) => {
+                    ffn::dense(l, d, &s.xn, &mut fs, s.pool, tr, &mut s.y);
+                    lap(&mut p.dense_ffn);
+                }
+                Ffn::Moe(m) => {
+                    ffn::moe(l, m, &s.xn, &mut fs, s.pool, &mut s.routed, forced.map(|f| &f[l - FIRST_K_DENSE_REPLACE]), tr, &mut s.y);
+                    let e = s.routed.elapsed();
+                    p.experts += e;
+                    lap(&mut p.router_shared);
+                    p.router_shared -= e;
+                }
             }
             tr.edge(l, "ffn_out", &s.y);
             hc::post(&mix, &s.y, &mut s.streams);
@@ -456,9 +509,11 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 s.mean[d] = acc / HC as f32;
             }
             tr.edge(l, "out", &s.mean);
+            lap(&mut p.hc);
         }
         rmsnorm::<H>(&s.mean, &w.norm, RMS_NORM_EPS, &mut s.xn);
         gemv::bf16_par::<VOCAB_SIZE, H>(w.lm_head, &s.xn, &mut s.logits, s.pool);
         tr.edge(NONE, "logits", &s.logits);
+        lap(&mut p.head);
     }
 }

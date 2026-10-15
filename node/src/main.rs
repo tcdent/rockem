@@ -20,6 +20,7 @@
 //!   rockem.max=64              console: tokens to generate per line (the wire runs to EOS or a full context)
 //!   rockem.cache=<GB>          host memory for cached contexts (default: half of what is free)
 //!   rockem.debug=<dir>         dev: write every position's logits as <dir>/pos<N>.f32 and print the top-2 margin
+//!   rockem.profile=N           GLM: a line of the token's time by phase every N tokens
 //!   rockem.shell=1 / rockem.exit=1   dev conveniences (see os/qemu.sh)
 mod engine;
 mod glm;
@@ -518,7 +519,7 @@ fn main() {
     let (gpu, experts_host) = (config("rockem.gpu").is_some(), config("rockem.experts").as_deref() == Some("host"));
     let e: Box<dyn Engine> = match name.as_str() {
         "deepseek-v2-lite" => v2lite::V2Lite::open(bundle, mem, max_ctx, gpu, experts_host),
-        "glm-5.3-flash" => glm::Glm::open(bundle, mem, max_ctx, gpu),
+        "glm-5.3-flash" => glm::Glm::open(bundle, mem, max_ctx, gpu, config("rockem.profile").and_then(|v| v.parse().ok()).unwrap_or(0)),
         other => halt(&format!("the manifest names model {other:?}, which this node does not carry")),
     };
     assert!(max_ctx > e.first_pos(), "rockem.ctx must leave room after the prefix");

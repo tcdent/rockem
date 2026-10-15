@@ -26,11 +26,18 @@ pub struct Scratch<'a> {
 /// `idx` on `x` (`[H]`), each one's raw output to `out[k·H..]` in the order of `idx`.
 pub trait Routed {
     fn run(&mut self, l: usize, idx: &[usize; TOP_K], x: &[f32], out: &mut [f32]);
+    /// Seconds spent in `run` since the last call of this (bring-up: the token's profile); 0 if unmeasured.
+    fn elapsed(&mut self) -> f64 {
+        0.0
+    }
 }
 #[cfg(feature = "std")]
 impl<R: Routed + ?Sized> Routed for Box<R> {
     fn run(&mut self, l: usize, idx: &[usize; TOP_K], x: &[f32], out: &mut [f32]) {
         (**self).run(l, idx, x, out)
+    }
+    fn elapsed(&mut self) -> f64 {
+        (**self).elapsed()
     }
 }
 

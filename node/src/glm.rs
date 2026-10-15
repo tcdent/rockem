@@ -38,6 +38,8 @@ impl Trace for DebugTrace {
 }
 
 pub struct Glm {
+    /// `rockem.profile=N`: a line of the token's time by phase every N tokens (0: never).
+    profile_every: usize,
     w: Weights<'static>,
     model: CpuModel<'static, CpuExperts<'static>>,
     prefix: &'static [f32],
@@ -49,7 +51,7 @@ pub struct Glm {
 }
 
 impl Glm {
-    pub fn open(bundle: &std::path::Path, mem: loader::Mem, max_ctx: usize, gpu: bool) -> Box<dyn Engine> {
+    pub fn open(bundle: &std::path::Path, mem: loader::Mem, max_ctx: usize, gpu: bool, profile_every: usize) -> Box<dyn Engine> {
         let t0 = std::time::Instant::now();
         let dense = loader::load(&bundle.join(layout::DENSE_FILE), mem);
         let experts = loader::load(&bundle.join(layout::EXPERTS_FILE), mem);
@@ -87,7 +89,9 @@ impl Glm {
         println!("prefix   : {} tokens in {:.1}s; this realization vs the bundle's f32 state: rows {:.1e} of {:.1e}, memory {:.1e} of {:.1e}", FIRST_POS, t1.elapsed().as_secs_f32(), dr, mr, ds, ms);
         model.seed_prefix(&w, prefix);
         println!("model    : glm-5.3-flash, ctx {max_ctx}, temperature {}, top-k {}, top-p {}, dense native, experts q4 in DRAM, {}", SAMPLING.temperature, SAMPLING.top_k, SAMPLING.top_p, if gpu { "the KDA layers on the cards, the rest on this CPU's cores" } else { "every op on this CPU's cores" });
+        model.profile = Default::default();
         Box::new(Glm {
+            profile_every,
             w,
             model,
             prefix,
@@ -148,6 +152,10 @@ impl Engine for Glm {
                 self.model.step(&self.w, tok, pos + i, None, &mut NoTrace);
             }
             self.logits[i * VOCAB_SIZE..(i + 1) * VOCAB_SIZE].copy_from_slice(&self.model.logits);
+        }
+        if self.profile_every > 0 && self.model.profile.tokens >= self.profile_every {
+            println!("profile  : {}", self.model.profile.line());
+            self.model.profile = Default::default();
         }
     }
     fn rows(&self, i: usize, out: &mut [f32]) {
