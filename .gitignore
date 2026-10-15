@@ -24,3 +24,4 @@ bringup/evals/data/mmlu/
 bringup/evals/data/gsm8k/
 *.report.json
 bringup/*.log
+os/initramfs/dl/

@@ -32,4 +32,7 @@ fi
 p=$(arg rockem.bundle9p); [ -n "$p" ] && mount -t 9p -o trans=virtio,version=9p2000.L,msize=1048576 "$p" /bundle
 p=$(arg rockem.nfs);      [ -n "$p" ] && { mount -t nfs4 -o ro,nolock "$p" /bundle && echo "nfs      : $p at /bundle" || echo "nfs      : mount of $p failed"; }
 [ "$(arg rockem.telnet)" = 1 ] && telnetd -l /bin/sh && echo "telnet   : root shell on port 23"
+# host and GPU metrics to voria (INFRA-52); it waits for a real host name and a set clock on its own.
+# Started here, from a running init: as an rdinit= wrapper ahead of init it stalled metatron's boot.
+setsid /usr/bin/voria-agent </dev/null >/dev/null 2>&1 &
 exec /node
