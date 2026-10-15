@@ -533,14 +533,19 @@ fn clamped_swiglu(gu: &[f32], ff: usize, out: &mut [f32]) {
 }
 
 impl Moe {
-    pub fn route(&self, x: &[f32], n: usize) -> Routing {
+    /// `forced`: `[n][TOP_K]` picks to take instead of the router's own (bring-up: teacher-forced
+    /// routing, to separate tie flips from everything else); the weights are always computed.
+    pub fn route(&self, x: &[f32], n: usize, forced: Option<&[usize]>) -> Routing {
         let logits = matmul(&self.router, E, H, x, n);
         let mut r = Routing { idx: vec![0; n * TOP_K], weight: vec![0.0; n * TOP_K] };
         for t in 0..n {
             let s: Vec<f32> = logits[t * E..(t + 1) * E].iter().map(|&l| sigmoid(l)).collect();
             let mut order: Vec<usize> = (0..E).collect();
             order.sort_by(|&a, &b| (s[b] + self.bias[b]).total_cmp(&(s[a] + self.bias[a])));
-            let mut pick = order[..TOP_K].to_vec();
+            let mut pick = match forced {
+                Some(f) => f[t * TOP_K..(t + 1) * TOP_K].to_vec(),
+                None => order[..TOP_K].to_vec(),
+            };
             pick.sort();
             let sum: f32 = pick.iter().map(|&e| s[e]).sum::<f32>() + 1e-20;
             for (k, &e) in pick.iter().enumerate() {
@@ -641,8 +646,8 @@ impl Layer {
     }
 
     /// `streams: [n][HC][H]` in place; `edge(name, [n][H])` sees the oracle's edges;
-    /// `expert(e)` widens routed expert `e` on demand, from any thread. Returns the routing of a MoE layer.
-    pub fn forward(&self, streams: &mut [f32], n: usize, st: &mut LayerState, edge: &mut dyn FnMut(&str, &[f32]), expert: &(dyn Fn(usize) -> Expert + Sync)) -> Option<Routing> {
+    /// `expert(e)` widens routed expert `e` on demand, from any thread; `forced` overrides the router's picks. Returns the routing of a MoE layer.
+    pub fn forward(&self, streams: &mut [f32], n: usize, st: &mut LayerState, edge: &mut dyn FnMut(&str, &[f32]), expert: &(dyn Fn(usize) -> Expert + Sync), forced: Option<&[usize]>) -> Option<Routing> {
         let mut x = vec![0f32; n * H];
         let mut mixes = Vec::with_capacity(n);
         for t in 0..n {
@@ -672,7 +677,7 @@ impl Layer {
         let (y, routing) = match &self.ffn {
             Ffn::Dense(m) => (m.forward(&x, n), None),
             Ffn::Moe(m) => {
-                let r = m.route(&x, n);
+                let r = m.route(&x, n, forced);
                 let (routed, shared) = m.forward(&x, n, &r, expert);
                 edge("routed", &routed);
                 edge("shared", &shared);

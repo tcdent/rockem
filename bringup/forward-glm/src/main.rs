@@ -3,6 +3,7 @@
 //! layer's weights resident at a time), and diff every edge the oracle saved.
 //!
 //!   forward-glm --goldens <bringup/goldens/glm/SET> [--ckpt ~/hf-cache/glm-5.3-flash] [--layers N] [--tol 1e-4]
+//!               [--force-picks]   every MoE layer takes the oracle's expert picks (weights still its own): separates tie flips from the rest
 //!               [--detail 1e-3]   also print every row past this relative error, and every position whose picks differ
 //!
 //! Edges per layer, each `[positions][H]`: attn_in (the normed block input), attn_out,
@@ -80,6 +81,7 @@ fn main() {
     let gdir = arg_required("--goldens");
     let ckpt = arg("--ckpt").unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap()).join("hf-cache/glm-5.3-flash"));
     let layers: usize = arg("--layers").map_or(NUM_HIDDEN_LAYERS, |v| v.to_str().unwrap().parse().unwrap());
+    let force = harness::flag("--force-picks");
     let detail: f32 = arg("--detail").map_or(0.0, |v| v.to_str().unwrap().parse().unwrap());
     let tol: f32 = arg("--tol").map_or(1e-4, |v| v.to_str().unwrap().parse().unwrap());
     let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(gdir.join("meta.json")).unwrap()).unwrap();
@@ -108,6 +110,7 @@ fn main() {
         let mut st = layer.state();
         let mut line = Vec::new();
         let touched = std::sync::atomic::AtomicUsize::new(0);
+        let forced: Option<Vec<usize>> = (force && !DENSE_MLP[l]).then(|| (0..n).flat_map(|t| routing.irow(&format!("l{l}.topk"), t).unwrap().iter().map(|&e| e as usize).collect::<Vec<_>>()).collect());
         let r = layer.forward(&mut streams, n, &mut st, &mut |name, data| {
             let key = format!("l{l}.{name}");
             if gold.row(&key, 0).is_none() {
@@ -125,7 +128,7 @@ fn main() {
         }, &|e| {
             touched.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             load_expert(&ck, l, e)
-        });
+        }, forced.as_deref());
         let touched = touched.into_inner();
         if let (LayerState::Mla(m), Some(_)) = (&st, routing.irow(&format!("l{l}.index"), 0)) {
             // the indexer's choices against the oracle's, as sets of positions
