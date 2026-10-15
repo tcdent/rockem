@@ -2,6 +2,14 @@
 //! activations. The inner loop of every dense projection; the unpack is a
 //! shift. `bf16` picks the fast realization for the target; `bf16_scalar`
 //! is always there to diff against.
+//!
+//! `fp8` is the same over FP8 e4m3 weights with one f32 scale per 128×128
+//! block, the format GLM-5.3-Flash's checkpoint stores its dense tensors in
+//! and the bundle ships them in. Every e4m3 value is exact in f32, so the
+//! unpack is bit arithmetic; a block's products are summed in eight lanes,
+//! then the lanes scaled once. The AVX2 realization fuses each multiply-add
+//! and the scalar twin (no `mul_add` without std) rounds twice, so the two
+//! agree to a few ulp, not bit for bit — as the bf16 pair do.
 
 #[inline(always)]
 pub fn widen(w: u16) -> f32 {
@@ -31,6 +39,59 @@ pub fn bf16<const M: usize, const K: usize>(w: &[u16], x: &[f32], out: &mut [f32
     }
     #[cfg(not(target_arch = "x86_64"))]
     bf16_scalar::<M, K>(w, x, out)
+}
+
+/// FP8 e4m3fn → f32, exact: 1 sign, 4 exponent bits biased by 7, 3 mantissa
+/// bits; no infinities (0x7f and 0xff are NaN, which weights never hold).
+#[inline(always)]
+pub fn e4m3(b: u8) -> f32 {
+    let (s, e, m) = ((b as u32) >> 7, ((b as u32) >> 3) & 0xf, (b as u32) & 7);
+    if e == 0 {
+        // subnormal: m · 2⁻⁹
+        let v = m as f32 * (1.0 / 512.0);
+        return if s == 1 { -v } else { v };
+    }
+    f32::from_bits((s << 31) | ((e + 120) << 23) | (m << 20))
+}
+
+/// Side of the FP8 scale blocks.
+pub const FP8_BLOCK: usize = 128;
+
+/// `scales[(m / 128) · (K / 128) + k / 128]`: the checkpoint's `<name>_scale_inv`.
+#[inline(always)]
+pub fn fp8_scalar<const M: usize, const K: usize>(w: &[u8], scales: &[f32], x: &[f32], out: &mut [f32]) {
+    const { assert!(K % FP8_BLOCK == 0) };
+    let kb = K / FP8_BLOCK;
+    for m in 0..M {
+        let row = &w[m * K..(m + 1) * K];
+        let mut lanes = [0f32; 8];
+        for g in 0..kb {
+            let mut acc = [0f32; 8];
+            for i in 0..FP8_BLOCK / 8 {
+                for j in 0..8 {
+                    let k = g * FP8_BLOCK + i * 8 + j;
+                    acc[j] += e4m3(row[k]) * x[k];
+                }
+            }
+            let sc = scales[(m / FP8_BLOCK) * kb + g];
+            for j in 0..8 {
+                lanes[j] += acc[j] * sc;
+            }
+        }
+        out[m] = ((lanes[0] + lanes[4]) + (lanes[2] + lanes[6])) + ((lanes[1] + lanes[5]) + (lanes[3] + lanes[7]));
+    }
+}
+
+/// The realization this target ships.
+#[inline(always)]
+pub fn fp8<const M: usize, const K: usize>(w: &[u8], scales: &[f32], x: &[f32], out: &mut [f32]) {
+    debug_assert!(w.len() >= M * K && scales.len() >= M.div_ceil(FP8_BLOCK) * (K / FP8_BLOCK) && x.len() >= K && out.len() >= M);
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        avx2::fp8::<M, K>(w.as_ptr(), scales.as_ptr(), x.as_ptr(), out.as_mut_ptr())
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    fp8_scalar::<M, K>(w, scales, x, out)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -74,6 +135,41 @@ pub mod avx2 {
             *out.add(m) = hsum(_mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3)));
         }
     }
+
+    /// Eight e4m3 bytes → eight f32, exactly (`super::e4m3`).
+    #[inline(always)]
+    unsafe fn e4m3x8(p: *const u8) -> __m256 {
+        let b = _mm256_cvtepu8_epi32(_mm_loadl_epi64(p as *const __m128i));
+        let sign = _mm256_slli_epi32::<24>(_mm256_and_si256(b, _mm256_set1_epi32(0x80)));
+        let e = _mm256_and_si256(_mm256_srli_epi32::<3>(b), _mm256_set1_epi32(0xf));
+        let m = _mm256_and_si256(b, _mm256_set1_epi32(7));
+        let normal = _mm256_or_si256(sign, _mm256_or_si256(_mm256_slli_epi32::<23>(_mm256_add_epi32(e, _mm256_set1_epi32(120))), _mm256_slli_epi32::<20>(m)));
+        let sub = _mm256_or_si256(_mm256_castps_si256(_mm256_mul_ps(_mm256_cvtepi32_ps(m), _mm256_set1_ps(1.0 / 512.0))), sign);
+        let is_sub = _mm256_cmpeq_epi32(e, _mm256_setzero_si256());
+        _mm256_castsi256_ps(_mm256_blendv_epi8(normal, sub, is_sub))
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn fp8<const M: usize, const K: usize>(w: *const u8, scales: *const f32, x: *const f32, out: *mut f32) {
+        const { assert!(K % super::FP8_BLOCK == 0) };
+        let kb = K / super::FP8_BLOCK;
+        for m in 0..M {
+            let row = w.add(m * K);
+            let srow = scales.add((m / super::FP8_BLOCK) * kb);
+            let mut lanes = _mm256_setzero_ps();
+            for g in 0..kb {
+                let mut acc = _mm256_setzero_ps();
+                let mut k = g * super::FP8_BLOCK;
+                let end = k + super::FP8_BLOCK;
+                while k < end {
+                    acc = _mm256_fmadd_ps(e4m3x8(row.add(k)), _mm256_loadu_ps(x.add(k)), acc);
+                    k += 8;
+                }
+                lanes = _mm256_fmadd_ps(acc, _mm256_set1_ps(*srow.add(g)), lanes);
+            }
+            *out.add(m) = hsum(lanes);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -95,6 +191,36 @@ mod tests {
         bf16::<M, K>(&w, &x, &mut b);
         for i in 0..M {
             assert!((a[i] - b[i]).abs() <= 1e-4 * a[i].abs().max(1.0), "{i}: {} vs {}", a[i], b[i]);
+        }
+    }
+
+    #[test]
+    fn e4m3_values() {
+        assert_eq!(e4m3(0x00), 0.0);
+        assert_eq!(e4m3(0x38), 1.0); // e=7, m=0
+        assert_eq!(e4m3(0x7e), 448.0); // the format's maximum: e=15, m=6
+        assert_eq!(e4m3(0x01), 1.0 / 512.0); // smallest subnormal
+        assert_eq!(e4m3(0x07), 7.0 / 512.0);
+        assert_eq!(e4m3(0x08), 1.0 / 64.0); // smallest normal: 2⁻⁶
+        assert_eq!(e4m3(0xb8), -1.0);
+        assert_eq!(e4m3(0x81), -1.0 / 512.0);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn fp8_avx2_matches_scalar() {
+        const M: usize = 37 + 128;
+        const K: usize = 384;
+        let mut rng = crate::testing::Rng::new(0x5eed_f8f8_0000_0001);
+        let w: Vec<u8> = (0..M * K).map(|_| (rng.next() & 0xff) as u8).map(|b| if b & 0x7f == 0x7f { b & 0x7e } else { b }).collect();
+        let scales: Vec<f32> = (0..M.div_ceil(FP8_BLOCK) * (K / FP8_BLOCK)).map(|_| rng.unit() * 0.01).collect();
+        let x: Vec<f32> = (0..K).map(|_| rng.unit()).collect();
+        let mut a = std::vec![0f32; M];
+        let mut b = std::vec![0f32; M];
+        fp8_scalar::<M, K>(&w, &scales, &x, &mut a);
+        fp8::<M, K>(&w, &scales, &x, &mut b);
+        for i in 0..M {
+            assert!((a[i] - b[i]).abs() <= 1e-4 * a[i].abs().max(1.0), "row {i}: {} vs {}", a[i], b[i]);
         }
     }
 }

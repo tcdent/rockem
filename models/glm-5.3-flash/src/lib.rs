@@ -57,7 +57,10 @@ pub const EOS_TOKENS: [u32; 3] = [154820, 154827, 154829];
 /// The seed is a constant of the model: the draw at position p uses `sample::uniform_at(SEED, p)`.
 pub const SAMPLING: common::sample::Sampling = common::sample::Sampling { temperature: 1.0, top_k: 50, top_p: 0.95 };
 pub const SEED: u64 = 0x726f_636b_656d_0002;
+/// The most tokens one step carries (`common::gemv::TOKENS`): the card's launch width.
+pub const TOKENS: usize = common::gemv::TOKENS;
 
+pub mod expert;
 pub mod layout;
 
 const _: () = assert!(LINEAR_ATTENTION.len() == NUM_HIDDEN_LAYERS);
