@@ -5,6 +5,10 @@
 //!   forward-glm --goldens <bringup/goldens/glm/SET> [--ckpt ~/hf-cache/glm-5.3-flash] [--layers N] [--tol 1e-4]
 //!               [--cpu <bundle dir>]  the shipped CPU realization (construct::CpuModel) from the bundle's dense, expert
 //!                                     and prefix files instead of the f32 reference from the checkpoint: the kernel gate
+//!               [--experts a8|q4f32|f32]  with --cpu: the routed experts as shipped (INT4 weights, INT8 activations), the
+//!                                     bundle's INT4 bytes dequantized through f32 arithmetic (the oracle's q4 recipe), or
+//!                                     the checkpoint's unquantized experts — what separates the recipe's cost from a kernel error
+//!               [--positions N]       stop after N computed positions
 //!               [--force-picks]   every MoE layer takes the oracle's expert picks (weights still its own): separates tie flips from the rest
 //!               [--detail 1e-3]   also print every row past this relative error, and every position whose picks differ
 //!
@@ -32,11 +36,13 @@ fn main() {
     let gold = Golden::load(&gdir.join("edges.safetensors"));
     let routing = Golden::load(&gdir.join("routing.safetensors"));
     let mut report = Report::new(tol);
-    let ck = if arg("--cpu").is_some() { Checkpoint::open_lazy(&ckpt) } else { Checkpoint::open(&ckpt) };
+    let ck = if arg("--cpu").is_some() && arg("--experts").map_or(true, |v| v.to_str() != Some("f32")) { Checkpoint::open_lazy(&ckpt) } else { Checkpoint::open(&ckpt) };
     println!("{n} positions, {layers} layers, goldens {}", gdir.display());
 
     if let Some(bundle) = arg("--cpu") {
-        cpu_gate(&bundle, &ids, layers, &gold, &routing, force, detail, &mut report, &meta);
+        let experts = arg("--experts").map_or("a8".to_string(), |v| v.to_string_lossy().into_owned());
+        let positions = arg("--positions").map_or(usize::MAX, |v| v.to_str().unwrap().parse().unwrap());
+        cpu_gate(&bundle, &ck, &experts, positions, &ids, layers, &gold, &routing, force, detail, &mut report, &meta);
         return;
     }
     let emb = ck.bf16("model.language_model.embed_tokens.weight");
@@ -169,7 +175,7 @@ impl common::trace::Trace for Collect {
 /// prefix state, every edge the oracle saved diffed against it, the picks forced to the
 /// oracle's when asked (what separates a tie flip from a kernel error).
 #[allow(clippy::too_many_arguments)]
-fn cpu_gate(bundle: &std::path::Path, ids: &[usize], layers: usize, gold: &Golden, routing: &Golden, force: bool, detail: f32, report: &mut Report, meta: &serde_json::Value) {
+fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, positions: usize, ids: &[usize], layers: usize, gold: &Golden, routing: &Golden, force: bool, detail: f32, report: &mut Report, meta: &serde_json::Value) {
     use glm_5_3_flash::layout;
     assert_eq!(layers, NUM_HIDDEN_LAYERS, "--cpu runs every layer: the realization has no partial forward");
     let n = ids.len();
@@ -183,12 +189,19 @@ fn cpu_gate(bundle: &std::path::Path, ids: &[usize], layers: usize, gold: &Golde
     let w = glm_5_3_flash::weights::Weights::from_dense(&dense[..]);
     let prefix_b = std::fs::read(bundle.join(layout::PREFIX_FILE)).unwrap();
     let prefix: Vec<f32> = prefix_b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
-    let mut model = CpuModel::new(CpuExperts::new(&experts[..]), n.max(FIRST_POS + 1));
+    let routed: Box<dyn glm_5_3_flash::ffn::Routed> = match experts_mode {
+        "a8" => Box::new(CpuExperts::new(&experts[..])),
+        "q4f32" => Box::new(F32Experts { get: Box::new(move |l, e| dequant_record(&experts[glm_5_3_flash::layout::record(l, e)])) }),
+        "f32" => Box::new(F32Experts { get: Box::new(move |l, e| { let x = load_expert(l, e, &|n| ck.f32s(n)); (x.gate_up, x.down) }) }),
+        m => panic!("--experts {m}: a8, q4f32 or f32"),
+    };
+    let mut model = CpuModel::new(routed, n.max(FIRST_POS + 1));
     model.seed_prefix(&w, &prefix);
     for (t, &id) in ids.iter().enumerate().take(FIRST_POS) {
         assert_eq!(id as u32, PREFIX_IDS[t], "the passage does not start with the model's prefix");
     }
-    println!("cpu gate : {} from {}, {} positions after the prefix{}", if force { "forced picks" } else { "the router's picks" }, bundle.display(), n - FIRST_POS, if gold.row("l0.attn_in", 0).is_some() { "" } else { " (a golden with layer outputs only)" });
+    let n = n.min(FIRST_POS.saturating_add(positions));
+    println!("cpu gate : {} from {}, experts {experts_mode}, {} positions after the prefix{}", if force { "forced picks" } else { "the router's picks" }, bundle.display(), n - FIRST_POS, if gold.row("l0.attn_in", 0).is_some() { "" } else { " (a golden with layer outputs only)" });
     let names = ["attn_in", "attn_out", "ffn_in", "routed", "shared", "ffn_out", "out"];
     let mut flips = 0;
     let (mut agree, mut agree_oracle, mut nll) = (0usize, 0usize, 0f64);
@@ -236,4 +249,44 @@ fn cpu_gate(bundle: &std::path::Path, ids: &[usize], layers: usize, gold: &Golde
     println!("head: top-1 agrees with the oracle's at {agree_oracle}/{}; with the text {:.3} (oracle {:.3}); NLL {:.4} (oracle {:.4}); picks differ {flips}", n - FIRST_POS, agree as f64 / scored, meta["top1_agreement"].as_f64().unwrap_or(f64::NAN), nll / scored, meta["nll"].as_f64().unwrap_or(f64::NAN));
     report.print();
     std::process::exit(if report.failures() > 0 { 1 } else { 0 });
+}
+
+/// Routed experts in f32 arithmetic with f32 activations (the oracle's recipe), from whatever
+/// `get(l, e)` returns: `(gate_up [2·D_FF][H], down [H][D_FF])` widened.
+struct F32Experts<'a> {
+    get: Box<dyn Fn(usize, usize) -> (Vec<f32>, Vec<f32>) + 'a>,
+}
+impl glm_5_3_flash::ffn::Routed for F32Experts<'_> {
+    fn run(&mut self, l: usize, idx: &[usize; TOP_K], x: &[f32], out: &mut [f32]) {
+        let mut act = vec![0f32; D_FF];
+        for k in 0..TOP_K {
+            let (gu, dn) = (self.get)(l, idx[k]);
+            let g = matmul_serial(&gu, 2 * D_FF, H, x, 1);
+            for i in 0..D_FF {
+                act[i] = common::swiglu::silu(g[i].min(SWIGLU_LIMIT)) * g[D_FF + i].clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT);
+            }
+            out[k * H..(k + 1) * H].copy_from_slice(&matmul_serial(&dn, H, D_FF, &act, 1));
+        }
+    }
+}
+
+/// One `q4g128` record's weights back to f32: integer × scale, the oracle's dequantized INT4.
+fn dequant_record(rec: &[u8]) -> (Vec<f32>, Vec<f32>) {
+    use common::q4::{self, GROUP};
+    use glm_5_3_flash::layout::{DOWN_W, GATE_UP_S, GATE_UP_W};
+    let f32s = |b: &[u8]| -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect() };
+    let (guw, rest) = rec.split_at(GATE_UP_W);
+    let (gus, rest) = rest.split_at(4 * GATE_UP_S);
+    let (dw, dsb) = rest.split_at(DOWN_W);
+    let (gus, ds) = (f32s(gus), f32s(dsb));
+    let expand = |m: usize, k: usize, w: &[u8], s: &[f32]| -> Vec<f32> {
+        let mut out = vec![0f32; m * k];
+        for r in 0..m {
+            for kk in 0..k {
+                out[r * k + kk] = q4::unpack(k, w, r, kk) as f32 * s[q4::scale_index(k, r, kk / GROUP)];
+            }
+        }
+        out
+    };
+    (expand(2 * D_FF, H, guw, &gus), expand(H, D_FF, dw, &ds))
 }
