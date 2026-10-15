@@ -111,11 +111,13 @@ fn best(iters: usize, mut f: impl FnMut()) -> f64 {
     b
 }
 
-/// The GEMV kernels over a DRAM-resident matrix: GB/s of weights streamed, one core and the pool.
+/// The GEMV kernels over a DRAM-resident matrix (1 GB of bf16, interleaved over the nodes
+/// as the loader places weights): GB/s of weights streamed, one core and the pool.
 fn gemv_rates(pool: &Threads, iters: usize) -> String {
     use common::pool::{Pool, Serial};
-    const M: usize = 8192;
+    const M: usize = 131072;
     const K: usize = 4096;
+    interleave(true);
     let w16: Vec<u16> = (0..M * K).map(|i| ((i * 2654435761) >> 7) as u16 & 0x3fff).collect();
     let w8: Vec<u8> = (0..M * K).map(|i| ((i * 2654435761) >> 11) as u8 & 0x7e).collect();
     let s8: Vec<f32> = vec![1e-3; M.div_ceil(128) * (K / 128)];
@@ -128,6 +130,7 @@ fn gemv_rates(pool: &Threads, iters: usize) -> String {
     // INT4 as the experts' records pack it: tiles of four rows, a scale per group
     let (q, sc): (Vec<i8>, Vec<f32>) = ((0..M * K).map(|i| ((i * 2654435761) >> 9) as i8 % 8).collect(), vec![1e-3; M * K / 128]);
     let (pw, ps) = common::q4::pack(M, K, &q, &sc);
+    interleave(false);
     let (mut xq, mut xs, mut xg) = (vec![0i8; K], vec![0f32; K / 128], vec![0i32; K / 128]);
     common::q4::QAct { q: &mut xq, scale: &mut xs, gsum: &mut xg }.quantize(&x);
     let act = common::q4::Act { q: &xq, scale: &xs, gsum: &xg };
