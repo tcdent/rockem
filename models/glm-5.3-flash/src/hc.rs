@@ -31,16 +31,24 @@ pub fn sigmoid(x: f32) -> f32 {
 /// `streams: [HC][H]` → the collapsed block input `x: [H]` and the mix.
 #[inline(always)]
 pub fn pre(w: &weights::Hc, streams: &[f32], s: &mut Scratch, pool: &dyn Pool, x: &mut [f32]) -> Mix {
-    let n = HC * H;
-    let mut ss = 0f32;
-    for &v in &streams[..n] {
-        ss += v * v;
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        avx2::norm_flat(streams.as_ptr(), s.flat.as_mut_ptr())
     }
-    let r = 1.0 / sqrt(ss / n as f32 + RMS_NORM_EPS);
-    for i in 0..n {
-        s.flat[i] = streams[i] * r;
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let n = HC * H;
+        let mut ss = 0f32;
+        for &v in &streams[..n] {
+            ss += v * v;
+        }
+        let r = 1.0 / sqrt(ss / n as f32 + RMS_NORM_EPS);
+        for i in 0..n {
+            s.flat[i] = streams[i] * r;
+        }
     }
-    gemv::bf16_par::<HC_COEFS, { HC * H }>(w.fn_, s.flat, s.coef, pool);
+    // 24 rows of 40 KB: a core each
+    gemv::bf16_par_r::<HC_COEFS, { HC * H }, 1>(w.fn_, s.flat, s.coef, pool);
     let c = &*s.coef;
     let mut pre = [0f32; HC];
     let mut mix = Mix { post: [0.0; HC], comb: [[0.0; HC]; HC] };
@@ -94,6 +102,11 @@ pub fn pre(w: &weights::Hc, streams: &[f32], s: &mut Scratch, pool: &dyn Pool, x
         }
         cols(cb);
     }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        avx2::collapse(&pre, streams.as_ptr(), x.as_mut_ptr())
+    }
+    #[cfg(not(target_arch = "x86_64"))]
     for d in 0..H {
         let mut acc = 0f32;
         for i in 0..HC {
@@ -108,6 +121,11 @@ pub fn pre(w: &weights::Hc, streams: &[f32], s: &mut Scratch, pool: &dyn Pool, x
 /// its four inputs before writing its four outputs.
 #[inline(always)]
 pub fn post(mix: &Mix, y: &[f32], streams: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        avx2::post(mix, y.as_ptr(), streams.as_mut_ptr())
+    }
+    #[cfg(not(target_arch = "x86_64"))]
     for d in 0..H {
         let mut res = [0f32; HC];
         for i in 0..HC {
@@ -119,6 +137,73 @@ pub fn post(mix: &Mix, y: &[f32], streams: &mut [f32]) {
                 acc += mix.comb[i][j] * res[i];
             }
             streams[j * H + d] = mix.post[j] * y[d] + acc;
+        }
+    }
+}
+
+/// The stream-wide loops eight floats at a time; the per-element products and
+/// sums in the scalar form's order (multiply, then add), so the results match it.
+#[cfg(target_arch = "x86_64")]
+mod avx2 {
+    use super::*;
+    use core::arch::x86_64::*;
+    const N: usize = HC * H;
+    const _: () = assert!(N % 32 == 0 && H % 8 == 0);
+
+    /// `flat = streams · r`, `r` the rms-norm scale over every stream's every channel.
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn norm_flat(streams: *const f32, flat: *mut f32) {
+        let (mut a0, mut a1, mut a2, mut a3) = (_mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps());
+        let mut i = 0;
+        while i < N {
+            let (v0, v1, v2, v3) = (_mm256_loadu_ps(streams.add(i)), _mm256_loadu_ps(streams.add(i + 8)), _mm256_loadu_ps(streams.add(i + 16)), _mm256_loadu_ps(streams.add(i + 24)));
+            a0 = _mm256_fmadd_ps(v0, v0, a0);
+            a1 = _mm256_fmadd_ps(v1, v1, a1);
+            a2 = _mm256_fmadd_ps(v2, v2, a2);
+            a3 = _mm256_fmadd_ps(v3, v3, a3);
+            i += 32;
+        }
+        let ss = gemv::avx2::hsum(_mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3)));
+        let r = _mm256_set1_ps(1.0 / sqrt(ss / N as f32 + RMS_NORM_EPS));
+        let mut i = 0;
+        while i < N {
+            _mm256_storeu_ps(flat.add(i), _mm256_mul_ps(_mm256_loadu_ps(streams.add(i)), r));
+            i += 8;
+        }
+    }
+
+    /// `x[d] = Σ_i pre[i] · streams[i][d]`.
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn collapse(pre: &[f32; HC], streams: *const f32, x: *mut f32) {
+        let p: [__m256; HC] = core::array::from_fn(|i| _mm256_set1_ps(pre[i]));
+        let mut d = 0;
+        while d < H {
+            let mut acc = _mm256_setzero_ps();
+            for i in 0..HC {
+                acc = _mm256_add_ps(acc, _mm256_mul_ps(p[i], _mm256_loadu_ps(streams.add(i * H + d))));
+            }
+            _mm256_storeu_ps(x.add(d), acc);
+            d += 8;
+        }
+    }
+
+    /// `stream_j = post_j · y + Σ_i comb_ij · stream_i`, eight channels at a time.
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn post(mix: &Mix, y: *const f32, streams: *mut f32) {
+        let comb: [[__m256; HC]; HC] = core::array::from_fn(|i| core::array::from_fn(|j| _mm256_set1_ps(mix.comb[i][j])));
+        let post: [__m256; HC] = core::array::from_fn(|j| _mm256_set1_ps(mix.post[j]));
+        let mut d = 0;
+        while d < H {
+            let res: [__m256; HC] = core::array::from_fn(|i| _mm256_loadu_ps(streams.add(i * H + d)));
+            let yv = _mm256_loadu_ps(y.add(d));
+            for j in 0..HC {
+                let mut acc = _mm256_setzero_ps();
+                for i in 0..HC {
+                    acc = _mm256_add_ps(acc, _mm256_mul_ps(comb[i][j], res[i]));
+                }
+                _mm256_storeu_ps(streams.add(j * H + d), _mm256_add_ps(_mm256_mul_ps(post[j], yv), acc));
+            }
+            d += 8;
         }
     }
 }

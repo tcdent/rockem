@@ -50,10 +50,17 @@ pub fn bf16<const M: usize, const K: usize>(w: &[u16], x: &[f32], out: &mut [f32
 /// writes its own rows of `out`, so the result is the serial one exactly.
 #[inline(always)]
 pub fn bf16_par<const M: usize, const K: usize>(w: &[u16], x: &[f32], out: &mut [f32], pool: &dyn super::pool::Pool) {
+    bf16_par_r::<M, K, { super::pool::ROWS }>(w, x, out, pool)
+}
+
+/// `bf16_par` with `R` rows an item: for a few very wide rows (the
+/// hyper-connections' 24 rows of 40 KB), one row an item puts a core on each.
+#[inline(always)]
+pub fn bf16_par_r<const M: usize, const K: usize, const R: usize>(w: &[u16], x: &[f32], out: &mut [f32], pool: &dyn super::pool::Pool) {
     debug_assert!(w.len() >= M * K && x.len() >= K && out.len() >= M);
     let (wp, xp, op) = (w.as_ptr() as usize, x.as_ptr() as usize, out.as_mut_ptr() as usize);
-    pool.run_at(M.div_ceil(super::pool::ROWS), &move |i| (wp + i * super::pool::ROWS * K * 2) as *const u8, &move |i| {
-        let (m0, m1) = (i * super::pool::ROWS, ((i + 1) * super::pool::ROWS).min(M));
+    pool.run_at(M.div_ceil(R), &move |i| (wp + i * R * K * 2) as *const u8, &move |i| {
+        let (m0, m1) = (i * R, ((i + 1) * R).min(M));
         #[cfg(target_arch = "x86_64")]
         unsafe {
             avx2::bf16_rows::<K>(wp as *const u16, xp as *const f32, op as *mut f32, m0, m1)
@@ -76,6 +83,17 @@ pub fn e4m3(b: u8) -> f32 {
         return if s == 1 { -v } else { v };
     }
     f32::from_bits((s << 31) | ((e + 120) << 23) | (m << 20))
+}
+
+/// `e4m3` without a branch, for the card: a subnormal is built one binade up
+/// (`2⁻⁶ · (1 + m/8)`) and its leading `2⁻⁶` taken back, which is `m · 2⁻⁹`
+/// exactly; the sign goes on last. Bit-identical to `e4m3`.
+#[inline(always)]
+pub fn e4m3_sel(b: u8) -> f32 {
+    let (s, e, m) = ((b as u32) >> 7, ((b as u32) >> 3) & 0xf, (b as u32) & 7);
+    let z = (e == 0) as u32;
+    let v = f32::from_bits(((e + 120 + z) << 23) | (m << 20)) - z as f32 * 0.015625;
+    f32::from_bits(v.to_bits() | (s << 31))
 }
 
 /// Side of the FP8 scale blocks.
@@ -230,6 +248,16 @@ pub mod avx2 {
 mod tests {
     use super::*;
     use std::vec::Vec;
+
+    #[test]
+    fn e4m3_sel_matches() {
+        for b in 0..=255u8 {
+            if b & 0x7f == 0x7f {
+                continue; // NaN, never a weight
+            }
+            assert_eq!(e4m3(b).to_bits(), e4m3_sel(b).to_bits(), "{b:#x}");
+        }
+    }
 
     #[test]
     #[cfg(target_arch = "x86_64")]
@@ -434,6 +462,85 @@ pub mod gfx11 {
         }
     }
 
+    /// A rows kernel's weight format: a row of a `[m][K]` matrix, and a lane's
+    /// eight weights of one of its steps against each token's staged activations.
+    pub trait Rows<const K: usize>: Copy {
+        type Row: Copy;
+        unsafe fn row(self, row: usize) -> Self::Row;
+        unsafe fn step<const NP: usize>(lane: u32, r: Self::Row, s: usize, slab: *const f32, acc: &mut [f32; PASS]);
+    }
+    /// bf16 rows: `bf16_row_step`.
+    #[derive(Clone, Copy)]
+    pub struct Bf16(pub *const u16);
+    impl<const K: usize> Rows<K> for Bf16 {
+        type Row = *const u16;
+        #[inline(always)]
+        unsafe fn row(self, row: usize) -> *const u16 {
+            self.0.add(row * K)
+        }
+        #[inline(always)]
+        unsafe fn step<const NP: usize>(lane: u32, r: *const u16, s: usize, slab: *const f32, acc: &mut [f32; PASS]) {
+            bf16_row_step::<K, NP>(lane, r, s, slab, acc)
+        }
+    }
+    /// FP8 e4m3 rows with an f32 scale per `FP8_BLOCK`-square block (`super::fp8`'s
+    /// layout): a row is its bytes and its block row of scales.
+    #[derive(Clone, Copy)]
+    pub struct Fp8 {
+        pub w: *const u8,
+        pub s: *const f32,
+    }
+    impl<const K: usize> Rows<K> for Fp8 {
+        type Row = (*const u8, *const f32);
+        #[inline(always)]
+        unsafe fn row(self, row: usize) -> (*const u8, *const f32) {
+            const { assert!(K % super::FP8_BLOCK == 0) };
+            (self.w.add(row * K), self.s.add(row / super::FP8_BLOCK * (K / super::FP8_BLOCK)))
+        }
+        #[inline(always)]
+        unsafe fn step<const NP: usize>(lane: u32, r: (*const u8, *const f32), s: usize, slab: *const f32, acc: &mut [f32; PASS]) {
+            fp8_row_step::<K, NP>(lane, r.0, r.1, s, slab, acc)
+        }
+    }
+
+    /// `bf16_row_step` for FP8 rows: the lane's eight bytes of step `s` decoded
+    /// (`super::e4m3`) and scaled by their block's scale once, then the same
+    /// products in the same order per token. A lane's eight elements lie in
+    /// one block (`FP8_BLOCK` is a multiple of 8). The block scale is folded
+    /// into the weights here, where the CPU's `fp8` applies it to each block's
+    /// sum: the two differ by rounding, not by value.
+    #[inline(always)]
+    pub unsafe fn fp8_row_step<const K: usize, const NP: usize>(lane: u32, w: *const u8, sc: *const f32, s: usize, slab: *const f32, acc: &mut [f32; PASS]) {
+        const { assert!(K % 8 == 0 && NP <= PASS && super::FP8_BLOCK % 8 == 0) };
+        let l = lane as usize;
+        let base = s * 256 + l * 8;
+        if base < K {
+            let q = core::ptr::read_unaligned(w.add(base) as *const u64);
+            let scale = *sc.add(base / super::FP8_BLOCK);
+            // four weights at a time: eight decoded at once spilled a register (2026-10-15)
+            let mut h = 0;
+            while h < 2 {
+                let mut wv = [0f32; 4];
+                let mut j = 0;
+                while j < 4 {
+                    wv[j] = super::e4m3_sel((q >> (8 * (4 * h + j))) as u8) * scale;
+                    j += 1;
+                }
+                let mut i = 0;
+                while i < NP {
+                    let x = slab.add(i * STEP + l * STRIDE + 4 * h);
+                    let mut j = 0;
+                    while j < 4 {
+                        acc[i] += wv[j] * *x.add(j);
+                        j += 1;
+                    }
+                    i += 1;
+                }
+                h += 1;
+            }
+        }
+    }
+
     /// The rows kernel skeleton: the workgroup's 8 rows (a wave each) of a
     /// `[m][K]` bf16 matrix over `n` activations, a pass of PASS tokens at a
     /// time, each pass staged a round of steps at a time from `stage(token,
@@ -459,13 +566,18 @@ pub mod gfx11 {
     /// weights: +12 µs a launch).
     #[inline(always)]
     pub unsafe fn rows_over<const K: usize, const NORM: bool>(tid: u32, w: *const u16, ln: *const u16, m: usize, n: usize, eps: f32, stage: impl Fn(usize, usize) -> f32, ready: impl Fn(), emit: impl Fn(usize, usize, f32)) {
+        rows_fmt::<K, NORM, Bf16>(tid, Bf16(w), ln, m, n, eps, stage, ready, emit)
+    }
+    /// `rows_over` for any weight format `F` (`Bf16`, `Fp8`).
+    #[inline(always)]
+    pub unsafe fn rows_fmt<const K: usize, const NORM: bool, F: Rows<K>>(tid: u32, w: F, ln: *const u16, m: usize, n: usize, eps: f32, stage: impl Fn(usize, usize) -> f32, ready: impl Fn(), emit: impl Fn(usize, usize, f32)) {
         let mut p0 = 0;
         while p0 < n {
             let np = if n - p0 < PASS { n - p0 } else { PASS };
             // the pass runs at a constant width so its token loop has nothing predicated
             match width(np) {
-                1 => rows_pass::<K, 1, NORM>(tid, w, ln, m, p0, np, eps, &stage, &ready, &emit),
-                _ => rows_pass::<K, PASS, NORM>(tid, w, ln, m, p0, np, eps, &stage, &ready, &emit),
+                1 => rows_pass::<K, 1, NORM, F>(tid, w, ln, m, p0, np, eps, &stage, &ready, &emit),
+                _ => rows_pass::<K, PASS, NORM, F>(tid, w, ln, m, p0, np, eps, &stage, &ready, &emit),
             }
             p0 += PASS;
         }
@@ -508,8 +620,8 @@ pub mod gfx11 {
     /// One pass of `np` tokens (from `p0`) at width `NP`: rounds of staged
     /// steps, the row sums, the emits for the `np` real tokens.
     #[inline(always)]
-    unsafe fn rows_pass<const K: usize, const NP: usize, const NORM: bool>(tid: u32, w: *const u16, ln: *const u16, m: usize, p0: usize, np: usize, eps: f32, stage: &impl Fn(usize, usize) -> f32, ready: &impl Fn(), emit: &impl Fn(usize, usize, f32)) {
-        const { assert!(K.div_ceil(256) * 4 * 256 <= 60 * 1024) };
+    unsafe fn rows_pass<const K: usize, const NP: usize, const NORM: bool, F: Rows<K>>(tid: u32, w: F, ln: *const u16, m: usize, p0: usize, np: usize, eps: f32, stage: &impl Fn(usize, usize) -> f32, ready: &impl Fn(), emit: &impl Fn(usize, usize, f32)) {
+        const { assert!((slab_floats(K, NP) + 8 * PASS) * 4 <= 60 * 1024) };
         let (lane, wave) = (tid % 32, (tid / 32) as usize);
         let slab: *mut f32 = crate::gfx11::lds();
         let red = slab.add(slab_floats(K, NP)); // 8 wave partials per token, the norm's
@@ -519,7 +631,7 @@ pub mod gfx11 {
         let mut acc = [0f32; PASS];
         let mut ss = [0f32; PASS];
         let live = row < m;
-        let wr = w.add(row * K);
+        let wr = w.row(row);
         // full rounds carry no guards, so their loads hoist; one guarded round takes the tail
         let mut s0 = 0;
         while s0 + r <= steps {
@@ -532,7 +644,7 @@ pub mod gfx11 {
             if live {
                 let mut k = 0;
                 while k < r {
-                    bf16_row_step::<K, NP>(lane, wr, s0 + k, slab.add(k * NP * STEP), &mut acc);
+                    F::step::<NP>(lane, wr, s0 + k, slab.add(k * NP * STEP), &mut acc);
                     k += 1;
                 }
             }
@@ -551,7 +663,7 @@ pub mod gfx11 {
             if live {
                 let mut k = 0;
                 while k < tail {
-                    bf16_row_step::<K, NP>(lane, wr, s0 + k, slab.add(k * NP * STEP), &mut acc);
+                    F::step::<NP>(lane, wr, s0 + k, slab.add(k * NP * STEP), &mut acc);
                     k += 1;
                 }
             }
