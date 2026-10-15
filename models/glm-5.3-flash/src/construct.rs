@@ -37,8 +37,10 @@ pub struct Threads {
     shared: std::sync::Arc<Shared>,
     /// The job before the current one, freed at the next publish.
     retired: std::sync::atomic::AtomicPtr<Job>,
-    /// The node of the calling thread's core.
-    node: usize,
+    /// The slot order the calling thread drains (`slot_order`).
+    order: Vec<usize>,
+    /// The CCDs of each node, as global CCD indices.
+    node_ccds: Vec<Vec<usize>>,
     /// The placed regions: base, length, the node of each `PAGE` of it.
     placed: std::sync::Mutex<Vec<(usize, usize, Vec<u8>)>>,
     /// Called by the calling thread between its own items of a run while set (`tick`): the
@@ -51,12 +53,17 @@ unsafe impl Send for Tick {}
 /// The grain of placement: a region's node is known per 2 MiB page.
 pub const PAGE: usize = 2 << 20;
 const MAX_NODES: usize = 8;
+const MAX_CCDS: usize = 16;
+/// A job's items sit in slots: slot `c < MAX_CCDS` is CCD `c`'s (an item with a
+/// preferred core complex), slot `MAX_CCDS + d` is node `d`'s (an item placed by its
+/// rows' node only, or every item when nothing is placed).
+const SLOTS: usize = MAX_CCDS + MAX_NODES;
 struct Job {
     f: *const (dyn Fn(usize) + Sync),
-    /// The items in node order: node `d`'s are `order[start[d]..start[d + 1]]`.
+    /// The items in slot order: slot `s`'s are `order[start[s]..start[s + 1]]`.
     order: Vec<u32>,
-    start: [usize; MAX_NODES + 1],
-    next: [Counter; MAX_NODES],
+    start: [usize; SLOTS + 1],
+    next: [Counter; SLOTS],
     done: Counter,
 }
 /// A counter on its own cache line: a node's cores share its `next`, nothing else bounces with it.
@@ -95,17 +102,29 @@ fn wait_on(job: &std::sync::atomic::AtomicPtr<Job>, seen: *mut Job) {
     }
 }
 
+/// The slots a thread on CCD `ccd` of node `node` drains, in order: its own CCD's, its node's,
+/// its node's other CCDs', then the other nodes' (their node slot, then their CCDs').
+fn slot_order(node: usize, ccd: usize, node_ccds: &[Vec<usize>]) -> Vec<usize> {
+    let mut o = vec![ccd, MAX_CCDS + node];
+    o.extend(node_ccds[node].iter().filter(|&&c| c != ccd));
+    for d in (0..MAX_NODES).filter(|&d| d != node) {
+        o.push(MAX_CCDS + d);
+        if let Some(cs) = node_ccds.get(d) {
+            o.extend(cs.iter().copied());
+        }
+    }
+    o
+}
 /// `work` with `tick` called between items.
-unsafe fn work_ticking(job: *const Job, node: usize, tick: &dyn Fn()) {
+unsafe fn work_ticking(job: *const Job, order: &[usize], tick: &dyn Fn()) {
     let j = &*job;
     let f = &*j.f;
     let mut mine = 0;
-    for k in 0..MAX_NODES {
-        let d = (node + k) % MAX_NODES;
+    for &s in order {
         loop {
             tick();
-            let i = j.next[d].0.fetch_add(1, Ordering::AcqRel);
-            if i >= j.start[d + 1] {
+            let i = j.next[s].0.fetch_add(1, Ordering::AcqRel);
+            if i >= j.start[s + 1] {
                 break;
             }
             f(j.order[i] as usize);
@@ -117,17 +136,16 @@ unsafe fn work_ticking(job: *const Job, node: usize, tick: &dyn Fn()) {
     }
 }
 
-/// Every item of `job` this thread can claim: its own node's in order, then the other
-/// nodes'; the completions counted once, at the end.
-unsafe fn work(job: *const Job, node: usize) {
+/// Every item of `job` this thread can claim, slot by slot in its order; the completions
+/// counted once, at the end.
+unsafe fn work(job: *const Job, order: &[usize]) {
     let j = &*job;
     let f = &*j.f;
     let mut mine = 0;
-    for k in 0..MAX_NODES {
-        let d = (node + k) % MAX_NODES;
+    for &s in order {
         loop {
-            let i = j.next[d].0.fetch_add(1, Ordering::AcqRel);
-            if i >= j.start[d + 1] {
+            let i = j.next[s].0.fetch_add(1, Ordering::AcqRel);
+            if i >= j.start[s + 1] {
                 break;
             }
             f(j.order[i] as usize);
@@ -143,10 +161,23 @@ impl Threads {
     pub fn new(cores: &[usize]) -> Self {
         assert!(!cores.is_empty());
         pin(cores[0]);
+        // the core complexes: cores sharing an L3, numbered by their first core, grouped by node
+        let mut ccd_keys: Vec<usize> = cores.iter().map(|&c| ccd_key(c)).collect();
+        ccd_keys.sort_unstable();
+        ccd_keys.dedup();
+        assert!(ccd_keys.len() <= MAX_CCDS, "{} core complexes", ccd_keys.len());
+        let ccd_of = |core: usize| ccd_keys.iter().position(|&k| k == ccd_key(core)).unwrap();
+        let mut node_ccds: Vec<Vec<usize>> = vec![Vec::new(); MAX_NODES];
+        for &c in cores {
+            let (d, cc) = (node_of_core(c), ccd_of(c));
+            if !node_ccds[d].contains(&cc) {
+                node_ccds[d].push(cc);
+            }
+        }
         let shared = std::sync::Arc::new(Shared { job: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()), active: AtomicUsize::new(0), busy: std::sync::atomic::AtomicBool::new(false), quit: std::sync::atomic::AtomicBool::new(false) });
         for &core in &cores[1..] {
             let sh = shared.clone();
-            let node = node_of_core(core);
+            let order = slot_order(node_of_core(core), ccd_of(core), &node_ccds);
             std::thread::spawn(move || {
                 pin(core);
                 let mut seen: *mut Job = std::ptr::null_mut();
@@ -167,13 +198,14 @@ impl Threads {
                     let job = sh.job.load(Ordering::Acquire);
                     seen = job;
                     if !job.is_null() {
-                        unsafe { work(job, node) };
+                        unsafe { work(job, &order) };
                     }
                     sh.active.fetch_sub(1, Ordering::AcqRel);
                 }
             });
         }
-        Threads { shared, retired: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()), node: node_of_core(cores[0]), placed: std::sync::Mutex::new(Vec::new()), tick: std::sync::Mutex::new(None) }
+        let order = slot_order(node_of_core(cores[0]), ccd_of(cores[0]), &node_ccds);
+        Threads { shared, retired: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()), order, node_ccds, placed: std::sync::Mutex::new(Vec::new()), tick: std::sync::Mutex::new(None) }
     }
     /// Tell the pool where a region's memory lives: `nodes[p]` is the node of its `p`th `PAGE`.
     pub fn place(&self, base: usize, len: usize, nodes: Vec<u8>) {
@@ -184,40 +216,46 @@ impl Threads {
     pub fn idle(&self) {
         self.shared.busy.store(false, Ordering::Relaxed);
     }
-    /// The items by node (a counting sort over the placement; every item is node 0's when nothing is placed or named), published, worked and waited for.
-    fn publish(&self, n: usize, at: Option<&(dyn Fn(usize) -> *const u8 + Sync)>, f: &(dyn Fn(usize) + Sync)) {
+    /// The items by slot (a counting sort over the placement: the node of each item's rows,
+    /// and its preferred CCD within that node when it names one; every item is node 0's when
+    /// nothing is placed or named), published, worked and waited for.
+    fn publish(&self, n: usize, at: Option<&(dyn Fn(usize) -> *const u8 + Sync)>, ccd: Option<&(dyn Fn(usize) -> usize + Sync)>, f: &(dyn Fn(usize) + Sync)) {
         if n <= 1 {
             for i in 0..n {
                 f(i);
             }
             return;
         }
-        let mut start = [0usize; MAX_NODES + 1];
+        let mut start = [0usize; SLOTS + 1];
         let mut order = vec![0u32; n];
-        let mut item_node = Vec::new();
+        let mut item_slot = Vec::new();
         if let Some(at) = at {
             let placed = self.placed.lock().unwrap();
             if !placed.is_empty() {
-                item_node = (0..n)
+                item_slot = (0..n)
                     .map(|i| {
                         let p = at(i) as usize;
-                        placed.iter().find(|(base, len, _)| p >= *base && p < base + len).map_or(0, |(base, _, nodes)| nodes[(p - base) / PAGE])
+                        let d = placed.iter().find(|(base, len, _)| p >= *base && p < base + len).map_or(0, |(base, _, nodes)| nodes[(p - base) / PAGE] as usize);
+                        match ccd {
+                            Some(c) if !self.node_ccds[d].is_empty() => self.node_ccds[d][c(i) % self.node_ccds[d].len()] as u8,
+                            _ => (MAX_CCDS + d) as u8,
+                        }
                     })
                     .collect();
             }
         }
-        let node_of = |i: usize| item_node.get(i).map_or(0, |&d| d as usize);
+        let slot_of = |i: usize| item_slot.get(i).map_or(MAX_CCDS, |&s| s as usize);
         for i in 0..n {
-            start[node_of(i) + 1] += 1;
+            start[slot_of(i) + 1] += 1;
         }
-        for d in 0..MAX_NODES {
-            start[d + 1] += start[d];
+        for s in 0..SLOTS {
+            start[s + 1] += start[s];
         }
         let mut fill = start;
         for i in 0..n {
-            let d = node_of(i);
-            order[fill[d]] = i as u32;
-            fill[d] += 1;
+            let s = slot_of(i);
+            order[fill[s]] = i as u32;
+            fill[s] += 1;
         }
         let sh = &*self.shared;
         sh.busy.store(true, Ordering::Relaxed);
@@ -226,7 +264,7 @@ impl Threads {
         }
         // no worker is inside any job: the one retired at the last publish can go
         let fp: *const (dyn Fn(usize) + Sync) = unsafe { std::mem::transmute(f) };
-        let job = Box::into_raw(Box::new(Job { f: fp, order, next: std::array::from_fn(|d| Counter(AtomicUsize::new(start[d]))), start, done: Counter(AtomicUsize::new(0)) }));
+        let job = Box::into_raw(Box::new(Job { f: fp, order, next: std::array::from_fn(|s| Counter(AtomicUsize::new(start[s]))), start, done: Counter(AtomicUsize::new(0)) }));
         let old = sh.job.swap(job, Ordering::AcqRel);
         let older = self.retired.swap(old, Ordering::AcqRel);
         if !older.is_null() {
@@ -234,8 +272,8 @@ impl Threads {
         }
         let tick = *self.tick.lock().unwrap();
         match tick {
-            Some(t) => unsafe { work_ticking(job, self.node, &*t.0) },
-            None => unsafe { work(job, self.node) },
+            Some(t) => unsafe { work_ticking(job, &self.order, &*t.0) },
+            None => unsafe { work(job, &self.order) },
         }
         while unsafe { (*job).done.0.load(Ordering::Acquire) } != n {
             if let Some(t) = tick {
@@ -252,15 +290,23 @@ impl Drop for Threads {
 }
 impl Pool for Threads {
     fn run(&self, n: usize, f: &(dyn Fn(usize) + Sync)) {
-        self.publish(n, None, f)
+        self.publish(n, None, None, f)
+    }
+    fn run_at_ccd(&self, n: usize, at: &(dyn Fn(usize) -> *const u8 + Sync), ccd: &(dyn Fn(usize) -> usize + Sync), f: &(dyn Fn(usize) + Sync)) {
+        self.publish(n, Some(at), Some(ccd), f)
     }
     fn tick(&self, f: Option<&dyn Fn()>) {
         // only the calling thread ever runs it, between its own items
         *self.tick.lock().unwrap() = f.map(|f| Tick(unsafe { std::mem::transmute::<&dyn Fn(), *const dyn Fn()>(f) }));
     }
     fn run_at(&self, n: usize, at: &(dyn Fn(usize) -> *const u8 + Sync), f: &(dyn Fn(usize) + Sync)) {
-        self.publish(n, Some(at), f)
+        self.publish(n, Some(at), None, f)
     }
+}
+
+/// A core's core complex, named by the first core sharing its L3 (from /sys; the core itself without the file).
+pub fn ccd_key(core: usize) -> usize {
+    std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{core}/cache/index3/shared_cpu_list")).ok().and_then(|s| s.trim().split([',', '-']).next().and_then(|v| v.parse().ok())).unwrap_or(core)
 }
 
 /// The NUMA node of a core, from /sys (0 where there is no NUMA).
@@ -345,7 +391,8 @@ impl Routed for CpuExperts<'_> {
             let (k, c) = (i / (D_FF / CHUNK), i % (D_FF / CHUNK));
             expert::Weights::from_record(&stream[layout::record(l, idx[k])]).gate_up_w[c * CHUNK / TILE * 2 * H..].as_ptr()
         };
-        self.pool.run_at(TOP_K * (D_FF / CHUNK), &gate_rows, &move |i| {
+        // a slice's core complex within its node: stable in (expert, slice), so a prefetch and the compute meet in one L3
+        self.pool.run_at_ccd(TOP_K * (D_FF / CHUNK), &gate_rows, &|i| i, &move |i| {
             let (k, c) = (i / (D_FF / CHUNK), i % (D_FF / CHUNK));
             let w = expert::Weights::from_record(&stream[layout::record(l, idx[k])]);
             let rows = |r0: usize| (&w.gate_up_w[r0 / TILE * 2 * H..(r0 + CHUNK) / TILE * 2 * H], &w.gate_up_s[r0 / TILE * (H / GROUP) * TILE..(r0 + CHUNK) / TILE * (H / GROUP) * TILE]);
@@ -363,7 +410,7 @@ impl Routed for CpuExperts<'_> {
             let (k, c) = (i / (H / DOWN_CHUNK), i % (H / DOWN_CHUNK));
             expert::Weights::from_record(&stream[layout::record(l, idx[k])]).down_w[c * DOWN_CHUNK / TILE * 2 * D_FF..].as_ptr()
         };
-        self.pool.run_at(TOP_K * (H / DOWN_CHUNK), &down_rows, &move |i| {
+        self.pool.run_at_ccd(TOP_K * (H / DOWN_CHUNK), &down_rows, &|i| i, &move |i| {
             let (k, c) = (i / (H / DOWN_CHUNK), i % (H / DOWN_CHUNK));
             let w = expert::Weights::from_record(&stream[layout::record(l, idx[k])]);
             let (mut hq, mut hs, mut hg) = ([0i8; D_FF], [0f32; D_FF / GROUP], [0i32; D_FF / GROUP]);
@@ -437,6 +484,10 @@ pub struct Profile {
     pub dense_ffn: f64,
     pub experts: f64,
     pub head: f64,
+    /// Over the MoE layers: how many of a layer's eight experts were also the previous token's at that layer
+    /// (the ceiling of a same-layer prefetch), and the layers counted.
+    pub reuse: usize,
+    pub moe_layers: usize,
 }
 impl Profile {
     /// One line of milliseconds a token, the phases in order and their sum.
@@ -445,7 +496,7 @@ impl Profile {
         let mla = self.mla_proj + self.mla_attn + self.mla_out;
         let rs = self.route + self.shared;
         let sum = self.hc + self.kda_card + self.kda_cpu + mla + self.dense_ffn + rs + self.experts + self.head;
-        format!("{} tokens: hc {:.1}  kda card {:.1}  kda cpu {:.1}  mla {:.1} (proj {:.1} attn {:.1} out {:.1})  dense ffn {:.1}  router+shared {:.1} (route {:.1} shared {:.1})  experts {:.1}  head {:.1}  = {:.1} ms a token", self.tokens, self.hc / n, self.kda_card / n, self.kda_cpu / n, mla / n, self.mla_proj / n, self.mla_attn / n, self.mla_out / n, self.dense_ffn / n, rs / n, self.route / n, self.shared / n, self.experts / n, self.head / n, sum / n)
+        format!("{} tokens: hc {:.1}  kda card {:.1}  kda cpu {:.1}  mla {:.1} (proj {:.1} attn {:.1} out {:.1})  dense ffn {:.1}  router+shared {:.1} (route {:.1} shared {:.1})  experts {:.1} (reused {:.2} of {} from the previous token)  head {:.1}  = {:.1} ms a token", self.tokens, self.hc / n, self.kda_card / n, self.kda_cpu / n, mla / n, self.mla_proj / n, self.mla_attn / n, self.mla_out / n, self.dense_ffn / n, rs / n, self.route / n, self.shared / n, self.experts / n, self.reuse as f64 / self.moe_layers.max(1) as f64, TOP_K, self.head / n, sum / n)
     }
 }
 
@@ -453,8 +504,10 @@ pub struct CpuModel<'p, R: Routed> {
     pub routed: R,
     pub pool: &'p dyn Pool,
     pub profile: Profile,
-    /// KDA layers that run elsewhere; `None` runs every layer here.
+    /// Blocks that run elsewhere; `None` runs every block here.
     pub placed: Option<Box<dyn Placed>>,
+    /// The previous token's expert picks by layer (`E` where none yet): the prefetch's predictor and its score.
+    pub last_picks: Vec<[usize; TOP_K]>,
     pub max_ctx: usize,
     pub layers: Vec<LayerState>,
     /// The last step's logits, `[VOCAB_SIZE]`.
@@ -506,6 +559,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             pool,
             profile: Profile::default(),
             placed: None,
+            last_picks: vec![[E; TOP_K]; NUM_HIDDEN_LAYERS],
             max_ctx,
             layers,
             logits: vec![0.0; VOCAB_SIZE],
@@ -715,10 +769,13 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     if let Some(b) = &beat {
                         s.pool.tick(Some(b));
                     }
-                    ffn::moe_routed(l, m, &s.xn, &mut fs, s.pool, &mut s.routed, forced.map(|f| &f[l - FIRST_K_DENSE_REPLACE]), tr, &mut s.y);
+                    let picks = ffn::moe_routed(l, m, &s.xn, &mut fs, s.pool, &mut s.routed, forced.map(|f| &f[l - FIRST_K_DENSE_REPLACE]), tr, &mut s.y);
                     if beat.is_some() {
                         s.pool.tick(None);
                     }
+                    p.reuse += picks.iter().filter(|e| s.last_picks[l].contains(e)).count();
+                    p.moe_layers += 1;
+                    s.last_picks[l] = picks;
                     let e = s.routed.elapsed();
                     p.experts += e;
                     lap(&mut p.route);

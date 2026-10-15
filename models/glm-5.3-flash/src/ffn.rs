@@ -95,7 +95,7 @@ pub fn route(l: usize, w: &weights::Moe, xn: &[f32], s: &mut Scratch, pool: &dyn
 /// The routed half of the MoE: the router's picks, the experts through
 /// `routed`, their weighted sum into `out`.
 #[inline(always)]
-pub fn moe_routed(l: usize, w: &weights::Moe, xn: &[f32], s: &mut Scratch, pool: &dyn Pool, routed: &mut impl Routed, forced: Option<&[usize; TOP_K]>, tr: &mut impl Trace, out: &mut [f32]) {
+pub fn moe_routed(l: usize, w: &weights::Moe, xn: &[f32], s: &mut Scratch, pool: &dyn Pool, routed: &mut impl Routed, forced: Option<&[usize; TOP_K]>, tr: &mut impl Trace, out: &mut [f32]) -> [usize; TOP_K] {
     let (idx, wt) = route(l, w, xn, s, pool, forced, tr);
     routed.run(l, &idx, xn, s.expert_out);
     for i in 0..H {
@@ -109,6 +109,7 @@ pub fn moe_routed(l: usize, w: &weights::Moe, xn: &[f32], s: &mut Scratch, pool:
         }
     }
     tr.edge(l, "routed", out);
+    idx
 }
 
 /// The shared expert on `xn`, into `s.shared`; the step adds it to the routed sum.

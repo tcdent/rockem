@@ -17,6 +17,14 @@ pub trait Pool: Sync {
         let _ = at;
         self.run(n, f)
     }
+    /// `run_at` with a preferred core complex (CCD) for each item within its rows' node:
+    /// `ccd(i)` is any stable number of the item (taken modulo the node's CCDs), so the
+    /// cores whose L3 prefetched an item's rows are the ones that stream them. The
+    /// default ignores the preference.
+    fn run_at_ccd(&self, n: usize, at: &(dyn Fn(usize) -> *const u8 + Sync), ccd: &(dyn Fn(usize) -> usize + Sync), f: &(dyn Fn(usize) + Sync)) {
+        let _ = ccd;
+        self.run_at(n, at, f)
+    }
     /// Run `f` between the calling thread's own items of the runs until `tick(None)`: a
     /// heartbeat for a device that must not fall asleep while the pool works. `f` must
     /// outlive those runs. A pool without a calling thread's loop ignores it.
