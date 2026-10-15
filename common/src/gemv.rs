@@ -345,6 +345,11 @@ pub const FLIGHT: usize = 8;
 /// Floats per staged token-step (`gfx11::STEP`): 32 lanes at a stride of 10.
 pub const STEP: usize = 320;
 
+/// What the host needs of the card's rows kernels: the FP8 decode table's size (floats of LDS).
+pub mod gfx11_lds {
+    pub const FP8_LDS: usize = 256;
+}
+
 #[cfg(target_arch = "amdgpu")]
 pub mod gfx11 {
     //! The bf16 GEMV row on gfx11: a wave reads one row in 512-byte
@@ -466,51 +471,66 @@ pub mod gfx11 {
     /// eight weights of one of its steps against each token's staged activations.
     pub trait Rows<const K: usize>: Copy {
         type Row: Copy;
+        /// Floats of LDS the format keeps past the skeleton's (a decode table), filled by `setup`.
+        const LDS: usize;
+        /// Once per workgroup, before the first round (the round's barrier publishes it).
+        unsafe fn setup(tid: u32, lds: *mut f32);
         unsafe fn row(self, row: usize) -> Self::Row;
-        unsafe fn step<const NP: usize>(lane: u32, r: Self::Row, s: usize, slab: *const f32, acc: &mut [f32; PASS]);
+        unsafe fn step<const NP: usize>(lane: u32, r: Self::Row, s: usize, slab: *const f32, lds: *const f32, acc: &mut [f32; PASS]);
     }
     /// bf16 rows: `bf16_row_step`.
     #[derive(Clone, Copy)]
     pub struct Bf16(pub *const u16);
     impl<const K: usize> Rows<K> for Bf16 {
         type Row = *const u16;
+        const LDS: usize = 0;
+        #[inline(always)]
+        unsafe fn setup(_: u32, _: *mut f32) {}
         #[inline(always)]
         unsafe fn row(self, row: usize) -> *const u16 {
             self.0.add(row * K)
         }
         #[inline(always)]
-        unsafe fn step<const NP: usize>(lane: u32, r: *const u16, s: usize, slab: *const f32, acc: &mut [f32; PASS]) {
+        unsafe fn step<const NP: usize>(lane: u32, r: *const u16, s: usize, slab: *const f32, _: *const f32, acc: &mut [f32; PASS]) {
             bf16_row_step::<K, NP>(lane, r, s, slab, acc)
         }
     }
     /// FP8 e4m3 rows with an f32 scale per `FP8_BLOCK`-square block (`super::fp8`'s
-    /// layout): a row is its bytes and its block row of scales.
+    /// layout): a row is its bytes and its block row of scales. The decode is a
+    /// 256-entry table in LDS (`FP8_LDS` floats): decoding in registers ran the rows
+    /// at 210–290 GB/s against bf16's 700 (2026-10-15).
     #[derive(Clone, Copy)]
     pub struct Fp8 {
         pub w: *const u8,
         pub s: *const f32,
     }
+    pub use super::gfx11_lds::FP8_LDS;
     impl<const K: usize> Rows<K> for Fp8 {
         type Row = (*const u8, *const f32);
+        const LDS: usize = FP8_LDS;
+        #[inline(always)]
+        unsafe fn setup(tid: u32, lds: *mut f32) {
+            *lds.add(tid as usize) = super::e4m3(tid as u8);
+        }
         #[inline(always)]
         unsafe fn row(self, row: usize) -> (*const u8, *const f32) {
             const { assert!(K % super::FP8_BLOCK == 0) };
             (self.w.add(row * K), self.s.add(row / super::FP8_BLOCK * (K / super::FP8_BLOCK)))
         }
         #[inline(always)]
-        unsafe fn step<const NP: usize>(lane: u32, r: (*const u8, *const f32), s: usize, slab: *const f32, acc: &mut [f32; PASS]) {
-            fp8_row_step::<K, NP>(lane, r.0, r.1, s, slab, acc)
+        unsafe fn step<const NP: usize>(lane: u32, r: (*const u8, *const f32), s: usize, slab: *const f32, lds: *const f32, acc: &mut [f32; PASS]) {
+            fp8_row_step::<K, NP>(lane, r.0, r.1, s, slab, lds, acc)
         }
     }
 
     /// `bf16_row_step` for FP8 rows: the lane's eight bytes of step `s` decoded
-    /// (`super::e4m3`) and scaled by their block's scale once, then the same
-    /// products in the same order per token. A lane's eight elements lie in
-    /// one block (`FP8_BLOCK` is a multiple of 8). The block scale is folded
-    /// into the weights here, where the CPU's `fp8` applies it to each block's
-    /// sum: the two differ by rounding, not by value.
+    /// through the table at `lut` and scaled by their block's scale once, then
+    /// the same products in the same order per token. A lane's eight elements
+    /// lie in one block (`FP8_BLOCK` is a multiple of 8). The block scale is
+    /// folded into the weights here, where the CPU's `fp8` applies it to each
+    /// block's sum: the two differ by rounding, not by value.
     #[inline(always)]
-    pub unsafe fn fp8_row_step<const K: usize, const NP: usize>(lane: u32, w: *const u8, sc: *const f32, s: usize, slab: *const f32, acc: &mut [f32; PASS]) {
+    pub unsafe fn fp8_row_step<const K: usize, const NP: usize>(lane: u32, w: *const u8, sc: *const f32, s: usize, slab: *const f32, lut: *const f32, acc: &mut [f32; PASS]) {
         const { assert!(K % 8 == 0 && NP <= PASS && super::FP8_BLOCK % 8 == 0) };
         let l = lane as usize;
         let base = s * 256 + l * 8;
@@ -523,7 +543,7 @@ pub mod gfx11 {
                 let mut wv = [0f32; 4];
                 let mut j = 0;
                 while j < 4 {
-                    wv[j] = super::e4m3_sel((q >> (8 * (4 * h + j))) as u8) * scale;
+                    wv[j] = *lut.add(((q >> (8 * (4 * h + j))) & 0xff) as usize) * scale;
                     j += 1;
                 }
                 let mut i = 0;
@@ -621,10 +641,12 @@ pub mod gfx11 {
     /// steps, the row sums, the emits for the `np` real tokens.
     #[inline(always)]
     unsafe fn rows_pass<const K: usize, const NP: usize, const NORM: bool, F: Rows<K>>(tid: u32, w: F, ln: *const u16, m: usize, p0: usize, np: usize, eps: f32, stage: &impl Fn(usize, usize) -> f32, ready: &impl Fn(), emit: &impl Fn(usize, usize, f32)) {
-        const { assert!((slab_floats(K, NP) + 8 * PASS) * 4 <= 60 * 1024) };
+        const { assert!((slab_floats(K, NP) + 8 * PASS + F::LDS) * 4 <= 60 * 1024) };
         let (lane, wave) = (tid % 32, (tid / 32) as usize);
         let slab: *mut f32 = crate::gfx11::lds();
         let red = slab.add(slab_floats(K, NP)); // 8 wave partials per token, the norm's
+        let fmt = red.add(8 * PASS); // the format's own (a decode table)
+        F::setup(tid, fmt);
         let row = core::arch::amdgpu::workgroup_id_x() as usize * 8 + wave;
         let steps = K.div_ceil(256);
         let r = round(NP, steps);
@@ -644,7 +666,7 @@ pub mod gfx11 {
             if live {
                 let mut k = 0;
                 while k < r {
-                    F::step::<NP>(lane, wr, s0 + k, slab.add(k * NP * STEP), &mut acc);
+                    F::step::<NP>(lane, wr, s0 + k, slab.add(k * NP * STEP), fmt, &mut acc);
                     k += 1;
                 }
             }
@@ -663,7 +685,7 @@ pub mod gfx11 {
             if live {
                 let mut k = 0;
                 while k < tail {
-                    F::step::<NP>(lane, wr, s0 + k, slab.add(k * NP * STEP), &mut acc);
+                    F::step::<NP>(lane, wr, s0 + k, slab.add(k * NP * STEP), fmt, &mut acc);
                     k += 1;
                 }
             }

@@ -27,8 +27,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// new job only when no worker is registered (`active`), and frees a job one
 /// generation after replacing it, so a worker that registered during the swap
 /// never reads freed memory. The pool has two states: busy — a step is in
-/// flight, and a worker between jobs spins, because the next job is
-/// microseconds away — and idle, entered by `idle()` when the node is about
+/// flight, and a worker between jobs waits on the job pointer's cache line
+/// with MWAITX (the core rests, and wakes within a microsecond of the next
+/// publish; 95 cores spinning through the card phases heated the package for
+/// nothing, 2026-10-15) — and idle, entered by `idle()` when the node is about
 /// to wait on the wire, in which a worker sleeps between looks. `run` makes
 /// the pool busy again.
 pub struct Threads {
@@ -68,6 +70,25 @@ fn pin(core: usize) {
     mask[core / 64] |= 1 << (core % 64);
     unsafe { sched_setaffinity(0, 128, mask.as_ptr()) };
 }
+/// Rest the core until a store lands on the line holding `job`, or ~30 µs pass:
+/// arm the monitor, re-check (a store between the check and the wait would be
+/// missed), then MWAITX in C1 with a cycle timeout. The x86-64 form; elsewhere a spin.
+#[inline(always)]
+fn wait_on(job: &std::sync::atomic::AtomicPtr<Job>, seen: *mut Job) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!("monitorx", in("rax") job as *const _ as *const u8, in("ecx") 0u32, in("edx") 0u32, options(nostack, preserves_flags));
+        if job.load(Ordering::Acquire) == seen {
+            core::arch::asm!("push rbx", "mov ebx, {t:e}", "mwaitx", "pop rbx", t = in(reg) 100_000u32, in("eax") 0u32, in("ecx") 2u32, options(nostack, preserves_flags));
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (job, seen);
+        std::hint::spin_loop();
+    }
+}
+
 /// Every item of `job` this thread can claim: its own node's in order, then the other
 /// nodes'; the completions counted once, at the end.
 unsafe fn work(job: *const Job, node: usize) {
@@ -107,7 +128,7 @@ impl Threads {
                             return;
                         }
                         if sh.busy.load(Ordering::Relaxed) {
-                            std::hint::spin_loop();
+                            wait_on(&sh.job, seen);
                         } else {
                             std::thread::sleep(std::time::Duration::from_micros(50));
                         }
@@ -365,9 +386,13 @@ pub struct Profile {
     pub hc: f64,
     pub kda_card: f64,
     pub kda_cpu: f64,
-    pub mla: f64,
+    /// The MoE's time but the experts': the router and the routed sum (`route`), the shared expert's finish (`shared`).
+    pub route: f64,
+    pub shared: f64,
+    pub mla_proj: f64,
+    pub mla_attn: f64,
+    pub mla_out: f64,
     pub dense_ffn: f64,
-    pub router_shared: f64,
     pub experts: f64,
     pub head: f64,
 }
@@ -375,8 +400,10 @@ impl Profile {
     /// One line of milliseconds a token, the phases in order and their sum.
     pub fn line(&self) -> String {
         let n = self.tokens.max(1) as f64 / 1e3;
-        let sum = self.hc + self.kda_card + self.kda_cpu + self.mla + self.dense_ffn + self.router_shared + self.experts + self.head;
-        format!("{} tokens: hc {:.1}  kda card {:.1}  kda cpu {:.1}  mla {:.1}  dense ffn {:.1}  router+shared {:.1}  experts {:.1}  head {:.1}  = {:.1} ms a token", self.tokens, self.hc / n, self.kda_card / n, self.kda_cpu / n, self.mla / n, self.dense_ffn / n, self.router_shared / n, self.experts / n, self.head / n, sum / n)
+        let mla = self.mla_proj + self.mla_attn + self.mla_out;
+        let rs = self.route + self.shared;
+        let sum = self.hc + self.kda_card + self.kda_cpu + mla + self.dense_ffn + rs + self.experts + self.head;
+        format!("{} tokens: hc {:.1}  kda card {:.1}  kda cpu {:.1}  mla {:.1} (proj {:.1} attn {:.1} out {:.1})  dense ffn {:.1}  router+shared {:.1} (route {:.1} shared {:.1})  experts {:.1}  head {:.1}  = {:.1} ms a token", self.tokens, self.hc / n, self.kda_card / n, self.kda_cpu / n, mla / n, self.mla_proj / n, self.mla_attn / n, self.mla_out / n, self.dense_ffn / n, rs / n, self.route / n, self.shared / n, self.experts / n, self.head / n, sum / n)
     }
 }
 
@@ -583,20 +610,23 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 }
                 (Attn::Mla(a), LayerState::Mla { cache, pools }) => {
                     let mut ms = mla::Scratch { qr: &mut s.m_qr, qa: &mut s.m_qa, q: &mut s.m_q, kva: &mut s.m_kva, ik: &mut s.m_ik, iq: &mut s.m_iq, iw: &mut s.m_iw, pscore: &mut s.m_pscore, sel: &mut s.m_sel, heads: &mut s.m_heads, hs: &mut s.m_hs };
-                    match s.placed.as_mut().filter(|p| p.mla(l)) {
-                        Some(pl) => {
-                            // the projections and the output projection on the card; the row, the selection and the attention here
-                            {
-                                let (latent, ikey, igate) = mla::row(cache, pos);
-                                pl.mla_project(l, &s.x, ms.q, ms.kva, ms.ik, igate, ms.iq, ms.iw);
-                                mla::finish_row(a, &ms, latent, ikey);
-                            }
-                            mla::attend(l, a, cache, pools, pos, &mut ms, s.pool, tr);
-                            pl.mla_output(l, ms.heads, &mut s.y);
+                    let mut placed_mla = s.placed.as_mut().filter(|p| p.mla(l));
+                    {
+                        let (latent, ikey, igate) = mla::row(cache, pos);
+                        match &mut placed_mla {
+                            Some(pl) => pl.mla_project(l, &s.x, ms.q, ms.kva, ms.ik, igate, ms.iq, ms.iw),
+                            None => mla::project(a, &s.xn, &mut ms, igate, s.pool),
                         }
-                        None => mla::step(l, a, &s.xn, cache, pools, pos, &mut ms, s.pool, tr, &mut s.y),
+                        mla::finish_row(a, &ms, latent, ikey);
                     }
-                    lap(&mut p.mla);
+                    lap(&mut p.mla_proj);
+                    mla::attend(l, a, cache, pools, pos, &mut ms, s.pool, tr);
+                    lap(&mut p.mla_attn);
+                    match placed_mla {
+                        Some(pl) => pl.mla_output(l, ms.heads, &mut s.y),
+                        None => mla::output(a, ms.heads, &mut s.y, s.pool),
+                    }
+                    lap(&mut p.mla_out);
                 }
                 _ => unreachable!("a layer's state and weights disagree"),
             }
@@ -628,6 +658,10 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                         p.ffn_start(l, &s.x);
                     }
                     ffn::moe_routed(l, m, &s.xn, &mut fs, s.pool, &mut s.routed, forced.map(|f| &f[l - FIRST_K_DENSE_REPLACE]), tr, &mut s.y);
+                    let e = s.routed.elapsed();
+                    p.experts += e;
+                    lap(&mut p.route);
+                    p.route -= e;
                     match placed {
                         Some(p) => p.ffn_finish(l, fs.shared),
                         None => ffn::moe_shared(m, &s.xn, &mut fs, s.pool),
@@ -636,10 +670,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     for i in 0..H {
                         s.y[i] += fs.shared[i];
                     }
-                    let e = s.routed.elapsed();
-                    p.experts += e;
-                    lap(&mut p.router_shared);
-                    p.router_shared -= e;
+                    lap(&mut p.shared);
                 }
             }
             tr.edge(l, "ffn_out", &s.y);

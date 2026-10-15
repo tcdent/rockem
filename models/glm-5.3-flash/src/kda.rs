@@ -160,8 +160,21 @@ pub mod gfx11_consts {
     pub const fn normed_rows_lds(k: usize, n: usize) -> usize {
         rows_lds(k, n) + 4 * 8 * common::gemv::PASS
     }
-    /// `kda_step`: a workgroup per head.
-    pub const STEP_GRID: u32 = KDA_HEADS as u32;
+    /// The FP8 rows kernels: the same, plus their decode table.
+    pub const fn fp8_rows_lds(k: usize, n: usize) -> usize {
+        normed_rows_lds(k, n) + 4 * common::gemv::gfx11_lds::FP8_LDS
+    }
+    /// `kda_step`: a workgroup per head of its part.
+    pub const STEP_GRID: u32 = (KDA_HEADS / PARTS) as u32;
+    /// A KDA layer splits by heads into this many parts, one card each where there are
+    /// two: each part projects its heads' q, k, v and gates, steps its heads, and takes its
+    /// heads' half of every output projection row; the host sums the parts' outputs.
+    pub const PARTS: usize = 2;
+    /// A part's heads and its share of the q, k, v (and normed) width.
+    pub const PART_HEADS: usize = KDA_HEADS / PARTS;
+    pub const PART_QKV: usize = KDA_QKV / PARTS;
+    /// `copy_f32`: words a workgroup copies.
+    pub const COPY_WG_WORDS: usize = 256 * 16;
     /// `kda_step`'s LDS, in floats: the head's conv outputs (q | k | v), the forget
     /// factors, two partials per value channel, and the reduction scratch.
     pub const CONV: usize = 0;
@@ -228,6 +241,35 @@ pub mod gfx11 {
         }
     }
 
+    /// `out[i][row] = W[row] · x[i]` for a `[m][PART_QKV]` bf16 matrix over `x: [n][PART_QKV]`: a
+    /// part's half of the output projection, over its heads' normed readouts. Grid: rows_grid(m).
+    #[no_mangle]
+    pub extern "gpu-kernel" fn rows_part(x: *const f32, w: *const u16, out: *mut f32, m: u32, n: u32) {
+        unsafe {
+            let tid = workitem_id_x();
+            let (m, n) = (m as usize, n as usize);
+            let t = tid as usize;
+            rows_over::<PART_QKV, false>(tid, w, core::ptr::null(), m, n, 0.0, |i, s| *x.add(i * PART_QKV + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
+        }
+    }
+
+    /// `dst[..n] = src[..n]`: a layer's state out to host memory for a snapshot (the host
+    /// reads its BAR at 10–30 MB/s). Grid: n.div_ceil(COPY_WG_WORDS).
+    #[no_mangle]
+    pub extern "gpu-kernel" fn copy_f32(src: *const f32, dst: *mut f32, n: u32) {
+        unsafe {
+            let base = workgroup_id_x() as usize * COPY_WG_WORDS + workitem_id_x() as usize;
+            let mut s = 0;
+            while s < COPY_WG_WORDS / 256 {
+                let i = base + s * 256;
+                if i < n as usize {
+                    *dst.add(i) = *src.add(i);
+                }
+                s += 1;
+            }
+        }
+    }
+
     #[inline(always)]
     fn sigmoid(x: f32) -> f32 {
         1.0 / (1.0 + exp(-x))
@@ -244,11 +286,11 @@ pub mod gfx11 {
     /// so a sweep's reduction over rows is 64 products in registers and one
     /// exchange of two partials per column. The sum order differs from the
     /// CPU's (two halves, then their sum), as the card's stream already does.
-    /// Grid: STEP_GRID; LDS: STEP_LDS.
+    /// Grid: STEP_GRID, over heads `head0..`; LDS: STEP_LDS.
     #[no_mangle]
-    pub extern "gpu-kernel" fn kda_step(mixed: *const f32, taps: *const u16, window: *mut f32, f: *const f32, dt_bias: *const f32, a_log: *const f32, beta: *const f32, gate: *const f32, mem: *mut f32, o_norm: *const f32, normed: *mut f32, n: u32) {
+    pub extern "gpu-kernel" fn kda_step(mixed: *const f32, taps: *const u16, window: *mut f32, f: *const f32, dt_bias: *const f32, a_log: *const f32, beta: *const f32, gate: *const f32, mem: *mut f32, o_norm: *const f32, normed: *mut f32, head0: u32, n: u32) {
         unsafe {
-            let h = workgroup_id_x() as usize;
+            let h = head0 as usize + workgroup_id_x() as usize;
             let tid = workitem_id_x();
             let t = tid as usize;
             let lane = tid % 32;

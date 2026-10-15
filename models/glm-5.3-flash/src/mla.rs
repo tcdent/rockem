@@ -16,7 +16,7 @@
 use crate::layout::MLA_ROW;
 use crate::weights;
 use crate::*;
-use common::gemv::{self, widen};
+use common::gemv;
 use common::math::{exp, sqrt};
 use common::pool::Pool;
 use common::rmsnorm::rmsnorm;
@@ -122,20 +122,9 @@ fn select(pos: usize, iq: &[f32], iw: &[f32], pools: &[f32], pscore: &mut [f32],
     n
 }
 
-/// `xn` is the normed block input (`[H]`); the cache holds rows `0..pos` and
-/// gains row `pos`; `out` is the block output (`[H]`). The three parts, so a
-/// placement can take the projections and the output while the attention
-/// runs here: `project`, `finish_row`, `attend`, `output`.
-#[inline(always)]
-pub fn step(l: usize, w: &weights::Mla, xn: &[f32], cache: &mut [f32], pools: &mut [f32], pos: usize, s: &mut Scratch, pool: &dyn Pool, tr: &mut impl Trace, out: &mut [f32]) {
-    {
-        let (latent, ikey, igate) = row(cache, pos);
-        project(w, xn, s, igate, pool);
-        finish_row(w, s, latent, ikey);
-    }
-    attend(l, w, cache, pools, pos, s, pool, tr);
-    output(w, s.heads, out, pool);
-}
+// The step is its parts, composed by the caller so a placement can take the
+// projections and the output while the row, the selection and the attention
+// run here: `row`, `project`, `finish_row`, `attend`, `output`.
 
 /// Position `pos`'s cache row: the latent, the indexer's key, the indexer's gate.
 #[inline(always)]
@@ -199,7 +188,8 @@ pub fn attend(l: usize, w: &weights::Mla, cache: &[f32], pools: &mut [f32], pos:
 
     let (q, sel) = (&*s.q, &s.sel[..n]);
     let (heads_p, hs_p) = (s.heads.as_mut_ptr() as usize, s.hs.as_mut_ptr() as usize);
-    pool.run(MLA_HEADS, &move |h| {
+    // a head's item streams its W_uk and W_uv: on their node
+    pool.run_at(MLA_HEADS, &move |h| w.kv_b[h * KVB_HEAD * KV_LORA_RANK..].as_ptr() as *const u8, &move |h| {
         let oh = unsafe { core::slice::from_raw_parts_mut((heads_p as *mut f32).add(h * V_HEAD_DIM), V_HEAD_DIM) };
         let hs = unsafe { core::slice::from_raw_parts_mut((hs_p as *mut f32).add(h * HEAD_SCRATCH), HEAD_SCRATCH) };
         let (q_abs, rest) = hs.split_at_mut(KV_LORA_RANK);
@@ -229,19 +219,12 @@ fn head(w: &weights::Mla, h: usize, q: &[f32], sel: &[usize], cache: &[f32], q_a
     }
     for i in 0..QK_NOPE_HEAD_DIM {
         let wi = &w_uk[i * KV_LORA_RANK..(i + 1) * KV_LORA_RANK];
-        let qi = qh[i];
-        for j in 0..KV_LORA_RANK {
-            q_abs[j] += widen(wi[j]) * qi;
-        }
+        lat_ops::axpy_bf16(wi, qh[i], q_abs);
     }
     let n = sel.len();
     for (i, &t) in sel.iter().enumerate() {
         let lat = &cache[t * MLA_ROW..t * MLA_ROW + KV_LORA_RANK];
-        let mut acc = 0f32;
-        for j in 0..KV_LORA_RANK {
-            acc += q_abs[j] * lat[j];
-        }
-        att[i] = acc * scale;
+        att[i] = lat_ops::dot(q_abs, lat) * scale;
     }
     softmax(&mut att[..n]);
     for j in 0..KV_LORA_RANK {
@@ -249,12 +232,99 @@ fn head(w: &weights::Mla, h: usize, q: &[f32], sel: &[usize], cache: &[f32], q_a
     }
     for (i, &t) in sel.iter().enumerate() {
         let lat = &cache[t * MLA_ROW..t * MLA_ROW + KV_LORA_RANK];
-        let p = att[i];
-        for j in 0..KV_LORA_RANK {
-            o_lat[j] += p * lat[j];
-        }
+        lat_ops::axpy(lat, att[i], o_lat);
     }
     gemv::bf16::<V_HEAD_DIM, KV_LORA_RANK>(w_uv, o_lat, oh);
+}
+
+/// The head's latent-width (`KV_LORA_RANK`) vector ops: `acc += a · w` over a bf16
+/// row, `Σ a·b`, `acc += p · x`. Eight wide on x86-64 with the scalar form's
+/// per-element order (multiply, then add; the dot's eight lanes summed at the end).
+mod lat_ops {
+    use crate::KV_LORA_RANK as N;
+    #[cfg(not(target_arch = "x86_64"))]
+    use common::gemv::widen;
+
+    #[inline(always)]
+    pub fn axpy_bf16(w: &[u16], a: f32, acc: &mut [f32]) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            avx2::axpy_bf16(w.as_ptr(), a, acc.as_mut_ptr())
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        for j in 0..N {
+            acc[j] += widen(w[j]) * a;
+        }
+    }
+    #[inline(always)]
+    pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            avx2::dot(a.as_ptr(), b.as_ptr())
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let mut acc = 0f32;
+            for j in 0..N {
+                acc += a[j] * b[j];
+            }
+            acc
+        }
+    }
+    #[inline(always)]
+    pub fn axpy(x: &[f32], p: f32, acc: &mut [f32]) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            avx2::axpy(x.as_ptr(), p, acc.as_mut_ptr())
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        for j in 0..N {
+            acc[j] += p * x[j];
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    mod avx2 {
+        use super::N;
+        use core::arch::x86_64::*;
+        const _: () = assert!(N % 16 == 0);
+
+        #[inline(always)]
+        unsafe fn widen8(p: *const u16) -> __m256 {
+            _mm256_castsi256_ps(_mm256_slli_epi32::<16>(_mm256_cvtepu16_epi32(_mm_loadu_si128(p as *const __m128i))))
+        }
+        #[target_feature(enable = "avx2,fma")]
+        pub unsafe fn axpy_bf16(w: *const u16, a: f32, acc: *mut f32) {
+            let av = _mm256_set1_ps(a);
+            let mut j = 0;
+            while j < N {
+                _mm256_storeu_ps(acc.add(j), _mm256_add_ps(_mm256_loadu_ps(acc.add(j)), _mm256_mul_ps(widen8(w.add(j)), av)));
+                _mm256_storeu_ps(acc.add(j + 8), _mm256_add_ps(_mm256_loadu_ps(acc.add(j + 8)), _mm256_mul_ps(widen8(w.add(j + 8)), av)));
+                j += 16;
+            }
+        }
+        #[target_feature(enable = "avx2,fma")]
+        pub unsafe fn dot(a: *const f32, b: *const f32) -> f32 {
+            let (mut s0, mut s1) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+            let mut j = 0;
+            while j < N {
+                s0 = _mm256_add_ps(s0, _mm256_mul_ps(_mm256_loadu_ps(a.add(j)), _mm256_loadu_ps(b.add(j))));
+                s1 = _mm256_add_ps(s1, _mm256_mul_ps(_mm256_loadu_ps(a.add(j + 8)), _mm256_loadu_ps(b.add(j + 8))));
+                j += 16;
+            }
+            common::gemv::avx2::hsum(_mm256_add_ps(s0, s1))
+        }
+        #[target_feature(enable = "avx2,fma")]
+        pub unsafe fn axpy(x: *const f32, p: f32, acc: *mut f32) {
+            let pv = _mm256_set1_ps(p);
+            let mut j = 0;
+            while j < N {
+                _mm256_storeu_ps(acc.add(j), _mm256_add_ps(_mm256_loadu_ps(acc.add(j)), _mm256_mul_ps(pv, _mm256_loadu_ps(x.add(j)))));
+                _mm256_storeu_ps(acc.add(j + 8), _mm256_add_ps(_mm256_loadu_ps(acc.add(j + 8)), _mm256_mul_ps(pv, _mm256_loadu_ps(x.add(j + 8)))));
+                j += 16;
+            }
+        }
+    }
 }
 
 pub mod gfx11_consts {

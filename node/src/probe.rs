@@ -379,8 +379,7 @@ pub fn run(elf: Option<&[u8]>) {
                 a.ptr(ln);
             }
             a.ptr(w8m.va).ptr(sc.va).ptr(out).u32(m as u32).u32(1);
-            let lds = if ln.is_some() { g::normed_rows_lds(kw, 1) } else { g::rows_lds(kw, 1) } as u32;
-            k.launch(kernel, g::rows_grid(m), g::WG, lds, &a);
+            k.launch(kernel, g::rows_grid(m), g::WG, g::fp8_rows_lds(kw, 1) as u32, &a);
         };
         let shared_gu = gbs(SHARED_GU_ROWS * H, best(iters, || {
             fp8(&gu_k, x.va, Some(ln.va), gu_out.va, SHARED_GU_ROWS, H);
@@ -398,6 +397,18 @@ pub fn run(elf: Option<&[u8]>) {
             fp8(&down_d, gu_out.va, None, y_host.va, H, INTERMEDIATE_SIZE);
             k.sync();
         }));
+        // the head's shape: rows_h over the vocabulary, 1.6 GB — nothing of it fits a cache
+        let head_w = k.vram_visible(glm_5_3_flash::VOCAB_SIZE * H * 2);
+        for off in (0..head_w.size).step_by(w16.len() * 2) {
+            k.upload(&head_w, off, &kfd::raw(&w16)[..(head_w.size - off).min(w16.len() * 2)]);
+        }
+        let head_out = k.host(glm_5_3_flash::VOCAB_SIZE * 4);
+        let head = gbs(head_w.size, best(iters, || {
+            rows(&rows_h, x.va, Some(ln.va), head_w.va, head_out.va, glm_5_3_flash::VOCAB_SIZE, H);
+            k.sync();
+        }));
+        let mclk = std::fs::read_to_string(format!("/sys/class/drm/card{}/device/pp_dpm_mclk", c)).map(|s| s.lines().filter(|l| l.ends_with('*')).map(|l| l.trim().to_string()).collect::<Vec<_>>().join(" ")).unwrap_or_default();
+        println!("card {c}   : the head's shape ({} MB of bf16 rows, normed) at {head:.0} GB/s into host memory; memory clock {mclk}", head_w.size / 1_000_000);
         println!("card {c}   : FP8 rows — the shared expert's gate|up ({} MB) at {shared_gu:.0} GB/s, its down at {shared_down:.0}; a dense layer's gate|up ({} MB) at {dense_gu:.0}, its down at {dense_down:.0} (one launch + sync each)", SHARED_GU_ROWS * H / 1_000_000, DENSE_GU_ROWS * H / 1_000_000);
     }
 }

@@ -469,6 +469,22 @@ impl Kfd {
         assert!(r == 0, "kfd {what}: {}", std::io::Error::last_os_error());
     }
 
+    /// Every card at its highest clocks. A token leaves a card idle between
+    /// launches and the driver clocks it down, so every launch paid the climb
+    /// back: on metatron a token went from 70 to 65 ms with the level forced
+    /// (2026-10-15). Set after the cards are open — set before, from the init,
+    /// the file read "high" but the clocks still fell.
+    pub fn clocks_high() {
+        let mut n = 0;
+        for e in std::fs::read_dir("/sys/class/drm").into_iter().flatten().flatten() {
+            let p = e.path().join("device/power_dpm_force_performance_level");
+            if p.exists() && std::fs::write(&p, "high").is_ok() {
+                n += 1;
+            }
+        }
+        println!("gpu      : {n} card{} held at their highest clocks", if n == 1 { "" } else { "s" });
+    }
+
     /// GPU memory at an address the CPU also owns. `host` maps it into this
     /// process (through the BAR for VRAM); `host_bytes` is how much of it (the
     /// ring's alias half is GPU-only).
