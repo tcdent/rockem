@@ -1,13 +1,15 @@
-//! rockem node. Construction then execution: report the platform, load the
-//! bundle into memory the way the design says (hugetlbfs, first-touched by
-//! the thread that will read it), build the model, then serve: on the wire
-//! (`wire.rs`: u32 token ids in and out over TCP, nothing transformed) or,
-//! without `rockem.listen`, on the console — its text twin: a line of ids in,
-//! the continuation out as text, streamed.
+//! rockem node. Construction then execution: report the platform, open the
+//! bundle — its manifest names the model, and that model's engine loads it
+//! into memory the way the design says (hugetlbfs, first-touched by the thread
+//! that will read it) and builds itself — then serve: on the wire (`wire.rs`:
+//! u32 token ids in and out over TCP, nothing transformed) or, without
+//! `rockem.listen`, on the console — its text twin: a line of ids in, the
+//! continuation out as text, streamed. One binary carries every model
+//! (`engine.rs`).
 //!
 //! Configuration is the kernel command line (`rockem.*` tokens) or, on a dev
 //! host, the same tokens as program arguments:
-//!   rockem.bundle=/bundle      directory with dense.bf16.bin, experts.q4g128.bin, vocab.bin
+//!   rockem.bundle=/bundle      a bundle directory (docs/bundle.md); `manifest.toml` names the model
 //!   rockem.mem=anon            dev: anonymous memory instead of hugetlbfs
 //!   rockem.gpu=1               the whole model on the card, the router and the draw included: one wait per token
 //!   rockem.experts=host        with rockem.gpu=1: the routed experts in this host's DRAM, the card waiting at each layer
@@ -18,13 +20,14 @@
 //!   rockem.cache=<GB>          host memory for cached contexts (default: half of what is free)
 //!   rockem.debug=<dir>         dev: write every position's logits as <dir>/pos<N>.f32 and print the top-2 margin
 //!   rockem.shell=1 / rockem.exit=1   dev conveniences (see os/qemu.sh)
+mod engine;
 mod kfd;
 mod loader;
 mod platform;
+mod v2lite;
 mod wire;
 
-use deepseek_v2_lite::layout;
-use deepseek_v2_lite::{Attention, CpuAttention, CpuExperts, CpuFfn, CpuModel, Model, Sampling, State, Weights, BOS_TOKEN, EOS_TOKEN, FIRST_POS, SAMPLING, SEED, TOKENS, VOCAB_SIZE};
+use engine::Engine;
 use std::io::{BufRead, Read, Write};
 
 /// The last occurrence of a key wins, as for the kernel's own parameters: a netboot line may repeat ours.
@@ -33,14 +36,30 @@ fn config(key: &str) -> Option<String> {
     std::env::args().skip(1).chain(cmd.split_whitespace().map(String::from)).filter_map(|t| t.strip_prefix(&format!("{key}=")).map(String::from)).last()
 }
 
+/// `name = "…"` under `[model]` in a manifest.
+fn model_name(manifest: &str) -> Option<String> {
+    let mut in_model = false;
+    for line in manifest.lines() {
+        let l = line.trim();
+        if l.starts_with('[') {
+            in_model = l == "[model]";
+        } else if in_model {
+            if let Some(v) = l.strip_prefix("name") {
+                return v.trim().strip_prefix('=').map(|v| v.trim().trim_matches('"').to_string());
+            }
+        }
+    }
+    None
+}
+
 /// The console vocabulary: byte offsets then bytes, by id.
 struct Vocab {
     offs: Vec<u32>,
     bytes: &'static [u8],
 }
 impl Vocab {
-    fn load(b: &'static [u8]) -> Self {
-        let n = deepseek_v2_lite::VOCAB_SIZE + 1;
+    fn load(b: &'static [u8], vocab_size: usize) -> Self {
+        let n = vocab_size + 1;
         let offs = b[..4 * n].chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
         Vocab { offs, bytes: &b[4 * n..] }
     }
@@ -49,53 +68,31 @@ impl Vocab {
     }
 }
 
-/// Dev: every layer's residual output and every routing decision for one
-/// position, so two placements can be compared layer by layer.
-struct DebugTrace {
-    layers: Vec<f32>, // [NUM_HIDDEN_LAYERS][H]
-    topk: Vec<u32>,   // [layers][TOP_K], 0 for the dense layer
-}
-impl DebugTrace {
-    fn new() -> Self {
-        DebugTrace { layers: vec![0.0; deepseek_v2_lite::NUM_HIDDEN_LAYERS * deepseek_v2_lite::H], topk: vec![0; deepseek_v2_lite::NUM_HIDDEN_LAYERS * deepseek_v2_lite::TOP_K] }
-    }
-}
-impl common::trace::Trace for DebugTrace {
-    fn edge(&mut self, layer: usize, name: &str, data: &[f32]) {
-        if layer != common::trace::NONE && name == "out" {
-            self.layers[layer * deepseek_v2_lite::H..(layer + 1) * deepseek_v2_lite::H].copy_from_slice(data);
-        }
-    }
-    fn topk(&mut self, layer: usize, idx: &[usize], _weight: &[f32]) {
-        for (k, &e) in idx.iter().enumerate() {
-            self.topk[layer * deepseek_v2_lite::TOP_K + k] = e as u32;
-        }
-    }
-    fn routed(&mut self, _: usize, _: usize, _: &[f32]) {}
-}
-
-/// Cached contexts: the attention cache rows of every transcript this node
-/// has computed, in host memory, content-addressed by a running hash of the
-/// ids. A context is `[pos][layout::POSITION]` f32 plus its ids; the sink is
-/// the one-position context every transcript begins with. Prefix reuse is
-/// transparent: as a prompt's ids arrive they are matched against the index
-/// and nothing is computed until the first id the store has not seen; the
-/// card is then seeded from the longest match (one write through the BAR)
-/// and computing resumes there. Eviction is LRU by context, never the one
-/// being written, over a budget of positions. Nothing persists.
-/// Where a closed context's rows live, `[pos][layout::POSITION]`: DRAM today;
-/// NVMe striped over drives the node owns through vfio is the next
-/// realization, chosen at construction. The context being written is always
-/// the store's one DRAM region (the kernel mirrors into it, the card is
-/// seeded from it); a context becomes a `Segment` when the next one starts.
+/// Cached contexts: the per-position rows of every transcript this node has
+/// computed, in host memory, content-addressed by a running hash of the ids,
+/// plus — for a model with sequence state that is not per position — the
+/// snapshot of that state at the transcript's end. A context is
+/// `[pos][position]` f32 plus its ids; the prefix is the `first_pos`-position
+/// context every transcript begins with. Prefix reuse is transparent: as a
+/// prompt's ids arrive they are matched against the index and nothing is
+/// computed until the first id the store has not seen; the model is then
+/// seeded from the longest match and computing resumes there. A model with
+/// snapshots can resume only at a cached transcript's end, where its snapshot
+/// was taken; a partial match of such a transcript resumes from the prefix and
+/// recomputes the matched ids. Eviction is LRU by context, never the one being
+/// written, over a budget of positions. Nothing persists.
+/// Where a closed context's rows live, `[pos][position]`: DRAM today; NVMe
+/// striped over drives the node owns through vfio is the next realization,
+/// chosen at construction. The context being written is always the store's
+/// one DRAM region (the kernel mirrors into it, the card is seeded from it); a
+/// context becomes a `Segment` when the next one starts.
 trait Segment {
-    /// Positions `0..n`, streamed into `out`.
-    fn read(&self, n: usize, out: &mut [f32]);
+    /// The first `len` f32s, streamed into `out`.
+    fn read(&self, len: usize, out: &mut [f32]);
 }
 struct Dram(Vec<f32>);
 impl Segment for Dram {
-    fn read(&self, n: usize, out: &mut [f32]) {
-        let len = n * layout::POSITION;
+    fn read(&self, len: usize, out: &mut [f32]) {
         common::copy::stream(bytes_mut(&mut out[..len]), bytes(&self.0[..len]));
     }
 }
@@ -109,6 +106,8 @@ struct Context {
     ids: Vec<u32>,
     keys: Vec<u64>, // keys[n] names ids[..=n]
     rows: Box<dyn Segment>,
+    /// The sequence state at the context's end, `snapshot_len` f32s (empty while the context is active).
+    snap: Vec<f32>,
     used: u64,
 }
 struct Store {
@@ -118,35 +117,39 @@ struct Store {
     held: usize,
     clock: u64,
     max_ctx: usize,
+    position: usize,
     active: Vec<f32>, // the context being written: max_ctx positions, untouched pages cost nothing
 }
 impl Store {
     fn key(prev: u64, id: u32) -> u64 {
         id.to_le_bytes().iter().fold(prev, |h, &b| (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3))
     }
-    /// The context being written becomes a segment; its rows are no longer the active region.
-    fn close(&mut self, ctx: usize) {
+    /// The context being written becomes a segment with `snap` as its end state; its rows are no longer the active region.
+    fn close(&mut self, ctx: usize, snap: Vec<f32>) {
         if let Some(c) = self.contexts[ctx].as_mut() {
             c.rows = Box::new(Dram(std::mem::take(&mut self.active)));
+            c.snap = snap;
         }
     }
-    /// A new context, the active one, holding `n` positions read from `from` (the sink when `from` is none).
-    fn open(&mut self, from: Option<(usize, usize)>, sink: &[f32]) -> usize {
+    /// A new context, the active one, holding `n` positions read from `from`, or the prefix (its ids and rows) when `from` is none.
+    fn open(&mut self, from: Option<(usize, usize)>, prefix_ids: &[u32], prefix_rows: &[f32]) -> usize {
         if self.active.is_empty() {
-            self.active = vec![0f32; self.max_ctx * layout::POSITION];
+            self.active = vec![0f32; self.max_ctx * self.position];
         }
-        let mut c = Context { ids: Vec::new(), keys: Vec::new(), rows: Box::new(Dram(Vec::new())), used: 0 };
+        let mut c = Context { ids: Vec::new(), keys: Vec::new(), rows: Box::new(Dram(Vec::new())), snap: Vec::new(), used: 0 };
         match from {
             Some((src, n)) => {
                 let p = self.contexts[src].as_ref().unwrap();
                 c.ids.extend_from_slice(&p.ids[..n]);
                 c.keys.extend_from_slice(&p.keys[..n]);
-                p.rows.read(n, &mut self.active);
+                p.rows.read(n * self.position, &mut self.active);
             }
             None => {
-                c.ids.push(BOS_TOKEN as u32);
-                c.keys.push(Self::key(0xcbf2_9ce4_8422_2325, BOS_TOKEN as u32));
-                self.active[..layout::POSITION].copy_from_slice(sink);
+                for (i, &id) in prefix_ids.iter().enumerate() {
+                    c.ids.push(id);
+                    c.keys.push(Self::key(if i == 0 { 0xcbf2_9ce4_8422_2325 } else { c.keys[i - 1] }, id));
+                }
+                self.active[..prefix_rows.len()].copy_from_slice(prefix_rows);
             }
         }
         self.held += c.ids.len();
@@ -156,7 +159,9 @@ impl Store {
             self.contexts.push(None);
             self.contexts.len() - 1
         });
-        self.index.entry(c.keys[0]).or_insert((slot, 1));
+        for (n, &k) in c.keys.iter().enumerate() {
+            self.index.entry(k).or_insert((slot, n + 1));
+        }
         self.contexts[slot] = Some(c);
         slot
     }
@@ -182,15 +187,11 @@ impl Store {
     }
 }
 
-/// One sequence at a time on this node: the model, its cache, and the
-/// sampler, driven by the same three moves from the wire or the console.
-struct Session<'a> {
-    w: Weights<'a>,
-    model: Box<dyn Model>,
-    st: State,
-    sink: &'a [f32],
-    /// The logits at the sink, computed once at start: what scores or draws the first token after BOS.
-    sink_logits: Vec<f32>,
+/// One sequence at a time on this node: the model behind its engine, the
+/// store, and the sampler, driven by the same three moves from the wire or
+/// the console.
+struct Session {
+    e: Box<dyn Engine>,
     /// SCORE was received on this sequence: each id fed is scored first.
     scoring: bool,
     /// The row of the last step's logits that belongs to its last token.
@@ -199,85 +200,120 @@ struct Session<'a> {
     pos: usize,
     max_ctx: usize,
     started: bool,
+    /// Prefix ids the client still owes after the first: they are checked, never fed.
+    prefix_left: usize,
     debug: Option<std::path::PathBuf>,
-    dtr: DebugTrace,
     store: Store,
     active: usize,
     /// While the prompt is a prefix the store holds: (context, positions matched); nothing computed yet.
     pending: Option<(usize, usize)>,
     hits: usize,
 }
-impl Session<'_> {
-    /// BOS: a new context. Whether the card is seeded from the sink or from a
-    /// longer cached prefix is decided by the ids that follow.
+impl Session {
+    fn first_pos(&self) -> usize {
+        self.e.first_pos()
+    }
+    /// The first prefix id: a new context. Whether the model is seeded from the
+    /// prefix or from a longer cached transcript is decided by the ids that follow.
     fn start(&mut self) {
         // the active region belongs to the active context whenever it is allocated; a new
         // connection resets `started` without closing, so the region, not the flag, decides
         if !self.store.active.is_empty() {
-            self.store.close(self.active);
+            let mut snap = vec![0f32; self.e.snapshot_len()];
+            self.e.snapshot(&mut snap);
+            self.store.close(self.active, snap);
         }
-        self.active = self.store.open(None, self.sink);
-        // position 0 is the sink until a longer cached prefix replaces it; seeding here is what
-        // makes a sequence that matches nothing identical to one that matches everything
-        self.model.seed(&self.store.active[..layout::POSITION]);
-        // the longest cached prefix so far is the sink itself, in some closed context — never this one
-        self.pending = self.store.index.get(&self.store.contexts[self.active].as_ref().unwrap().keys[0]).copied().filter(|&(c, _)| c != self.active);
-        self.pos = FIRST_POS;
+        let (rows, _) = self.e.prefix();
+        self.active = self.store.open(None, self.e.prefix_ids(), rows);
+        // the prefix is the sequence's state until a longer cached transcript replaces it; seeding here
+        // is what makes a sequence that matches nothing identical to one that matches everything
+        self.e.seed_prefix();
+        // the longest cached prefix so far is the prefix itself, in some closed context — never this one
+        let first = self.first_pos();
+        self.pending = self.store.index.get(&self.store.contexts[self.active].as_ref().unwrap().keys[first - 1]).copied().filter(|&(c, _)| c != self.active);
+        self.pos = first;
+        self.prefix_left = first - 1;
         self.started = true;
         self.scoring = false;
         self.hits = 0;
     }
     /// Leave the store's matching state with the logits current for the next
-    /// position: nothing to do if only BOS matched (the sink's logits stand);
-    /// otherwise the matched prefix but its last position is installed and that
-    /// position is recomputed for its logits.
+    /// position: nothing to do if only the prefix matched (its logits stand);
+    /// otherwise the matched transcript but its last position is installed and
+    /// that position is recomputed for its logits. False if the client never
+    /// finished the prefix, or the context is full.
     fn settle(&mut self) -> bool {
+        if self.prefix_left > 0 {
+            return false;
+        }
         match self.pending {
-            Some((_, 1)) => {
+            Some((_, n)) if n == self.first_pos() => {
                 self.pending = None;
                 true
             }
             Some((ctx, n)) => {
                 let last = self.store.contexts[ctx].as_ref().unwrap().ids[n - 1];
-                self.materialize(n - 1);
-                self.feed(last)
+                self.materialize(n - 1) && self.feed(last)
             }
             None => true,
         }
     }
     /// ln p(id) at the next position, before `id` is fed there: from the last
-    /// computed token's logits, the sink's if none was.
+    /// computed token's logits, the prefix's if none was.
     fn score(&mut self, id: u32) -> f32 {
-        if self.pos == FIRST_POS {
-            common::softmax::log_prob(&self.sink_logits, id as usize)
+        if self.pos == self.first_pos() {
+            self.e.score_prefix(id)
         } else {
-            let r = self.last_row;
-            self.model.score(r, id as usize, &self.st.logits[r * VOCAB_SIZE..(r + 1) * VOCAB_SIZE])
+            self.e.score(self.last_row, id)
         }
     }
     /// Leave the matching state: the active context becomes a copy of the
-    /// matched prefix's first `n` positions, the card is seeded from it, and
-    /// computing resumes at `n`.
-    fn materialize(&mut self, n: usize) {
+    /// matched transcript's first `n` positions, the model is seeded from it,
+    /// and computing resumes at `n` — or, when the model's snapshot is not
+    /// there (a partial match of a transcript with sequence state), from the
+    /// prefix, the matched ids recomputed. False when the context is full.
+    fn materialize(&mut self, n: usize) -> bool {
         let (src, matched) = self.pending.take().unwrap();
         let n = n.min(matched);
         self.store.touch(src);
+        let first = self.first_pos();
+        let src_len = self.store.contexts[src].as_ref().unwrap().ids.len();
+        let resumable = n == first || self.e.snapshot_len() == 0 || n == src_len;
+        let at = if resumable { n } else { first };
+        let replay: Vec<u32> = if resumable { Vec::new() } else { self.store.contexts[src].as_ref().unwrap().ids[first..n].to_vec() };
         let old = self.active;
-        self.active = self.store.open(Some((src, n)), self.sink);
+        let (rows, _) = self.e.prefix();
+        self.active = self.store.open(Some((src, at)), self.e.prefix_ids(), rows);
         self.store.held -= self.store.contexts[old].take().unwrap().ids.len();
-        self.model.seed(&self.store.active[..n * layout::POSITION]);
-        self.pos = n;
-        self.hits = n - 1;
+        if at == first {
+            self.e.seed_prefix();
+        } else {
+            let snap = &self.store.contexts[src].as_ref().unwrap().snap;
+            self.e.seed(&self.store.active[..at * self.store.position], snap);
+        }
+        self.pos = at;
+        self.hits = at - first;
+        replay.is_empty() || self.feed_many(&replay, &mut |_| {})
     }
     /// `ids` through the model at the next positions, as few steps as they
-    /// allow (TOKENS per step): ids still matching the store advance the
-    /// match and cost nothing; from the first that does not, the rest are
-    /// computed in steps. In scoring mode every id's ln p is given to `emit`
-    /// before it is fed, in order. False when the context is full.
+    /// allow (`tokens()` per step): the prefix's remaining ids are checked and
+    /// swallowed, ids still matching the store advance the match and cost
+    /// nothing, and from the first that does not, the rest are computed in
+    /// steps. In scoring mode every id's ln p is given to `emit` before it is
+    /// fed, in order. False when the context is full or the prefix is not the model's.
     fn feed_many(&mut self, ids: &[u32], emit: &mut dyn FnMut(f32)) -> bool {
         let mut at = 0;
         while at < ids.len() {
             let id = ids[at];
+            if self.prefix_left > 0 {
+                let first = self.first_pos();
+                if id != self.e.prefix_ids()[first - self.prefix_left] {
+                    return false;
+                }
+                self.prefix_left -= 1;
+                at += 1;
+                continue;
+            }
             if let Some((ctx, n)) = self.pending {
                 let key = Store::key(self.store.contexts[ctx].as_ref().unwrap().keys[n - 1], id);
                 if let Some(&(c2, n2)) = self.store.index.get(&key) {
@@ -287,10 +323,12 @@ impl Session<'_> {
                         continue;
                     }
                 }
-                self.materialize(n);
+                if !self.materialize(n) {
+                    return false;
+                }
             }
-            // the rest of the ids are computed: a step of up to TOKENS at a time
-            let n = (ids.len() - at).min(TOKENS).min(self.max_ctx.saturating_sub(self.pos));
+            // the rest of the ids are computed: a step of up to `tokens()` at a time
+            let n = (ids.len() - at).min(self.e.tokens()).min(self.max_ctx.saturating_sub(self.pos));
             if n == 0 {
                 return false;
             }
@@ -301,7 +339,7 @@ impl Session<'_> {
             self.step(&ids[at..at + n]);
             if self.scoring {
                 for j in 1..n {
-                    let lp = self.model.score(j - 1, ids[at + j] as usize, &self.st.logits[(j - 1) * VOCAB_SIZE..j * VOCAB_SIZE]);
+                    let lp = self.e.score(j - 1, ids[at + j]);
                     emit(lp);
                 }
             }
@@ -315,30 +353,26 @@ impl Session<'_> {
         let s = self;
         let n = toks.len();
         let pos = s.pos;
-        if s.debug.is_some() {
-            s.st.run(&s.w, toks, pos, &mut s.model, &mut s.dtr);
-        } else {
-            s.st.run(&s.w, toks, pos, &mut s.model, &mut common::trace::NoTrace);
-        }
+        s.e.run(toks, pos, s.debug.is_some());
         // the draw at a position is a function of the seed and the position alone, so a
         // sequence draws the same whether its prefix was computed or served from the store
-        let u = common::sample::uniform_at(SEED, (pos + n - 1) as u64);
-        s.next = s.model.draw(n - 1, &SAMPLING, u, &s.st.logits[(n - 1) * VOCAB_SIZE..n * VOCAB_SIZE]) as u32;
+        let u = common::sample::uniform_at(s.e.seed_value(), (pos + n - 1) as u64);
+        s.next = s.e.draw(n - 1, u);
         s.last_row = n - 1;
+        let position = s.store.position;
         for i in 0..n {
             let p = pos + i;
-            s.model.rows(i, &mut s.store.active[p * layout::POSITION..(p + 1) * layout::POSITION]);
+            s.e.rows(i, &mut s.store.active[p * position..(p + 1) * position]);
             let c = s.store.contexts[s.active].as_mut().unwrap();
             c.ids.push(toks[i]);
             let key = Store::key(c.keys[p - 1], toks[i]);
             c.keys.push(key);
             s.store.grew(s.active, p);
             if let Some(d) = &s.debug {
-                s.model.token_trace(i, &mut s.dtr.layers, &mut s.dtr.topk, &mut s.st.logits[i * VOCAB_SIZE..(i + 1) * VOCAB_SIZE]);
+                let (layers, topk, lg) = s.e.trace(i);
                 let raw = |v: &[f32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, 4 * v.len()) }.to_vec();
-                std::fs::write(d.join(format!("pos{p}.layers.f32")), raw(&s.dtr.layers)).unwrap();
-                std::fs::write(d.join(format!("pos{p}.topk.u32")), unsafe { std::slice::from_raw_parts(s.dtr.topk.as_ptr() as *const u8, 4 * s.dtr.topk.len()) }).unwrap();
-                let lg = &s.st.logits[i * VOCAB_SIZE..(i + 1) * VOCAB_SIZE];
+                std::fs::write(d.join(format!("pos{p}.layers.f32")), raw(layers)).unwrap();
+                std::fs::write(d.join(format!("pos{p}.topk.u32")), unsafe { std::slice::from_raw_parts(topk.as_ptr() as *const u8, 4 * topk.len()) }).unwrap();
                 let mut ix = (0..lg.len()).collect::<Vec<_>>();
                 ix.sort_by(|&a, &b| lg[b].partial_cmp(&lg[a]).unwrap());
                 eprintln!("  pos {p}: argmax {} margin {:.4e} (top2 {})", ix[0], lg[ix[0]] - lg[ix[1]], ix[1]);
@@ -358,16 +392,17 @@ impl Session<'_> {
         if !self.settle() {
             return false;
         }
-        if self.pos == FIRST_POS {
-            // nothing fed after BOS: the first draw is from the sink's logits
-            self.next = self.model.draw(0, &SAMPLING, common::sample::uniform_at(SEED, 0), &self.sink_logits) as u32;
+        let first = self.first_pos();
+        if self.pos == first {
+            // nothing fed after the prefix: the first draw is from the prefix's logits
+            self.next = self.e.draw_prefix(common::sample::uniform_at(self.e.seed_value(), (first - 1) as u64));
         }
         for _ in 0..limit {
             let id = self.next;
             if !emit(id) || !self.feed(id) {
                 return false;
             }
-            if id as usize == EOS_TOKEN {
+            if self.e.is_eos(id) {
                 break;
             }
         }
@@ -379,18 +414,19 @@ impl Session<'_> {
 fn serve(listen: &str, session: &mut Session, identity: u64) {
     let listener = std::net::TcpListener::bind(listen).unwrap();
     println!("ready    : wire on {listen}, identity {identity:016x}");
+    let (bos, vocab_size, tokens, first) = (session.e.bos(), session.e.vocab_size(), session.e.tokens(), session.first_pos());
     for conn in listener.incoming() {
         let Ok(mut s) = conn else { continue };
         s.set_nodelay(true).unwrap();
         let mut h = [0u8; wire::HELLO];
-        if s.read_exact(&mut h).is_err() || !matches!(wire::accept(&h), Some(want) if want == 0 || want == identity) || s.write_all(&wire::header(identity, (session.max_ctx - FIRST_POS) as u32)).is_err() {
+        if s.read_exact(&mut h).is_err() || !matches!(wire::accept(&h), Some(want) if want == 0 || want == identity) || s.write_all(&wire::header(identity, (session.max_ctx - first) as u32)).is_err() {
             continue;
         }
         session.started = false;
         let mut word = [0u8; 4];
         let mut ids: Vec<u32> = Vec::new();
         // ids are fed as they arrive, in whatever steps arrive: a prompt that is already in the
-        // socket's buffer goes through the model TOKENS at a time; a stream of single ids one at a time
+        // socket's buffer goes through the model `tokens` at a time; a stream of single ids one at a time
         let flush = |session: &mut Session, ids: &mut Vec<u32>, s: &mut std::net::TcpStream| -> bool {
             if ids.is_empty() {
                 return true;
@@ -410,7 +446,7 @@ fn serve(listen: &str, session: &mut Session, identity: u64) {
         };
         while s.read_exact(&mut word).is_ok() {
             let ok = match u32::from_le_bytes(word) {
-                id if id as usize == BOS_TOKEN => {
+                id if id == bos => {
                     let ok = flush(session, &mut ids, &mut s);
                     session.start();
                     ok
@@ -421,12 +457,12 @@ fn serve(listen: &str, session: &mut Session, identity: u64) {
                     session.scoring = session.started;
                     ok && session.started && session.settle()
                 }
-                id if (id as usize) < VOCAB_SIZE => {
+                id if (id as usize) < vocab_size => {
                     if !session.started {
                         false
                     } else {
                         ids.push(id);
-                        if ids.len() >= TOKENS || !more_now(&s) {
+                        if ids.len() >= tokens || !more_now(&s) {
                             flush(session, &mut ids, &mut s)
                         } else {
                             true
@@ -439,6 +475,13 @@ fn serve(listen: &str, session: &mut Session, identity: u64) {
                 break;
             }
         }
+    }
+}
+
+fn halt(msg: &str) -> ! {
+    println!("-- {msg}; halting --");
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
     }
 }
 
@@ -456,40 +499,22 @@ fn main() {
             println!("-- rockem.exit=1: leaving --");
             std::process::exit(0);
         }
-        println!("-- no rockem.bundle=<dir>; nothing to serve; halting --");
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(3600));
-        }
+        halt("no rockem.bundle=<dir>; nothing to serve");
     };
 
-    // --- construction ---
+    // --- construction: the manifest names the model, its engine builds it ---
     let mem = if config("rockem.mem").as_deref() == Some("anon") { loader::Mem::Anon } else { loader::Mem::Hugetlb };
-    let t0 = std::time::Instant::now();
     let bundle = std::path::Path::new(&bundle);
-    let dense_b = loader::load(&bundle.join(layout::DENSE_FILE), mem);
-    let experts = loader::load(&bundle.join(layout::EXPERTS_FILE), mem);
-    let vocab_b = loader::load(&bundle.join(layout::VOCAB_FILE), loader::Mem::Anon);
-    println!("bundle   : {} loaded in {:.1}s ({:.1} GB)", bundle.display(), t0.elapsed().as_secs_f32(), (dense_b.len() + experts.len()) as f64 / 1e9);
-    let (p, dense, q) = unsafe { dense_b.align_to::<u16>() };
-    assert!(p.is_empty() && q.is_empty(), "dense file alignment");
-    let w = Weights::from_dense(dense);
-    let vocab = Vocab::load(vocab_b);
+    let manifest = std::fs::read(bundle.join("manifest.toml")).unwrap_or_else(|e| halt(&format!("{}: {e}", bundle.join("manifest.toml").display())));
+    let name = model_name(&String::from_utf8_lossy(&manifest)).unwrap_or_else(|| halt("the manifest names no model ([model] name)"));
     let max_ctx: usize = config("rockem.ctx").and_then(|v| v.parse().ok()).unwrap_or(2048);
-    assert!(max_ctx > FIRST_POS, "rockem.ctx must leave room after BOS");
-    let mut st = State::new(max_ctx);
-    let mut model: Box<dyn Model> = if config("rockem.gpu").is_some() {
-        let k = kfd::Kfd::new(loader::load(&bundle.join(layout::KERNELS_FILE), loader::Mem::Anon), false);
-        // the placement table: every routed expert on the card, or every one in this host's
-        // DRAM (rockem.experts=host) — the manifest's table replaces this once there is one
-        let place = vec![if config("rockem.experts").as_deref() == Some("host") { 1u32 } else { 0 }; deepseek_v2_lite::N_ROUTED_EXPERTS];
-        Box::new(kfd::KfdModel::new(k, dense, &experts[..layout::STREAM], &st.rope, max_ctx, &place))
-    } else {
-        Box::new(CpuModel { attention: CpuAttention::new(max_ctx), ffn: CpuFfn::new(CpuExperts::new(&experts[..layout::STREAM])) })
+    let (gpu, experts_host) = (config("rockem.gpu").is_some(), config("rockem.experts").as_deref() == Some("host"));
+    let e: Box<dyn Engine> = match name.as_str() {
+        "deepseek-v2-lite" => v2lite::V2Lite::open(bundle, mem, max_ctx, gpu, experts_host),
+        other => halt(&format!("the manifest names model {other:?}, which this node does not carry")),
     };
-    // the sink token's state: every sequence starts from it at FIRST_POS
-    let sink_b = loader::load(&bundle.join(layout::SINK_FILE), loader::Mem::Anon);
-    let (p, sink, q) = unsafe { sink_b.align_to::<f32>() };
-    assert!(p.is_empty() && q.is_empty() && sink.len() == layout::SINK_LEN, "sink file");
+    assert!(max_ctx > e.first_pos(), "rockem.ctx must leave room after the prefix");
+    let vocab = Vocab::load(loader::load(&bundle.join("vocab.bin"), loader::Mem::Anon), e.vocab_size());
     let debug = config("rockem.debug").map(std::path::PathBuf::from);
     if let Some(d) = &debug {
         std::fs::create_dir_all(d).unwrap();
@@ -498,26 +523,22 @@ fn main() {
     // an assumed mean between the store and everything else the node holds; `rockem.cache` sets it
     let avail_kb: usize = std::fs::read_to_string("/proc/meminfo").unwrap_or_default().lines().find_map(|l| l.strip_prefix("MemAvailable:")).and_then(|v| v.trim().split(' ').next()).and_then(|v| v.parse().ok()).unwrap_or(0);
     let budget_bytes = config("rockem.cache").and_then(|v| v.parse::<usize>().ok()).map(|gb| gb << 30).unwrap_or(avail_kb << 9);
-    let store = Store { contexts: Vec::new(), index: std::collections::HashMap::new(), budget: (budget_bytes / (layout::POSITION * 4)).max(max_ctx), held: 0, clock: 0, max_ctx, active: Vec::new() };
-    println!("cache    : {} cached positions ({:.1} GB of host memory), {} KB each", store.budget, budget_bytes as f64 / 1e9, layout::POSITION * 4 / 1024);
-    // the sink's logits: BOS through the model once, at position 0, before anything is served
-    let mut sink_logits = {
-        st.decode(&w, BOS_TOKEN as u32, 0, &mut model, &Sampling::GREEDY, 0.0, &mut common::trace::NoTrace);
-        st.logits[..VOCAB_SIZE].to_vec()
-    };
-    model.token_trace(0, &mut vec![0f32; deepseek_v2_lite::NUM_HIDDEN_LAYERS * deepseek_v2_lite::H], &mut vec![0u32; deepseek_v2_lite::NUM_HIDDEN_LAYERS * deepseek_v2_lite::TOP_K], &mut sink_logits);
-    let mut session = Session { w, model, st, sink, sink_logits, scoring: false, last_row: 0, next: 0, pos: FIRST_POS, max_ctx, started: false, debug, dtr: DebugTrace::new(), store, active: 0, pending: None, hits: 0 };
-    println!("model    : deepseek-v2-lite, ctx {max_ctx}, temperature {}, top-k {}, top-p {}", SAMPLING.temperature, SAMPLING.top_k, SAMPLING.top_p);
+    let position = e.position();
+    let store = Store { contexts: Vec::new(), index: std::collections::HashMap::new(), budget: (budget_bytes / (position * 4)).max(max_ctx), held: 0, clock: 0, max_ctx, position, active: Vec::new() };
+    println!("cache    : {} cached positions ({:.1} GB of host memory), {} KB each{}, for {}", store.budget, budget_bytes as f64 / 1e9, position * 4 / 1024, if e.snapshot_len() > 0 { format!(", {} MB of state a transcript", e.snapshot_len() * 4 >> 20) } else { String::new() }, e.name());
+    let (bos, first) = (e.bos(), e.first_pos());
+    let mut session = Session { e, scoring: false, last_row: 0, next: 0, pos: first, max_ctx, started: false, prefix_left: 0, debug, store, active: 0, pending: None, hits: 0 };
 
     // --- execution ---
     if let Some(listen) = config("rockem.listen") {
-        let identity = wire::identity(&std::fs::read(bundle.join("manifest.toml")).unwrap_or_default());
+        let identity = wire::identity(&manifest);
         serve(&listen, &mut session, identity);
         return;
     }
     // the console: one line is a prompt, its newline is GENERATE
     let max_new: usize = config("rockem.max").and_then(|v| v.parse().ok()).unwrap_or(64);
-    println!("ready    : type token ids, e.g.  100000 549 6077 280 7239 317  ({max_new} tokens per line)");
+    let prefix: Vec<String> = session.e.prefix_ids().iter().map(|id| id.to_string()).collect();
+    println!("ready    : type token ids, e.g.  {} 549 6077 280 7239 317  ({max_new} tokens per line)", prefix.join(" "));
     let stdin = std::io::stdin();
     let mut out = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -527,14 +548,14 @@ fn main() {
             continue;
         }
         let t1 = std::time::Instant::now();
-        // the line's ids after BOS go through the model in steps, as the wire's do
-        if ids[0] as usize != BOS_TOKEN || ids.iter().skip(1).any(|&id| id as usize == BOS_TOKEN) {
-            println!("[a prompt is one BOS ({BOS_TOKEN}) then ids: position 0 is the precomputed sink]");
+        // the line's ids after the prefix go through the model in steps, as the wire's do
+        if ids[0] != bos || ids.iter().skip(1).any(|&id| id == bos) {
+            println!("[a prompt is the prefix ({}) then ids: the prefix's positions are precomputed]", prefix.join(" "));
             continue;
         }
         session.start();
         if !session.feed_many(&ids[1..], &mut |_| {}) {
-            println!("[the context is full]");
+            println!("[the context is full, or the prefix is not the model's]");
             continue;
         }
         for &id in &ids {
