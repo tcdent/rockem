@@ -29,7 +29,8 @@ use glm_5_3_flash::construct::Placed;
 use glm_5_3_flash::ffn::gfx11_consts::{DENSE_GU_ROWS, SHARED_GU_ROWS};
 use glm_5_3_flash::kda::gfx11_consts as g;
 use glm_5_3_flash::layout::{KDA_MEMORY, KDA_WINDOW};
-use glm_5_3_flash::mla::gfx11_consts::{IX_ROWS, O_IN};
+use glm_5_3_flash::mla::gfx11_consts::{ATTEND_GRID, ATTEND_LDS, IX_ROWS, O_IN};
+use glm_5_3_flash::DENSE_BELOW;
 use glm_5_3_flash::{INDEX_HEAD_DIM, INDEX_N_HEADS, KV_LORA_RANK, Q_LORA_RANK};
 use glm_5_3_flash::weights::{Attn, Ffn, Fp8, Weights};
 use glm_5_3_flash::{CONV_DIM, CONV_TAPS, D_FF, H, INTERMEDIATE_SIZE, KDA_DIM, KDA_HEADS, KDA_QKV, LINEAR_ATTENTION, MLA_HEADS, NUM_HIDDEN_LAYERS, N_SHARED_EXPERTS, Q_HEAD, VOCAB_SIZE};
@@ -47,6 +48,7 @@ struct Card {
     ffn_down_dense: crate::kfd::Kernel,
     mla_qb: crate::kfd::Kernel,
     mla_iq: crate::kfd::Kernel,
+    mla_attend: crate::kfd::Kernel,
     mla_o: crate::kfd::Kernel,
     // the step's buffers, one token deep; a set per part slot, for the parts on this card
     x: Mem,      // [H] f32, host-visible: the block input
@@ -63,12 +65,13 @@ struct Card {
     lg: Mem,     // [VOCAB_SIZE] f32, host memory: the logits
     // the MLA's
     mqa: Mem,    // [Q_LORA_RANK] f32: q_a's output, the input of q_b and the indexer's query
-    mproj: Mem,  // host memory: q [MLA_HEADS·Q_HEAD] | kva [KV_LORA_RANK] | ix [IX_ROWS] | iq [INDEX_N_HEADS·INDEX_HEAD_DIM]
-    mheads: Mem, // [O_IN] f32, host-visible: the heads' outputs
+    mq: Mem,     // [MLA_HEADS·Q_HEAD] f32: the query, the attention's input
+    mproj: Mem,  // host memory: kva [KV_LORA_RANK] | ix [IX_ROWS] | iq [INDEX_N_HEADS·INDEX_HEAD_DIM]
+    msel: Mem,   // [DENSE_BELOW] u32, host-visible: the positions attended
+    mheads: Mem, // [O_IN] f32: the heads' outputs, the output projection's input
     my: Mem,     // [H] f32, host memory: the output projection
 }
-const MQ: usize = 0;
-const MKVA: usize = MQ + MLA_HEADS * Q_HEAD;
+const MKVA: usize = 0;
 const MIX: usize = MKVA + KV_LORA_RANK;
 const MIQ: usize = MIX + IX_ROWS;
 const MPROJ: usize = MIQ + INDEX_N_HEADS * INDEX_HEAD_DIM;
@@ -123,6 +126,8 @@ struct MlaOn {
     ix: Mem,
     q_b: (Mem, Mem),
     ix_wq_b: Mem,
+    kv_b: Mem, // [MLA_HEADS][KVB_HEAD][KV_LORA_RANK] bf16: the absorbed attention's W_uk and W_uv per head
+    lat: Mem,  // [max_ctx][KV_LORA_RANK] f32: the latents, the host's cache rows mirrored
     o: (Mem, Mem),
 }
 
@@ -148,7 +153,7 @@ impl Cards {
     /// Open every gfx1100 card, load the code object on each, and place the
     /// blocks on them in order: the KDA layers an equal share each, every
     /// layer's FFN half with the KDA layer at or before it, the head last.
-    pub fn new(elf: &[u8], w: &Weights) -> Self {
+    pub fn new(elf: &[u8], w: &Weights, max_ctx: usize) -> Self {
         let n = Kfd::cards().len();
         assert!(n > 0, "rockem.gpu: no gfx1100 card");
         let t0 = std::time::Instant::now();
@@ -167,6 +172,7 @@ impl Cards {
                     ffn_down_dense: k.kernel("ffn_down_dense"),
                     mla_qb: k.kernel("mla_qb"),
                     mla_iq: k.kernel("mla_iq"),
+                    mla_attend: k.kernel("mla_attend"),
                     mla_o: k.kernel("mla_o"),
                     x: alloc(H),
                     small: alloc(SMALL_ROWS),
@@ -180,7 +186,9 @@ impl Cards {
                     fy: k.host(H * 4),
                     lg: k.host(VOCAB_SIZE * 4),
                     mqa: alloc(Q_LORA_RANK),
+                    mq: alloc(MLA_HEADS * Q_HEAD),
                     mproj: k.host(MPROJ * 4),
+                    msel: alloc(DENSE_BELOW),
                     mheads: alloc(O_IN),
                     my: k.host(H * 4),
                     k,
@@ -329,8 +337,8 @@ impl Cards {
                 k.upload(&m, (mw.ix_wk.len() + mw.ix_gate.len()) * 2, raw(mw.ix_weights));
                 m
             };
-            let on = MlaOn { card, input_ln: up(raw(&bf16_of(w.layers[l].input_ln))), qa_ln: up(raw(&bf16_of(mw.q_a_ln))), q_a: one(mw.q_a), kv_a: one(mw.kv_a), ix, q_b: one(mw.q_b), ix_wq_b: up(raw(mw.ix_wq_b)), o: one(mw.o) };
-            bytes += on.q_a.0.size + on.q_a.1.size + on.kv_a.0.size + on.kv_a.1.size + on.ix.size + on.q_b.0.size + on.q_b.1.size + on.ix_wq_b.size + on.o.0.size + on.o.1.size;
+            let on = MlaOn { card, input_ln: up(raw(&bf16_of(w.layers[l].input_ln))), qa_ln: up(raw(&bf16_of(mw.q_a_ln))), q_a: one(mw.q_a), kv_a: one(mw.kv_a), ix, q_b: one(mw.q_b), ix_wq_b: up(raw(mw.ix_wq_b)), kv_b: up(raw(mw.kv_b)), lat: k.vram_visible(max_ctx * KV_LORA_RANK * 4), o: one(mw.o) };
+            bytes += on.q_a.0.size + on.q_a.1.size + on.kv_a.0.size + on.kv_a.1.size + on.ix.size + on.q_b.0.size + on.q_b.1.size + on.ix_wq_b.size + on.kv_b.size + on.lat.size + on.o.0.size + on.o.1.size;
             mlas[l] = Some(on);
             mla_n += 1;
         }
@@ -345,7 +353,7 @@ impl Cards {
             bytes += norm.size + lm.size;
             Some((card, norm, lm))
         };
-        println!("gpu      : {} KDA layers, {mla_n} MLA layers' projections, {dense} dense FFNs, {shared} shared experts and the head on {} card{} ({:.1} GB with their state) in {:.1}s", kda_layers.len(), n, if n == 1 { "" } else { "s" }, bytes as f64 / 1e9, t0.elapsed().as_secs_f32());
+        println!("gpu      : {} KDA layers, {mla_n} MLA layers (their latents to {max_ctx} positions), {dense} dense FFNs, {shared} shared experts and the head on {} card{} ({:.1} GB with their state) in {:.1}s", kda_layers.len(), n, if n == 1 { "" } else { "s" }, bytes as f64 / 1e9, t0.elapsed().as_secs_f32());
         Cards { cards, layers, ffns, mlas, head }
     }
 
@@ -433,7 +441,7 @@ impl Placed for Cards {
     fn mla(&self, l: usize) -> bool {
         self.mlas[l].is_some()
     }
-    fn mla_project(&mut self, l: usize, x: &[f32], q: &mut [f32], kva: &mut [f32], ik: &mut [f32], igate: &mut [f32], iq: &mut [f32], iw: &mut [f32]) {
+    fn mla_project(&mut self, l: usize, x: &[f32], kva: &mut [f32], ik: &mut [f32], igate: &mut [f32], iq: &mut [f32], iw: &mut [f32]) {
         let m = self.mlas[l].as_ref().unwrap();
         let c = &self.cards[m.card];
         c.k.upload(&c.fx, 0, raw(&x[..H]));
@@ -444,23 +452,32 @@ impl Placed for Cards {
         self.rows_free(c, &c.rows_h, c.fx.va, ln, m.ix.va, c.mproj.at(MIX * 4), IX_ROWS, H);
         // over q_a's output normed with q_a's norm: the query and, alongside it, the indexer's query
         let qln = Some(m.qa_ln.va);
-        self.rows8(c, &c.mla_qb, c.mqa.va, qln, m.q_b.0.va, m.q_b.1.va, c.mproj.at(MQ * 4), MLA_HEADS * Q_HEAD, Q_LORA_RANK);
+        self.rows8(c, &c.mla_qb, c.mqa.va, qln, m.q_b.0.va, m.q_b.1.va, c.mq.va, MLA_HEADS * Q_HEAD, Q_LORA_RANK);
         self.rows_free(c, &c.mla_iq, c.mqa.va, qln, m.ix_wq_b.va, c.mproj.at(MIQ * 4), INDEX_N_HEADS * INDEX_HEAD_DIM, Q_LORA_RANK);
         c.k.sync();
-        read(&c.mproj, MQ * 4, &mut q[..MLA_HEADS * Q_HEAD]);
         read(&c.mproj, MKVA * 4, &mut kva[..KV_LORA_RANK]);
         read(&c.mproj, MIX * 4, &mut ik[..INDEX_HEAD_DIM]);
         read(&c.mproj, (MIX + INDEX_HEAD_DIM) * 4, &mut igate[..INDEX_HEAD_DIM]);
         read(&c.mproj, (MIX + 2 * INDEX_HEAD_DIM) * 4, &mut iw[..INDEX_N_HEADS]);
         read(&c.mproj, MIQ * 4, &mut iq[..INDEX_N_HEADS * INDEX_HEAD_DIM]);
     }
-    fn mla_output(&mut self, l: usize, heads: &[f32], out: &mut [f32]) {
+    fn mla_attend(&mut self, l: usize, pos: usize, latent: &[f32], sel: &[usize], out: &mut [f32]) {
         let m = self.mlas[l].as_ref().unwrap();
         let c = &self.cards[m.card];
-        c.k.upload(&c.mheads, 0, raw(&heads[..O_IN]));
+        // the position's latent into the mirror, the selection, the heads, the output projection
+        c.k.upload(&m.lat, pos * KV_LORA_RANK * 4, raw(&latent[..KV_LORA_RANK]));
+        let sel32: Vec<u32> = sel.iter().map(|&p| p as u32).collect();
+        c.k.upload(&c.msel, 0, raw(&sel32));
+        let mut a = Args::new();
+        a.ptr(c.mq.va).ptr(m.kv_b.va).ptr(m.lat.va).ptr(c.msel.va).u32(sel.len() as u32).ptr(c.mheads.va);
+        c.k.launch(&c.mla_attend, ATTEND_GRID, g::WG, ATTEND_LDS as u32, &a);
         self.rows8(c, &c.mla_o, c.mheads.va, None, m.o.0.va, m.o.1.va, c.my.va, H, O_IN);
         c.k.sync();
         read(&c.my, 0, &mut out[..H]);
+    }
+    fn mla_seed(&mut self, l: usize, pos: usize, latent: &[f32]) {
+        let m = self.mlas[l].as_ref().unwrap();
+        self.cards[m.card].k.upload(&m.lat, pos * KV_LORA_RANK * 4, raw(&latent[..KV_LORA_RANK]));
     }
     fn kda_step(&mut self, l: usize, x: &[f32], out: &mut [f32]) {
         let lay = self.layers[l].as_ref().unwrap();

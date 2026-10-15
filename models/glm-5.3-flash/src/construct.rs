@@ -358,12 +358,17 @@ pub trait Placed {
     fn ffn_finish(&mut self, l: usize, out: &mut [f32]);
     fn head(&self) -> bool;
     fn logits(&mut self, mean: &[f32], logits: &mut [f32]);
-    /// The MLA projections of block input `x` (`mla::project`'s outputs: the
-    /// query, the latent and the indexer's key before their norms, the gate,
-    /// the indexer's query and unscaled head weights), waited for.
+    /// The MLA projections of block input `x` (`mla::project`'s outputs but
+    /// the query, which stays there: the latent and the indexer's key before
+    /// their norms, the gate, the indexer's query and unscaled head weights),
+    /// waited for; then the attention over the selected positions `sel` with
+    /// position `pos`'s latent just made, and the output projection, into
+    /// `out`. The latents live there too: `mla_seed` installs position
+    /// `pos`'s when a sequence is seeded.
     fn mla(&self, l: usize) -> bool;
-    fn mla_project(&mut self, l: usize, x: &[f32], q: &mut [f32], kva: &mut [f32], ik: &mut [f32], igate: &mut [f32], iq: &mut [f32], iw: &mut [f32]);
-    fn mla_output(&mut self, l: usize, heads: &[f32], out: &mut [f32]);
+    fn mla_project(&mut self, l: usize, x: &[f32], kva: &mut [f32], ik: &mut [f32], igate: &mut [f32], iq: &mut [f32], iw: &mut [f32]);
+    fn mla_attend(&mut self, l: usize, pos: usize, latent: &[f32], sel: &[usize], out: &mut [f32]);
+    fn mla_seed(&mut self, l: usize, pos: usize, latent: &[f32]);
 }
 
 /// One layer's sequence state: a KDA layer's convolution window and memory
@@ -524,6 +529,11 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                         let (c, pk) = (&*cache, &mut pools[j * INDEX_HEAD_DIM..(j + 1) * INDEX_HEAD_DIM]);
                         mla::pool_key(mw, c, j, pk);
                     }
+                    if let Some(pl) = self.placed.as_mut().filter(|p| p.mla(l)) {
+                        for p in 0..n {
+                            pl.mla_seed(l, p, &cache[p * MLA_ROW..p * MLA_ROW + KV_LORA_RANK]);
+                        }
+                    }
                     mi += 1;
                 }
                 _ => unreachable!("a layer's state and weights disagree"),
@@ -609,17 +619,23 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     {
                         let (latent, ikey, igate) = mla::row(cache, pos);
                         match &mut placed_mla {
-                            Some(pl) => pl.mla_project(l, &s.x, ms.q, ms.kva, ms.ik, igate, ms.iq, ms.iw),
+                            Some(pl) => pl.mla_project(l, &s.x, ms.kva, ms.ik, igate, ms.iq, ms.iw),
                             None => mla::project(a, &s.xn, &mut ms, igate, s.pool),
                         }
                         mla::finish_row(a, &ms, latent, ikey);
                     }
                     lap(&mut p.mla_proj);
-                    mla::attend(l, a, cache, pools, pos, &mut ms, s.pool, tr);
-                    lap(&mut p.mla_attn);
+                    let n = mla::select_at(l, a, cache, pools, pos, &mut ms, tr);
                     match placed_mla {
-                        Some(pl) => pl.mla_output(l, ms.heads, &mut s.y),
-                        None => mla::output(a, ms.heads, &mut s.y, s.pool),
+                        Some(pl) => {
+                            lap(&mut p.mla_attn);
+                            pl.mla_attend(l, pos, &cache[pos * MLA_ROW..pos * MLA_ROW + KV_LORA_RANK], &ms.sel[..n], &mut s.y);
+                        }
+                        None => {
+                            mla::heads(l, a, cache, &mut ms, n, s.pool, tr);
+                            lap(&mut p.mla_attn);
+                            mla::output(a, ms.heads, &mut s.y, s.pool);
+                        }
                     }
                     lap(&mut p.mla_out);
                 }
