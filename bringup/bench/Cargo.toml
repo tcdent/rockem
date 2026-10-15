@@ -8,6 +8,7 @@ description = "Per-op benches on real bundle bytes: every realization against th
 harness = { path = "../harness" }
 common = { path = "../../common", features = ["std"] }
 deepseek_v2_lite = { path = "../../models/deepseek-v2-lite", features = ["std"] }
+glm_5_3_flash = { path = "../../models/glm-5.3-flash", features = ["std"] }
 memmap2 = "0.9"
 
 [[bin]]
@@ -65,3 +66,7 @@ path = "src/repeat.rs"
 name = "bench-memtest"
 path = "src/memtest.rs"
 
+
+[[bin]]
+name = "bench-box"
+path = "src/box_.rs"

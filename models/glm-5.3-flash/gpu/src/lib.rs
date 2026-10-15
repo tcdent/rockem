@@ -4,6 +4,7 @@
 #![no_std]
 
 pub use glm_5_3_flash::kda::gfx11 as kda;
+pub use glm_5_3_flash::probe::gfx11 as probe;
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {

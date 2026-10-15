@@ -68,6 +68,7 @@ pub mod hc;
 pub mod kda;
 pub mod layout;
 pub mod mla;
+pub mod probe;
 #[cfg(feature = "std")]
 pub mod construct;
 pub mod weights;
