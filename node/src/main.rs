@@ -34,10 +34,13 @@ mod wire;
 use engine::Engine;
 use std::io::{BufRead, Read, Write};
 
-/// The last occurrence of a key wins, as for the kernel's own parameters: a netboot line may repeat ours.
+/// The kernel command line, then the program's arguments; the last occurrence of a key
+/// wins, as for the kernel's own parameters — so a netboot line that repeats ours overrides
+/// the image's, and an argument given by hand overrides both (a node run from a shell on a
+/// booted box listens where it is told, not where the image's node does).
 fn config(key: &str) -> Option<String> {
     let cmd = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
-    std::env::args().skip(1).chain(cmd.split_whitespace().map(String::from)).filter_map(|t| t.strip_prefix(&format!("{key}=")).map(String::from)).last()
+    cmd.split_whitespace().map(String::from).chain(std::env::args().skip(1)).filter_map(|t| t.strip_prefix(&format!("{key}=")).map(String::from)).last()
 }
 
 /// `name = "…"` under `[model]` in a manifest.
