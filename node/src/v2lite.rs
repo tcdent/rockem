@@ -56,7 +56,7 @@ impl V2Lite {
             // the placement table: every routed expert on the card, or every one in this host's
             // DRAM — the manifest's table replaces this once there is one
             let place = vec![if experts_host { 1u32 } else { 0 }; deepseek_v2_lite::N_ROUTED_EXPERTS];
-            Box::new(kfd::KfdModel::new(k, dense, &experts[..layout::STREAM], &st.rope, max_ctx, &place))
+            Box::new(crate::v2lite_kfd::KfdModel::new(k, dense, &experts[..layout::STREAM], &st.rope, max_ctx, &place))
         } else {
             Box::new(CpuModel { attention: CpuAttention::new(max_ctx), ffn: CpuFfn::new(CpuExperts::new(&experts[..layout::STREAM])) })
         };

@@ -2,12 +2,15 @@
 //! layer, in the types the kernels take: bf16 rows as `&[u16]`, FP8 rows with
 //! their block scales as `Fp8`, and the small vectors (norms, biases, the
 //! hyper-connection coefficients' base and scale, the pool offsets) widened
-//! to f32 once. The routed experts are not here: they belong to a `Routed`
-//! realization over the expert stream. `std` only; construction only.
+//! to f32 once at construction and kept for the process (`std`). The routed
+//! experts are not here: they belong to a `Routed` realization over the
+//! expert stream. The structs are plain slices, so the kernels — CPU and GPU
+//! alike — see them without `std`.
 
+#[cfg(feature = "std")]
 use crate::layout::{self, Kind, Tensor};
+#[cfg(feature = "std")]
 use crate::*;
-use common::gemv::widen;
 
 /// FP8 e4m3 rows with one f32 scale per 128×128 block (`common::gemv::fp8`).
 #[derive(Clone, Copy)]
@@ -35,25 +38,25 @@ pub struct Kda<'a> {
     pub b: &'a [u16], // [KDA_HEADS][H]
     pub g_a: &'a [u16],
     pub g_b: &'a [u16],
-    pub o_norm: Vec<f32>,
+    pub o_norm: &'a [f32],
     pub o: &'a [u16], // [H][KDA_QKV]
 }
 
 pub struct Mla<'a> {
     pub q_a: Fp8<'a>, // [Q_LORA_RANK][H]
-    pub q_a_ln: Vec<f32>,
+    pub q_a_ln: &'a [f32],
     pub q_b: Fp8<'a>, // [MLA_HEADS·Q_HEAD][Q_LORA_RANK]
     pub kv_a: Fp8<'a>, // [KV_LORA_RANK][H]
-    pub kv_a_ln: Vec<f32>,
+    pub kv_a_ln: &'a [f32],
     /// `[MLA_HEADS][KVB_HEAD][KV_LORA_RANK]`: per head the key rows, then the value rows.
     pub kv_b: &'a [u16],
     pub o: Fp8<'a>, // [H][MLA_HEADS·V_HEAD_DIM]
     pub ix_wq_b: &'a [u16], // [INDEX_N_HEADS·INDEX_HEAD_DIM][Q_LORA_RANK]
     pub ix_wk: &'a [u16],   // [INDEX_HEAD_DIM][H]
-    pub ix_k_norm_w: Vec<f32>,
-    pub ix_k_norm_b: Vec<f32>,
+    pub ix_k_norm_w: &'a [f32],
+    pub ix_k_norm_b: &'a [f32],
     pub ix_weights: &'a [u16], // [INDEX_N_HEADS][H]
-    pub ix_ape: Vec<f32>,      // [INDEX_KPOOL][INDEX_HEAD_DIM]
+    pub ix_ape: &'a [f32],      // [INDEX_KPOOL][INDEX_HEAD_DIM]
     pub ix_gate: &'a [u16],    // [INDEX_HEAD_DIM][H]
 }
 
@@ -82,25 +85,28 @@ pub enum Ffn<'a> {
 }
 
 pub struct Layer<'a> {
-    pub input_ln: Vec<f32>,
-    pub post_ln: Vec<f32>,
+    pub input_ln: &'a [f32],
+    pub post_ln: &'a [f32],
     pub hc_attn: Hc<'a>,
     pub hc_ffn: Hc<'a>,
     pub attn: Attn<'a>,
     pub ffn: Ffn<'a>,
 }
 
+#[cfg(feature = "std")]
 pub struct Weights<'a> {
     pub embed: &'a [u16], // [VOCAB_SIZE][H]
-    pub norm: Vec<f32>,
+    pub norm: &'a [f32],
     pub lm_head: &'a [u16], // [VOCAB_SIZE][H]
     pub layers: Vec<Layer<'a>>,
 }
 
 /// A tensor's bytes in the file, by layer and name.
+#[cfg(feature = "std")]
 struct At<'a> {
     dense: &'a [u8],
 }
+#[cfg(feature = "std")]
 impl<'a> At<'a> {
     fn slot(&self, l: Option<usize>, name: &str) -> (&'a [u8], Tensor) {
         let (off, t) = layout::locate(l, name).unwrap_or_else(|| panic!("layout has no {name} in layer {l:?}"));
@@ -128,11 +134,14 @@ impl<'a> At<'a> {
         assert!(p.is_empty() && q.is_empty() && s.len() == t.scales(), "{name}: scales");
         Fp8 { w, s }
     }
-    fn widened(&self, l: Option<usize>, name: &str) -> Vec<f32> {
-        self.bf16(l, name).iter().map(|&v| widen(v)).collect()
+    /// A small bf16 vector widened once and kept for the process: a construction-time allocation.
+    fn widened(&self, l: Option<usize>, name: &str) -> &'a [f32] {
+        let v: Vec<f32> = self.bf16(l, name).iter().map(|&v| common::gemv::widen(v)).collect();
+        Box::leak(v.into_boxed_slice())
     }
 }
 
+#[cfg(feature = "std")]
 impl<'a> Weights<'a> {
     /// The bundle's dense file, as loaded (its base must be 4-byte aligned; the slots are 64-byte).
     pub fn from_dense(dense: &'a [u8]) -> Self {
@@ -200,4 +209,5 @@ impl<'a> Weights<'a> {
 }
 
 /// The file's base alignment the slices need: f32 scales and bf16 rows are read in place.
+#[cfg(feature = "std")]
 const ALIGN_MIN: usize = 4;

@@ -25,3 +25,5 @@ bringup/evals/data/gsm8k/
 *.report.json
 bringup/*.log
 os/initramfs/dl/
+models/glm-5.3-flash/gpu/target/
+models/glm-5.3-flash/gpu/target-stats/

@@ -17,6 +17,8 @@
 //! ```
 //! then the mean of the four streams, norm, lm_head.
 #![cfg_attr(not(any(feature = "std", test)), no_std)]
+#![cfg_attr(target_arch = "amdgpu", feature(abi_gpu_kernel, stdarch_amdgpu))]
+#![allow(clippy::too_many_arguments)]
 
 include!(concat!(env!("OUT_DIR"), "/config_consts.rs"));
 
@@ -68,7 +70,6 @@ pub mod layout;
 pub mod mla;
 #[cfg(feature = "std")]
 pub mod construct;
-#[cfg(feature = "std")]
 pub mod weights;
 
 const _: () = assert!(LINEAR_ATTENTION.len() == NUM_HIDDEN_LAYERS);

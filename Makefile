@@ -2,7 +2,7 @@
 PROFILE ?= dev
 RUN = os/run.sh
 
-.PHONY: image configure kernel kernels node initramfs release publish qemu kvm clean gate-dump lasenora-vm
+.PHONY: image configure kernel kernels kernels-glm node initramfs release publish qemu kvm clean gate-dump lasenora-vm
 
 image:            ## build the pinned builder image
 	os/builder/build-image.sh
@@ -18,6 +18,10 @@ kernels:          ## the gfx1100 code objects (release + stats) on the host's ni
 	cd models/deepseek-v2-lite/gpu && cargo +nightly build --release --features stats --target-dir target-stats
 	cp models/deepseek-v2-lite/gpu/target-stats/amdgcn-amd-amdhsa/release/deepseek_v2_lite_gpu.elf bundles/kernels-stats.gfx1100.elf
 	python3 bringup/kernel_report.py models/deepseek-v2-lite/gpu/target/amdgcn-amd-amdhsa/release/deepseek_v2_lite_gpu.elf
+
+kernels-glm:      ## GLM-5.3-Flash's gfx1100 code object and its static report
+	cd models/glm-5.3-flash/gpu && cargo +nightly build --release
+	python3 bringup/kernel_report.py models/glm-5.3-flash/gpu/target/amdgcn-amd-amdhsa/release/glm_5_3_flash_gpu.elf
 
 node:             ## the static node binary (musl)
 	$(RUN) cargo build --release --target x86_64-unknown-linux-musl -p node

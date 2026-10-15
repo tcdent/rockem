@@ -173,6 +173,18 @@ impl Routed for CpuExperts<'_> {
     }
 }
 
+/// KDA layers placed away from this CPU — on a card — behind one interface.
+/// `step` runs placed layer `l` over the block input `x` (`[H]`, before the
+/// input norm: the placement norms it) into `out`; `seed` and `snapshot`
+/// move a placed layer's state (its convolution window and memory). A layer
+/// the placement does not hold runs here.
+pub trait KdaPlaced {
+    fn placed(&self, l: usize) -> bool;
+    fn step(&mut self, l: usize, x: &[f32], out: &mut [f32]);
+    fn seed(&mut self, l: usize, window: &[f32], mem: &[f32]);
+    fn snapshot(&self, l: usize, window: &mut [f32], mem: &mut [f32]);
+}
+
 /// One layer's sequence state: a KDA layer's convolution window and memory
 /// (the snapshot's), or an MLA layer's cache rows and pool keys (the rows').
 pub enum LayerState {
@@ -183,6 +195,8 @@ pub enum LayerState {
 pub struct CpuModel<'p, R: Routed> {
     pub routed: R,
     pub pool: &'p dyn Pool,
+    /// KDA layers that run elsewhere; `None` runs every layer here.
+    pub placed: Option<Box<dyn KdaPlaced>>,
     pub max_ctx: usize,
     pub layers: Vec<LayerState>,
     /// The last step's logits, `[VOCAB_SIZE]`.
@@ -232,6 +246,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
         CpuModel {
             routed,
             pool,
+            placed: None,
             max_ctx,
             layers,
             logits: vec![0.0; VOCAB_SIZE],
@@ -284,6 +299,9 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     let base = ki * layout::KDA_STATE;
                     window.copy_from_slice(&snap[base..base + KDA_WINDOW]);
                     mem.copy_from_slice(&snap[base + KDA_WINDOW..base + layout::KDA_STATE]);
+                    if let Some(p) = self.placed.as_mut().filter(|p| p.placed(l)) {
+                        p.seed(l, window, mem);
+                    }
                     ki += 1;
                 }
                 (LayerState::Mla { cache, pools }, Attn::Mla(mw)) => {
@@ -309,11 +327,17 @@ impl<'p, R: Routed> CpuModel<'p, R> {
     /// The KDA layers' state now, `[SNAPSHOT]`.
     pub fn snapshot(&self, out: &mut [f32]) {
         let mut ki = 0;
-        for st in &self.layers {
+        for (l, st) in self.layers.iter().enumerate() {
             if let LayerState::Kda { window, mem } = st {
                 let base = ki * layout::KDA_STATE;
-                out[base..base + KDA_WINDOW].copy_from_slice(window);
-                out[base + KDA_WINDOW..base + layout::KDA_STATE].copy_from_slice(mem);
+                let (w, m) = out[base..base + layout::KDA_STATE].split_at_mut(KDA_WINDOW);
+                match self.placed.as_ref().filter(|p| p.placed(l)) {
+                    Some(p) => p.snapshot(l, w, m),
+                    None => {
+                        w.copy_from_slice(window);
+                        m.copy_from_slice(mem);
+                    }
+                }
                 ki += 1;
             }
         }
@@ -349,6 +373,9 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             rmsnorm::<H>(&s.x, &lw.input_ln, RMS_NORM_EPS, &mut s.xn);
             tr.edge(l, "attn_in", &s.xn);
             match (&lw.attn, &mut s.layers[l]) {
+                (Attn::Kda(_), _) if s.placed.as_ref().is_some_and(|p| p.placed(l)) => {
+                    s.placed.as_mut().unwrap().step(l, &s.x, &mut s.y);
+                }
                 (Attn::Kda(a), LayerState::Kda { window, mem }) => {
                     let mut ks = kda::Scratch { mixed: &mut s.k_mixed, conv: &mut s.k_conv, fa: &mut s.k_fa, f: &mut s.k_f, beta: &mut s.k_beta, ga: &mut s.k_ga, gate: &mut s.k_gate, normed: &mut s.k_normed, heads: &mut s.k_heads };
                     kda::step(l, a, &s.xn, window, mem, &mut ks, s.pool, tr, &mut s.y);

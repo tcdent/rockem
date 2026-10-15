@@ -9,6 +9,7 @@
 //!                                     bundle's INT4 bytes dequantized through f32 arithmetic (the oracle's q4 recipe), or
 //!                                     the checkpoint's unquantized experts — what separates the recipe's cost from a kernel error
 //!               [--positions N]       stop after N computed positions
+//!               [--gpu]               with --cpu: the KDA layers on the gfx1100 cards (node/src/glm_kfd.rs), the bundle's code object
 //!               [--force-picks]   every MoE layer takes the oracle's expert picks (weights still its own): separates tie flips from the rest
 //!               [--detail 1e-3]   also print every row past this relative error, and every position whose picks differ
 //!
@@ -16,6 +17,12 @@
 //! ffn_in, ffn_out, out (the mean of the four streams). The table is the worst
 //! row per edge class; each layer also prints its own worst per edge, which is
 //! where an error's growth shows. Edges a golden lacks are skipped.
+
+#[path = "../../../node/src/kfd.rs"]
+#[allow(dead_code)]
+mod kfd;
+#[path = "../../../node/src/glm_kfd.rs"]
+mod glm_kfd;
 
 use glm_5_3_flash::construct::{CpuExperts, CpuModel};
 use glm_5_3_flash::reference::*;
@@ -197,6 +204,10 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
         m => panic!("--experts {m}: a8, q4f32 or f32"),
     };
     let mut model = CpuModel::new(routed, &pool, n.max(FIRST_POS + 1));
+    if harness::flag("--gpu") {
+        let elf = std::fs::read(bundle.join(layout::KERNELS_FILE)).unwrap_or_else(|e| panic!("{}: {e}", bundle.join(layout::KERNELS_FILE).display()));
+        model.placed = Some(Box::new(glm_kfd::KdaCards::new(&elf, &w)));
+    }
     model.seed_prefix(&w, &prefix);
     for (t, &id) in ids.iter().enumerate().take(FIRST_POS) {
         assert_eq!(id as u32, PREFIX_IDS[t], "the passage does not start with the model's prefix");

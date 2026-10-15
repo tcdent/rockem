@@ -1,0 +1,28 @@
+[package]
+name = "glm_5_3_flash_gpu"
+version = "0.0.0"
+edition = "2021"
+description = "The code object: glm_5_3_flash's GPU kernel entries compiled for gfx1100 into one ELF the bundle carries. Built with the pinned nightly; see .cargo/config.toml."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+glm_5_3_flash = { path = ".." }
+
+[features]
+stats = ["glm_5_3_flash/stats"]
+
+[workspace]
+
+[profile.release]
+opt-level = 3
+lto = true
+panic = "abort"
+codegen-units = 1
+
+[profile.dev]
+opt-level = 1
+lto = true
+panic = "abort"
+incremental = false

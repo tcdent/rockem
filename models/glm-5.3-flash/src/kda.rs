@@ -140,3 +140,226 @@ fn head(w: &weights::Kda, h: usize, conv: &[f32], f: &[f32], beta: &[f32], gate:
         normed[vv] = on[vv] * sigmoid(gate[h * KDA_DIM + vv]);
     }
 }
+
+/// Launch geometry of the gfx11 realization, visible to hosts that launch it.
+pub mod gfx11_consts {
+    use crate::*;
+    pub const WG: u32 = 256;
+    /// The rows kernels: 8 rows per workgroup.
+    pub const fn rows_grid(m: usize) -> u32 {
+        m.div_ceil(8) as u32
+    }
+    /// LDS a rows kernel over `[m][k]` needs for a step of `n` tokens (`common::gemv::gfx11`).
+    pub const fn rows_lds(k: usize, n: usize) -> usize {
+        let steps = k.div_ceil(256);
+        let flight = common::gemv::FLIGHT;
+        let slots = if n <= 1 { if steps < flight { steps } else { flight } } else { 2 * 8 };
+        4 * (slots * common::gemv::STEP + 8)
+    }
+    /// A rows kernel that norms its input: the slab, then 8 wave partials per token of the pass.
+    pub const fn normed_rows_lds(k: usize, n: usize) -> usize {
+        rows_lds(k, n) + 4 * 8 * common::gemv::PASS
+    }
+    /// `kda_step`: a workgroup per head.
+    pub const STEP_GRID: u32 = KDA_HEADS as u32;
+    /// `kda_step`'s LDS, in floats: the head's conv outputs (q | k | v), the forget
+    /// factors, two partials per value channel, and the reduction scratch.
+    pub const CONV: usize = 0;
+    pub const FORGET: usize = CONV + 3 * KDA_DIM;
+    pub const EX: usize = FORGET + KDA_DIM;
+    pub const RED: usize = EX + 2 * KDA_DIM;
+    pub const STEP_LDS: usize = 4 * (RED + 16);
+    /// The three convolutions' taps as one `[3][KDA_QKV][CONV_TAPS]` bf16 block: q's, k's, v's.
+    pub const TAPS: usize = 3 * KDA_QKV * CONV_TAPS;
+}
+
+#[cfg(target_arch = "amdgpu")]
+pub mod gfx11 {
+    //! The GPU realization of the KDA layer, for `n` tokens of a step at once:
+    //! `rows_h` (rows of a `[m][H]` bf16 matrix over `n` activations, each
+    //! rms-normed with the layer's input weight as it is staged — the q, k, v
+    //! projections, the forget and output gates' first halves, the beta rows),
+    //! `rows_d` (`[m][KDA_DIM]` rows: the gates' second halves), `kda_step` (a
+    //! workgroup per head: the short convolution, the l2 norms, the bounded
+    //! forget gate, the delta rule over the head's memory held in registers
+    //! across the step's tokens, the gated norm) and `rows_qkv` (`[m][KDA_QKV]`
+    //! rows: the output projection). One token is n = 1 through the same kernels.
+    pub use super::gfx11_consts::*;
+    use crate::*;
+    use common::gemv::gfx11::rows_over;
+    use common::gemv::widen;
+    use common::gfx11::{lds, wave_sum, workgroup_sync};
+    use common::math::{exp, rsqrt};
+    use common::swiglu::silu;
+    use core::arch::amdgpu::{workgroup_id_x, workitem_id_x};
+    const _: () = assert!(TOKENS == common::gemv::gfx11::TOKENS);
+
+    /// `out[i][row] = W[row] · rmsnorm_ln(x[i])` for `m` rows of a `[m][H]`
+    /// bf16 matrix and `n` activations `x` (`[n][H]`). Grid: rows_grid(m).
+    #[no_mangle]
+    pub extern "gpu-kernel" fn rows_h(x: *const f32, ln: *const u16, w: *const u16, out: *mut f32, m: u32, n: u32) {
+        unsafe {
+            let tid = workitem_id_x();
+            let (m, n) = (m as usize, n as usize);
+            let t = tid as usize;
+            rows_over::<H, true>(tid, w, ln, m, n, RMS_NORM_EPS, |i, s| *x.add(i * H + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
+        }
+    }
+
+    /// `out[i][row] = W[row] · x[i]` for a `[m][KDA_DIM]` bf16 matrix over `x: [n][KDA_DIM]`. Grid: rows_grid(m).
+    #[no_mangle]
+    pub extern "gpu-kernel" fn rows_d(x: *const f32, w: *const u16, out: *mut f32, m: u32, n: u32) {
+        unsafe {
+            let tid = workitem_id_x();
+            let (m, n) = (m as usize, n as usize);
+            let t = tid as usize;
+            rows_over::<KDA_DIM, false>(tid, w, core::ptr::null(), m, n, 0.0, |i, s| if s * 256 + t < KDA_DIM { *x.add(i * KDA_DIM + s * 256 + t) } else { 0.0 }, || {}, |row, i, y| *out.add(i * m + row) = y);
+        }
+    }
+
+    /// `out[i][row] = W[row] · x[i]` for a `[m][KDA_QKV]` bf16 matrix over `x: [n][KDA_QKV]`: the output projection. Grid: rows_grid(m).
+    #[no_mangle]
+    pub extern "gpu-kernel" fn rows_qkv(x: *const f32, w: *const u16, out: *mut f32, m: u32, n: u32) {
+        unsafe {
+            let tid = workitem_id_x();
+            let (m, n) = (m as usize, n as usize);
+            let t = tid as usize;
+            rows_over::<KDA_QKV, false>(tid, w, core::ptr::null(), m, n, 0.0, |i, s| *x.add(i * KDA_QKV + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
+        }
+    }
+
+    #[inline(always)]
+    fn sigmoid(x: f32) -> f32 {
+        1.0 / (1.0 + exp(-x))
+    }
+
+    /// One head of the layer through the step's `n` tokens, in order. Inputs
+    /// per token i: `mixed[i]` (`[3][KDA_QKV]`: the q, k, v projections),
+    /// `f[i]` and `gate[i]` (`[KDA_QKV]`), `beta[i]` (`[KDA_HEADS]`); the
+    /// layer's `taps` (`[3][KDA_QKV][CONV_TAPS]` bf16), `dt_bias`, `a_log`,
+    /// `o_norm`; its state, `window` (`[CONV_TAPS-1][CONV_DIM]`) and `mem`
+    /// (`[KDA_HEADS][KDA_DIM][KDA_DIM]`), advanced by `n` positions; output
+    /// `normed[i]` (`[KDA_QKV]`), the gated-normed readouts. Thread `t` holds
+    /// column `t % KDA_DIM` of the memory over rows `(t / KDA_DIM) · 64 ..+64`,
+    /// so a sweep's reduction over rows is 64 products in registers and one
+    /// exchange of two partials per column. The sum order differs from the
+    /// CPU's (two halves, then their sum), as the card's stream already does.
+    /// Grid: STEP_GRID; LDS: STEP_LDS.
+    #[no_mangle]
+    pub extern "gpu-kernel" fn kda_step(mixed: *const f32, taps: *const u16, window: *mut f32, f: *const f32, dt_bias: *const f32, a_log: *const f32, beta: *const f32, gate: *const f32, mem: *mut f32, o_norm: *const f32, normed: *mut f32, n: u32) {
+        unsafe {
+            let h = workgroup_id_x() as usize;
+            let tid = workitem_id_x();
+            let t = tid as usize;
+            let lane = tid % 32;
+            let l: *mut f32 = lds();
+            let (conv, e, ex, red) = (l.add(CONV), l.add(FORGET), l.add(EX), l.add(RED));
+            const D: usize = KDA_DIM;
+            const HALF: usize = D / 2;
+            let vv = t % D;
+            let kk0 = (t / D) * HALF;
+            let decay = exp(*a_log.add(h));
+            let scale = rsqrt(D as f32);
+            // the head's memory: this thread's column over its half of the rows
+            let mut s = [0f32; HALF];
+            let mut r = 0;
+            while r < HALF {
+                s[r] = *mem.add(h * D * D + (kk0 + r) * D + vv);
+                r += 1;
+            }
+            let mut i = 0;
+            while i < n as usize {
+                // the convolution for this head's 3·D channels (two per thread), the window advanced
+                let mut c = t;
+                while c < 3 * D {
+                    let part = c / D;
+                    let g = part * KDA_QKV + h * D + c % D;
+                    let tp = taps.add((part * KDA_QKV + h * D + c % D) * CONV_TAPS);
+                    let (w0, w1, w2) = (*window.add(g), *window.add(CONV_DIM + g), *window.add(2 * CONV_DIM + g));
+                    let x = *mixed.add(i * CONV_DIM + g);
+                    let acc = widen(*tp) * w0 + widen(*tp.add(1)) * w1 + widen(*tp.add(2)) * w2 + widen(*tp.add(3)) * x;
+                    *conv.add(c) = silu(acc);
+                    *window.add(g) = w1;
+                    *window.add(CONV_DIM + g) = w2;
+                    *window.add(2 * CONV_DIM + g) = x;
+                    c += 256;
+                }
+                // the forget factors: log-decay in (LOWER, 0) per key channel
+                if t < D {
+                    *e.add(t) = exp(LINEAR_GATE_LOWER_BOUND * sigmoid(decay * (*f.add(i * KDA_QKV + h * D + t) + *dt_bias.add(h * D + t))));
+                }
+                workgroup_sync();
+                // l2-normed q (wave 0) and k (wave 1): four channels a lane
+                if t < 64 {
+                    let base = (t / 32) * D + lane as usize * 4;
+                    let mut ss = 0f32;
+                    let mut j = 0;
+                    while j < 4 {
+                        let v = *conv.add(base + j);
+                        ss += v * v;
+                        j += 1;
+                    }
+                    let rn = 1.0 / common::math::sqrt(wave_sum(lane, ss) + 1e-6);
+                    let rn = if t < 32 { rn * scale } else { rn };
+                    let mut j = 0;
+                    while j < 4 {
+                        *conv.add(base + j) *= rn;
+                        j += 1;
+                    }
+                }
+                workgroup_sync();
+                let b = sigmoid(*beta.add(i * KDA_HEADS + h));
+                // sweep one: decay the rows, read S·k
+                let mut d = 0f32;
+                let mut r = 0;
+                while r < HALF {
+                    s[r] *= *e.add(kk0 + r);
+                    d += s[r] * *conv.add(D + kk0 + r);
+                    r += 1;
+                }
+                *ex.add((t / D) * D + vv) = d;
+                workgroup_sync();
+                let delta = (*conv.add(2 * D + vv) - (*ex.add(vv) + *ex.add(D + vv))) * b;
+                workgroup_sync();
+                // sweep two: the update, the readout S·q
+                let mut o = 0f32;
+                let mut r = 0;
+                while r < HALF {
+                    let k = *conv.add(D + kk0 + r);
+                    s[r] += k * delta;
+                    o += s[r] * *conv.add(kk0 + r);
+                    r += 1;
+                }
+                *ex.add((t / D) * D + vv) = o;
+                workgroup_sync();
+                // the gated norm of the readout, by the first D threads
+                if t < D {
+                    let ov = *ex.add(vv) + *ex.add(D + vv);
+                    let ss = wave_sum(lane, ov * ov);
+                    if lane == 0 {
+                        *red.add(t / 32) = ss;
+                    }
+                    workgroup_sync_waves4(red);
+                    let total = *red.add(0) + *red.add(1) + *red.add(2) + *red.add(3);
+                    let rn = rsqrt(total / D as f32 + RMS_NORM_EPS);
+                    *normed.add(i * KDA_QKV + h * D + vv) = *o_norm.add(vv) * (ov * rn) * sigmoid(*gate.add(i * KDA_QKV + h * D + vv));
+                } else {
+                    workgroup_sync_waves4(red);
+                }
+                workgroup_sync();
+                i += 1;
+            }
+            let mut r = 0;
+            while r < HALF {
+                *mem.add(h * D * D + (kk0 + r) * D + vv) = s[r];
+                r += 1;
+            }
+        }
+    }
+
+    /// The barrier the readout's four-wave reduction crosses; one for every thread of the group.
+    #[inline(always)]
+    unsafe fn workgroup_sync_waves4(_red: *mut f32) {
+        workgroup_sync();
+    }
+}

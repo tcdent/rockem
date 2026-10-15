@@ -6,6 +6,8 @@
 #[path = "../../../node/src/kfd.rs"]
 #[allow(dead_code)]
 mod kfd;
+#[path = "../../../node/src/v2lite_kfd.rs"]
+mod v2lite_kfd;
 
 use common::q4::{QAct, GROUP};
 use deepseek_v2_lite::layout::{self, RECORD};
@@ -44,14 +46,14 @@ fn main() {
     k.upload(&d_xg, 0, unsafe { std::slice::from_raw_parts(xg.as_ptr() as *const u8, 4 * H / GROUP) });
     let d_gu = k.vram(n * 2 * D_FF * 4);
     let d_out = k.host(n * H * 4);
-    let (grid_up, grid_dn) = ((n as u32 * kfd::UP_TILES * 32).div_ceil(kfd::WG), (n as u32 * kfd::DOWN_TILES * 32).div_ceil(kfd::WG));
+    let (grid_up, grid_dn) = ((n as u32 * deepseek_v2_lite::expert::gfx11_consts::UP_TILES * 32).div_ceil(kfd::WG), (n as u32 * deepseek_v2_lite::expert::gfx11_consts::DOWN_TILES * 32).div_ceil(kfd::WG));
     let pair = |k: &kfd::Kfd| {
         let mut a = kfd::Args::new();
         a.ptr(d_stream.va).ptr(d_off.va).u32(n as u32).ptr(d_xq.va).ptr(d_xs.va).ptr(d_xg.va).ptr(d_gu.va);
-        k.launch(&up, grid_up, kfd::WG, kfd::stage_bytes(H), &a);
+        k.launch(&up, grid_up, kfd::WG, v2lite_kfd::stage_bytes(H), &a);
         let mut b = kfd::Args::new();
         b.ptr(d_stream.va).ptr(d_off.va).u32(n as u32).ptr(d_gu.va).ptr(d_out.va);
-        k.launch(&down, grid_dn, kfd::WG, kfd::stage_bytes(D_FF), &b);
+        k.launch(&down, grid_dn, kfd::WG, v2lite_kfd::stage_bytes(D_FF), &b);
     };
     pair(&k);
     k.sync();

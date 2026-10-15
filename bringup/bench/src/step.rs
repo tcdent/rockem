@@ -6,6 +6,8 @@
 #[path = "../../../node/src/kfd.rs"]
 #[allow(dead_code)]
 mod kfd;
+#[path = "../../../node/src/v2lite_kfd.rs"]
+mod v2lite_kfd;
 use deepseek_v2_lite::{attn, ffn, Attention, FeedForward, Head, Model, Rope, Weights, NUM_HIDDEN_LAYERS, QK_ROPE_HEAD_DIM, SAMPLING, VOCAB_SIZE};
 use harness::{arg, arg_required};
 use std::io::Write;
@@ -24,7 +26,7 @@ fn main() {
     let rope = Rope::new(max_ctx);
     let k = kfd::Kfd::new(&elf, true);
     let place = vec![if harness::arg("--experts").map(|p| p.to_str().unwrap() == "host").unwrap_or(false) { 1u32 } else { 0 }; deepseek_v2_lite::N_ROUTED_EXPERTS];
-    let mut m = kfd::KfdModel::new(k, dense, &experts[..deepseek_v2_lite::layout::STREAM], &rope, max_ctx, &place);
+    let mut m = v2lite_kfd::KfdModel::new(k, dense, &experts[..deepseek_v2_lite::layout::STREAM], &rope, max_ctx, &place);
     let mut rng = common::testing::Rng::new(1);
     let mut h: Vec<f32> = (0..n * deepseek_v2_lite::H).map(|_| rng.unit()).collect();
     let mut logits = vec![0f32; n * VOCAB_SIZE];

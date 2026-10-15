@@ -1,0 +1,11 @@
+//! gfx1100 code object for GLM-5.3-Flash. The kernel entries live in the
+//! model crate next to their CPU twins; this crate only gives them a home
+//! the linker turns into an ELF.
+#![no_std]
+
+pub use glm_5_3_flash::kda::gfx11 as kda;
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo) -> ! {
+    loop {}
+}

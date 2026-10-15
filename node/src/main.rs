@@ -11,7 +11,8 @@
 //! host, the same tokens as program arguments:
 //!   rockem.bundle=/bundle      a bundle directory (docs/bundle.md); `manifest.toml` names the model
 //!   rockem.mem=anon            dev: anonymous memory instead of hugetlbfs
-//!   rockem.gpu=1               the whole model on the card, the router and the draw included: one wait per token
+//!   rockem.gpu=1               V2-Lite: the whole model on the card, the router and the draw included: one wait per token;
+//!                              GLM: the recurrent-attention layers on the cards, split by layer between them
 //!   rockem.experts=host        with rockem.gpu=1: the routed experts in this host's DRAM, the card waiting at each layer
 //!   rockem.ctx=2048            positions of attention cache on the card or in the CPU model (default 2048): the
 //!                              node's memory budget, not the bundle's, so the wire's header reports it
@@ -22,10 +23,12 @@
 //!   rockem.shell=1 / rockem.exit=1   dev conveniences (see os/qemu.sh)
 mod engine;
 mod glm;
+mod glm_kfd;
 mod kfd;
 mod loader;
 mod platform;
 mod v2lite;
+mod v2lite_kfd;
 mod wire;
 
 use engine::Engine;
@@ -512,7 +515,7 @@ fn main() {
     let (gpu, experts_host) = (config("rockem.gpu").is_some(), config("rockem.experts").as_deref() == Some("host"));
     let e: Box<dyn Engine> = match name.as_str() {
         "deepseek-v2-lite" => v2lite::V2Lite::open(bundle, mem, max_ctx, gpu, experts_host),
-        "glm-5.3-flash" => glm::Glm::open(bundle, mem, max_ctx),
+        "glm-5.3-flash" => glm::Glm::open(bundle, mem, max_ctx, gpu),
         other => halt(&format!("the manifest names model {other:?}, which this node does not carry")),
     };
     assert!(max_ctx > e.first_pos(), "rockem.ctx must leave room after the prefix");

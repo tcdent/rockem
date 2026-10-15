@@ -11,6 +11,8 @@
 #[path = "../../../node/src/kfd.rs"]
 #[allow(dead_code)]
 mod kfd;
+#[path = "../../../node/src/v2lite_kfd.rs"]
+mod v2lite_kfd;
 
 use deepseek_v2_lite::layout;
 use deepseek_v2_lite::{attn, ffn, Attention, FeedForward, Head, Model, Rope, State, Weights, NUM_HIDDEN_LAYERS, SAMPLING, VOCAB_SIZE};
@@ -31,7 +33,7 @@ fn main() {
     let max_ctx = 2048;
     let rope = Rope::new(max_ctx);
     let place = vec![if harness::arg("--experts").map(|p| p.to_str().unwrap() == "host").unwrap_or(false) { 1u32 } else { 0 }; deepseek_v2_lite::N_ROUTED_EXPERTS];
-    let mut m = kfd::KfdModel::new(k.clone(), dense, &emm[..layout::STREAM], &rope, max_ctx, &place);
+    let mut m = v2lite_kfd::KfdModel::new(k.clone(), dense, &emm[..layout::STREAM], &rope, max_ctx, &place);
     let mut rng = common::testing::Rng::new(3);
     let rows: Vec<f32> = (0..(pos + 1) * layout::POSITION).map(|_| rng.unit() * 0.1).collect();
     m.seed(&rows);
@@ -44,7 +46,7 @@ fn main() {
     };
     let ms = |b: harness::Bench| b.median.as_secs_f64() * 1e3;
 
-    let attention = |m: &mut kfd::KfdModel, h: &mut [f32]| {
+    let attention = |m: &mut v2lite_kfd::KfdModel, h: &mut [f32]| {
         for l in 0..NUM_HIDDEN_LAYERS {
             m.step(l, &aw(l), h, pos, 1, cos, sin, rope.softmax_scale, &mut common::trace::NoTrace);
         }
@@ -53,7 +55,7 @@ fn main() {
     attention(&mut m, &mut h);
     let t_attn = ms(harness::bench(iters, || attention(&mut m, &mut h)));
 
-    let ffn_all = |m: &mut kfd::KfdModel, h: &mut [f32]| {
+    let ffn_all = |m: &mut v2lite_kfd::KfdModel, h: &mut [f32]| {
         for (l, lw) in w.layers.iter().enumerate() {
             match &lw.ffn {
                 deepseek_v2_lite::Ffn::Dense { gate, up, down } => m.dense(l, &ffn::Dense { post_ln: &lw.post_ln, gate, up, down }, h, 1, &mut common::trace::NoTrace),
@@ -65,12 +67,12 @@ fn main() {
     ffn_all(&mut m, &mut h);
     let t_ffn = ms(harness::bench(iters, || ffn_all(&mut m, &mut h)));
 
-    let head = |m: &mut kfd::KfdModel, logits: &mut [f32]| m.logits(&w.norm, w.lm_head, &h, 1, logits);
+    let head = |m: &mut v2lite_kfd::KfdModel, logits: &mut [f32]| m.logits(&w.norm, w.lm_head, &h, 1, logits);
     head(&mut m, &mut logits);
     let t_head = ms(harness::bench(iters, || head(&mut m, &mut logits)));
 
     // the layers as decode runs them, attention and FFN interleaved, no head: one wait
-    let layers = |m: &mut kfd::KfdModel, h: &mut [f32]| {
+    let layers = |m: &mut v2lite_kfd::KfdModel, h: &mut [f32]| {
         for (l, lw) in w.layers.iter().enumerate() {
             m.step(l, &aw(l), h, pos, 1, cos, sin, rope.softmax_scale, &mut common::trace::NoTrace);
             match &lw.ffn {
@@ -83,7 +85,7 @@ fn main() {
     layers(&mut m, &mut h);
     let t_layers = ms(harness::bench(iters, || layers(&mut m, &mut h)));
     // the head and the draw, one wait
-    let tail = |m: &mut kfd::KfdModel, logits: &mut [f32]| {
+    let tail = |m: &mut v2lite_kfd::KfdModel, logits: &mut [f32]| {
         m.logits(&w.norm, w.lm_head, &h, 1, logits);
         m.draw(0, &SAMPLING, 0.5, logits);
     };

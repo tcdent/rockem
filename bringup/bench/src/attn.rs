@@ -7,6 +7,8 @@
 #[path = "../../../node/src/kfd.rs"]
 #[allow(dead_code)]
 mod kfd;
+#[path = "../../../node/src/v2lite_kfd.rs"]
+mod v2lite_kfd;
 
 use deepseek_v2_lite::layout;
 use deepseek_v2_lite::{attn, Attention, Rope, Weights, H, NUM_HIDDEN_LAYERS};
@@ -26,7 +28,7 @@ fn main() {
     let k = kfd::Kfd::new(&elf, true);
     let rope = Rope::new(ctx);
     let place = vec![if harness::arg("--experts").map(|p| p.to_str().unwrap() == "host").unwrap_or(false) { 1u32 } else { 0 }; deepseek_v2_lite::N_ROUTED_EXPERTS];
-    let mut attention = kfd::KfdModel::new(k.clone(), dense, &emm[..layout::STREAM], &rope, ctx, &place);
+    let mut attention = v2lite_kfd::KfdModel::new(k.clone(), dense, &emm[..layout::STREAM], &rope, ctx, &place);
 
     let mut rng = common::testing::Rng::new(3);
     let rows: Vec<f32> = (0..ctx * layout::POSITION).map(|_| rng.unit() * 0.1).collect();
@@ -39,7 +41,7 @@ fn main() {
     let mut tr = common::trace::NoTrace;
     // the card's realization reads its weights from `d_dense` and ignores this argument
     // 27 layers posted, one wait: the node's shape of a token's attention
-    let mut token = |attention: &mut kfd::KfdModel, h: &mut [f32]| {
+    let mut token = |attention: &mut v2lite_kfd::KfdModel, h: &mut [f32]| {
         for l in 0..NUM_HIDDEN_LAYERS {
             let lw = &w.layers[l];
             let aw = attn::Weights { input_ln: &lw.input_ln, q_proj: lw.q_proj, kv_a: lw.kv_a, kv_a_ln: &lw.kv_a_ln, kv_b: &lw.kv_b, o_proj: lw.o_proj };

@@ -27,6 +27,7 @@ pub struct Scratch<'a> {
 pub trait Routed {
     fn run(&mut self, l: usize, idx: &[usize; TOP_K], x: &[f32], out: &mut [f32]);
 }
+#[cfg(feature = "std")]
 impl<R: Routed + ?Sized> Routed for Box<R> {
     fn run(&mut self, l: usize, idx: &[usize; TOP_K], x: &[f32], out: &mut [f32]) {
         (**self).run(l, idx, x, out)

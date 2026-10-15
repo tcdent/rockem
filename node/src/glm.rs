@@ -49,7 +49,7 @@ pub struct Glm {
 }
 
 impl Glm {
-    pub fn open(bundle: &std::path::Path, mem: loader::Mem, max_ctx: usize) -> Box<dyn Engine> {
+    pub fn open(bundle: &std::path::Path, mem: loader::Mem, max_ctx: usize, gpu: bool) -> Box<dyn Engine> {
         let t0 = std::time::Instant::now();
         let dense = loader::load(&bundle.join(layout::DENSE_FILE), mem);
         let experts = loader::load(&bundle.join(layout::EXPERTS_FILE), mem);
@@ -63,6 +63,11 @@ impl Glm {
         let pool: &'static Threads = Box::leak(Box::new(Threads::new(&cores)));
         println!("threads  : {} pinned, one per physical core", cores.len());
         let mut model = CpuModel::new(CpuExperts::new(experts, pool), pool, max_ctx);
+        if gpu {
+            // the KDA layers on the cards, split by layer order between them; everything else here
+            let elf = loader::load(&bundle.join(layout::KERNELS_FILE), loader::Mem::Anon);
+            model.placed = Some(Box::new(crate::glm_kfd::KdaCards::new(elf, &w)));
+        }
         // the prefix from nothing: its logits, and the realization against the bundle's state
         let t1 = std::time::Instant::now();
         for (pos, &id) in PREFIX_IDS.iter().enumerate() {
@@ -81,7 +86,7 @@ impl Glm {
         let (ds, ms) = dev(&snap, psnap);
         println!("prefix   : {} tokens in {:.1}s; this realization vs the bundle's f32 state: rows {:.1e} of {:.1e}, memory {:.1e} of {:.1e}", FIRST_POS, t1.elapsed().as_secs_f32(), dr, mr, ds, ms);
         model.seed_prefix(&w, prefix);
-        println!("model    : glm-5.3-flash, ctx {max_ctx}, temperature {}, top-k {}, top-p {}, dense native, experts q4 in DRAM, every op on this CPU's cores", SAMPLING.temperature, SAMPLING.top_k, SAMPLING.top_p);
+        println!("model    : glm-5.3-flash, ctx {max_ctx}, temperature {}, top-k {}, top-p {}, dense native, experts q4 in DRAM, {}", SAMPLING.temperature, SAMPLING.top_k, SAMPLING.top_p, if gpu { "the KDA layers on the cards, the rest on this CPU's cores" } else { "every op on this CPU's cores" });
         Box::new(Glm {
             w,
             model,

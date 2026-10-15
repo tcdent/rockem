@@ -11,6 +11,8 @@
 #[path = "../../../node/src/kfd.rs"]
 #[allow(dead_code)]
 mod kfd;
+#[path = "../../../node/src/v2lite_kfd.rs"]
+mod v2lite_kfd;
 use deepseek_v2_lite::{attn, ffn, Attention, FeedForward, Head, Model, Rope, Weights, H, NUM_HIDDEN_LAYERS, QK_ROPE_HEAD_DIM, TOP_K, VOCAB_SIZE};
 use harness::{arg, arg_required};
 
@@ -33,12 +35,12 @@ fn main() {
     let rope = Rope::new(max_ctx);
     let k = kfd::Kfd::new(&elf, false);
     let place = vec![if harness::arg("--experts").map(|p| p.to_str().unwrap() == "host").unwrap_or(false) { 1u32 } else { 0 }; deepseek_v2_lite::N_ROUTED_EXPERTS];
-    let mut m = kfd::KfdModel::new(k, dense, &experts[..deepseek_v2_lite::layout::STREAM], &rope, max_ctx, &place);
+    let mut m = v2lite_kfd::KfdModel::new(k, dense, &experts[..deepseek_v2_lite::layout::STREAM], &rope, max_ctx, &place);
     let mut rng = common::testing::Rng::new(1);
     let fill: Vec<f32> = (0..32 * H).map(|_| rng.unit() * 0.1).collect();
     let mut h: Vec<f32> = (0..n * H).map(|_| rng.unit() * 0.1).collect();
     let mut logits = vec![0f32; n * VOCAB_SIZE];
-    let forward = |m: &mut kfd::KfdModel, h: &mut Vec<f32>, pos: usize, n: usize, logits: &mut Vec<f32>| {
+    let forward = |m: &mut v2lite_kfd::KfdModel, h: &mut Vec<f32>, pos: usize, n: usize, logits: &mut Vec<f32>| {
         let cos = &rope.cos[pos * QK_ROPE_HEAD_DIM..];
         let sin = &rope.sin[pos * QK_ROPE_HEAD_DIM..];
         for l in 0..NUM_HIDDEN_LAYERS {
@@ -78,7 +80,7 @@ fn main() {
         let mut st = deepseek_v2_lite::State::new(max_ctx);
         st.decode(&w, deepseek_v2_lite::BOS_TOKEN as u32, 0, &mut m, &deepseek_v2_lite::Sampling::GREEDY, 0.0, &mut common::trace::NoTrace);
         let positions = ids.len();
-        let run = |m: &mut kfd::KfdModel, st: &mut deepseek_v2_lite::State| -> Vec<(Vec<f32>, Vec<u32>, Vec<f32>)> {
+        let run = |m: &mut v2lite_kfd::KfdModel, st: &mut deepseek_v2_lite::State| -> Vec<(Vec<f32>, Vec<u32>, Vec<f32>)> {
             m.seed(&sink);
             let mut out = Vec::with_capacity(positions);
             let (mut pos, mut at) = (1usize, 0usize);
@@ -140,7 +142,7 @@ fn main() {
         println!("the prompt's {positions} ids in steps of {n} × {repeat} runs in {:.0} s: {bad} runs differ from the first", t.elapsed().as_secs_f64());
         return;
     }
-    let run = |m: &mut kfd::KfdModel, all: &mut Vec<f32>, lg: &mut Vec<f32>, n: usize| -> Vec<(Vec<f32>, Vec<u32>, Vec<f32>)> {
+    let run = |m: &mut v2lite_kfd::KfdModel, all: &mut Vec<f32>, lg: &mut Vec<f32>, n: usize| -> Vec<(Vec<f32>, Vec<u32>, Vec<f32>)> {
         let mut out = Vec::with_capacity(positions);
         let mut pos = 0;
         while pos < positions {
