@@ -78,7 +78,7 @@ impl Glm {
         if gpu {
             // the KDA layers on the cards, split by layer order between them; everything else here
             let elf = loader::load(&bundle.join(layout::KERNELS_FILE), loader::Mem::Anon);
-            model.placed = Some(Box::new(crate::glm_kfd::Cards::new(elf, &w, max_ctx)));
+            model.placed = Some(Box::new(crate::glm_kfd::Cards::new(elf, &w, max_ctx, crate::glm_kfd::Place::ALL)));
         }
         // the prefix from nothing: its logits, and the realization against the bundle's state
         let t1 = std::time::Instant::now();

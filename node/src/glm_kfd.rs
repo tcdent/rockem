@@ -131,7 +131,28 @@ struct MlaOn {
     o: (Mem, Mem),
 }
 
+/// Which blocks the cards answer for — every one when serving; a bring-up gate
+/// (`forward-glm --place`) narrows it to find a wrong one. The blocks are still
+/// loaded; only the `Placed` predicates change.
+#[derive(Clone, Copy)]
+pub struct Place {
+    pub kda: bool,
+    pub ffn: bool,
+    pub mla: bool,
+    pub head: bool,
+}
+impl Place {
+    pub const ALL: Place = Place { kda: true, ffn: true, mla: true, head: true };
+    /// `kda,ffn,mla,head` in any subset (the bring-up gate's flag).
+    #[allow(dead_code)]
+    pub fn parse(s: &str) -> Place {
+        let has = |n: &str| s.split(',').any(|p| p.trim() == n);
+        Place { kda: has("kda"), ffn: has("ffn"), mla: has("mla"), head: has("head") }
+    }
+}
+
 pub struct Cards {
+    place: Place,
     cards: Vec<Card>,
     layers: Vec<Option<Layer>>,
     ffns: Vec<Option<FfnOn>>,
@@ -153,7 +174,7 @@ impl Cards {
     /// Open every gfx1100 card, load the code object on each, and place the
     /// blocks on them in order: the KDA layers an equal share each, every
     /// layer's FFN half with the KDA layer at or before it, the head last.
-    pub fn new(elf: &[u8], w: &Weights, max_ctx: usize) -> Self {
+    pub fn new(elf: &[u8], w: &Weights, max_ctx: usize, place: Place) -> Self {
         let n = Kfd::cards().len();
         assert!(n > 0, "rockem.gpu: no gfx1100 card");
         let t0 = std::time::Instant::now();
@@ -354,7 +375,7 @@ impl Cards {
             Some((card, norm, lm))
         };
         println!("gpu      : {} KDA layers, {mla_n} MLA layers (their latents to {max_ctx} positions), {dense} dense FFNs, {shared} shared experts and the head on {} card{} ({:.1} GB with their state) in {:.1}s", kda_layers.len(), n, if n == 1 { "" } else { "s" }, bytes as f64 / 1e9, t0.elapsed().as_secs_f32());
-        Cards { cards, layers, ffns, mlas, head }
+        Cards { place, cards, layers, ffns, mlas, head }
     }
 
     /// One FP8 rows launch on card `c`: `out[row] = W[row] · x` (normed with `ln` when given) for `m` rows of width `k_width`, scales `s`.
@@ -408,13 +429,13 @@ impl Cards {
 
 impl Placed for Cards {
     fn kda(&self, l: usize) -> bool {
-        self.layers[l].is_some()
+        self.place.kda && self.layers[l].is_some()
     }
     fn ffn(&self, l: usize) -> bool {
-        self.ffns[l].is_some()
+        self.place.ffn && self.ffns[l].is_some()
     }
     fn head(&self) -> bool {
-        self.head.is_some()
+        self.place.head && self.head.is_some()
     }
     fn ffn_start(&mut self, l: usize, x: &[f32]) {
         let f = self.ffns[l].as_ref().unwrap();
@@ -439,7 +460,7 @@ impl Placed for Cards {
         read(&c.lg, 0, &mut logits[..VOCAB_SIZE]);
     }
     fn mla(&self, l: usize) -> bool {
-        self.mlas[l].is_some()
+        self.place.mla && self.mlas[l].is_some()
     }
     fn mla_project(&mut self, l: usize, x: &[f32], kva: &mut [f32], ik: &mut [f32], igate: &mut [f32], iq: &mut [f32], iw: &mut [f32]) {
         let m = self.mlas[l].as_ref().unwrap();
