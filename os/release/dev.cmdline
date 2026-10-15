@@ -1,1 +1,1 @@
-console=tty0 hugepagesz=1G hugepages=16 rockem.net=dhcp rockem.telnet=1 rockem.nfs=192.168.88.2:/home/slomp/Work/rockem/bundles rockem.bundle=/bundle/v2lite-q4gptq rockem.gpu=1 rockem.ctx=100000 rockem.listen=0.0.0.0:7332
+console=tty0 hugepagesz=1G hugepages=170 rockem.net=dhcp rockem.telnet=1 rockem.nfs=192.168.88.2:/home/slomp/Work/rockem/bundles rockem.bundle=/bundle/glm-5.3-flash-q4rtn rockem.ctx=32768 rockem.listen=0.0.0.0:7332
