@@ -1,0 +1,11 @@
+[package]
+name = "glm_5_3_flash"
+version = "0.0.0"
+edition = "2021"
+description = "GLM-5.3-Flash: the pinned config, its constants, and the f32 transcription of the reference forward that bring-up diffs against the oracle."
+
+[features]
+std = []
+
+[dependencies]
+common = { path = "../../common" }

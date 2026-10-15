@@ -1,0 +1,15 @@
+[package]
+name = "forward-glm"
+version = "0.0.0"
+edition = "2021"
+description = "Bring-up driver for GLM-5.3-Flash: runs the f32 transcription layer by layer from the FP8 checkpoint over an oracle passage and diffs every edge against the goldens. Dev box only."
+
+[dependencies]
+harness = { path = "../harness" }
+common = { path = "../../common" }
+glm_5_3_flash = { path = "../../models/glm-5.3-flash", features = ["std"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+debug = 1
