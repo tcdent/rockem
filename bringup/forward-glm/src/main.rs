@@ -3,11 +3,12 @@
 //! layer's weights resident at a time), and diff every edge the oracle saved.
 //!
 //!   forward-glm --goldens <bringup/goldens/glm/SET> [--ckpt ~/hf-cache/glm-5.3-flash] [--layers N] [--tol 1e-4]
+//!               [--detail 1e-3]   also print every row past this relative error, and every position whose picks differ
 //!
 //! Edges per layer, each `[positions][H]`: attn_in (the normed block input), attn_out,
 //! ffn_in, ffn_out, out (the mean of the four streams). The table is the worst
 //! row per edge class; each layer also prints its own worst per edge, which is
-//! where an error's growth shows.
+//! where an error's growth shows. Edges a golden lacks are skipped.
 
 use glm_5_3_flash::reference::*;
 use glm_5_3_flash::*;
@@ -48,6 +49,15 @@ fn load_layer(ck: &Checkpoint, l: usize) -> Layer {
             kv_a_ln: w("self_attn.kv_a_layernorm.weight"),
             kv_b: w("self_attn.kv_b_proj.weight"),
             o: w("self_attn.o_proj.weight"),
+            indexer: Indexer {
+                wq_b: w("self_attn.indexer.wq_b.weight"),
+                wk: w("self_attn.indexer.wk.weight"),
+                k_norm_w: w("self_attn.indexer.k_norm.weight"),
+                k_norm_b: w("self_attn.indexer.k_norm.bias"),
+                weights: w("self_attn.indexer.weights_proj.weight"),
+                ape: w("self_attn.indexer.index_kpool_compress_ape"),
+                gate: w("self_attn.indexer.index_kpool_compress_gate"),
+            },
         })
     };
     let mlp = |pre: &str, ff| Mlp { gate: w(&format!("{pre}gate_proj.weight")), up: w(&format!("{pre}up_proj.weight")), down: w(&format!("{pre}down_proj.weight")), ff };
@@ -70,6 +80,7 @@ fn main() {
     let gdir = arg_required("--goldens");
     let ckpt = arg("--ckpt").unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap()).join("hf-cache/glm-5.3-flash"));
     let layers: usize = arg("--layers").map_or(NUM_HIDDEN_LAYERS, |v| v.to_str().unwrap().parse().unwrap());
+    let detail: f32 = arg("--detail").map_or(0.0, |v| v.to_str().unwrap().parse().unwrap());
     let tol: f32 = arg("--tol").map_or(1e-4, |v| v.to_str().unwrap().parse().unwrap());
     let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(gdir.join("meta.json")).unwrap()).unwrap();
     let ids: Vec<usize> = meta["ids"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as usize).collect();
@@ -99,9 +110,15 @@ fn main() {
         let touched = std::sync::atomic::AtomicUsize::new(0);
         let r = layer.forward(&mut streams, n, &mut st, &mut |name, data| {
             let key = format!("l{l}.{name}");
+            if gold.row(&key, 0).is_none() {
+                return; // a golden run with fewer edges (--no-edges keeps each layer's out)
+            }
             let mut worst = 0f32;
             for t in 0..n {
-                let (_, rel) = report.record(&format!("model.layers.{l}.{name}"), &data[t * H..(t + 1) * H], gold.row(&key, t).unwrap_or_else(|| panic!("no golden {key}")), &format!("pos {t}"));
+                let (_, rel) = report.record(&format!("model.layers.{l}.{name}"), &data[t * H..(t + 1) * H], gold.row(&key, t).unwrap(), &format!("pos {t}"));
+                if detail > 0.0 && rel > detail {
+                    println!("    l{l}.{name} pos {t}: rel {rel:.2e}");
+                }
                 worst = worst.max(rel);
             }
             line.push(format!("{name} {worst:.1e}"));
@@ -110,6 +127,28 @@ fn main() {
             load_expert(&ck, l, e)
         });
         let touched = touched.into_inner();
+        if let (LayerState::Mla(m), Some(_)) = (&st, routing.irow(&format!("l{l}.index"), 0)) {
+            // the indexer's choices against the oracle's, as sets of positions
+            let (mut differ, mut first) = (0, None);
+            for t in 0..n {
+                let mut g: Vec<usize> = routing.irow(&format!("l{l}.index"), t).unwrap().iter().filter(|&&j| j >= 0).map(|&j| j as usize).collect();
+                g.sort();
+                g.dedup();
+                if g != m.selected[t] {
+                    differ += 1;
+                    first.get_or_insert(t);
+                    if detail > 0.0 {
+                        let only_ours = m.selected[t].iter().filter(|j| g.binary_search(j).is_err()).count();
+                        let only_theirs = g.iter().filter(|j| m.selected[t].binary_search(j).is_err()).count();
+                        println!("    l{l} pos {t}: selection differs, {only_ours} only ours, {only_theirs} only the oracle's (of {})", g.len());
+                    }
+                }
+            }
+            if differ > 0 {
+                report.fail(&format!("model.layers.{l}.index"), format!("{differ} selections differ at layer {l}, first at pos {}", first.unwrap()));
+            }
+            line.push(format!("index: {differ} of {n} selections differ"));
+        }
         if let Some(r) = r {
             // the picks as sets (the reference's top-k is unsorted), the weights matched by expert
             let (mut flips, mut wworst) = (0, 0f32);
@@ -117,7 +156,11 @@ fn main() {
                 let gi = routing.irow(&format!("l{l}.topk"), t).unwrap();
                 let gw = routing.row(&format!("l{l}.weights"), t).unwrap();
                 let mine = &r.idx[t * TOP_K..(t + 1) * TOP_K];
-                flips += mine.iter().filter(|e| !gi.contains(&(**e as i64))).count();
+                let miss = mine.iter().filter(|e| !gi.contains(&(**e as i64))).count();
+                if miss > 0 && detail > 0.0 {
+                    println!("    l{l} pos {t}: {miss} picks differ, ours {mine:?} oracle {gi:?}");
+                }
+                flips += miss;
                 for (k, &e) in mine.iter().enumerate() {
                     if let Some(j) = gi.iter().position(|&g| g == e as i64) {
                         wworst = wworst.max((r.weight[t * TOP_K + k] - gw[j]).abs() / gw[j].abs());

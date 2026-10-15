@@ -36,9 +36,9 @@ pub const CONV_TAPS: usize = LINEAR_CONV_KERNEL;
 pub const MLA_HEADS: usize = NUM_ATTENTION_HEADS;
 pub const Q_HEAD: usize = QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM;
 pub const KVB_HEAD: usize = QK_NOPE_HEAD_DIM + V_HEAD_DIM;
-/// Below this many positions the indexer selects every visible key (all
+/// Up to this many positions the indexer selects every visible key (all
 /// `INDEX_TOPK / INDEX_KPOOL` pools plus the incomplete tail), so sparse
-/// attention is dense causal attention exactly.
+/// attention is dense causal attention exactly — the oracle-free test of the sparse path.
 pub const DENSE_BELOW: usize = INDEX_TOPK + INDEX_KPOOL - 1;
 pub const TOP_K: usize = NUM_EXPERTS_PER_TOK;
 pub const E: usize = N_ROUTED_EXPERTS;

@@ -350,6 +350,10 @@ def main():
             if hasattr(layer.mlp, "experts"):
                 hs.append(layer.mlp.experts.register_forward_hook(hook(f"l{l}.routed")))
                 hs.append(layer.mlp.shared_experts.register_forward_hook(hook(f"l{l}.shared")))
+        if getattr(layer.self_attn, "indexer", None) is not None:
+            def index_hook(mod, inp, out, l=l):
+                routing[f"l{l}.index"] = out.detach().clone().to(torch.int32)  # [1, S, topk + kpool - 1], -1 = none
+            hs.append(layer.self_attn.indexer.register_forward_hook(index_hook))
         if hasattr(layer.mlp, "gate"):
             def gate_hook(mod, inp, out, l=l):
                 logits, w, idx = out

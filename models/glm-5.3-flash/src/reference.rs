@@ -46,8 +46,35 @@ pub fn matmul_serial(w: &[f32], m: usize, k: usize, x: &[f32], n: usize) -> Vec<
     y
 }
 
+/// `f(0..count)` across the machine's threads, results in order.
+pub fn par_map<T: Send>(count: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism().map_or(1, |t| t.get()).min(count.max(1));
+    let mut all: Vec<(usize, T)> = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..threads)
+            .map(|_| {
+                sc.spawn(|| {
+                    let mut mine = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= count {
+                            break;
+                        }
+                        mine.push((i, f(i)));
+                    }
+                    mine
+                })
+            })
+            .collect();
+        hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
+    });
+    all.sort_by_key(|(i, _)| *i);
+    all.into_iter().map(|(_, v)| v).collect()
+}
+
 /// `y[s][m] = Σ_k w[m][k] · x[s][k]` for `w: [m][k]`, `x: [n][k]`; the rows of
-/// `w` are split across the machine's threads, each read once for all `n`.
+/// `w` are split across the machine's threads, and the positions taken in
+/// blocks that stay in cache (each position's sum is the same dot either way).
 pub fn matmul(w: &[f32], m: usize, k: usize, x: &[f32], n: usize) -> Vec<f32> {
     assert_eq!(w.len(), m * k);
     assert_eq!(x.len(), n * k);
@@ -58,11 +85,15 @@ pub fn matmul(w: &[f32], m: usize, k: usize, x: &[f32], n: usize) -> Vec<f32> {
             .map(|t| {
                 sc.spawn(move || {
                     let (m0, m1) = (t * per, ((t + 1) * per).min(m));
+                    // positions in blocks that stay in cache, this thread's rows streamed once a block
+                    const BLOCK: usize = 32;
                     let mut y = vec![0f32; n * (m1.saturating_sub(m0))];
-                    for i in m0..m1 {
-                        let row = &w[i * k..(i + 1) * k];
-                        for s in 0..n {
-                            y[s * (m1 - m0) + i - m0] = dot(row, &x[s * k..(s + 1) * k]);
+                    for s0 in (0..n).step_by(BLOCK) {
+                        for i in m0..m1 {
+                            let row = &w[i * k..(i + 1) * k];
+                            for s in s0..(s0 + BLOCK).min(n) {
+                                y[s * (m1 - m0) + i - m0] = dot(row, &x[s * k..(s + 1) * k]);
+                            }
                         }
                     }
                     y
@@ -226,14 +257,14 @@ impl Kda {
         let beta = matmul(&self.b, KDA_HEADS, H, x, n);
         let gate = matmul(&self.g_b, KDA_QKV, KDA_DIM, &matmul(&self.g_a, KDA_DIM, H, x, n), n);
         let scale = 1.0 / sqrt(KDA_DIM as f32);
-        let mut normed = vec![0f32; n * KDA_QKV];
+        // the causal depthwise conv over every position first: tap j sees the input
+        // TAPS-1-j steps back; the window holds the last TAPS-1 inputs
+        let mut conv = vec![0f32; n * CONV_DIM];
         let mut mixed = vec![0f32; CONV_DIM];
-        let mut conv = vec![0f32; CONV_DIM];
         for t in 0..n {
             mixed[..KDA_QKV].copy_from_slice(&q[t * KDA_QKV..(t + 1) * KDA_QKV]);
             mixed[KDA_QKV..2 * KDA_QKV].copy_from_slice(&k[t * KDA_QKV..(t + 1) * KDA_QKV]);
             mixed[2 * KDA_QKV..].copy_from_slice(&v[t * KDA_QKV..(t + 1) * KDA_QKV]);
-            // causal depthwise conv: tap j sees the input j - (TAPS-1) steps back; window holds the last TAPS-1
             for c in 0..CONV_DIM {
                 let w = &self.conv[c * CONV_TAPS..(c + 1) * CONV_TAPS];
                 let mut acc = 0f32;
@@ -241,30 +272,31 @@ impl Kda {
                     acc += w[j] * st.window[j * CONV_DIM + c];
                 }
                 acc += w[CONV_TAPS - 1] * mixed[c];
-                conv[c] = silu(acc);
+                conv[t * CONV_DIM + c] = silu(acc);
             }
             st.window.copy_within(CONV_DIM.., 0);
             st.window[(CONV_TAPS - 2) * CONV_DIM..].copy_from_slice(&mixed);
-
-            let ft = &f[t * KDA_QKV..(t + 1) * KDA_QKV];
-            let gt = &gate[t * KDA_QKV..(t + 1) * KDA_QKV];
-            for h in 0..KDA_HEADS {
-                let r = h * KDA_DIM..(h + 1) * KDA_DIM;
-                let mut qh: Vec<f32> = conv[r.clone()].to_vec();
-                let mut kh: Vec<f32> = conv[KDA_QKV + h * KDA_DIM..KDA_QKV + (h + 1) * KDA_DIM].to_vec();
-                let vh = &conv[2 * KDA_QKV + h * KDA_DIM..2 * KDA_QKV + (h + 1) * KDA_DIM];
+        }
+        // then the delta rule, each head's recurrence on its own thread
+        let heads = par_map(KDA_HEADS, |h| {
+            let mut s = st.s[h * KDA_DIM * KDA_DIM..(h + 1) * KDA_DIM * KDA_DIM].to_vec();
+            let mut out = vec![0f32; n * KDA_DIM];
+            let decay = exp(self.a_log[h]);
+            for t in 0..n {
+                let c = &conv[t * CONV_DIM..(t + 1) * CONV_DIM];
+                let mut qh: Vec<f32> = c[h * KDA_DIM..(h + 1) * KDA_DIM].to_vec();
+                let mut kh: Vec<f32> = c[KDA_QKV + h * KDA_DIM..KDA_QKV + (h + 1) * KDA_DIM].to_vec();
+                let vh = &c[2 * KDA_QKV + h * KDA_DIM..2 * KDA_QKV + (h + 1) * KDA_DIM];
                 l2norm(&mut qh);
                 l2norm(&mut kh);
                 for v in qh.iter_mut() {
                     *v *= scale;
                 }
-                let decay = exp(self.a_log[h]);
                 let b = sigmoid(beta[t * KDA_HEADS + h]);
-                let s = &mut st.s[h * KDA_DIM * KDA_DIM..(h + 1) * KDA_DIM * KDA_DIM];
+                let ft = &f[t * KDA_QKV + h * KDA_DIM..t * KDA_QKV + (h + 1) * KDA_DIM];
                 // the forget gate, bounded below: log-decay in (LOWER, 0) per key channel
                 for kk in 0..KDA_DIM {
-                    let g = LINEAR_GATE_LOWER_BOUND * sigmoid(decay * (ft[h * KDA_DIM + kk] + self.dt_bias[h * KDA_DIM + kk]));
-                    let e = exp(g);
+                    let e = exp(LINEAR_GATE_LOWER_BOUND * sigmoid(decay * (ft[kk] + self.dt_bias[h * KDA_DIM + kk])));
                     for vv in 0..KDA_DIM {
                         s[kk * KDA_DIM + vv] *= e;
                     }
@@ -285,9 +317,18 @@ impl Kda {
                 }
                 // gated RMSNorm per head
                 let on = rmsnorm(&o, KDA_DIM, &self.o_norm, RMS_NORM_EPS);
+                let gt = &gate[t * KDA_QKV + h * KDA_DIM..t * KDA_QKV + (h + 1) * KDA_DIM];
                 for vv in 0..KDA_DIM {
-                    normed[t * KDA_QKV + h * KDA_DIM + vv] = on[vv] * sigmoid(gt[h * KDA_DIM + vv]);
+                    out[t * KDA_DIM + vv] = on[vv] * sigmoid(gt[vv]);
                 }
+            }
+            (s, out)
+        });
+        let mut normed = vec![0f32; n * KDA_QKV];
+        for (h, (s, out)) in heads.into_iter().enumerate() {
+            st.s[h * KDA_DIM * KDA_DIM..(h + 1) * KDA_DIM * KDA_DIM].copy_from_slice(&s);
+            for t in 0..n {
+                normed[t * KDA_QKV + h * KDA_DIM..t * KDA_QKV + (h + 1) * KDA_DIM].copy_from_slice(&out[t * KDA_DIM..(t + 1) * KDA_DIM]);
             }
         }
         matmul(&self.o, H, KDA_QKV, &normed, n)
@@ -311,9 +352,80 @@ impl Mlp {
     }
 }
 
-/// NoPE MLA (`Glm5NextTextAttention`) over the keys the indexer selects. Below
-/// `DENSE_BELOW` positions that is every earlier key, which is what this runs;
-/// the indexer is its own piece.
+/// The DSA indexer with k-pool compression (`Glm5NextTextIndexer`): consecutive
+/// `INDEX_KPOOL` positions form a pool whose key is a per-channel softmax-weighted
+/// mix of theirs; a query scores the complete pools that end at or before it
+/// (`Σ_h w_h · relu(q_h · key · d^-½)`), keeps the best `INDEX_TOPK / INDEX_KPOOL`,
+/// and always sees its own incomplete pool's positions (the tail).
+pub struct Indexer {
+    /// `[INDEX_N_HEADS·INDEX_HEAD_DIM][Q_LORA_RANK]`, over the query's normed LoRA residual
+    pub wq_b: Vec<f32>,
+    pub wk: Vec<f32>,
+    pub k_norm_w: Vec<f32>,
+    pub k_norm_b: Vec<f32>,
+    pub weights: Vec<f32>,
+    /// `[INDEX_KPOOL][INDEX_HEAD_DIM]`, a learned offset per position in the pool
+    pub ape: Vec<f32>,
+    /// `[INDEX_HEAD_DIM][H]`
+    pub gate: Vec<f32>,
+}
+
+/// What an MLA layer keeps per position: the normed latent, and the indexer's key and pool gate;
+/// and, for bring-up, the positions the last forward's queries attended.
+#[derive(Default)]
+pub struct MlaState {
+    pub latent: Vec<f32>,
+    pub ikey: Vec<f32>,
+    pub igate: Vec<f32>,
+    pub selected: Vec<Vec<usize>>,
+}
+
+impl Indexer {
+    /// The positions query `p` attends, ascending: the selected pools' and its tail.
+    fn select(&self, p: usize, q: &[f32], w: &[f32], pools: &[f32]) -> Vec<usize> {
+        let visible = (p + 1) / INDEX_KPOOL;
+        let keep = INDEX_TOPK / INDEX_KPOOL;
+        let mut chosen: Vec<usize> = if visible <= keep {
+            (0..visible).collect()
+        } else {
+            let scale = 1.0 / sqrt(INDEX_HEAD_DIM as f32);
+            let mut scored: Vec<(f32, usize)> = (0..visible)
+                .map(|j| {
+                    let key = &pools[j * INDEX_HEAD_DIM..(j + 1) * INDEX_HEAD_DIM];
+                    let mut sc = 0f32;
+                    for h in 0..INDEX_N_HEADS {
+                        sc += w[h] * (dot(&q[h * INDEX_HEAD_DIM..(h + 1) * INDEX_HEAD_DIM], key) * scale).max(0.0);
+                    }
+                    (sc, j)
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+            scored[..keep].iter().map(|&(_, j)| j).collect()
+        };
+        chosen.sort();
+        let mut out: Vec<usize> = chosen.iter().flat_map(|&j| j * INDEX_KPOOL..(j + 1) * INDEX_KPOOL).collect();
+        out.extend(visible * INDEX_KPOOL..=p);
+        out
+    }
+
+    /// The complete pools' keys over the first `total` positions, `[pools][INDEX_HEAD_DIM]`.
+    fn pools(&self, st: &MlaState, total: usize) -> Vec<f32> {
+        let d = INDEX_HEAD_DIM;
+        let mut out = vec![0f32; total / INDEX_KPOOL * d];
+        for j in 0..total / INDEX_KPOOL {
+            for c in 0..d {
+                let logit: [f32; INDEX_KPOOL] = core::array::from_fn(|i| st.igate[(j * INDEX_KPOOL + i) * d + c] + self.ape[i * d + c]);
+                let mx = logit.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                let e: [f32; INDEX_KPOOL] = core::array::from_fn(|i| exp(logit[i] - mx));
+                let sum: f32 = e.iter().sum();
+                out[j * d + c] = (0..INDEX_KPOOL).map(|i| e[i] / sum * st.ikey[(j * INDEX_KPOOL + i) * d + c]).sum();
+            }
+        }
+        out
+    }
+}
+
+/// NoPE MLA (`Glm5NextTextAttention`) over the keys the indexer selects.
 pub struct Mla {
     pub q_a: Vec<f32>,
     pub q_a_ln: Vec<f32>,
@@ -323,45 +435,69 @@ pub struct Mla {
     /// `[MLA_HEADS][KVB_HEAD][KV_LORA_RANK]`: per head the key rows, then the value rows
     pub kv_b: Vec<f32>,
     pub o: Vec<f32>,
+    pub indexer: Indexer,
 }
 
 impl Mla {
-    /// `x: [n][H]` at the positions after the `cache`'s; the cache (normed latents, one
-    /// `KV_LORA_RANK` row a position) grows by `n`.
-    pub fn forward(&self, x: &[f32], n: usize, cache: &mut Vec<f32>) -> Vec<f32> {
+    /// `x: [n][H]` at the positions after the state's; the state grows by `n`.
+    pub fn forward(&self, x: &[f32], n: usize, st: &mut MlaState) -> Vec<f32> {
         let qr = rmsnorm(&matmul(&self.q_a, Q_LORA_RANK, H, x, n), Q_LORA_RANK, &self.q_a_ln, RMS_NORM_EPS);
         let q = matmul(&self.q_b, MLA_HEADS * Q_HEAD, Q_LORA_RANK, &qr, n);
-        let past = cache.len() / KV_LORA_RANK;
-        cache.extend(rmsnorm(&matmul(&self.kv_a, KV_LORA_RANK, H, x, n), KV_LORA_RANK, &self.kv_a_ln, RMS_NORM_EPS));
+        let past = st.latent.len() / KV_LORA_RANK;
+        st.latent.extend(rmsnorm(&matmul(&self.kv_a, KV_LORA_RANK, H, x, n), KV_LORA_RANK, &self.kv_a_ln, RMS_NORM_EPS));
+        let ix = &self.indexer;
+        // the indexer's key: LayerNorm (with bias, eps 1e-6) of wk·x
+        let k = matmul(&ix.wk, INDEX_HEAD_DIM, H, x, n);
+        for r in k.chunks_exact(INDEX_HEAD_DIM) {
+            let mean = r.iter().sum::<f32>() / INDEX_HEAD_DIM as f32;
+            let var = r.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / INDEX_HEAD_DIM as f32;
+            let rs = 1.0 / sqrt(var + 1e-6);
+            st.ikey.extend((0..INDEX_HEAD_DIM).map(|c| (r[c] - mean) * rs * ix.k_norm_w[c] + ix.k_norm_b[c]));
+        }
+        st.igate.extend(matmul(&ix.gate, INDEX_HEAD_DIM, H, x, n));
+        let iq = matmul(&ix.wq_b, INDEX_N_HEADS * INDEX_HEAD_DIM, Q_LORA_RANK, &qr, n);
+        let wscale = 1.0 / sqrt(INDEX_N_HEADS as f32);
+        let iw: Vec<f32> = matmul(&ix.weights, INDEX_N_HEADS, H, x, n).iter().map(|v| v * wscale).collect();
         let total = past + n;
-        assert!(total <= DENSE_BELOW, "{total} positions: past {DENSE_BELOW} the indexer selects, and it is not transcribed yet");
-        let kv = matmul(&self.kv_b, MLA_HEADS * KVB_HEAD, KV_LORA_RANK, cache, total);
+        let pools = ix.pools(st, total);
+        let sel: Vec<Vec<usize>> = par_map(n, |t| {
+            ix.select(past + t, &iq[t * INDEX_N_HEADS * INDEX_HEAD_DIM..(t + 1) * INDEX_N_HEADS * INDEX_HEAD_DIM], &iw[t * INDEX_N_HEADS..(t + 1) * INDEX_N_HEADS], &pools)
+        });
+
+        let kv = matmul(&self.kv_b, MLA_HEADS * KVB_HEAD, KV_LORA_RANK, &st.latent, total);
         let scale = 1.0 / sqrt(Q_HEAD as f32);
-        let mut out = vec![0f32; n * MLA_HEADS * V_HEAD_DIM];
-        let mut w = vec![0f32; total];
-        for t in 0..n {
-            let p = past + t;
-            for h in 0..MLA_HEADS {
+        let heads = par_map(MLA_HEADS, |h| {
+            let mut out = vec![0f32; n * V_HEAD_DIM];
+            let mut w = vec![0f32; total];
+            for t in 0..n {
                 let qh = &q[(t * MLA_HEADS + h) * Q_HEAD..(t * MLA_HEADS + h + 1) * Q_HEAD];
-                let key = |j: usize| &kv[(j * MLA_HEADS + h) * KVB_HEAD..(j * MLA_HEADS + h) * KVB_HEAD + QK_NOPE_HEAD_DIM];
+                let js = &sel[t];
                 let mut mx = f32::NEG_INFINITY;
-                for j in 0..=p {
-                    w[j] = dot(qh, key(j)) * scale;
-                    mx = mx.max(w[j]);
+                for (i, &j) in js.iter().enumerate() {
+                    w[i] = dot(qh, &kv[(j * MLA_HEADS + h) * KVB_HEAD..(j * MLA_HEADS + h) * KVB_HEAD + QK_NOPE_HEAD_DIM]) * scale;
+                    mx = mx.max(w[i]);
                 }
                 let mut sum = 0f32;
-                for wj in w[..=p].iter_mut() {
-                    *wj = exp(*wj - mx);
-                    sum += *wj;
+                for wi in w[..js.len()].iter_mut() {
+                    *wi = exp(*wi - mx);
+                    sum += *wi;
                 }
-                let o = &mut out[(t * MLA_HEADS + h) * V_HEAD_DIM..(t * MLA_HEADS + h + 1) * V_HEAD_DIM];
-                for j in 0..=p {
-                    let a = w[j] / sum;
+                let o = &mut out[t * V_HEAD_DIM..(t + 1) * V_HEAD_DIM];
+                for (i, &j) in js.iter().enumerate() {
+                    let a = w[i] / sum;
                     let v = &kv[(j * MLA_HEADS + h) * KVB_HEAD + QK_NOPE_HEAD_DIM..(j * MLA_HEADS + h + 1) * KVB_HEAD];
                     for (od, vd) in o.iter_mut().zip(v) {
                         *od += a * vd;
                     }
                 }
+            }
+            out
+        });
+        st.selected = sel;
+        let mut out = vec![0f32; n * MLA_HEADS * V_HEAD_DIM];
+        for (h, o) in heads.iter().enumerate() {
+            for t in 0..n {
+                out[(t * MLA_HEADS + h) * V_HEAD_DIM..(t * MLA_HEADS + h + 1) * V_HEAD_DIM].copy_from_slice(&o[t * V_HEAD_DIM..(t + 1) * V_HEAD_DIM]);
             }
         }
         matmul(&self.o, H, MLA_HEADS * V_HEAD_DIM, &out, n)
@@ -493,15 +629,14 @@ pub struct Layer {
 /// What a layer carries from one position to the next.
 pub enum LayerState {
     Kda(KdaState),
-    /// the normed latents, `[positions][KV_LORA_RANK]`
-    Mla(Vec<f32>),
+    Mla(MlaState),
 }
 
 impl Layer {
     pub fn state(&self) -> LayerState {
         match self.attn {
             Attn::Kda(_) => LayerState::Kda(KdaState::default()),
-            Attn::Mla(_) => LayerState::Mla(Vec::new()),
+            Attn::Mla(_) => LayerState::Mla(MlaState::default()),
         }
     }
 
