@@ -21,8 +21,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// there: a worker that wakes late to a finished job finds its counter spent
 /// and leaves. `run` publishes a new job only when no worker is registered
 /// (`active`), and frees a job one generation after replacing it, so a worker
-/// that registered during the swap never reads freed memory. Between jobs the
-/// workers spin for a while, then yield, so an idle node does not burn its sockets.
+/// that registered during the swap never reads freed memory. The pool has two
+/// states: busy — a step is in flight, and a worker between jobs spins, because
+/// the next job is microseconds away — and idle, entered by `idle()` when the
+/// node is about to wait on the wire, in which a worker sleeps between looks.
+/// `run` makes the pool busy again.
 pub struct Threads {
     shared: std::sync::Arc<Shared>,
     /// The job before the current one, freed at the next publish.
@@ -37,6 +40,7 @@ struct Job {
 struct Shared {
     job: std::sync::atomic::AtomicPtr<Job>,
     active: AtomicUsize,
+    busy: std::sync::atomic::AtomicBool,
     quit: std::sync::atomic::AtomicBool,
 }
 extern "C" {
@@ -64,27 +68,24 @@ impl Threads {
     pub fn new(cores: &[usize]) -> Self {
         assert!(!cores.is_empty());
         pin(cores[0]);
-        let shared = std::sync::Arc::new(Shared { job: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()), active: AtomicUsize::new(0), quit: std::sync::atomic::AtomicBool::new(false) });
+        let shared = std::sync::Arc::new(Shared { job: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()), active: AtomicUsize::new(0), busy: std::sync::atomic::AtomicBool::new(false), quit: std::sync::atomic::AtomicBool::new(false) });
         for &core in &cores[1..] {
             let sh = shared.clone();
             std::thread::spawn(move || {
                 pin(core);
                 let mut seen: *mut Job = std::ptr::null_mut();
-                let mut idle = 0u32;
                 loop {
                     if sh.job.load(Ordering::Acquire) == seen {
                         if sh.quit.load(Ordering::Relaxed) {
                             return;
                         }
-                        idle += 1;
-                        if idle < 20_000 {
+                        if sh.busy.load(Ordering::Relaxed) {
                             std::hint::spin_loop();
                         } else {
                             std::thread::sleep(std::time::Duration::from_micros(50));
                         }
                         continue;
                     }
-                    idle = 0;
                     // registered first, then the job as it is now: whatever it is, it is alive and its counters are its own
                     sh.active.fetch_add(1, Ordering::AcqRel);
                     let job = sh.job.load(Ordering::Acquire);
@@ -97,6 +98,12 @@ impl Threads {
             });
         }
         Threads { shared, retired: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }
+    }
+}
+impl Threads {
+    /// The node is about to wait: the workers may sleep between looks until the next `run`.
+    pub fn idle(&self) {
+        self.shared.busy.store(false, Ordering::Relaxed);
     }
 }
 impl Drop for Threads {
@@ -113,6 +120,7 @@ impl Pool for Threads {
             return;
         }
         let sh = &*self.shared;
+        sh.busy.store(true, Ordering::Relaxed);
         while sh.active.load(Ordering::Acquire) != 0 {
             std::hint::spin_loop();
         }

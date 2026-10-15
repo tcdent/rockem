@@ -2,9 +2,11 @@
 //! placed on a card holds its weights and its state there — the projections,
 //! the convolution taps, the gates' parameters, the window and the memory —
 //! and a step runs its ten launches on that card's queue with one wait: the
-//! normed projections (`rows_h`), the gates' second halves (`rows_d`), the
-//! delta rule with the memory resident in registers (`kda_step`), and the
-//! output projection (`rows_qkv`). The block input comes in and the block
+//! normed projections (`rows_h`: q, k and v as one launch over their rows
+//! back to back, then the gates' first halves and beta as another), the gates'
+//! second halves (`rows_d`), the delta rule with the memory resident in
+//! registers (`kda_step`), and the output projection (`rows_qkv`) — six
+//! launches a layer. The block input comes in and the block
 //! output goes out through host-visible VRAM; the residual streams stay on
 //! the host, where the hyper-connections and the FFN half still run. The 34
 //! layers split in order between the cards the topology lists.
@@ -26,28 +28,24 @@ struct Card {
     // the step's buffers, one token deep
     x: Mem,      // [H] f32, host-visible: the block input
     mixed: Mem,  // [3][KDA_QKV] f32: q | k | v
-    fa: Mem,     // [KDA_DIM]
-    ga: Mem,     // [KDA_DIM]
+    small: Mem,  // [KDA_DIM] fa | [KDA_DIM] ga | [KDA_HEADS] beta
     f: Mem,      // [KDA_QKV]
     gate: Mem,   // [KDA_QKV]
-    beta: Mem,   // [KDA_HEADS]
     normed: Mem, // [KDA_QKV]
     y: Mem,      // [H] f32, host-visible: the block output
 }
+/// Rows of the fused small projection: f_a's, g_a's, b's.
+const SMALL_ROWS: usize = 2 * KDA_DIM + KDA_HEADS;
 
 struct Layer {
     card: usize,
     input_ln: Mem,
-    q: Mem,
-    k: Mem,
-    v: Mem,
+    qkv: Mem,   // [3·KDA_QKV][H] bf16: q's rows, k's, v's
     o: Mem,
-    taps: Mem, // [3][KDA_QKV][CONV_TAPS] bf16
-    f_a: Mem,
+    taps: Mem,  // [3][KDA_QKV][CONV_TAPS] bf16
+    small: Mem, // [SMALL_ROWS][H] bf16: f_a's rows, g_a's, b's
     f_b: Mem,
-    g_a: Mem,
     g_b: Mem,
-    b: Mem,
     dt_bias: Mem,
     a_log: Mem,
     o_norm: Mem,
@@ -82,11 +80,9 @@ impl KdaCards {
                     step: k.kernel("kda_step"),
                     x: alloc(H),
                     mixed: alloc(3 * KDA_QKV),
-                    fa: alloc(KDA_DIM),
-                    ga: alloc(KDA_DIM),
+                    small: alloc(SMALL_ROWS),
                     f: alloc(KDA_QKV),
                     gate: alloc(KDA_QKV),
-                    beta: alloc(KDA_HEADS),
                     normed: alloc(KDA_QKV),
                     y: alloc(H),
                     k,
@@ -113,26 +109,37 @@ impl KdaCards {
             let input_ln: Vec<u16> = w.layers[l].input_ln.iter().map(|&v| (v.to_bits() >> 16) as u16).collect();
             let zero_w = vec![0f32; KDA_WINDOW];
             let zero_m = vec![0f32; KDA_MEMORY];
+            // q, k, v back to back, and the three small projections: one launch each
+            let qkv = {
+                let m = k.vram_visible(3 * kw.q.len() * 2);
+                k.upload(&m, 0, raw(kw.q));
+                k.upload(&m, kw.q.len() * 2, raw(kw.k));
+                k.upload(&m, 2 * kw.q.len() * 2, raw(kw.v));
+                m
+            };
+            let small = {
+                let m = k.vram_visible(SMALL_ROWS * H * 2);
+                k.upload(&m, 0, raw(kw.f_a));
+                k.upload(&m, kw.f_a.len() * 2, raw(kw.g_a));
+                k.upload(&m, 2 * kw.f_a.len() * 2, raw(kw.b));
+                m
+            };
             let lay = Layer {
                 card,
                 input_ln: up(raw(&input_ln)),
-                q: up(raw(kw.q)),
-                k: up(raw(kw.k)),
-                v: up(raw(kw.v)),
+                qkv,
                 o: up(raw(kw.o)),
                 taps: up(raw(&taps)),
-                f_a: up(raw(kw.f_a)),
+                small,
                 f_b: up(raw(kw.f_b)),
-                g_a: up(raw(kw.g_a)),
                 g_b: up(raw(kw.g_b)),
-                b: up(raw(kw.b)),
                 dt_bias: up(raw(kw.dt_bias)),
                 a_log: up(raw(kw.a_log)),
                 o_norm: up(raw(kw.o_norm)),
                 window: up(raw(&zero_w)),
                 mem: up(raw(&zero_m)),
             };
-            bytes += 2 * (kw.q.len() + kw.k.len() + kw.v.len() + kw.o.len() + kw.f_a.len() + kw.f_b.len() + kw.g_a.len() + kw.g_b.len() + kw.b.len() + taps.len()) + 4 * (KDA_WINDOW + KDA_MEMORY);
+            bytes += 2 * (3 * kw.q.len() + kw.o.len() + SMALL_ROWS * H + kw.f_b.len() + kw.g_b.len() + taps.len()) + 4 * (KDA_WINDOW + KDA_MEMORY);
             layers[l] = Some(lay);
         }
         println!("gpu      : {} KDA layers on {} card{} ({:.1} GB with their state) in {:.1}s", kda_layers.len(), n, if n == 1 { "" } else { "s" }, bytes as f64 / 1e9, t0.elapsed().as_secs_f32());
@@ -160,18 +167,14 @@ impl KdaPlaced for KdaCards {
         let lay = self.layers[l].as_ref().unwrap();
         let c = &self.cards[lay.card];
         c.k.upload(&c.x, 0, raw(&x[..H]));
-        // q | k | v, the gates' first halves, beta: all over the normed input
+        // q | k | v as one launch, the gates' first halves and beta as another, all over the normed input
         let ln = Some(lay.input_ln.va);
-        self.rows(c, &c.rows_h, c.x.va, ln, lay.q.va, c.mixed.va, KDA_QKV, H);
-        self.rows(c, &c.rows_h, c.x.va, ln, lay.k.va, c.mixed.at(KDA_QKV * 4), KDA_QKV, H);
-        self.rows(c, &c.rows_h, c.x.va, ln, lay.v.va, c.mixed.at(2 * KDA_QKV * 4), KDA_QKV, H);
-        self.rows(c, &c.rows_h, c.x.va, ln, lay.f_a.va, c.fa.va, KDA_DIM, H);
-        self.rows(c, &c.rows_h, c.x.va, ln, lay.g_a.va, c.ga.va, KDA_DIM, H);
-        self.rows(c, &c.rows_h, c.x.va, ln, lay.b.va, c.beta.va, KDA_HEADS, H);
-        self.rows(c, &c.rows_d, c.fa.va, None, lay.f_b.va, c.f.va, KDA_QKV, KDA_DIM);
-        self.rows(c, &c.rows_d, c.ga.va, None, lay.g_b.va, c.gate.va, KDA_QKV, KDA_DIM);
+        self.rows(c, &c.rows_h, c.x.va, ln, lay.qkv.va, c.mixed.va, 3 * KDA_QKV, H);
+        self.rows(c, &c.rows_h, c.x.va, ln, lay.small.va, c.small.va, SMALL_ROWS, H);
+        self.rows(c, &c.rows_d, c.small.va, None, lay.f_b.va, c.f.va, KDA_QKV, KDA_DIM);
+        self.rows(c, &c.rows_d, c.small.at(KDA_DIM * 4), None, lay.g_b.va, c.gate.va, KDA_QKV, KDA_DIM);
         let mut a = Args::new();
-        a.ptr(c.mixed.va).ptr(lay.taps.va).ptr(lay.window.va).ptr(c.f.va).ptr(lay.dt_bias.va).ptr(lay.a_log.va).ptr(c.beta.va).ptr(c.gate.va).ptr(lay.mem.va).ptr(lay.o_norm.va).ptr(c.normed.va).u32(1);
+        a.ptr(c.mixed.va).ptr(lay.taps.va).ptr(lay.window.va).ptr(c.f.va).ptr(lay.dt_bias.va).ptr(lay.a_log.va).ptr(c.small.at(2 * KDA_DIM * 4)).ptr(c.gate.va).ptr(lay.mem.va).ptr(lay.o_norm.va).ptr(c.normed.va).u32(1);
         c.k.launch(&c.step, g::STEP_GRID, g::WG, g::STEP_LDS as u32, &a);
         self.rows(c, &c.rows_qkv, c.normed.va, None, lay.o.va, c.y.va, H, KDA_QKV);
         c.k.sync();

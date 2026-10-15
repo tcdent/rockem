@@ -38,6 +38,7 @@ impl Trace for DebugTrace {
 }
 
 pub struct Glm {
+    pool: &'static Threads,
     /// `rockem.profile=N`: a line of the token's time by phase every N tokens (0: never).
     profile_every: usize,
     w: Weights<'static>,
@@ -91,6 +92,7 @@ impl Glm {
         println!("model    : glm-5.3-flash, ctx {max_ctx}, temperature {}, top-k {}, top-p {}, dense native, experts q4 in DRAM, {}", SAMPLING.temperature, SAMPLING.top_k, SAMPLING.top_p, if gpu { "the KDA layers on the cards, the rest on this CPU's cores" } else { "every op on this CPU's cores" });
         model.profile = Default::default();
         Box::new(Glm {
+            pool,
             profile_every,
             w,
             model,
@@ -172,6 +174,9 @@ impl Engine for Glm {
     }
     fn score_prefix(&mut self, id: u32) -> f32 {
         common::softmax::log_prob(&self.prefix_logits, id as usize)
+    }
+    fn idle(&mut self) {
+        self.pool.idle()
     }
     fn trace(&mut self, i: usize) -> (&[f32], &[u32], &[f32]) {
         let a = i * NUM_HIDDEN_LAYERS;

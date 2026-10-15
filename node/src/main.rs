@@ -452,7 +452,14 @@ fn serve(listen: &str, session: &mut Session, identity: u64) {
             s.set_nonblocking(false).unwrap();
             r
         };
-        while s.read_exact(&mut word).is_ok() {
+        loop {
+            // about to wait for the next word: the engine's spinning threads may rest
+            if !more_now(&s) {
+                session.e.idle();
+            }
+            if s.read_exact(&mut word).is_err() {
+                break;
+            }
             let ok = match u32::from_le_bytes(word) {
                 id if id == bos => {
                     let ok = flush(session, &mut ids, &mut s);
@@ -552,6 +559,7 @@ fn main() {
     let mut out = std::io::stdout();
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
+        session.e.idle();
         let ids: Vec<u32> = line.split_whitespace().filter_map(|t| t.parse().ok()).collect();
         if ids.is_empty() {
             continue;

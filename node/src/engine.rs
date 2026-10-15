@@ -58,6 +58,8 @@ pub trait Engine {
     /// The same two from the prefix's logits: what the first computed position is drawn or scored from.
     fn draw_prefix(&mut self, u: f64) -> u32;
     fn score_prefix(&mut self, id: u32) -> f32;
+    /// The node is about to wait for input: whatever the engine keeps spinning may rest.
+    fn idle(&mut self) {}
     /// Dev: token `i`'s trace of the last step — every layer's residual output,
     /// every layer's routing, its logits — in the model's own shapes.
     fn trace(&mut self, i: usize) -> (&[f32], &[u32], &[f32]);
