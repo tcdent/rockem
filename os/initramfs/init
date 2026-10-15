@@ -11,7 +11,8 @@ mount -t devpts devpts /dev/pts
 mount -t hugetlbfs -o pagesize=1G hugetlbfs /dev/hugepages 2>/dev/null || mount -t hugetlbfs hugetlbfs /dev/hugepages 2>/dev/null
 mount -t tmpfs tmpfs /tmp
 ip link set lo up
-arg() { for t in $(cat /proc/cmdline); do case $t in "$1"=*) echo "${t#"$1"=}";; esac; done; }
+# the last occurrence wins, as for the kernel's own parameters (the netboot line may repeat ours)
+arg() { v=; for t in $(cat /proc/cmdline); do case $t in "$1"=*) v=${t#"$1"=};; esac; done; echo "$v"; }
 
 if [ "$(arg rockem.net)" = dhcp ]; then
   for d in /sys/class/net/*; do

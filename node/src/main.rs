@@ -27,9 +27,10 @@ use deepseek_v2_lite::layout;
 use deepseek_v2_lite::{Attention, CpuAttention, CpuExperts, CpuFfn, CpuModel, Model, Sampling, State, Weights, BOS_TOKEN, EOS_TOKEN, FIRST_POS, SAMPLING, SEED, TOKENS, VOCAB_SIZE};
 use std::io::{BufRead, Read, Write};
 
+/// The last occurrence of a key wins, as for the kernel's own parameters: a netboot line may repeat ours.
 fn config(key: &str) -> Option<String> {
     let cmd = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
-    std::env::args().skip(1).chain(cmd.split_whitespace().map(String::from)).find_map(|t| t.strip_prefix(&format!("{key}=")).map(String::from))
+    std::env::args().skip(1).chain(cmd.split_whitespace().map(String::from)).filter_map(|t| t.strip_prefix(&format!("{key}=")).map(String::from)).last()
 }
 
 /// The console vocabulary: byte offsets then bytes, by id.
