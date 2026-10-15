@@ -3,6 +3,8 @@
 //! layer's weights resident at a time), and diff every edge the oracle saved.
 //!
 //!   forward-glm --goldens <bringup/goldens/glm/SET> [--ckpt ~/hf-cache/glm-5.3-flash] [--layers N] [--tol 1e-4]
+//!               [--cpu <bundle dir>]  the shipped CPU realization (construct::CpuModel) from the bundle's dense, expert
+//!                                     and prefix files instead of the f32 reference from the checkpoint: the kernel gate
 //!               [--force-picks]   every MoE layer takes the oracle's expert picks (weights still its own): separates tie flips from the rest
 //!               [--detail 1e-3]   also print every row past this relative error, and every position whose picks differ
 //!
@@ -11,6 +13,7 @@
 //! row per edge class; each layer also prints its own worst per edge, which is
 //! where an error's growth shows. Edges a golden lacks are skipped.
 
+use glm_5_3_flash::construct::{CpuExperts, CpuModel};
 use glm_5_3_flash::reference::*;
 use glm_5_3_flash::*;
 use harness::{arg, arg_required, Checkpoint, Golden, Report};
@@ -28,10 +31,14 @@ fn main() {
     let n = ids.len();
     let gold = Golden::load(&gdir.join("edges.safetensors"));
     let routing = Golden::load(&gdir.join("routing.safetensors"));
-    let ck = Checkpoint::open(&ckpt);
     let mut report = Report::new(tol);
+    let ck = if arg("--cpu").is_some() { Checkpoint::open_lazy(&ckpt) } else { Checkpoint::open(&ckpt) };
     println!("{n} positions, {layers} layers, goldens {}", gdir.display());
 
+    if let Some(bundle) = arg("--cpu") {
+        cpu_gate(&bundle, &ids, layers, &gold, &routing, force, detail, &mut report, &meta);
+        return;
+    }
     let emb = ck.bf16("model.language_model.embed_tokens.weight");
     let mut streams = vec![0f32; n * HC * H];
     for (t, &id) in ids.iter().enumerate() {
@@ -69,7 +76,7 @@ fn main() {
             load_expert(l, e, &|n| ck.f32s(n))
         }, forced.as_deref());
         let touched = touched.into_inner();
-        if let (LayerState::Mla(m), Some(_)) = (&st, routing.irow(&format!("l{l}.index"), 0)) {
+        if let (glm_5_3_flash::reference::LayerState::Mla(m), Some(_)) = (&st, routing.irow(&format!("l{l}.index"), 0)) {
             // the indexer's choices against the oracle's, as sets of positions
             let (mut differ, mut first) = (0, None);
             for t in 0..n {
@@ -138,6 +145,95 @@ fn main() {
         println!("head: top-1 agrees with the oracle's at {agree_oracle}/{n}; with the text {:.3} (oracle {:.3}); NLL {:.4} (oracle {:.4})",
             agree as f64 / (n - 1) as f64, meta["top1_agreement"].as_f64().unwrap_or(f64::NAN), nll / (n - 1) as f64, meta["nll"].as_f64().unwrap_or(f64::NAN));
     }
+    report.print();
+    std::process::exit(if report.failures() > 0 { 1 } else { 0 });
+}
+
+/// Every edge of one token, by (layer, name), and the MoE layers' picks.
+#[derive(Default)]
+struct Collect {
+    edges: Vec<(usize, String, Vec<f32>)>,
+    topk: Vec<(usize, Vec<usize>)>,
+}
+impl common::trace::Trace for Collect {
+    fn edge(&mut self, layer: usize, name: &str, data: &[f32]) {
+        self.edges.push((layer, name.to_string(), data.to_vec()));
+    }
+    fn topk(&mut self, layer: usize, idx: &[usize], _weight: &[f32]) {
+        self.topk.push((layer, idx.to_vec()));
+    }
+    fn routed(&mut self, _: usize, _: usize, _: &[f32]) {}
+}
+
+/// The kernel gate: the shipped CPU realization from the bundle, token by token from the
+/// prefix state, every edge the oracle saved diffed against it, the picks forced to the
+/// oracle's when asked (what separates a tie flip from a kernel error).
+#[allow(clippy::too_many_arguments)]
+fn cpu_gate(bundle: &std::path::Path, ids: &[usize], layers: usize, gold: &Golden, routing: &Golden, force: bool, detail: f32, report: &mut Report, meta: &serde_json::Value) {
+    use glm_5_3_flash::layout;
+    assert_eq!(layers, NUM_HIDDEN_LAYERS, "--cpu runs every layer: the realization has no partial forward");
+    let n = ids.len();
+    let map = |name: &str| -> memmap2::Mmap {
+        let f = std::fs::File::open(bundle.join(name)).unwrap_or_else(|e| panic!("{}: {e}", bundle.join(name).display()));
+        unsafe { memmap2::Mmap::map(&f).unwrap() }
+    };
+    let (dense, experts) = (map(layout::DENSE_FILE), map(layout::EXPERTS_FILE));
+    dense.advise(memmap2::Advice::WillNeed).unwrap();
+    experts.advise(memmap2::Advice::Random).unwrap();
+    let w = glm_5_3_flash::weights::Weights::from_dense(&dense[..]);
+    let prefix_b = std::fs::read(bundle.join(layout::PREFIX_FILE)).unwrap();
+    let prefix: Vec<f32> = prefix_b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+    let mut model = CpuModel::new(CpuExperts::new(&experts[..]), n.max(FIRST_POS + 1));
+    model.seed_prefix(&w, &prefix);
+    for (t, &id) in ids.iter().enumerate().take(FIRST_POS) {
+        assert_eq!(id as u32, PREFIX_IDS[t], "the passage does not start with the model's prefix");
+    }
+    println!("cpu gate : {} from {}, {} positions after the prefix{}", if force { "forced picks" } else { "the router's picks" }, bundle.display(), n - FIRST_POS, if gold.row("l0.attn_in", 0).is_some() { "" } else { " (a golden with layer outputs only)" });
+    let names = ["attn_in", "attn_out", "ffn_in", "routed", "shared", "ffn_out", "out"];
+    let mut flips = 0;
+    let (mut agree, mut agree_oracle, mut nll) = (0usize, 0usize, 0f64);
+    let t0 = std::time::Instant::now();
+    for t in FIRST_POS..n {
+        let forced: Vec<[usize; TOP_K]> = (FIRST_K_DENSE_REPLACE..NUM_HIDDEN_LAYERS).map(|l| routing.irow(&format!("l{l}.topk"), t).unwrap().iter().map(|&e| e as usize).collect::<Vec<_>>().try_into().unwrap()).collect();
+        let mut c = Collect::default();
+        model.step(&w, ids[t] as u32, t, if force { Some(&forced) } else { None }, &mut c);
+        for (l, name, data) in &c.edges {
+            let key = if *l == common::trace::NONE { name.clone() } else { format!("l{l}.{name}") };
+            if *l != common::trace::NONE && !names.contains(&name.as_str()) {
+                continue;
+            }
+            let Some(g) = gold.row(&key, t) else { continue };
+            let class = if *l == common::trace::NONE { name.clone() } else { format!("model.layers.{l}.{name}") };
+            let (_, rel) = report.record(&class, data, g, &format!("pos {t}"));
+            if detail > 0.0 && rel > detail {
+                println!("    {key} pos {t}: rel {rel:.2e}");
+            }
+        }
+        for (l, mine) in &c.topk {
+            let gi = routing.irow(&format!("l{l}.topk"), t).unwrap();
+            let miss = mine.iter().filter(|e| !gi.contains(&(**e as i64))).count();
+            if miss > 0 && detail > 0.0 {
+                println!("    l{l} pos {t}: {miss} picks differ, ours {mine:?} oracle {gi:?}");
+            }
+            flips += miss;
+        }
+        let lg = &model.logits;
+        let am = |r: &[f32]| r.iter().enumerate().fold((0, f32::NEG_INFINITY), |a, (i, &v)| if v > a.1 { (i, v) } else { a }).0;
+        if let Some(g) = gold.row("logits", t) {
+            agree_oracle += (am(lg) == am(g)) as usize;
+        }
+        if t + 1 < n {
+            agree += (am(lg) == ids[t + 1]) as usize;
+            let mx = lg.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
+            let lse = mx + lg.iter().map(|&v| ((v as f64) - mx).exp()).sum::<f64>().ln();
+            nll += lse - lg[ids[t + 1]] as f64;
+        }
+        if (t - FIRST_POS + 1) % 8 == 0 || t + 1 == n {
+            println!("  pos {t}: {:.1} s a token so far", t0.elapsed().as_secs_f32() / (t - FIRST_POS + 1) as f32);
+        }
+    }
+    let scored = (n - FIRST_POS - 1) as f64;
+    println!("head: top-1 agrees with the oracle's at {agree_oracle}/{}; with the text {:.3} (oracle {:.3}); NLL {:.4} (oracle {:.4}); picks differ {flips}", n - FIRST_POS, agree as f64 / scored, meta["top1_agreement"].as_f64().unwrap_or(f64::NAN), nll / scored, meta["nll"].as_f64().unwrap_or(f64::NAN));
     report.print();
     std::process::exit(if report.failures() > 0 { 1 } else { 0 });
 }

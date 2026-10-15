@@ -61,7 +61,15 @@ pub const SEED: u64 = 0x726f_636b_656d_0002;
 pub const TOKENS: usize = common::gemv::TOKENS;
 
 pub mod expert;
+pub mod ffn;
+pub mod hc;
+pub mod kda;
 pub mod layout;
+pub mod mla;
+#[cfg(feature = "std")]
+pub mod construct;
+#[cfg(feature = "std")]
+pub mod weights;
 
 const _: () = assert!(LINEAR_ATTENTION.len() == NUM_HIDDEN_LAYERS);
 const _: () = assert!(DENSE_MLP.len() == NUM_HIDDEN_LAYERS);

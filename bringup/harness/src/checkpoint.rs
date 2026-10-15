@@ -40,6 +40,11 @@ impl Checkpoint {
         Checkpoint { shards, map }
     }
 
+    /// An empty handle for a tool that may not touch the checkpoint at all (every lookup then panics).
+    pub fn open_lazy(_dir: &Path) -> Self {
+        Checkpoint { shards: HashMap::new(), map: HashMap::new() }
+    }
+
     pub fn bf16(&self, name: &str) -> &'static [u16] {
         let t = self.view(name);
         assert_eq!(t.dtype(), Dtype::BF16, "{name}");

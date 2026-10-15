@@ -1,5 +1,6 @@
-//! One routed expert on its `q4g128` record: `out = down(silu(gate·x) ⊙ (up·x))`
-//! with the activation quantizer and the SwiGLU fused in — f32 in, f32 out,
+//! One routed expert on its `q4g128` record: `out = down(silu(min(gate·x, L)) ⊙
+//! clamp(up·x, ±L))`, L the model's `swiglu_limit`, with the activation
+//! quantizer and the clamped SwiGLU fused in — f32 in, f32 out,
 //! one signature. This is the unit the dispatcher issues per expert per
 //! thread; the GPU realization lands here as a grouped kernel over the same
 //! bytes.
@@ -7,7 +8,7 @@
 use crate::layout::{DOWN_W, GATE_UP_S, GATE_UP_W, RECORD};
 use crate::{D_FF, H};
 use common::q4::{self, QAct};
-use common::swiglu::swiglu;
+use common::swiglu::swiglu_clamped;
 
 pub struct Weights<'a> {
     pub gate_up_w: &'a [u8],
@@ -92,7 +93,7 @@ impl Default for ScratchBuf {
 pub fn forward(w: &Weights, x: &[f32], s: &mut Scratch, out: &mut [f32]) {
     s.xa.quantize(&x[..H]);
     q4::gemv::<H>(2 * D_FF, w.gate_up_w, w.gate_up_s, &s.xa, s.gu);
-    swiglu::<D_FF>(s.gu, s.h);
+    swiglu_clamped::<D_FF>(s.gu, crate::SWIGLU_LIMIT, s.h);
     s.ha.quantize(s.h);
     q4::gemv::<D_FF>(H, w.down_w, w.down_s, &s.ha, out);
 }
@@ -106,7 +107,7 @@ pub fn forward_q(w: &Weights, xq: &[i8], xs: &[f32], xg: &[i32], s: &mut Scratch
     s.xa.scale.copy_from_slice(&xs[..H / q4::GROUP]);
     s.xa.gsum.copy_from_slice(&xg[..H / q4::GROUP]);
     q4::gemv::<H>(2 * D_FF, w.gate_up_w, w.gate_up_s, &s.xa, s.gu);
-    swiglu::<D_FF>(s.gu, s.h);
+    swiglu_clamped::<D_FF>(s.gu, crate::SWIGLU_LIMIT, s.h);
     s.ha.quantize(s.h);
     q4::gemv::<D_FF>(H, w.down_w, w.down_s, &s.ha, out);
 }
@@ -115,7 +116,7 @@ pub fn forward_q(w: &Weights, xq: &[i8], xs: &[f32], xg: &[i32], s: &mut Scratch
 pub fn forward_scalar(w: &Weights, x: &[f32], s: &mut Scratch, out: &mut [f32]) {
     s.xa.quantize(&x[..H]);
     q4::gemv_scalar(H, 2 * D_FF, w.gate_up_w, w.gate_up_s, &s.xa, s.gu);
-    swiglu::<D_FF>(s.gu, s.h);
+    swiglu_clamped::<D_FF>(s.gu, crate::SWIGLU_LIMIT, s.h);
     s.ha.quantize(s.h);
     q4::gemv_scalar(D_FF, H, w.down_w, w.down_s, &s.ha, out);
 }
@@ -376,7 +377,11 @@ pub mod gfx11 {
                         let mut amax = 0f32;
                         let mut jj = 0;
                         while jj < 4 {
-                            v[jj] = silu(*g.add(k0 + jj)) * *g.add(D_FF + k0 + jj);
+                            // the clamp, as the CPU twin: gate capped at the limit, up clamped to ±limit
+                            let (ga, ua) = (*g.add(k0 + jj), *g.add(D_FF + k0 + jj));
+                            let ga = if ga > crate::SWIGLU_LIMIT { crate::SWIGLU_LIMIT } else { ga };
+                            let ua = if ua > crate::SWIGLU_LIMIT { crate::SWIGLU_LIMIT } else if ua < -crate::SWIGLU_LIMIT { -crate::SWIGLU_LIMIT } else { ua };
+                            v[jj] = silu(ga) * ua;
                             let a = if v[jj] < 0.0 { -v[jj] } else { v[jj] };
                             if a > amax {
                                 amax = a;

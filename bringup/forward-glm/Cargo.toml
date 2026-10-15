@@ -8,6 +8,7 @@ description = "Bring-up driver for GLM-5.3-Flash: runs the f32 transcription lay
 harness = { path = "../harness" }
 common = { path = "../../common" }
 glm_5_3_flash = { path = "../../models/glm-5.3-flash", features = ["std"] }
+memmap2 = "0.9"
 serde_json = "1"
 
 [profile.release]
