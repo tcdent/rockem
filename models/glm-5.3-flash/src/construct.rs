@@ -258,34 +258,35 @@ pub fn physical_cores() -> Vec<usize> {
 
 /// The routed experts from the bundle's expert stream in this process's memory,
 /// each expert's rows split over the pool: first the gate/up rows in chunks of
-/// `CHUNK` hidden channels — a chunk's clamped SwiGLU and its INT8 group are
-/// its own — then the down rows in chunks of `DOWN_CHUNK` over every expert's
-/// quantized hidden state. Every item names the rows it streams, so a placed
-/// pool runs it on their node. Every row's arithmetic is `expert::forward`'s
-/// exactly (the same tiles, groups and flush); only the cores differ.
+/// `CHUNK` hidden channels — a chunk's clamped SwiGLU is its own, written as
+/// f32 — then the down rows in chunks of `DOWN_CHUNK`, each item quantizing
+/// its expert's whole hidden state to INT8 groups itself (the same groups and
+/// bits whoever cuts them; 2 µs against an item's 100 µs of streaming — so the
+/// gate/up items are not held to a group's width: 128 of them over 48 cores a
+/// node left a whole item of tail, 2026-10-15). Every item names the rows it
+/// streams, so a placed pool runs it on their node. Every row's arithmetic is
+/// `expert::forward`'s exactly (the same tiles, groups and flush); only the
+/// cores differ.
 pub struct CpuExperts<'a> {
     stream: &'a [u8],
     pool: &'a dyn Pool,
     xq: Vec<i8>,
     xs: Vec<f32>,
     xg: Vec<i32>,
-    hq: Vec<i8>,  // [TOP_K][D_FF]
-    hs: Vec<f32>, // [TOP_K][D_FF / GROUP]
-    hg: Vec<i32>,
+    h: Vec<f32>, // [TOP_K][D_FF]: the experts' hidden states
     elapsed: f64,
 }
-/// Hidden channels an item takes: one INT8 group, sixteen items an expert — with
-/// the eight experts' items split between two sockets, more than a socket's cores.
-const CHUNK: usize = 128;
-/// Output rows an item takes for the down projection: twenty items an expert.
+/// Hidden channels an item takes: 32 items an expert.
+const CHUNK: usize = 64;
+/// Output rows an item takes for the down projection: 20 items an expert.
 const DOWN_CHUNK: usize = 256;
-const _: () = assert!(D_FF % CHUNK == 0 && CHUNK % common::q4::GROUP == 0 && CHUNK % common::q4::TILE == 0 && H % DOWN_CHUNK == 0 && DOWN_CHUNK % common::q4::TILE == 0);
+const _: () = assert!(D_FF % CHUNK == 0 && CHUNK % common::q4::TILE == 0 && D_FF % common::q4::GROUP == 0 && H % DOWN_CHUNK == 0 && DOWN_CHUNK % common::q4::TILE == 0);
 
 impl<'a> CpuExperts<'a> {
     pub fn new(stream: &'a [u8], pool: &'a dyn Pool) -> Self {
         use common::q4::GROUP;
         assert_eq!(stream.len(), layout::STREAM);
-        CpuExperts { stream, pool, xq: vec![0; H], xs: vec![0.0; H / GROUP], xg: vec![0; H / GROUP], hq: vec![0; TOP_K * D_FF], hs: vec![0.0; TOP_K * D_FF / GROUP], hg: vec![0; TOP_K * D_FF / GROUP], elapsed: 0.0 }
+        CpuExperts { stream, pool, xq: vec![0; H], xs: vec![0.0; H / GROUP], xg: vec![0; H / GROUP], h: vec![0.0; TOP_K * D_FF], elapsed: 0.0 }
     }
 }
 impl Routed for CpuExperts<'_> {
@@ -299,8 +300,8 @@ impl Routed for CpuExperts<'_> {
         QAct { q: &mut self.xq, scale: &mut self.xs, gsum: &mut self.xg }.quantize(&x[..H]);
         let xa = Act { q: &self.xq, scale: &self.xs, gsum: &self.xg };
         let stream = self.stream;
-        let (hq_p, hs_p, hg_p, out_p) = (self.hq.as_mut_ptr() as usize, self.hs.as_mut_ptr() as usize, self.hg.as_mut_ptr() as usize, out.as_mut_ptr() as usize);
-        // the gate/up rows: item (k, c) owns expert k's hidden channels c·CHUNK.. and their group
+        let (h_p, out_p) = (self.h.as_mut_ptr() as usize, out.as_mut_ptr() as usize);
+        // the gate/up rows: item (k, c) owns expert k's hidden channels c·CHUNK..
         let gate_rows = move |i: usize| {
             let (k, c) = (i / (D_FF / CHUNK), i % (D_FF / CHUNK));
             expert::Weights::from_record(&stream[layout::record(l, idx[k])]).gate_up_w[c * CHUNK / TILE * 2 * H..].as_ptr()
@@ -314,19 +315,11 @@ impl Routed for CpuExperts<'_> {
             q4::gemv::<H>(CHUNK, gw, gs, &xa, &mut gu[..CHUNK]);
             let (uw, us) = rows(D_FF + c * CHUNK);
             q4::gemv::<H>(CHUNK, uw, us, &xa, &mut gu[CHUNK..]);
-            let mut h = [0f32; CHUNK];
-            swiglu_clamped::<CHUNK>(&gu, SWIGLU_LIMIT, &mut h);
-            let (q, sc, g) = unsafe {
-                (
-                    std::slice::from_raw_parts_mut((hq_p as *mut i8).add(k * D_FF + c * CHUNK), CHUNK),
-                    std::slice::from_raw_parts_mut((hs_p as *mut f32).add(k * D_FF / GROUP + c * CHUNK / GROUP), CHUNK / GROUP),
-                    std::slice::from_raw_parts_mut((hg_p as *mut i32).add(k * D_FF / GROUP + c * CHUNK / GROUP), CHUNK / GROUP),
-                )
-            };
-            QAct { q, scale: sc, gsum: g }.quantize(&h);
+            let h = unsafe { std::slice::from_raw_parts_mut((h_p as *mut f32).add(k * D_FF + c * CHUNK), CHUNK) };
+            swiglu_clamped::<CHUNK>(&gu, SWIGLU_LIMIT, h);
         });
-        // the down rows: item (k, c) owns rows c·DOWN_CHUNK.. of expert k's output over its whole hidden state
-        let (hq, hs, hg) = (&self.hq, &self.hs, &self.hg);
+        // the down rows: item (k, c) owns rows c·DOWN_CHUNK.. of expert k's output over its whole hidden state, quantized here
+        let h = &self.h;
         let down_rows = move |i: usize| {
             let (k, c) = (i / (H / DOWN_CHUNK), i % (H / DOWN_CHUNK));
             expert::Weights::from_record(&stream[layout::record(l, idx[k])]).down_w[c * DOWN_CHUNK / TILE * 2 * D_FF..].as_ptr()
@@ -334,7 +327,9 @@ impl Routed for CpuExperts<'_> {
         self.pool.run_at(TOP_K * (H / DOWN_CHUNK), &down_rows, &move |i| {
             let (k, c) = (i / (H / DOWN_CHUNK), i % (H / DOWN_CHUNK));
             let w = expert::Weights::from_record(&stream[layout::record(l, idx[k])]);
-            let ha = Act { q: &hq[k * D_FF..(k + 1) * D_FF], scale: &hs[k * D_FF / GROUP..(k + 1) * D_FF / GROUP], gsum: &hg[k * D_FF / GROUP..(k + 1) * D_FF / GROUP] };
+            let (mut hq, mut hs, mut hg) = ([0i8; D_FF], [0f32; D_FF / GROUP], [0i32; D_FF / GROUP]);
+            QAct { q: &mut hq, scale: &mut hs, gsum: &mut hg }.quantize(&h[k * D_FF..(k + 1) * D_FF]);
+            let ha = Act { q: &hq, scale: &hs, gsum: &hg };
             let r0 = c * DOWN_CHUNK;
             let (dw, ds) = (&w.down_w[r0 / TILE * 2 * D_FF..(r0 + DOWN_CHUNK) / TILE * 2 * D_FF], &w.down_s[r0 / TILE * (D_FF / GROUP) * TILE..(r0 + DOWN_CHUNK) / TILE * (D_FF / GROUP) * TILE]);
             let o = unsafe { std::slice::from_raw_parts_mut((out_p as *mut f32).add(k * H + r0), DOWN_CHUNK) };

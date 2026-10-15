@@ -409,6 +409,18 @@ pub fn run(elf: Option<&[u8]>) {
         }));
         let mclk = std::fs::read_to_string(format!("/sys/class/drm/card{}/device/pp_dpm_mclk", c)).map(|s| s.lines().filter(|l| l.ends_with('*')).map(|l| l.trim().to_string()).collect::<Vec<_>>().join(" ")).unwrap_or_default();
         println!("card {c}   : the head's shape ({} MB of bf16 rows, normed) at {head:.0} GB/s into host memory; memory clock {mclk}", head_w.size / 1_000_000);
+        // what a wait costs: a sync with nothing pending, and a sync for the shared expert's pair launched 600 µs earlier (as the serving node waits for it after the routed experts)
+        let idle_sync = best(iters, || k.sync()) * 1e6;
+        let after_gap = best(iters, || {
+            fp8(&gu_k, x.va, Some(ln.va), gu_out.va, SHARED_GU_ROWS, H);
+            fp8(&down_s, gu_out.va, None, y_host.va, H, D_FF);
+            let t = std::time::Instant::now();
+            while t.elapsed().as_micros() < 600 {
+                std::hint::spin_loop();
+            }
+            k.sync();
+        }) * 1e6 - 600.0;
+        println!("card {c}   : a sync with nothing pending {idle_sync:.0} µs; the shared expert's pair launched, 600 µs of other work, then its sync: {after_gap:.0} µs past the gap");
         println!("card {c}   : FP8 rows — the shared expert's gate|up ({} MB) at {shared_gu:.0} GB/s, its down at {shared_down:.0}; a dense layer's gate|up ({} MB) at {dense_gu:.0}, its down at {dense_down:.0} (one launch + sync each)", SHARED_GU_ROWS * H / 1_000_000, DENSE_GU_ROWS * H / 1_000_000);
     }
 }

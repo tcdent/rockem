@@ -339,17 +339,38 @@ impl Cards {
 
     /// One FP8 rows launch on card `c`: `out[row] = W[row] · x` (normed with `ln` when given) for `m` rows of width `k_width`, scales `s`.
     fn rows8(&self, c: &Card, kernel: &crate::kfd::Kernel, x: usize, ln: Option<usize>, w: usize, s: usize, out: usize, m: usize, k_width: usize) {
+        self.rows8_at(c, kernel, x, ln, w, s, out, m, k_width, true)
+    }
+    fn rows8_free(&self, c: &Card, kernel: &crate::kfd::Kernel, x: usize, ln: Option<usize>, w: usize, s: usize, out: usize, m: usize, k_width: usize) {
+        self.rows8_at(c, kernel, x, ln, w, s, out, m, k_width, false)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn rows8_at(&self, c: &Card, kernel: &crate::kfd::Kernel, x: usize, ln: Option<usize>, w: usize, s: usize, out: usize, m: usize, k_width: usize, barrier: bool) {
         let mut a = Args::new();
         a.ptr(x);
         if let Some(ln) = ln {
             a.ptr(ln);
         }
         a.ptr(w).ptr(s).ptr(out).u32(m as u32).u32(1);
-        c.k.launch(kernel, g::rows_grid(m), g::WG, g::fp8_rows_lds(k_width, 1) as u32, &a);
+        let lds = g::fp8_rows_lds(k_width, 1) as u32;
+        if barrier {
+            c.k.launch(kernel, g::rows_grid(m), g::WG, lds, &a);
+        } else {
+            c.k.launch_free(kernel, g::rows_grid(m), g::WG, lds, &a);
+        }
     }
 
     /// One rows launch on card `c`: `out[row] = W[row] · x` (normed with `ln` when given) for `m` rows of width `k_width`. Addresses are device VAs.
     fn rows(&self, c: &Card, kernel: &crate::kfd::Kernel, x: usize, ln: Option<usize>, w: usize, out: usize, m: usize, k_width: usize) {
+        self.rows_at(c, kernel, x, ln, w, out, m, k_width, true)
+    }
+    /// `rows` launched free: as soon as the launch before it has launched, so the two run together —
+    /// for a launch whose inputs were complete when the one before it launched.
+    fn rows_free(&self, c: &Card, kernel: &crate::kfd::Kernel, x: usize, ln: Option<usize>, w: usize, out: usize, m: usize, k_width: usize) {
+        self.rows_at(c, kernel, x, ln, w, out, m, k_width, false)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn rows_at(&self, c: &Card, kernel: &crate::kfd::Kernel, x: usize, ln: Option<usize>, w: usize, out: usize, m: usize, k_width: usize, barrier: bool) {
         let mut a = Args::new();
         a.ptr(x);
         if let Some(ln) = ln {
@@ -357,7 +378,11 @@ impl Cards {
         }
         a.ptr(w).ptr(out).u32(m as u32).u32(1);
         let lds = if ln.is_some() { g::normed_rows_lds(k_width, 1) } else { g::rows_lds(k_width, 1) } as u32;
-        c.k.launch(kernel, g::rows_grid(m), g::WG, lds, &a);
+        if barrier {
+            c.k.launch(kernel, g::rows_grid(m), g::WG, lds, &a);
+        } else {
+            c.k.launch_free(kernel, g::rows_grid(m), g::WG, lds, &a);
+        }
     }
 }
 
@@ -403,12 +428,12 @@ impl Placed for Cards {
         let ln = Some(m.input_ln.va);
         // over the normed block input: q_a into VRAM for the next two, kv_a and the indexer's three out to the host
         self.rows8(c, &c.ffn_gu, c.fx.va, ln, m.q_a.0.va, m.q_a.1.va, c.mqa.va, Q_LORA_RANK, H);
-        self.rows8(c, &c.ffn_gu, c.fx.va, ln, m.kv_a.0.va, m.kv_a.1.va, c.mproj.at(MKVA * 4), KV_LORA_RANK, H);
-        self.rows(c, &c.rows_h, c.fx.va, ln, m.ix.va, c.mproj.at(MIX * 4), IX_ROWS, H);
-        // over q_a's output normed with q_a's norm: the query and the indexer's query
+        self.rows8_free(c, &c.ffn_gu, c.fx.va, ln, m.kv_a.0.va, m.kv_a.1.va, c.mproj.at(MKVA * 4), KV_LORA_RANK, H);
+        self.rows_free(c, &c.rows_h, c.fx.va, ln, m.ix.va, c.mproj.at(MIX * 4), IX_ROWS, H);
+        // over q_a's output normed with q_a's norm: the query and, alongside it, the indexer's query
         let qln = Some(m.qa_ln.va);
         self.rows8(c, &c.mla_qb, c.mqa.va, qln, m.q_b.0.va, m.q_b.1.va, c.mproj.at(MQ * 4), MLA_HEADS * Q_HEAD, Q_LORA_RANK);
-        self.rows(c, &c.mla_iq, c.mqa.va, qln, m.ix_wq_b.va, c.mproj.at(MIQ * 4), INDEX_N_HEADS * INDEX_HEAD_DIM, Q_LORA_RANK);
+        self.rows_free(c, &c.mla_iq, c.mqa.va, qln, m.ix_wq_b.va, c.mproj.at(MIQ * 4), INDEX_N_HEADS * INDEX_HEAD_DIM, Q_LORA_RANK);
         c.k.sync();
         read(&c.mproj, MQ * 4, &mut q[..MLA_HEADS * Q_HEAD]);
         read(&c.mproj, MKVA * 4, &mut kva[..KV_LORA_RANK]);
@@ -441,11 +466,13 @@ impl Placed for Cards {
             let c = &self.cards[p.card];
             let ln = Some(p.input_ln.va);
             let at = p.head0 * KDA_DIM * 4; // the part's heads' offset into a [KDA_QKV] buffer
-            for part in 0..3 {
-                self.rows(c, &c.rows_h, c.x.va, ln, p.qkv[part].va, c.mixed.at(part * KDA_QKV * 4 + at), g::PART_QKV, H);
+            // q, k, v, and the gates' second halves alongside them (the small projections completed before q launched)
+            self.rows(c, &c.rows_h, c.x.va, ln, p.qkv[0].va, c.mixed.at(at), g::PART_QKV, H);
+            for part in 1..3 {
+                self.rows_free(c, &c.rows_h, c.x.va, ln, p.qkv[part].va, c.mixed.at(part * KDA_QKV * 4 + at), g::PART_QKV, H);
             }
-            self.rows(c, &c.rows_d, c.small.va, None, p.f_b.va, c.f.at(at), g::PART_QKV, KDA_DIM);
-            self.rows(c, &c.rows_d, c.small.at(KDA_DIM * 4), None, p.g_b.va, c.gate.at(at), g::PART_QKV, KDA_DIM);
+            self.rows_free(c, &c.rows_d, c.small.va, None, p.f_b.va, c.f.at(at), g::PART_QKV, KDA_DIM);
+            self.rows_free(c, &c.rows_d, c.small.at(KDA_DIM * 4), None, p.g_b.va, c.gate.at(at), g::PART_QKV, KDA_DIM);
             let mut a = Args::new();
             a.ptr(c.mixed.va).ptr(p.taps.va).ptr(p.window.va).ptr(c.f.va).ptr(p.dt_bias.va).ptr(p.a_log.va).ptr(c.small.at(2 * KDA_DIM * 4)).ptr(c.gate.va).ptr(p.mem.va).ptr(p.o_norm.va).ptr(c.normed.va).u32(p.head0 as u32).u32(1);
             c.k.launch(&c.step, g::STEP_GRID, g::WG, g::STEP_LDS as u32, &a);
