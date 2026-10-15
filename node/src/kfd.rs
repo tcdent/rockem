@@ -296,6 +296,8 @@ pub struct Kfd {
     signal: Mem,
     doorbell: *mut u64,
     write_index: Cell<u64>,
+    /// The index of the barrier packet `fence` posted last.
+    fenced: Cell<u64>,
     /// The host has written GPU-visible memory since the last launch: the next
     /// dispatch acquires at system scope (an L2 invalidate); the ones after it
     /// at agent scope, since kernels only hand each other what the card wrote.
@@ -378,6 +380,7 @@ impl Kfd {
             signal: Mem { va: 0, size: 0 },
             doorbell: std::ptr::null_mut(),
             write_index: Cell::new(0),
+            fenced: Cell::new(0),
             host_wrote: Cell::new(true),
             instrument,
             stamps: Mem { va: 0, size: 0 },
@@ -707,11 +710,27 @@ impl Kfd {
     /// Wait for everything posted so far: a barrier packet carrying the
     /// signal, then MWAITX on the signal's line until the CP decrements it.
     pub fn sync(&self) {
+        self.fence();
+        self.wait();
+    }
+    /// Post the completion of everything so far — a barrier packet carrying
+    /// the signal — without waiting: the CP decrements the signal the moment
+    /// the work is done, while it is still awake, and `wait` later finds it
+    /// decremented. A card left idle 400 µs pays ~100 µs on its next packet
+    /// (probe, 2026-10-15), so the packet that completes a launch sequence
+    /// goes out with it. One completion outstanding at a time.
+    pub fn fence(&self) {
         let s = self.signal.ptr() as *const Signal;
         unsafe { (*s).value.store(1, Ordering::Release) };
         let idx = self.write_index.get();
         let pkt = Packet { header: PACKET_INVALID, setup: 0, workgroup_size: [0; 3], reserved0: 0, grid_size: [0; 3], private_segment_size: 0, group_segment_size: 0, kernel_object: 0, kernarg_address: 0, reserved2: 0, completion_signal: self.signal.va as u64 };
         self.post(idx, pkt, PACKET_BARRIER_AND | HEADER_BARRIER | (FENCE_SYSTEM << HEADER_ACQUIRE_SHIFT) | (FENCE_SYSTEM << HEADER_RELEASE_SHIFT));
+        self.fenced.set(idx);
+    }
+    /// Wait for the completion `fence` posted.
+    pub fn wait(&self) {
+        let s = self.signal.ptr() as *const Signal;
+        let idx = self.fenced.get();
         let value = unsafe { &(*s).value };
         let t0 = std::time::Instant::now();
         while value.load(Ordering::Acquire) != 0 {

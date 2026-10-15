@@ -4,6 +4,7 @@
 #![no_std]
 
 pub use glm_5_3_flash::ffn::gfx11 as ffn;
+pub use glm_5_3_flash::hc::gfx11 as hc;
 pub use glm_5_3_flash::kda::gfx11 as kda;
 pub use glm_5_3_flash::mla::gfx11 as mla;
 pub use glm_5_3_flash::probe::gfx11 as probe;

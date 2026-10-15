@@ -207,3 +207,204 @@ mod avx2 {
         }
     }
 }
+
+pub mod gfx11_consts {
+    use crate::*;
+    /// `hc_coef`: the coefficient rows over the flattened streams, `rows_grid(HC_COEFS)` workgroups.
+    pub const COEF_ROWS: usize = HC_COEFS;
+    /// The mix the card keeps between a block's two halves: pre `[HC]`, post `[HC]`, comb `[HC][HC]`.
+    pub const MIX: usize = 2 * HC + HC * HC;
+    /// `hc_post` and `hc_mean`: a thread a channel.
+    pub const CHANNEL_GRID: u32 = (H / 256) as u32;
+}
+
+#[cfg(target_arch = "amdgpu")]
+pub mod gfx11 {
+    //! The hyper-connections on the card, where the residual streams live
+    //! (`[HC][H]` f32): `hc_coef` (the coefficient GEMV over the flattened
+    //! streams rms-normed without a weight as they are staged — `rows_h`'s
+    //! skeleton with a row of ones), `hc_mix` (one workgroup: the sigmoids, the
+    //! softmax rows and Sinkhorn into the mix, then the collapse to the block
+    //! input, written to VRAM and, when asked, to host memory for the routed
+    //! experts), `hc_post` (the stream update from the block output), and
+    //! `hc_mean` (the streams' mean, the head's input). The per-element order
+    //! is the host's (`pre`, `post`): multiply, then add, streams in order.
+    pub use super::gfx11_consts::*;
+    use crate::*;
+    use common::gemv::gfx11::rows_over;
+    use common::math::exp;
+    use core::arch::amdgpu::{workgroup_id_x, workitem_id_x};
+
+    #[inline(always)]
+    fn sigmoid(x: f32) -> f32 {
+        1.0 / (1.0 + exp(-x))
+    }
+
+    /// `coef[row] = W[row] · rmsnorm(streams)` over all `HC·H` channels (`ones` the norm's weight). Grid: rows_grid(COEF_ROWS).
+    #[no_mangle]
+    pub extern "gpu-kernel" fn hc_coef(streams: *const f32, ones: *const u16, w: *const u16, coef: *mut f32, m: u32, n: u32) {
+        unsafe {
+            let tid = workitem_id_x();
+            let (m, n) = (m as usize, n as usize);
+            let t = tid as usize;
+            rows_over::<{ HC * H }, true>(tid, w, ones, m, n, RMS_NORM_EPS, |i, s| *streams.add(i * HC * H + s * 256 + t), || {}, |row, i, y| *coef.add(i * m + row) = y);
+        }
+    }
+
+    /// The mix from the coefficients (`hc::pre`'s arithmetic), and the collapsed block input
+    /// `x[d] = Σ_i pre_i · stream_i[d]`, into `x` and, when `x_host` is not null, there too. Grid: 1.
+    #[no_mangle]
+    pub extern "gpu-kernel" fn hc_mix(coef: *const f32, base: *const f32, scale: *const f32, streams: *const f32, mix: *mut f32, x: *mut f32, x_host: *mut f32) {
+        unsafe {
+            let t = workitem_id_x() as usize;
+            // every thread computes the whole mix: a few hundred operations, no exchange needed
+            let (s0, s1, s2) = (*scale, *scale.add(1), *scale.add(2));
+            let mut pre = [0f32; HC];
+            let mut post = [0f32; HC];
+            let mut cb = [[0f32; HC]; HC];
+            let mut i = 0;
+            while i < HC {
+                pre[i] = sigmoid(*coef.add(i) * s0 + *base.add(i)) + HC_EPS;
+                post[i] = 2.0 * sigmoid(*coef.add(HC + i) * s1 + *base.add(HC + i));
+                i += 1;
+            }
+            let mut i = 0;
+            while i < HC {
+                let mut row = [0f32; HC];
+                let mut mx = f32::NEG_INFINITY;
+                let mut j = 0;
+                while j < HC {
+                    row[j] = *coef.add(2 * HC + i * HC + j) * s2 + *base.add(2 * HC + i * HC + j);
+                    if row[j] > mx {
+                        mx = row[j];
+                    }
+                    j += 1;
+                }
+                let mut sum = 0f32;
+                let mut j = 0;
+                while j < HC {
+                    row[j] = exp(row[j] - mx);
+                    sum += row[j];
+                    j += 1;
+                }
+                let mut j = 0;
+                while j < HC {
+                    cb[i][j] = row[j] / sum + HC_EPS;
+                    j += 1;
+                }
+                i += 1;
+            }
+            // Sinkhorn-Knopp: columns first, then rows and columns HC_SINKHORN_ITERS - 1 times
+            let mut it = 0;
+            while it < HC_SINKHORN_ITERS {
+                if it > 0 {
+                    let mut i = 0;
+                    while i < HC {
+                        let mut sum = 0f32;
+                        let mut j = 0;
+                        while j < HC {
+                            sum += cb[i][j];
+                            j += 1;
+                        }
+                        let sum = sum + HC_EPS;
+                        let mut j = 0;
+                        while j < HC {
+                            cb[i][j] /= sum;
+                            j += 1;
+                        }
+                        i += 1;
+                    }
+                }
+                let mut j = 0;
+                while j < HC {
+                    let mut sum = 0f32;
+                    let mut i = 0;
+                    while i < HC {
+                        sum += cb[i][j];
+                        i += 1;
+                    }
+                    let sum = sum + HC_EPS;
+                    let mut i = 0;
+                    while i < HC {
+                        cb[i][j] /= sum;
+                        i += 1;
+                    }
+                    j += 1;
+                }
+                it += 1;
+            }
+            // one thread writes the mix, with constant indices (indexing the arrays by thread spilled them)
+            if t == 0 {
+                let mut i = 0;
+                while i < HC {
+                    *mix.add(i) = pre[i];
+                    *mix.add(HC + i) = post[i];
+                    let mut j = 0;
+                    while j < HC {
+                        *mix.add(2 * HC + i * HC + j) = cb[i][j];
+                        j += 1;
+                    }
+                    i += 1;
+                }
+            }
+            // the collapse: this thread's channels
+            let mut d = t;
+            while d < H {
+                let mut acc = 0f32;
+                let mut i = 0;
+                while i < HC {
+                    acc += pre[i] * *streams.add(i * H + d);
+                    i += 1;
+                }
+                *x.add(d) = acc;
+                if !x_host.is_null() {
+                    *x_host.add(d) = acc;
+                }
+                d += 256;
+            }
+        }
+    }
+
+    /// `stream_j[d] = post_j · y[d] + Σ_i comb_ij · stream_i[d]`, a thread a channel. Grid: CHANNEL_GRID.
+    #[no_mangle]
+    pub extern "gpu-kernel" fn hc_post(mix: *const f32, y: *const f32, streams: *mut f32) {
+        unsafe {
+            let d = workgroup_id_x() as usize * 256 + workitem_id_x() as usize;
+            let mut res = [0f32; HC];
+            let mut i = 0;
+            while i < HC {
+                res[i] = *streams.add(i * H + d);
+                i += 1;
+            }
+            let yd = *y.add(d);
+            let mut j = 0;
+            while j < HC {
+                let mut acc = 0f32;
+                let mut i = 0;
+                while i < HC {
+                    acc += *mix.add(2 * HC + i * HC + j) * res[i];
+                    i += 1;
+                }
+                *streams.add(j * H + d) = *mix.add(HC + j) * yd + acc;
+                j += 1;
+            }
+        }
+    }
+
+    /// `mean[d] = Σ_j stream_j[d] / HC`, a thread a channel. Grid: CHANNEL_GRID.
+    #[no_mangle]
+    pub extern "gpu-kernel" fn hc_mean(streams: *const f32, mean: *mut f32) {
+        unsafe {
+            let d = workgroup_id_x() as usize * 256 + workitem_id_x() as usize;
+            let mut acc = 0f32;
+            let mut j = 0;
+            while j < HC {
+                acc += *streams.add(j * H + d);
+                j += 1;
+            }
+            *mean.add(d) = acc / HC as f32;
+        }
+    }
+    const _: () = assert!(H % 256 == 0 && (HC * H) % 256 == 0 && HC * HC <= 256);
+}
+

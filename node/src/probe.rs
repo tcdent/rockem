@@ -46,6 +46,66 @@ fn pin(core: usize) {
     unsafe { sched_setaffinity(0, 128, mask.as_ptr()) };
 }
 
+/// The physical cores of a node grouped by the L3 they share (a CCD each), from /sys.
+fn ccds_of(cores: &[usize]) -> Vec<Vec<usize>> {
+    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+    for &c in cores {
+        let key = std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{c}/cache/index3/shared_cpu_list")).unwrap_or_default();
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, g)) => g.push(c),
+            None => groups.push((key, vec![c])),
+        }
+    }
+    groups.into_iter().map(|(_, g)| g).collect()
+}
+/// A core and its SMT siblings.
+fn siblings_of(core: usize) -> Vec<usize> {
+    let s = std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{core}/topology/thread_siblings_list")).unwrap_or_default();
+    let mut out = Vec::new();
+    for part in s.trim().split(',') {
+        let (a, b) = part.split_once('-').map(|(a, b)| (a.parse::<usize>().unwrap(), b.parse::<usize>().unwrap())).unwrap_or_else(|| (part.parse().unwrap_or(core), part.parse().unwrap_or(core)));
+        out.extend(a..=b);
+    }
+    if out.is_empty() {
+        out.push(core);
+    }
+    out
+}
+/// The memory devices the firmware reports (SMBIOS type 17 from /sys/firmware/dmi): count, sizes, speeds, ranks.
+fn dimms() -> String {
+    let Ok(rd) = std::fs::read_dir("/sys/firmware/dmi/entries") else { return "no DMI tables".into() };
+    let mut devs: Vec<(u32, u16, u16, u8)> = Vec::new(); // MB, speed MT/s, configured MT/s, ranks
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("17-") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read(e.path().join("raw")) else { continue };
+        if raw.len() < 0x22 {
+            continue;
+        }
+        let u16at = |o: usize| u16::from_le_bytes([raw[o], raw[o + 1]]);
+        let size = match u16at(0x0c) {
+            0 | 0xffff => 0,
+            0x7fff if raw.len() >= 0x20 => u32::from_le_bytes([raw[0x1c], raw[0x1d], raw[0x1e], raw[0x1f]]),
+            v if v & 0x8000 != 0 => (v & 0x7fff) as u32 / 1024,
+            v => v as u32,
+        };
+        if size == 0 {
+            continue;
+        }
+        devs.push((size, u16at(0x15), u16at(0x20), raw[0x1b] & 0x0f));
+    }
+    if devs.is_empty() {
+        return "no populated memory devices in the DMI tables".into();
+    }
+    let total: u64 = devs.iter().map(|d| d.0 as u64).sum();
+    let mut kinds: Vec<String> = devs.iter().map(|d| format!("{} GB {} MT/s (configured {}) {} rank{}", d.0 / 1024, d.1, d.2, d.3, if d.3 == 1 { "" } else { "s" })).collect();
+    kinds.sort();
+    kinds.dedup();
+    format!("{} devices, {} GB: {}", devs.len(), total / 1024, kinds.join("; "))
+}
+
 /// The physical cores of each NUMA node, from /sys.
 fn nodes() -> Vec<Vec<usize>> {
     let phys = physical_cores();
@@ -70,6 +130,10 @@ fn nodes() -> Vec<Vec<usize>> {
 /// Threads pinned to `cpus`, each streaming its own `mb` MB (first-touched by itself under
 /// the policy), all starting together: aggregate GB/s, best of `iters`.
 fn dram(cpus: &[usize], mb: usize, iters: usize, inter: bool) -> f64 {
+    dram_pages(cpus, mb, iters, inter, false)
+}
+/// `dram` with the buffers on 2 MiB pages when `huge` (madvise; the kernel's THP is on madvise).
+fn dram_pages(cpus: &[usize], mb: usize, iters: usize, inter: bool, huge: bool) -> f64 {
     let n = mb << 20;
     let start = Barrier::new(cpus.len());
     std::thread::scope(|sc| {
@@ -80,7 +144,17 @@ fn dram(cpus: &[usize], mb: usize, iters: usize, inter: bool) -> f64 {
                 sc.spawn(move || {
                     pin(cpu);
                     interleave(inter);
-                    let mut buf = vec![0u8; n];
+                    let buf: &mut [u8] = if huge {
+                        const PAGE: usize = 2 << 20;
+                        let len = n.div_ceil(PAGE) * PAGE + PAGE;
+                        let p = unsafe { mmap(std::ptr::null_mut(), len, 3, 0x22, -1, 0) };
+                        assert!(p as isize != -1, "mmap");
+                        let aligned = ((p as usize + PAGE - 1) & !(PAGE - 1)) as *mut u8;
+                        unsafe { syscall(28, aligned, (n.div_ceil(PAGE) * PAGE) as u64, 14i32) }; // madvise(MADV_HUGEPAGE)
+                        unsafe { std::slice::from_raw_parts_mut(aligned, n) }
+                    } else {
+                        Box::leak(vec![0u8; n].into_boxed_slice())
+                    };
                     for (i, b) in buf.iter_mut().enumerate().step_by(4096) {
                         *b = i as u8;
                     }
@@ -251,6 +325,21 @@ pub fn run(elf: Option<&[u8]>) {
         println!("dram     : every node local, {} threads: {:.0} GB/s", all.len(), dram(&all, mb, iters, false));
         println!("dram     : interleaved pages, {} threads: {:.0} GB/s (the loader's placement)", all.len(), dram(&all, mb, iters, true));
     }
+    // the sweep toward the channels' peak, on node 0: threads a CCD, SMT siblings, 2 MiB pages
+    let ccds = ccds_of(&nodes[0]);
+    let per_ccd: Vec<String> = [1usize, 2, 4, 8]
+        .iter()
+        .filter(|&&k| ccds.iter().all(|c| c.len() >= k))
+        .map(|&k| {
+            let cpus: Vec<usize> = ccds.iter().flat_map(|c| c[..k].iter().copied()).collect();
+            format!("{k} a CCD ({}) {:.0}", cpus.len(), dram(&cpus, (2048 / cpus.len()).max(16), iters, false))
+        })
+        .collect();
+    let smt: Vec<usize> = nodes[0].iter().flat_map(|&c| siblings_of(c)).collect();
+    let smt_rate = dram(&smt, (2048 / smt.len()).max(16), iters, false);
+    let huge_rate = dram_pages(&nodes[0], mb, iters, false, true);
+    println!("dram     : node 0 local, threads a CCD — {}; every SMT sibling ({}) {smt_rate:.0}; 48 threads on 2 MiB pages {huge_rate:.0} GB/s ({} CCDs)", per_ccd.join(", "), smt.len(), ccds.len());
+    println!("dimms    : {}", dimms());
     let pool = Threads::new(&all);
     println!("{}", gemv_rates(&pool, iters, nodes.len(), false));
     if nodes.len() > 1 {

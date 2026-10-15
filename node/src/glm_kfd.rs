@@ -444,11 +444,12 @@ impl Placed for Cards {
         let (rows, down, k_width) = if f.dense { (DENSE_GU_ROWS, &c.ffn_down_dense, INTERMEDIATE_SIZE) } else { (SHARED_GU_ROWS, &c.ffn_down_shared, N_SHARED_EXPERTS * D_FF) };
         self.rows8(c, &c.ffn_gu, c.fx.va, Some(f.ln.va), f.gu_w.va, f.gu_s.va, c.gu.va, rows, H);
         self.rows8(c, down, c.gu.va, None, f.down_w.va, f.down_s.va, c.fy.va, H, k_width);
+        c.k.fence(); // completed while the card is awake; the host waits later
     }
     fn ffn_finish(&mut self, l: usize, out: &mut [f32]) {
         let f = self.ffns[l].as_ref().unwrap();
         let c = &self.cards[f.card];
-        c.k.sync();
+        c.k.wait();
         read(&c.fy, 0, &mut out[..H]);
     }
     fn logits(&mut self, mean: &[f32], logits: &mut [f32]) {
