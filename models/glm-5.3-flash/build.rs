@@ -13,6 +13,7 @@ const KEYS: &[(&str, &str, &str, &str)] = &[
     ("", "n_shared_experts", "N_SHARED_EXPERTS", "usize"),
     ("", "num_experts_per_tok", "NUM_EXPERTS_PER_TOK", "usize"),
     ("", "num_hidden_layers", "NUM_HIDDEN_LAYERS", "usize"),
+    ("", "first_k_dense_replace", "FIRST_K_DENSE_REPLACE", "usize"),
     ("", "num_attention_heads", "NUM_ATTENTION_HEADS", "usize"),
     ("", "q_lora_rank", "Q_LORA_RANK", "usize"),
     ("", "kv_lora_rank", "KV_LORA_RANK", "usize"),

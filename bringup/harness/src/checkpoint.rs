@@ -66,6 +66,14 @@ impl Checkpoint {
         self.map.contains_key(name)
     }
 
+    /// The tensor's bytes as stored, and what they are: "BF16", "F32", "F8_E4M3", …
+    pub fn raw(&self, name: &str) -> &'static [u8] {
+        unsafe { std::mem::transmute(self.view(name).data()) }
+    }
+    pub fn kind(&self, name: &str) -> String {
+        format!("{:?}", self.view(name).dtype())
+    }
+
     pub fn shape(&self, name: &str) -> Vec<usize> {
         self.view(name).shape().to_vec()
     }

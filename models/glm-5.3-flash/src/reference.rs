@@ -617,6 +617,65 @@ pub enum Attn {
     Mla(Mla),
 }
 
+/// Layer `l` widened to f32 from `get(checkpoint tensor name)`; the routed experts are not here.
+pub fn load(l: usize, get: &dyn Fn(&str) -> Vec<f32>) -> Layer {
+    let p = |s: &str| format!("model.language_model.layers.{l}.{s}");
+    let w = |s: &str| get(&p(s));
+    let hc = |which: &str| Hc { fn_: w(&format!("hc_{which}_fn")), base: w(&format!("hc_{which}_base")), scale: w(&format!("hc_{which}_scale")).try_into().unwrap() };
+    let attn = if LINEAR_ATTENTION[l] {
+        let conv = ["q", "k", "v"].iter().flat_map(|c| w(&format!("self_attn.{c}_conv1d.weight"))).collect();
+        Attn::Kda(Kda {
+            q: w("self_attn.q_proj.weight"),
+            k: w("self_attn.k_proj.weight"),
+            v: w("self_attn.v_proj.weight"),
+            conv,
+            f_a: w("self_attn.f_a_proj.weight"),
+            f_b: w("self_attn.f_b_proj.weight"),
+            dt_bias: w("self_attn.dt_bias"),
+            a_log: w("self_attn.A_log"),
+            b: w("self_attn.b_proj.weight"),
+            g_a: w("self_attn.g_a_proj.weight"),
+            g_b: w("self_attn.g_b_proj.weight"),
+            o_norm: w("self_attn.o_norm.weight"),
+            o: w("self_attn.o_proj.weight"),
+        })
+    } else {
+        Attn::Mla(Mla {
+            q_a: w("self_attn.q_a_proj.weight"),
+            q_a_ln: w("self_attn.q_a_layernorm.weight"),
+            q_b: w("self_attn.q_b_proj.weight"),
+            kv_a: w("self_attn.kv_a_proj_with_mqa.weight"),
+            kv_a_ln: w("self_attn.kv_a_layernorm.weight"),
+            kv_b: w("self_attn.kv_b_proj.weight"),
+            o: w("self_attn.o_proj.weight"),
+            indexer: Indexer {
+                wq_b: w("self_attn.indexer.wq_b.weight"),
+                wk: w("self_attn.indexer.wk.weight"),
+                k_norm_w: w("self_attn.indexer.k_norm.weight"),
+                k_norm_b: w("self_attn.indexer.k_norm.bias"),
+                weights: w("self_attn.indexer.weights_proj.weight"),
+                ape: w("self_attn.indexer.index_kpool_compress_ape"),
+                gate: w("self_attn.indexer.index_kpool_compress_gate"),
+            },
+        })
+    };
+    let mlp = |pre: &str, ff| Mlp { gate: w(&format!("{pre}gate_proj.weight")), up: w(&format!("{pre}up_proj.weight")), down: w(&format!("{pre}down_proj.weight")), ff };
+    let ffn = if DENSE_MLP[l] {
+        Ffn::Dense(mlp("mlp.", INTERMEDIATE_SIZE))
+    } else {
+        Ffn::Moe(Moe { router: w("mlp.gate.weight"), bias: w("mlp.gate.e_score_correction_bias"), shared: mlp("mlp.shared_experts.", D_FF * N_SHARED_EXPERTS) })
+    };
+    Layer { attn_hc: hc("attn"), ffn_hc: hc("ffn"), input_layernorm: w("input_layernorm.weight"), post_attention_layernorm: w("post_attention_layernorm.weight"), attn, ffn }
+}
+
+/// Routed expert `e` of layer `l`, widened: gate rows then up rows, and down.
+pub fn load_expert(l: usize, e: usize, get: &dyn Fn(&str) -> Vec<f32>) -> Expert {
+    let p = |s: &str| get(&format!("model.language_model.layers.{l}.mlp.experts.{e}.{s}_proj.weight"));
+    let mut gate_up = p("gate");
+    gate_up.extend(p("up"));
+    Expert { gate_up, down: p("down") }
+}
+
 pub enum Ffn {
     Dense(Mlp),
     Moe(Moe),

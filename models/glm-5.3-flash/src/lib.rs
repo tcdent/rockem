@@ -45,6 +45,20 @@ pub const E: usize = N_ROUTED_EXPERTS;
 pub const D_FF: usize = MOE_INTERMEDIATE_SIZE;
 
 const _: () = assert!(QK_ROPE_HEAD_DIM == 0);
+/// The prefix every sequence begins with, `[gMASK]<sop>` (tokenizer.json's added
+/// tokens): the model's own start, whose state the bundle ships — `<sop>` is the
+/// sink (analysis.md §5). Positions `0..FIRST_POS` are never computed at runtime.
+pub const PREFIX_IDS: [u32; 2] = [154822, 154824];
+pub const FIRST_POS: usize = PREFIX_IDS.len();
+/// generation_config.json: the ids that end a turn — `<|endoftext|>`, `<|user|>`, `<|observation|>`.
+pub const EOS_TOKENS: [u32; 3] = [154820, 154827, 154829];
+/// Sampling, from generation_config.json: temperature 1.0, top_p 0.95; top_k is the
+/// default of the transformers it names (5.16), 50. The order is `common::sample`'s.
+/// The seed is a constant of the model: the draw at position p uses `sample::uniform_at(SEED, p)`.
+pub const SAMPLING: common::sample::Sampling = common::sample::Sampling { temperature: 1.0, top_k: 50, top_p: 0.95 };
+pub const SEED: u64 = 0x726f_636b_656d_0002;
+
+pub mod layout;
 
 const _: () = assert!(LINEAR_ATTENTION.len() == NUM_HIDDEN_LAYERS);
 const _: () = assert!(DENSE_MLP.len() == NUM_HIDDEN_LAYERS);
