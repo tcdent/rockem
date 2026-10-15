@@ -446,6 +446,14 @@ impl Placed for Cards {
         self.rows8(c, down, c.gu.va, None, f.down_w.va, f.down_s.va, c.fy.va, H, k_width);
         c.k.fence(); // completed while the card is awake; the host waits later
     }
+    fn heartbeat(&self, l: usize) {
+        let c = &self.cards[self.ffns[l].as_ref().unwrap().card];
+        if c.k.quiet_for() >= std::time::Duration::from_micros(250) {
+            let mut a = Args::new();
+            a.ptr(c.snap.va).ptr(c.snap.va).u32(0);
+            c.k.launch(&c.copy, 1, g::WG, 0, &a); // nothing to copy: a packet, so the card stays awake
+        }
+    }
     fn ffn_finish(&mut self, l: usize, out: &mut [f32]) {
         let f = self.ffns[l].as_ref().unwrap();
         let c = &self.cards[f.card];

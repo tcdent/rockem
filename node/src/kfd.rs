@@ -298,6 +298,8 @@ pub struct Kfd {
     write_index: Cell<u64>,
     /// The index of the barrier packet `fence` posted last.
     fenced: Cell<u64>,
+    /// When a packet was last posted or a completion seen: how long the card has been quiet.
+    touched: Cell<std::time::Instant>,
     /// The host has written GPU-visible memory since the last launch: the next
     /// dispatch acquires at system scope (an L2 invalidate); the ones after it
     /// at agent scope, since kernels only hand each other what the card wrote.
@@ -381,6 +383,7 @@ impl Kfd {
             doorbell: std::ptr::null_mut(),
             write_index: Cell::new(0),
             fenced: Cell::new(0),
+            touched: Cell::new(std::time::Instant::now()),
             host_wrote: Cell::new(true),
             instrument,
             stamps: Mem { va: 0, size: 0 },
@@ -740,6 +743,7 @@ impl Kfd {
         self.host_wrote.set(true); // the host reads and writes freely until the next launch
         self.last_span.set((self.token_start.get(), idx));
         self.token_start.set(idx + 1);
+        self.touched.set(std::time::Instant::now());
     }
     /// The last token's statistics, per launch in order: kernel name, then
     /// per slot the values every wave wrote (`common::gfx11` stats; empty
@@ -801,6 +805,11 @@ impl Kfd {
             std::ptr::write_volatile(self.doorbell, idx);
         }
         self.write_index.set(idx + 1);
+        self.touched.set(std::time::Instant::now());
+    }
+    /// How long since this queue last posted a packet or saw a completion.
+    pub fn quiet_for(&self) -> std::time::Duration {
+        self.touched.get().elapsed()
     }
 }
 

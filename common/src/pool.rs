@@ -17,6 +17,12 @@ pub trait Pool: Sync {
         let _ = at;
         self.run(n, f)
     }
+    /// Run `f` between the calling thread's own items of the runs until `tick(None)`: a
+    /// heartbeat for a device that must not fall asleep while the pool works. `f` must
+    /// outlive those runs. A pool without a calling thread's loop ignores it.
+    fn tick(&self, f: Option<&dyn Fn()>) {
+        let _ = f;
+    }
 }
 
 pub struct Serial;

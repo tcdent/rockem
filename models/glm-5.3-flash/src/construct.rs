@@ -41,7 +41,13 @@ pub struct Threads {
     node: usize,
     /// The placed regions: base, length, the node of each `PAGE` of it.
     placed: std::sync::Mutex<Vec<(usize, usize, Vec<u8>)>>,
+    /// Called by the calling thread between its own items of a run while set (`tick`): the
+    /// card's heartbeat during the expert phase.
+    tick: std::sync::Mutex<Option<Tick>>,
 }
+#[derive(Clone, Copy)]
+struct Tick(*const dyn Fn());
+unsafe impl Send for Tick {}
 /// The grain of placement: a region's node is known per 2 MiB page.
 pub const PAGE: usize = 2 << 20;
 const MAX_NODES: usize = 8;
@@ -86,6 +92,28 @@ fn wait_on(job: &std::sync::atomic::AtomicPtr<Job>, seen: *mut Job) {
     {
         let _ = (job, seen);
         std::hint::spin_loop();
+    }
+}
+
+/// `work` with `tick` called between items.
+unsafe fn work_ticking(job: *const Job, node: usize, tick: &dyn Fn()) {
+    let j = &*job;
+    let f = &*j.f;
+    let mut mine = 0;
+    for k in 0..MAX_NODES {
+        let d = (node + k) % MAX_NODES;
+        loop {
+            tick();
+            let i = j.next[d].0.fetch_add(1, Ordering::AcqRel);
+            if i >= j.start[d + 1] {
+                break;
+            }
+            f(j.order[i] as usize);
+            mine += 1;
+        }
+    }
+    if mine > 0 {
+        j.done.0.fetch_add(mine, Ordering::AcqRel);
     }
 }
 
@@ -145,7 +173,7 @@ impl Threads {
                 }
             });
         }
-        Threads { shared, retired: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()), node: node_of_core(cores[0]), placed: std::sync::Mutex::new(Vec::new()) }
+        Threads { shared, retired: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()), node: node_of_core(cores[0]), placed: std::sync::Mutex::new(Vec::new()), tick: std::sync::Mutex::new(None) }
     }
     /// Tell the pool where a region's memory lives: `nodes[p]` is the node of its `p`th `PAGE`.
     pub fn place(&self, base: usize, len: usize, nodes: Vec<u8>) {
@@ -204,8 +232,15 @@ impl Threads {
         if !older.is_null() {
             drop(unsafe { Box::from_raw(older) });
         }
-        unsafe { work(job, self.node) };
+        let tick = *self.tick.lock().unwrap();
+        match tick {
+            Some(t) => unsafe { work_ticking(job, self.node, &*t.0) },
+            None => unsafe { work(job, self.node) },
+        }
         while unsafe { (*job).done.0.load(Ordering::Acquire) } != n {
+            if let Some(t) = tick {
+                unsafe { (*t.0)() };
+            }
             std::hint::spin_loop();
         }
     }
@@ -218,6 +253,10 @@ impl Drop for Threads {
 impl Pool for Threads {
     fn run(&self, n: usize, f: &(dyn Fn(usize) + Sync)) {
         self.publish(n, None, f)
+    }
+    fn tick(&self, f: Option<&dyn Fn()>) {
+        // only the calling thread ever runs it, between its own items
+        *self.tick.lock().unwrap() = f.map(|f| Tick(unsafe { std::mem::transmute::<&dyn Fn(), *const dyn Fn()>(f) }));
     }
     fn run_at(&self, n: usize, at: &(dyn Fn(usize) -> *const u8 + Sync), f: &(dyn Fn(usize) + Sync)) {
         self.publish(n, Some(at), f)
@@ -356,6 +395,9 @@ pub trait Placed {
     fn ffn(&self, l: usize) -> bool;
     fn ffn_start(&mut self, l: usize, x: &[f32]);
     fn ffn_finish(&mut self, l: usize, out: &mut [f32]);
+    /// Keep layer `l`'s card awake while the host works: a trivial launch once it has been
+    /// quiet a while (a card idle ≥ 400 µs pays ~100 µs on its next packet, probe 2026-10-15).
+    fn heartbeat(&self, l: usize);
     fn head(&self) -> bool;
     fn logits(&mut self, mean: &[f32], logits: &mut [f32]);
     /// The MLA projections of block input `x` (`mla::project`'s outputs but
@@ -668,7 +710,15 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     if let Some(p) = &mut placed {
                         p.ffn_start(l, &s.x);
                     }
+                    // the heartbeat through the routed experts, from the main thread between its items
+                    let beat = placed.as_deref().map(|p| move || p.heartbeat(l));
+                    if let Some(b) = &beat {
+                        s.pool.tick(Some(b));
+                    }
                     ffn::moe_routed(l, m, &s.xn, &mut fs, s.pool, &mut s.routed, forced.map(|f| &f[l - FIRST_K_DENSE_REPLACE]), tr, &mut s.y);
+                    if beat.is_some() {
+                        s.pool.tick(None);
+                    }
                     let e = s.routed.elapsed();
                     p.experts += e;
                     lap(&mut p.route);
