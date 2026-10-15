@@ -15,6 +15,7 @@ lsmod   = "lasenora /proc/modules, 2026-09-16, 141 modules -> localyesconfig"
 source  = "lasenora:/lib/firmware/amdgpu, Debian firmware-amd-graphics 20250410-2 (known to bring up the RX 7900 XT on 6.12.101)"
 files   = "os/firmware/amdgpu/*.bin, hashes in os/baseline/firmware-lasenora.txt"
 upstream = "https://gitlab.com/kernel-firmware/linux-firmware — refresh from here once the 7.2 driver's dmesg is read"
+vcn      = "amdgpu/vcn_4_0_0.bin from upstream tag 20250410 (the tag the Debian package is built from; gc_11_0_0_imu and psp_13_0_0_sos hash-identical), added 2026-10-14"
 
 [builder]
 containerfile = "os/builder/Containerfile"
