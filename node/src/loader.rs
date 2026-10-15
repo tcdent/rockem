@@ -25,6 +25,7 @@ extern "C" {
     fn syscall(nr: i64, ...) -> i64;
 }
 const SYS_SET_MEMPOLICY: i64 = 238;
+const SYS_MOVE_PAGES: i64 = 279;
 const MPOL_DEFAULT: i32 = 0;
 const MPOL_INTERLEAVE: i32 = 3;
 /// Interleave this thread's new pages over every online node (all 64 bits set names more nodes than exist, which the kernel masks to the possible ones).
@@ -41,6 +42,22 @@ const MAP_ANONYMOUS: i32 = 0x20;
 const MAP_POPULATE: i32 = 0x8000;
 const HUGEPAGES: &str = "/dev/hugepages";
 const GB: usize = 1 << 30;
+
+/// The NUMA node of every 2 MiB page of a loaded region (`construct::PAGE`), asked of the
+/// kernel (`move_pages` with no destination): the truth a placed pool runs its items by.
+pub fn placement(buf: &[u8]) -> Vec<u8> {
+    const PAGE: usize = glm_5_3_flash::construct::PAGE;
+    let n = buf.len().div_ceil(PAGE);
+    let mut nodes = Vec::with_capacity(n);
+    for chunk in (0..n).collect::<Vec<_>>().chunks(4096) {
+        let pages: Vec<*const u8> = chunk.iter().map(|&p| unsafe { buf.as_ptr().add(p * PAGE) }).collect();
+        let mut status = vec![-1i32; pages.len()];
+        let r = unsafe { syscall(SYS_MOVE_PAGES, 0i64, pages.len() as u64, pages.as_ptr(), std::ptr::null::<i32>(), status.as_mut_ptr(), 0i32) };
+        assert_eq!(r, 0, "move_pages: {}", std::io::Error::last_os_error());
+        nodes.extend(status.iter().map(|&s| u8::try_from(s).unwrap_or_else(|_| panic!("page not resident: status {s}"))));
+    }
+    nodes
+}
 
 pub fn load(path: &std::path::Path, mem: Mem) -> &'static [u8] {
     let mut src = fs::File::open(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));

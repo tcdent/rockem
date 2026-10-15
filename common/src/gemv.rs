@@ -52,7 +52,7 @@ pub fn bf16<const M: usize, const K: usize>(w: &[u16], x: &[f32], out: &mut [f32
 pub fn bf16_par<const M: usize, const K: usize>(w: &[u16], x: &[f32], out: &mut [f32], pool: &dyn super::pool::Pool) {
     debug_assert!(w.len() >= M * K && x.len() >= K && out.len() >= M);
     let (wp, xp, op) = (w.as_ptr() as usize, x.as_ptr() as usize, out.as_mut_ptr() as usize);
-    pool.run(M.div_ceil(super::pool::ROWS), &move |i| {
+    pool.run_at(M.div_ceil(super::pool::ROWS), &move |i| (wp + i * super::pool::ROWS * K * 2) as *const u8, &move |i| {
         let (m0, m1) = (i * super::pool::ROWS, ((i + 1) * super::pool::ROWS).min(M));
         #[cfg(target_arch = "x86_64")]
         unsafe {
@@ -127,7 +127,7 @@ pub fn fp8<const M: usize, const K: usize>(w: &[u8], scales: &[f32], x: &[f32], 
 pub fn fp8_par<const M: usize, const K: usize>(w: &[u8], scales: &[f32], x: &[f32], out: &mut [f32], pool: &dyn super::pool::Pool) {
     debug_assert!(w.len() >= M * K && x.len() >= K && out.len() >= M);
     let (wp, sp, xp, op) = (w.as_ptr() as usize, scales.as_ptr() as usize, x.as_ptr() as usize, out.as_mut_ptr() as usize);
-    pool.run(M.div_ceil(super::pool::ROWS), &move |i| {
+    pool.run_at(M.div_ceil(super::pool::ROWS), &move |i| (wp + i * super::pool::ROWS * K) as *const u8, &move |i| {
         let (m0, m1) = (i * super::pool::ROWS, ((i + 1) * super::pool::ROWS).min(M));
         #[cfg(target_arch = "x86_64")]
         unsafe {

@@ -8,7 +8,7 @@ mount -t proc     proc     /proc
 mount -t sysfs    sysfs    /sys
 mkdir -p /dev/hugepages /dev/shm /dev/pts /tmp /bundle
 mount -t devpts devpts /dev/pts
-mount -t hugetlbfs -o pagesize=1G hugetlbfs /dev/hugepages 2>/dev/null || mount -t hugetlbfs hugetlbfs /dev/hugepages 2>/dev/null
+mount -t hugetlbfs -o pagesize=2M hugetlbfs /dev/hugepages 2>/dev/null || mount -t hugetlbfs hugetlbfs /dev/hugepages 2>/dev/null
 mount -t tmpfs tmpfs /tmp
 ip link set lo up
 # the last occurrence wins, as for the kernel's own parameters (the netboot line may repeat ours)

@@ -6,9 +6,12 @@
 //! back to back, then the gates' first halves and beta as another), the gates'
 //! second halves (`rows_d`), the delta rule with the memory resident in
 //! registers (`kda_step`), and the output projection (`rows_qkv`) — six
-//! launches a layer. The block input comes in and the block
-//! output goes out through host-visible VRAM; the residual streams stay on
-//! the host, where the hyper-connections and the FFN half still run. The 34
+//! launches a layer. The block input comes in through host-visible VRAM (a
+//! BAR write streams at 16 GB/s); the block output goes out through host
+//! memory the output projection writes across the link, because the host
+//! reads its BAR at 10–30 MB/s — 470–690 µs for the 20 KB, against 0.2 µs
+//! from host memory (probe, 2026-10-15). The residual streams stay on the
+//! host, where the hyper-connections and the FFN half still run. The 34
 //! layers split in order between the cards the topology lists.
 
 use crate::kfd::{read, Args, Kfd, Mem};
@@ -32,7 +35,7 @@ struct Card {
     f: Mem,      // [KDA_QKV]
     gate: Mem,   // [KDA_QKV]
     normed: Mem, // [KDA_QKV]
-    y: Mem,      // [H] f32, host-visible: the block output
+    y: Mem,      // [H] f32, host memory: the block output
 }
 /// Rows of the fused small projection: f_a's, g_a's, b's.
 const SMALL_ROWS: usize = 2 * KDA_DIM + KDA_HEADS;
@@ -84,7 +87,7 @@ impl KdaCards {
                     f: alloc(KDA_QKV),
                     gate: alloc(KDA_QKV),
                     normed: alloc(KDA_QKV),
-                    y: alloc(H),
+                    y: k.host(H * 4),
                     k,
                 }
             })

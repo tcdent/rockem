@@ -15,28 +15,45 @@ use common::trace::{Trace, NONE};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Worker threads pinned to `cores`, spinning for work. A job is one
-/// allocation — the function, its item count, the item counter and the done
-/// counter — published through one atomic pointer, so whatever job a worker
-/// loads, it draws items from that job's own counter and counts completions
-/// there: a worker that wakes late to a finished job finds its counter spent
-/// and leaves. `run` publishes a new job only when no worker is registered
-/// (`active`), and frees a job one generation after replacing it, so a worker
-/// that registered during the swap never reads freed memory. The pool has two
-/// states: busy — a step is in flight, and a worker between jobs spins, because
-/// the next job is microseconds away — and idle, entered by `idle()` when the
-/// node is about to wait on the wire, in which a worker sleeps between looks.
-/// `run` makes the pool busy again.
+/// allocation — the function, its items in node order with a counter per
+/// node, and the done counter — published through one atomic pointer, so
+/// whatever job a worker loads, it draws items from that job's own counters
+/// and counts completions there: a worker that wakes late to a finished job
+/// finds the counters spent and leaves. `run_at` sorts the items by the NUMA
+/// node of the memory each streams, through the placement `place` was told
+/// (the node of every 2 MiB page of a loaded file); a worker drains its own
+/// node's items first, then the other nodes' — the weights stream at every
+/// socket's local bandwidth, and the tail still balances. `run` publishes a
+/// new job only when no worker is registered (`active`), and frees a job one
+/// generation after replacing it, so a worker that registered during the swap
+/// never reads freed memory. The pool has two states: busy — a step is in
+/// flight, and a worker between jobs spins, because the next job is
+/// microseconds away — and idle, entered by `idle()` when the node is about
+/// to wait on the wire, in which a worker sleeps between looks. `run` makes
+/// the pool busy again.
 pub struct Threads {
     shared: std::sync::Arc<Shared>,
     /// The job before the current one, freed at the next publish.
     retired: std::sync::atomic::AtomicPtr<Job>,
+    /// The node of the calling thread's core.
+    node: usize,
+    /// The placed regions: base, length, the node of each `PAGE` of it.
+    placed: std::sync::Mutex<Vec<(usize, usize, Vec<u8>)>>,
 }
+/// The grain of placement: a region's node is known per 2 MiB page.
+pub const PAGE: usize = 2 << 20;
+const MAX_NODES: usize = 8;
 struct Job {
     f: *const (dyn Fn(usize) + Sync),
-    n: usize,
-    next: AtomicUsize,
-    done: AtomicUsize,
+    /// The items in node order: node `d`'s are `order[start[d]..start[d + 1]]`.
+    order: Vec<u32>,
+    start: [usize; MAX_NODES + 1],
+    next: [Counter; MAX_NODES],
+    done: Counter,
 }
+/// A counter on its own cache line: a node's cores share its `next`, nothing else bounces with it.
+#[repr(align(64))]
+struct Counter(AtomicUsize);
 struct Shared {
     job: std::sync::atomic::AtomicPtr<Job>,
     active: AtomicUsize,
@@ -51,16 +68,25 @@ fn pin(core: usize) {
     mask[core / 64] |= 1 << (core % 64);
     unsafe { sched_setaffinity(0, 128, mask.as_ptr()) };
 }
-/// Every item of `job` this thread can claim, in order.
-unsafe fn work(job: *const Job) {
-    let (f, n) = (&*(*job).f, (*job).n);
-    loop {
-        let i = (*job).next.fetch_add(1, Ordering::AcqRel);
-        if i >= n {
-            break;
+/// Every item of `job` this thread can claim: its own node's in order, then the other
+/// nodes'; the completions counted once, at the end.
+unsafe fn work(job: *const Job, node: usize) {
+    let j = &*job;
+    let f = &*j.f;
+    let mut mine = 0;
+    for k in 0..MAX_NODES {
+        let d = (node + k) % MAX_NODES;
+        loop {
+            let i = j.next[d].0.fetch_add(1, Ordering::AcqRel);
+            if i >= j.start[d + 1] {
+                break;
+            }
+            f(j.order[i] as usize);
+            mine += 1;
         }
-        f(i);
-        (*job).done.fetch_add(1, Ordering::AcqRel);
+    }
+    if mine > 0 {
+        j.done.0.fetch_add(mine, Ordering::AcqRel);
     }
 }
 impl Threads {
@@ -71,6 +97,7 @@ impl Threads {
         let shared = std::sync::Arc::new(Shared { job: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()), active: AtomicUsize::new(0), busy: std::sync::atomic::AtomicBool::new(false), quit: std::sync::atomic::AtomicBool::new(false) });
         for &core in &cores[1..] {
             let sh = shared.clone();
+            let node = node_of_core(core);
             std::thread::spawn(move || {
                 pin(core);
                 let mut seen: *mut Job = std::ptr::null_mut();
@@ -91,19 +118,75 @@ impl Threads {
                     let job = sh.job.load(Ordering::Acquire);
                     seen = job;
                     if !job.is_null() {
-                        unsafe { work(job) };
+                        unsafe { work(job, node) };
                     }
                     sh.active.fetch_sub(1, Ordering::AcqRel);
                 }
             });
         }
-        Threads { shared, retired: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }
+        Threads { shared, retired: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()), node: node_of_core(cores[0]), placed: std::sync::Mutex::new(Vec::new()) }
     }
-}
-impl Threads {
+    /// Tell the pool where a region's memory lives: `nodes[p]` is the node of its `p`th `PAGE`.
+    pub fn place(&self, base: usize, len: usize, nodes: Vec<u8>) {
+        assert!(nodes.len() == len.div_ceil(PAGE) && nodes.iter().all(|&d| (d as usize) < MAX_NODES), "placement of {len} bytes: {} pages", nodes.len());
+        self.placed.lock().unwrap().push((base, len, nodes));
+    }
     /// The node is about to wait: the workers may sleep between looks until the next `run`.
     pub fn idle(&self) {
         self.shared.busy.store(false, Ordering::Relaxed);
+    }
+    /// The items by node (a counting sort over the placement; every item is node 0's when nothing is placed or named), published, worked and waited for.
+    fn publish(&self, n: usize, at: Option<&(dyn Fn(usize) -> *const u8 + Sync)>, f: &(dyn Fn(usize) + Sync)) {
+        if n <= 1 {
+            for i in 0..n {
+                f(i);
+            }
+            return;
+        }
+        let mut start = [0usize; MAX_NODES + 1];
+        let mut order = vec![0u32; n];
+        let mut item_node = Vec::new();
+        if let Some(at) = at {
+            let placed = self.placed.lock().unwrap();
+            if !placed.is_empty() {
+                item_node = (0..n)
+                    .map(|i| {
+                        let p = at(i) as usize;
+                        placed.iter().find(|(base, len, _)| p >= *base && p < base + len).map_or(0, |(base, _, nodes)| nodes[(p - base) / PAGE])
+                    })
+                    .collect();
+            }
+        }
+        let node_of = |i: usize| item_node.get(i).map_or(0, |&d| d as usize);
+        for i in 0..n {
+            start[node_of(i) + 1] += 1;
+        }
+        for d in 0..MAX_NODES {
+            start[d + 1] += start[d];
+        }
+        let mut fill = start;
+        for i in 0..n {
+            let d = node_of(i);
+            order[fill[d]] = i as u32;
+            fill[d] += 1;
+        }
+        let sh = &*self.shared;
+        sh.busy.store(true, Ordering::Relaxed);
+        while sh.active.load(Ordering::Acquire) != 0 {
+            std::hint::spin_loop();
+        }
+        // no worker is inside any job: the one retired at the last publish can go
+        let fp: *const (dyn Fn(usize) + Sync) = unsafe { std::mem::transmute(f) };
+        let job = Box::into_raw(Box::new(Job { f: fp, order, next: std::array::from_fn(|d| Counter(AtomicUsize::new(start[d]))), start, done: Counter(AtomicUsize::new(0)) }));
+        let old = sh.job.swap(job, Ordering::AcqRel);
+        let older = self.retired.swap(old, Ordering::AcqRel);
+        if !older.is_null() {
+            drop(unsafe { Box::from_raw(older) });
+        }
+        unsafe { work(job, self.node) };
+        while unsafe { (*job).done.0.load(Ordering::Acquire) } != n {
+            std::hint::spin_loop();
+        }
     }
 }
 impl Drop for Threads {
@@ -113,30 +196,25 @@ impl Drop for Threads {
 }
 impl Pool for Threads {
     fn run(&self, n: usize, f: &(dyn Fn(usize) + Sync)) {
-        if n <= 1 {
-            for i in 0..n {
-                f(i);
+        self.publish(n, None, f)
+    }
+    fn run_at(&self, n: usize, at: &(dyn Fn(usize) -> *const u8 + Sync), f: &(dyn Fn(usize) + Sync)) {
+        self.publish(n, Some(at), f)
+    }
+}
+
+/// The NUMA node of a core, from /sys (0 where there is no NUMA).
+pub fn node_of_core(core: usize) -> usize {
+    for n in 0..MAX_NODES {
+        let Ok(list) = std::fs::read_to_string(format!("/sys/devices/system/node/node{n}/cpulist")) else { break };
+        for part in list.trim().split(',') {
+            let (a, b) = part.split_once('-').map(|(a, b)| (a.parse::<usize>().unwrap(), b.parse::<usize>().unwrap())).unwrap_or_else(|| (part.parse().unwrap(), part.parse().unwrap()));
+            if (a..=b).contains(&core) {
+                return n;
             }
-            return;
-        }
-        let sh = &*self.shared;
-        sh.busy.store(true, Ordering::Relaxed);
-        while sh.active.load(Ordering::Acquire) != 0 {
-            std::hint::spin_loop();
-        }
-        // no worker is inside any job: the one retired at the last publish can go
-        let fp: *const (dyn Fn(usize) + Sync) = unsafe { std::mem::transmute(f) };
-        let job = Box::into_raw(Box::new(Job { f: fp, n, next: AtomicUsize::new(0), done: AtomicUsize::new(0) }));
-        let old = sh.job.swap(job, Ordering::AcqRel);
-        let older = self.retired.swap(old, Ordering::AcqRel);
-        if !older.is_null() {
-            drop(unsafe { Box::from_raw(older) });
-        }
-        unsafe { work(job) };
-        while unsafe { (*job).done.load(Ordering::Acquire) } != n {
-            std::hint::spin_loop();
         }
     }
+    0
 }
 
 /// The cores a pool on this machine should take: one per physical core (the
@@ -159,9 +237,10 @@ pub fn physical_cores() -> Vec<usize> {
 
 /// The routed experts from the bundle's expert stream in this process's memory,
 /// each expert's rows split over the pool: first the gate/up rows in chunks of
-/// `CHUNK` hidden channels — a chunk's clamped SwiGLU and its INT8 groups are
+/// `CHUNK` hidden channels — a chunk's clamped SwiGLU and its INT8 group are
 /// its own — then the down rows in chunks of `DOWN_CHUNK` over every expert's
-/// quantized hidden state. Every row's arithmetic is `expert::forward`'s
+/// quantized hidden state. Every item names the rows it streams, so a placed
+/// pool runs it on their node. Every row's arithmetic is `expert::forward`'s
 /// exactly (the same tiles, groups and flush); only the cores differ.
 pub struct CpuExperts<'a> {
     stream: &'a [u8],
@@ -174,10 +253,11 @@ pub struct CpuExperts<'a> {
     hg: Vec<i32>,
     elapsed: f64,
 }
-/// Hidden channels an item takes: two INT8 groups, eight items an expert.
-const CHUNK: usize = 256;
-/// Output rows an item takes for the down projection: eight items an expert.
-const DOWN_CHUNK: usize = 512;
+/// Hidden channels an item takes: one INT8 group, sixteen items an expert — with
+/// the eight experts' items split between two sockets, more than a socket's cores.
+const CHUNK: usize = 128;
+/// Output rows an item takes for the down projection: twenty items an expert.
+const DOWN_CHUNK: usize = 256;
 const _: () = assert!(D_FF % CHUNK == 0 && CHUNK % common::q4::GROUP == 0 && CHUNK % common::q4::TILE == 0 && H % DOWN_CHUNK == 0 && DOWN_CHUNK % common::q4::TILE == 0);
 
 impl<'a> CpuExperts<'a> {
@@ -199,8 +279,12 @@ impl Routed for CpuExperts<'_> {
         let xa = Act { q: &self.xq, scale: &self.xs, gsum: &self.xg };
         let stream = self.stream;
         let (hq_p, hs_p, hg_p, out_p) = (self.hq.as_mut_ptr() as usize, self.hs.as_mut_ptr() as usize, self.hg.as_mut_ptr() as usize, out.as_mut_ptr() as usize);
-        // the gate/up rows: item (k, c) owns expert k's hidden channels c·CHUNK.. and their groups
-        self.pool.run(TOP_K * (D_FF / CHUNK), &move |i| {
+        // the gate/up rows: item (k, c) owns expert k's hidden channels c·CHUNK.. and their group
+        let gate_rows = move |i: usize| {
+            let (k, c) = (i / (D_FF / CHUNK), i % (D_FF / CHUNK));
+            expert::Weights::from_record(&stream[layout::record(l, idx[k])]).gate_up_w[c * CHUNK / TILE * 2 * H..].as_ptr()
+        };
+        self.pool.run_at(TOP_K * (D_FF / CHUNK), &gate_rows, &move |i| {
             let (k, c) = (i / (D_FF / CHUNK), i % (D_FF / CHUNK));
             let w = expert::Weights::from_record(&stream[layout::record(l, idx[k])]);
             let rows = |r0: usize| (&w.gate_up_w[r0 / TILE * 2 * H..(r0 + CHUNK) / TILE * 2 * H], &w.gate_up_s[r0 / TILE * (H / GROUP) * TILE..(r0 + CHUNK) / TILE * (H / GROUP) * TILE]);
@@ -222,7 +306,11 @@ impl Routed for CpuExperts<'_> {
         });
         // the down rows: item (k, c) owns rows c·DOWN_CHUNK.. of expert k's output over its whole hidden state
         let (hq, hs, hg) = (&self.hq, &self.hs, &self.hg);
-        self.pool.run(TOP_K * (H / DOWN_CHUNK), &move |i| {
+        let down_rows = move |i: usize| {
+            let (k, c) = (i / (H / DOWN_CHUNK), i % (H / DOWN_CHUNK));
+            expert::Weights::from_record(&stream[layout::record(l, idx[k])]).down_w[c * DOWN_CHUNK / TILE * 2 * D_FF..].as_ptr()
+        };
+        self.pool.run_at(TOP_K * (H / DOWN_CHUNK), &down_rows, &move |i| {
             let (k, c) = (i / (H / DOWN_CHUNK), i % (H / DOWN_CHUNK));
             let w = expert::Weights::from_record(&stream[layout::record(l, idx[k])]);
             let ha = Act { q: &hq[k * D_FF..(k + 1) * D_FF], scale: &hs[k * D_FF / GROUP..(k + 1) * D_FF / GROUP], gsum: &hg[k * D_FF / GROUP..(k + 1) * D_FF / GROUP] };

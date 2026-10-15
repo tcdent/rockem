@@ -16,7 +16,7 @@ if [ -n "${BUNDLE:-}" ]; then
   B=$(cd "$HERE/.." && cd "$BUNDLE" && pwd)
   EXTRA+=(-virtfs "local,path=$B,mount_tag=bundle,security_model=none,readonly=on")
   # 11 GB of bundle lands in 1 GB hugepages; the rest of the guest is page cache for the 9p copy
-  APPEND="rockem.bundle9p=bundle rockem.bundle=/bundle hugepagesz=1G hugepages=12"
+  APPEND="rockem.bundle9p=bundle rockem.bundle=/bundle hugepagesz=2M hugepages=6144"
   MEM=${MEM:-16G}
 fi
 MEM=${MEM:-4G}

@@ -10,6 +10,13 @@
 pub trait Pool: Sync {
     /// Run `f(i)` for every `i < n`, returning when all have.
     fn run(&self, n: usize, f: &(dyn Fn(usize) + Sync));
+    /// The same, each item naming the address of the weights it streams
+    /// (`at(i)`): a pool that knows where memory lives runs the item on a core
+    /// local to it. The default is `run`; the items are still independent.
+    fn run_at(&self, n: usize, at: &(dyn Fn(usize) -> *const u8 + Sync), f: &(dyn Fn(usize) + Sync)) {
+        let _ = at;
+        self.run(n, f)
+    }
 }
 
 pub struct Serial;

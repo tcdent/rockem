@@ -61,10 +61,19 @@ impl Glm {
         let prefix_b = loader::load(&bundle.join(layout::PREFIX_FILE), loader::Mem::Anon);
         let (p, prefix, q) = unsafe { prefix_b.align_to::<f32>() };
         assert!(p.is_empty() && q.is_empty() && prefix.len() == layout::PREFIX_LEN, "prefix file");
-        // the pool: a thread per physical core, every socket (the weights are interleaved over them)
+        // the pool: a thread per physical core, every socket, told where every page of the weights lives
         let cores = physical_cores();
         let pool: &'static Threads = Box::leak(Box::new(Threads::new(&cores)));
-        println!("threads  : {} pinned, one per physical core", cores.len());
+        let mut by_node = [0usize; 8];
+        for buf in [dense, experts] {
+            let nodes = loader::placement(buf);
+            for &d in &nodes {
+                by_node[d as usize] += 1;
+            }
+            pool.place(buf.as_ptr() as usize, buf.len(), nodes);
+        }
+        let used: Vec<String> = by_node.iter().filter(|&&n| n > 0).map(|&n| format!("{:.1}", n as f64 * 2.0 / 1024.0)).collect();
+        println!("threads  : {} pinned, one per physical core; the weights' 2 MiB pages by node: {} GB", cores.len(), used.join(" / "));
         let mut model = CpuModel::new(CpuExperts::new(experts, pool), pool, max_ctx);
         if gpu {
             // the KDA layers on the cards, split by layer order between them; everything else here
