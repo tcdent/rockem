@@ -362,5 +362,42 @@ pub fn run(elf: Option<&[u8]>) {
         pool.run(2, &|_| {}); // busy: the workers spin, as between a step's jobs
         measure("spinning");
         pool.idle();
+        // the FFN's FP8 projections at their shapes: a gate|up launch over the normed input, the down over its SwiGLU
+        use glm_5_3_flash::ffn::gfx11_consts::{DENSE_GU_ROWS, SHARED_GU_ROWS};
+        use glm_5_3_flash::{D_FF, INTERMEDIATE_SIZE};
+        let (gu_k, down_s, down_d) = (k.kernel("ffn_gu"), k.kernel("ffn_down_shared"), k.kernel("ffn_down_dense"));
+        let w8: Vec<u8> = (0..DENSE_GU_ROWS * H).map(|i| ((i * 2654435761) >> 11) as u8 & 0x7e).collect();
+        let w8m = k.vram_visible(w8.len());
+        k.upload(&w8m, 0, &w8);
+        let sc = k.vram_visible(DENSE_GU_ROWS / 128 * (INTERMEDIATE_SIZE / 128) * 4);
+        k.upload(&sc, 0, kfd::raw(&vec![1e-3f32; sc.size / 4]));
+        let gu_out = k.vram_visible(DENSE_GU_ROWS * 4);
+        let fp8 = |kernel: &kfd::Kernel, x: usize, ln: Option<usize>, out: usize, m: usize, kw: usize| {
+            let mut a = kfd::Args::new();
+            a.ptr(x);
+            if let Some(ln) = ln {
+                a.ptr(ln);
+            }
+            a.ptr(w8m.va).ptr(sc.va).ptr(out).u32(m as u32).u32(1);
+            let lds = if ln.is_some() { g::normed_rows_lds(kw, 1) } else { g::rows_lds(kw, 1) } as u32;
+            k.launch(kernel, g::rows_grid(m), g::WG, lds, &a);
+        };
+        let shared_gu = gbs(SHARED_GU_ROWS * H, best(iters, || {
+            fp8(&gu_k, x.va, Some(ln.va), gu_out.va, SHARED_GU_ROWS, H);
+            k.sync();
+        }));
+        let shared_down = gbs(H * D_FF, best(iters, || {
+            fp8(&down_s, gu_out.va, None, y_host.va, H, D_FF);
+            k.sync();
+        }));
+        let dense_gu = gbs(DENSE_GU_ROWS * H, best(iters, || {
+            fp8(&gu_k, x.va, Some(ln.va), gu_out.va, DENSE_GU_ROWS, H);
+            k.sync();
+        }));
+        let dense_down = gbs(H * INTERMEDIATE_SIZE, best(iters, || {
+            fp8(&down_d, gu_out.va, None, y_host.va, H, INTERMEDIATE_SIZE);
+            k.sync();
+        }));
+        println!("card {c}   : FP8 rows — the shared expert's gate|up ({} MB) at {shared_gu:.0} GB/s, its down at {shared_down:.0}; a dense layer's gate|up ({} MB) at {dense_gu:.0}, its down at {dense_down:.0} (one launch + sync each)", SHARED_GU_ROWS * H / 1_000_000, DENSE_GU_ROWS * H / 1_000_000);
     }
 }

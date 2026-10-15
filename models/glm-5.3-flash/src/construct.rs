@@ -323,16 +323,31 @@ impl Routed for CpuExperts<'_> {
     }
 }
 
-/// KDA layers placed away from this CPU — on a card — behind one interface.
-/// `step` runs placed layer `l` over the block input `x` (`[H]`, before the
-/// input norm: the placement norms it) into `out`; `seed` and `snapshot`
-/// move a placed layer's state (its convolution window and memory). A layer
-/// the placement does not hold runs here.
-pub trait KdaPlaced {
-    fn placed(&self, l: usize) -> bool;
-    fn step(&mut self, l: usize, x: &[f32], out: &mut [f32]);
+/// Blocks placed away from this CPU — on the cards — behind one interface.
+/// `kda_step` runs placed KDA layer `l` over the block input `x` (`[H]`,
+/// before the input norm: the placement norms it) into `out`; `seed` and
+/// `snapshot` move a placed layer's state (its convolution window and
+/// memory). `ffn_start` begins a placed FFN — a dense layer's MLP, or a MoE
+/// layer's shared expert — over the block input (normed there with the post
+/// norm) and returns at once, so the routed experts run here meanwhile;
+/// `ffn_finish` waits for its output. `logits` is the final norm and the
+/// head over the streams' mean. A block the placement does not hold runs here.
+pub trait Placed {
+    fn kda(&self, l: usize) -> bool;
+    fn kda_step(&mut self, l: usize, x: &[f32], out: &mut [f32]);
     fn seed(&mut self, l: usize, window: &[f32], mem: &[f32]);
     fn snapshot(&self, l: usize, window: &mut [f32], mem: &mut [f32]);
+    fn ffn(&self, l: usize) -> bool;
+    fn ffn_start(&mut self, l: usize, x: &[f32]);
+    fn ffn_finish(&mut self, l: usize, out: &mut [f32]);
+    fn head(&self) -> bool;
+    fn logits(&mut self, mean: &[f32], logits: &mut [f32]);
+    /// The MLA projections of block input `x` (`mla::project`'s outputs: the
+    /// query, the latent and the indexer's key before their norms, the gate,
+    /// the indexer's query and unscaled head weights), waited for.
+    fn mla(&self, l: usize) -> bool;
+    fn mla_project(&mut self, l: usize, x: &[f32], q: &mut [f32], kva: &mut [f32], ik: &mut [f32], igate: &mut [f32], iq: &mut [f32], iw: &mut [f32]);
+    fn mla_output(&mut self, l: usize, heads: &[f32], out: &mut [f32]);
 }
 
 /// One layer's sequence state: a KDA layer's convolution window and memory
@@ -370,7 +385,7 @@ pub struct CpuModel<'p, R: Routed> {
     pub pool: &'p dyn Pool,
     pub profile: Profile,
     /// KDA layers that run elsewhere; `None` runs every layer here.
-    pub placed: Option<Box<dyn KdaPlaced>>,
+    pub placed: Option<Box<dyn Placed>>,
     pub max_ctx: usize,
     pub layers: Vec<LayerState>,
     /// The last step's logits, `[VOCAB_SIZE]`.
@@ -474,7 +489,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     let base = ki * layout::KDA_STATE;
                     window.copy_from_slice(&snap[base..base + KDA_WINDOW]);
                     mem.copy_from_slice(&snap[base + KDA_WINDOW..base + layout::KDA_STATE]);
-                    if let Some(p) = self.placed.as_mut().filter(|p| p.placed(l)) {
+                    if let Some(p) = self.placed.as_mut().filter(|p| p.kda(l)) {
                         p.seed(l, window, mem);
                     }
                     ki += 1;
@@ -506,7 +521,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             if let LayerState::Kda { window, mem } = st {
                 let base = ki * layout::KDA_STATE;
                 let (w, m) = out[base..base + layout::KDA_STATE].split_at_mut(KDA_WINDOW);
-                match self.placed.as_ref().filter(|p| p.placed(l)) {
+                match self.placed.as_ref().filter(|p| p.kda(l)) {
                     Some(p) => p.snapshot(l, w, m),
                     None => {
                         w.copy_from_slice(window);
@@ -557,8 +572,8 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             tr.edge(l, "attn_in", &s.xn);
             lap(&mut p.hc);
             match (&lw.attn, &mut s.layers[l]) {
-                (Attn::Kda(_), _) if s.placed.as_ref().is_some_and(|p| p.placed(l)) => {
-                    s.placed.as_mut().unwrap().step(l, &s.x, &mut s.y);
+                (Attn::Kda(_), _) if s.placed.as_ref().is_some_and(|p| p.kda(l)) => {
+                    s.placed.as_mut().unwrap().kda_step(l, &s.x, &mut s.y);
                     lap(&mut p.kda_card);
                 }
                 (Attn::Kda(a), LayerState::Kda { window, mem }) => {
@@ -568,7 +583,19 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 }
                 (Attn::Mla(a), LayerState::Mla { cache, pools }) => {
                     let mut ms = mla::Scratch { qr: &mut s.m_qr, qa: &mut s.m_qa, q: &mut s.m_q, kva: &mut s.m_kva, ik: &mut s.m_ik, iq: &mut s.m_iq, iw: &mut s.m_iw, pscore: &mut s.m_pscore, sel: &mut s.m_sel, heads: &mut s.m_heads, hs: &mut s.m_hs };
-                    mla::step(l, a, &s.xn, cache, pools, pos, &mut ms, s.pool, tr, &mut s.y);
+                    match s.placed.as_mut().filter(|p| p.mla(l)) {
+                        Some(pl) => {
+                            // the projections and the output projection on the card; the row, the selection and the attention here
+                            {
+                                let (latent, ikey, igate) = mla::row(cache, pos);
+                                pl.mla_project(l, &s.x, ms.q, ms.kva, ms.ik, igate, ms.iq, ms.iw);
+                                mla::finish_row(a, &ms, latent, ikey);
+                            }
+                            mla::attend(l, a, cache, pools, pos, &mut ms, s.pool, tr);
+                            pl.mla_output(l, ms.heads, &mut s.y);
+                        }
+                        None => mla::step(l, a, &s.xn, cache, pools, pos, &mut ms, s.pool, tr, &mut s.y),
+                    }
                     lap(&mut p.mla);
                 }
                 _ => unreachable!("a layer's state and weights disagree"),
@@ -582,13 +609,33 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             tr.edge(l, "ffn_in", &s.xn);
             lap(&mut p.hc);
             let mut fs = ffn::Scratch { gu: &mut s.f_gu, h: &mut s.f_h, expert_out: &mut s.f_expert_out, shared: &mut s.f_shared, score: &mut s.f_score };
+            let mut placed = s.placed.as_mut().filter(|p| p.ffn(l));
             match &lw.ffn {
                 Ffn::Dense(d) => {
-                    ffn::dense(l, d, &s.xn, &mut fs, s.pool, tr, &mut s.y);
+                    match placed {
+                        Some(p) => {
+                            p.ffn_start(l, &s.x);
+                            p.ffn_finish(l, &mut s.y);
+                            tr.edge(l, "mlp.out", &s.y);
+                        }
+                        None => ffn::dense(l, d, &s.xn, &mut fs, s.pool, tr, &mut s.y),
+                    }
                     lap(&mut p.dense_ffn);
                 }
                 Ffn::Moe(m) => {
-                    ffn::moe(l, m, &s.xn, &mut fs, s.pool, &mut s.routed, forced.map(|f| &f[l - FIRST_K_DENSE_REPLACE]), tr, &mut s.y);
+                    // the shared expert runs on its card while the routed experts run here
+                    if let Some(p) = &mut placed {
+                        p.ffn_start(l, &s.x);
+                    }
+                    ffn::moe_routed(l, m, &s.xn, &mut fs, s.pool, &mut s.routed, forced.map(|f| &f[l - FIRST_K_DENSE_REPLACE]), tr, &mut s.y);
+                    match placed {
+                        Some(p) => p.ffn_finish(l, fs.shared),
+                        None => ffn::moe_shared(m, &s.xn, &mut fs, s.pool),
+                    }
+                    tr.edge(l, "shared", fs.shared);
+                    for i in 0..H {
+                        s.y[i] += fs.shared[i];
+                    }
                     let e = s.routed.elapsed();
                     p.experts += e;
                     lap(&mut p.router_shared);
@@ -607,8 +654,13 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             tr.edge(l, "out", &s.mean);
             lap(&mut p.hc);
         }
-        rmsnorm::<H>(&s.mean, &w.norm, RMS_NORM_EPS, &mut s.xn);
-        gemv::bf16_par::<VOCAB_SIZE, H>(w.lm_head, &s.xn, &mut s.logits, s.pool);
+        match s.placed.as_mut().filter(|p| p.head()) {
+            Some(p) => p.logits(&s.mean, &mut s.logits),
+            None => {
+                rmsnorm::<H>(&s.mean, &w.norm, RMS_NORM_EPS, &mut s.xn);
+                gemv::bf16_par::<VOCAB_SIZE, H>(w.lm_head, &s.xn, &mut s.logits, s.pool);
+            }
+        }
         tr.edge(NONE, "logits", &s.logits);
         lap(&mut p.head);
     }

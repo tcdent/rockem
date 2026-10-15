@@ -92,8 +92,10 @@ pub fn route(l: usize, w: &weights::Moe, xn: &[f32], s: &mut Scratch, pool: &dyn
     (idx, wt)
 }
 
+/// The routed half of the MoE: the router's picks, the experts through
+/// `routed`, their weighted sum into `out`.
 #[inline(always)]
-pub fn moe(l: usize, w: &weights::Moe, xn: &[f32], s: &mut Scratch, pool: &dyn Pool, routed: &mut impl Routed, forced: Option<&[usize; TOP_K]>, tr: &mut impl Trace, out: &mut [f32]) {
+pub fn moe_routed(l: usize, w: &weights::Moe, xn: &[f32], s: &mut Scratch, pool: &dyn Pool, routed: &mut impl Routed, forced: Option<&[usize; TOP_K]>, tr: &mut impl Trace, out: &mut [f32]) {
     let (idx, wt) = route(l, w, xn, s, pool, forced, tr);
     routed.run(l, &idx, xn, s.expert_out);
     for i in 0..H {
@@ -107,13 +109,81 @@ pub fn moe(l: usize, w: &weights::Moe, xn: &[f32], s: &mut Scratch, pool: &dyn P
         }
     }
     tr.edge(l, "routed", out);
+}
+
+/// The shared expert on `xn`, into `s.shared`; the step adds it to the routed sum.
+#[inline(always)]
+pub fn moe_shared(w: &weights::Moe, xn: &[f32], s: &mut Scratch, pool: &dyn Pool) {
     const S: usize = N_SHARED_EXPERTS * D_FF;
     gemv::fp8_par::<S, H>(w.shared_gate.w, w.shared_gate.s, xn, &mut s.gu[..S], pool);
     gemv::fp8_par::<S, H>(w.shared_up.w, w.shared_up.s, xn, &mut s.gu[S..2 * S], pool);
     swiglu_clamped::<S>(s.gu, SWIGLU_LIMIT, &mut s.h[..S]);
     gemv::fp8_par::<H, S>(w.shared_down.w, w.shared_down.s, &s.h[..S], s.shared, pool);
-    tr.edge(l, "shared", s.shared);
-    for i in 0..H {
-        out[i] += s.shared[i];
+}
+
+pub mod gfx11_consts {
+    use crate::*;
+    /// Rows of the fused gate|up launch: the gate's rows, then the up's.
+    pub const SHARED_GU_ROWS: usize = 2 * N_SHARED_EXPERTS * D_FF;
+    pub const DENSE_GU_ROWS: usize = 2 * INTERMEDIATE_SIZE;
+}
+
+#[cfg(target_arch = "amdgpu")]
+pub mod gfx11 {
+    //! The FFN's FP8 projections on the card: `ffn_gu` (rows of a `[m][H]`
+    //! FP8 matrix over `n` activations rms-normed with `ln` on the way — a
+    //! gate|up pair as one launch, the gate's rows first), and the down
+    //! projections `ffn_down_shared` (`[H][D_FF]`) and `ffn_down_dense`
+    //! (`[H][INTERMEDIATE_SIZE]`), whose activation is the clamped SwiGLU of
+    //! the gate|up output computed as it is staged — no epilogue launch.
+    //! Scales: one f32 per 128×128 block, `[m/128][K/128]` (`common::gemv::fp8`).
+    use crate::*;
+    use common::gemv::gfx11::{rows_fmt, Fp8};
+    use common::swiglu::silu;
+    use core::arch::amdgpu::workitem_id_x;
+
+    /// `out[i][row] = W[row] · rmsnorm_ln(x[i])`, FP8 rows of width H. Grid: rows_grid(m).
+    #[no_mangle]
+    pub extern "gpu-kernel" fn ffn_gu(x: *const f32, ln: *const u16, w: *const u8, s: *const f32, out: *mut f32, m: u32, n: u32) {
+        unsafe {
+            let tid = workitem_id_x();
+            let (m, n) = (m as usize, n as usize);
+            let t = tid as usize;
+            rows_fmt::<H, true, Fp8>(tid, Fp8 { w, s }, ln, m, n, RMS_NORM_EPS, |i, s| *x.add(i * H + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
+        }
     }
+
+    /// The clamped SwiGLU of element `k` of token `i`'s gate|up output (`[n][2·N]`).
+    #[inline(always)]
+    unsafe fn swiglu_at<const N: usize>(gu: *const f32, i: usize, k: usize) -> f32 {
+        let (g, u) = (*gu.add(i * 2 * N + k), *gu.add(i * 2 * N + N + k));
+        let g = if g > SWIGLU_LIMIT { SWIGLU_LIMIT } else { g };
+        let u = if u > SWIGLU_LIMIT { SWIGLU_LIMIT } else if u < -SWIGLU_LIMIT { -SWIGLU_LIMIT } else { u };
+        silu(g) * u
+    }
+
+    /// `out[i][row] = W[row] · swiglu(gu[i])` for a `[m][D_FF]` FP8 matrix: the shared expert's down projection. Grid: rows_grid(m).
+    #[no_mangle]
+    pub extern "gpu-kernel" fn ffn_down_shared(gu: *const f32, w: *const u8, s: *const f32, out: *mut f32, m: u32, n: u32) {
+        unsafe {
+            const N: usize = N_SHARED_EXPERTS * D_FF;
+            let tid = workitem_id_x();
+            let (m, n) = (m as usize, n as usize);
+            let t = tid as usize;
+            rows_fmt::<N, false, Fp8>(tid, Fp8 { w, s }, core::ptr::null(), m, n, 0.0, |i, s| if s * 256 + t < N { swiglu_at::<N>(gu, i, s * 256 + t) } else { 0.0 }, || {}, |row, i, y| *out.add(i * m + row) = y);
+        }
+    }
+
+    /// The same over `[m][INTERMEDIATE_SIZE]`: the dense layers' down projection.
+    #[no_mangle]
+    pub extern "gpu-kernel" fn ffn_down_dense(gu: *const f32, w: *const u8, s: *const f32, out: *mut f32, m: u32, n: u32) {
+        unsafe {
+            const N: usize = INTERMEDIATE_SIZE;
+            let tid = workitem_id_x();
+            let (m, n) = (m as usize, n as usize);
+            let t = tid as usize;
+            rows_fmt::<N, false, Fp8>(tid, Fp8 { w, s }, core::ptr::null(), m, n, 0.0, |i, s| swiglu_at::<N>(gu, i, s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
+        }
+    }
+    const _: () = assert!(INTERMEDIATE_SIZE % 256 == 0 && (N_SHARED_EXPERTS * D_FF) % 256 == 0);
 }

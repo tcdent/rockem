@@ -123,19 +123,49 @@ fn select(pos: usize, iq: &[f32], iw: &[f32], pools: &[f32], pscore: &mut [f32],
 }
 
 /// `xn` is the normed block input (`[H]`); the cache holds rows `0..pos` and
-/// gains row `pos`; `out` is the block output (`[H]`).
+/// gains row `pos`; `out` is the block output (`[H]`). The three parts, so a
+/// placement can take the projections and the output while the attention
+/// runs here: `project`, `finish_row`, `attend`, `output`.
 #[inline(always)]
 pub fn step(l: usize, w: &weights::Mla, xn: &[f32], cache: &mut [f32], pools: &mut [f32], pos: usize, s: &mut Scratch, pool: &dyn Pool, tr: &mut impl Trace, out: &mut [f32]) {
-    gemv::fp8_par::<Q_LORA_RANK, H>(w.q_a.w, w.q_a.s, xn, s.qa, pool);
-    rmsnorm::<Q_LORA_RANK>(s.qa, &w.q_a_ln, RMS_NORM_EPS, s.qr);
-    gemv::fp8_par::<{ MLA_HEADS * Q_HEAD }, Q_LORA_RANK>(w.q_b.w, w.q_b.s, s.qr, s.q, pool);
-    // this position's row: the normed latent, the indexer's key (LayerNorm, eps 1e-6) and gate
-    gemv::fp8_par::<KV_LORA_RANK, H>(w.kv_a.w, w.kv_a.s, xn, s.kva, pool);
+    {
+        let (latent, ikey, igate) = row(cache, pos);
+        project(w, xn, s, igate, pool);
+        finish_row(w, s, latent, ikey);
+    }
+    attend(l, w, cache, pools, pos, s, pool, tr);
+    output(w, s.heads, out, pool);
+}
+
+/// Position `pos`'s cache row: the latent, the indexer's key, the indexer's gate.
+#[inline(always)]
+pub fn row(cache: &mut [f32], pos: usize) -> (&mut [f32], &mut [f32], &mut [f32]) {
     let row = &mut cache[pos * MLA_ROW..(pos + 1) * MLA_ROW];
     let (latent, rest) = row.split_at_mut(KV_LORA_RANK);
     let (ikey, igate) = rest.split_at_mut(INDEX_HEAD_DIM);
-    rmsnorm::<KV_LORA_RANK>(s.kva, &w.kv_a_ln, RMS_NORM_EPS, latent);
+    (latent, ikey, igate)
+}
+
+/// The projections of the normed block input: the query through its LoRA pair
+/// (`s.q`), the latent before its norm (`s.kva`), the indexer's key before its
+/// LayerNorm (`s.ik`), the position's gate (`igate`, the cache row's), the
+/// indexer's query (`s.iq`) and head weights (`s.iw`, unscaled).
+#[inline(always)]
+pub fn project(w: &weights::Mla, xn: &[f32], s: &mut Scratch, igate: &mut [f32], pool: &dyn Pool) {
+    gemv::fp8_par::<Q_LORA_RANK, H>(w.q_a.w, w.q_a.s, xn, s.qa, pool);
+    rmsnorm::<Q_LORA_RANK>(s.qa, &w.q_a_ln, RMS_NORM_EPS, s.qr);
+    gemv::fp8_par::<{ MLA_HEADS * Q_HEAD }, Q_LORA_RANK>(w.q_b.w, w.q_b.s, s.qr, s.q, pool);
+    gemv::fp8_par::<KV_LORA_RANK, H>(w.kv_a.w, w.kv_a.s, xn, s.kva, pool);
     gemv::bf16::<INDEX_HEAD_DIM, H>(w.ix_wk, xn, s.ik);
+    gemv::bf16::<INDEX_HEAD_DIM, H>(w.ix_gate, xn, igate);
+    gemv::bf16_par::<{ INDEX_N_HEADS * INDEX_HEAD_DIM }, Q_LORA_RANK>(w.ix_wq_b, s.qr, s.iq, pool);
+    gemv::bf16::<INDEX_N_HEADS, H>(w.ix_weights, xn, s.iw);
+}
+
+/// The cache row's normed latent and the indexer's key (LayerNorm, eps 1e-6) from the projections.
+#[inline(always)]
+pub fn finish_row(w: &weights::Mla, s: &Scratch, latent: &mut [f32], ikey: &mut [f32]) {
+    rmsnorm::<KV_LORA_RANK>(s.kva, &w.kv_a_ln, RMS_NORM_EPS, latent);
     let mut mean = 0f32;
     for &v in s.ik.iter() {
         mean += v;
@@ -149,14 +179,17 @@ pub fn step(l: usize, w: &weights::Mla, xn: &[f32], cache: &mut [f32], pools: &m
     for c in 0..INDEX_HEAD_DIM {
         ikey[c] = (s.ik[c] - mean) * rs * w.ix_k_norm_w[c] + w.ix_k_norm_b[c];
     }
-    gemv::bf16::<INDEX_HEAD_DIM, H>(w.ix_gate, xn, igate);
+}
+
+/// The pool key a completed pool gains, the selection, and absorbed MLA over the
+/// selected positions, a head per item on its own scratch, into `s.heads`.
+#[inline(always)]
+pub fn attend(l: usize, w: &weights::Mla, cache: &[f32], pools: &mut [f32], pos: usize, s: &mut Scratch, pool: &dyn Pool, tr: &mut impl Trace) {
     if (pos + 1) % INDEX_KPOOL == 0 {
         let j = (pos + 1) / INDEX_KPOOL - 1;
-        let (c, p) = (&*cache, &mut pools[j * INDEX_HEAD_DIM..(j + 1) * INDEX_HEAD_DIM]);
-        pool_key(w, c, j, p);
+        let p = &mut pools[j * INDEX_HEAD_DIM..(j + 1) * INDEX_HEAD_DIM];
+        pool_key(w, cache, j, p);
     }
-    gemv::bf16_par::<{ INDEX_N_HEADS * INDEX_HEAD_DIM }, Q_LORA_RANK>(w.ix_wq_b, s.qr, s.iq, pool);
-    gemv::bf16::<INDEX_N_HEADS, H>(w.ix_weights, xn, s.iw);
     let wscale = 1.0 / sqrt(INDEX_N_HEADS as f32);
     for v in s.iw.iter_mut() {
         *v *= wscale;
@@ -164,18 +197,22 @@ pub fn step(l: usize, w: &weights::Mla, xn: &[f32], cache: &mut [f32], pools: &m
     let n = select(pos, s.iq, s.iw, pools, s.pscore, s.sel);
     tr.edge(l, "self_attn.indexer.count", &[n as f32]);
 
-    // absorbed MLA over the selected positions, a head per item on its own scratch and output
-    let (q, sel, cache_r) = (&*s.q, &s.sel[..n], &*cache);
+    let (q, sel) = (&*s.q, &s.sel[..n]);
     let (heads_p, hs_p) = (s.heads.as_mut_ptr() as usize, s.hs.as_mut_ptr() as usize);
     pool.run(MLA_HEADS, &move |h| {
         let oh = unsafe { core::slice::from_raw_parts_mut((heads_p as *mut f32).add(h * V_HEAD_DIM), V_HEAD_DIM) };
         let hs = unsafe { core::slice::from_raw_parts_mut((hs_p as *mut f32).add(h * HEAD_SCRATCH), HEAD_SCRATCH) };
         let (q_abs, rest) = hs.split_at_mut(KV_LORA_RANK);
         let (o_lat, att) = rest.split_at_mut(KV_LORA_RANK);
-        head(w, h, q, sel, cache_r, q_abs, o_lat, att, oh);
+        head(w, h, q, sel, cache, q_abs, o_lat, att, oh);
     });
     tr.edge(l, "self_attn.o_proj.in", s.heads);
-    gemv::fp8_par::<H, { MLA_HEADS * V_HEAD_DIM }>(w.o.w, w.o.s, s.heads, out, pool);
+}
+
+/// The output projection of the heads' outputs.
+#[inline(always)]
+pub fn output(w: &weights::Mla, heads: &[f32], out: &mut [f32], pool: &dyn Pool) {
+    gemv::fp8_par::<H, { MLA_HEADS * V_HEAD_DIM }>(w.o.w, w.o.s, heads, out, pool);
 }
 
 /// One head over the selected positions: `q_abs = W_ukᵀ q`, scores against the
@@ -218,4 +255,61 @@ fn head(w: &weights::Mla, h: usize, q: &[f32], sel: &[usize], cache: &[f32], q_a
         }
     }
     gemv::bf16::<V_HEAD_DIM, KV_LORA_RANK>(w_uv, o_lat, oh);
+}
+
+pub mod gfx11_consts {
+    use crate::*;
+    /// Rows of the fused indexer launch over the normed block input: the key's, the gate's, the head weights'.
+    pub const IX_ROWS: usize = 2 * INDEX_HEAD_DIM + INDEX_N_HEADS;
+    /// Rows of the output projection's input: every head's value output.
+    pub const O_IN: usize = MLA_HEADS * V_HEAD_DIM;
+}
+
+#[cfg(target_arch = "amdgpu")]
+pub mod gfx11 {
+    //! The MLA projections on the card. Over the normed block input the FFN's
+    //! `ffn_gu` (FP8, width H) and the KDA's `rows_h` (bf16, width H) serve
+    //! as they are: q_a, kv_a, and the indexer's key | gate | head weights as
+    //! one bf16 launch. Here: `mla_qb` (the query's second half, FP8 rows of
+    //! width Q_LORA_RANK over q_a's output rms-normed with q_a's norm as it is
+    //! staged), `mla_iq` (the indexer's query, bf16 rows over the same), and
+    //! `mla_o` (the output projection, FP8 rows of width MLA_HEADS·V_HEAD_DIM).
+    pub use super::gfx11_consts::*;
+    use crate::*;
+    use common::gemv::gfx11::{rows_fmt, Bf16, Fp8};
+    use core::arch::amdgpu::workitem_id_x;
+
+    /// `out[i][row] = W[row] · rmsnorm_ln(qa[i])` for `[m][Q_LORA_RANK]` FP8 rows. Grid: rows_grid(m).
+    #[no_mangle]
+    pub extern "gpu-kernel" fn mla_qb(qa: *const f32, ln: *const u16, w: *const u8, s: *const f32, out: *mut f32, m: u32, n: u32) {
+        unsafe {
+            let tid = workitem_id_x();
+            let (m, n) = (m as usize, n as usize);
+            let t = tid as usize;
+            rows_fmt::<Q_LORA_RANK, true, Fp8>(tid, Fp8 { w, s }, ln, m, n, RMS_NORM_EPS, |i, s| *qa.add(i * Q_LORA_RANK + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
+        }
+    }
+
+    /// The same for bf16 rows: the indexer's query. Grid: rows_grid(m).
+    #[no_mangle]
+    pub extern "gpu-kernel" fn mla_iq(qa: *const f32, ln: *const u16, w: *const u16, out: *mut f32, m: u32, n: u32) {
+        unsafe {
+            let tid = workitem_id_x();
+            let (m, n) = (m as usize, n as usize);
+            let t = tid as usize;
+            rows_fmt::<Q_LORA_RANK, true, Bf16>(tid, Bf16(w), ln, m, n, RMS_NORM_EPS, |i, s| *qa.add(i * Q_LORA_RANK + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
+        }
+    }
+
+    /// `out[i][row] = W[row] · heads[i]` for `[m][O_IN]` FP8 rows: the output projection. Grid: rows_grid(m).
+    #[no_mangle]
+    pub extern "gpu-kernel" fn mla_o(heads: *const f32, w: *const u8, s: *const f32, out: *mut f32, m: u32, n: u32) {
+        unsafe {
+            let tid = workitem_id_x();
+            let (m, n) = (m as usize, n as usize);
+            let t = tid as usize;
+            rows_fmt::<O_IN, false, Fp8>(tid, Fp8 { w, s }, core::ptr::null(), m, n, 0.0, |i, s| *heads.add(i * O_IN + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
+        }
+    }
+    const _: () = assert!(Q_LORA_RANK % 256 == 0 && O_IN % 256 == 0);
 }
