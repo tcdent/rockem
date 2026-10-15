@@ -3,10 +3,10 @@
 //! are two: a part holds its heads' projections, the layer's small tensors
 //! and the state, and a step runs on each card the normed projections
 //! (`rows_h`: the gates' first halves and beta once a card, then the part's
-//! q, k and v rows as one launch), the gates' second halves (`rows_d`, f_b's
-//! and g_b's rows as one launch, alongside the first), the delta rule with
-//! the heads' memory resident in registers (`kda_step` over the part's
-//! heads), and the part's half of the output projection (`rows_part`): four
+//! q, k and v rows as one launch), the gates' second halves (`rows_d`, f_b
+//! over f_a's output and g_b over g_a's, alongside the first), the delta rule
+//! with the heads' memory resident in registers (`kda_step` over the part's
+//! heads), and the part's half of the output projection (`rows_part`): five
 //! launches a part and one a card, the cards waited for, the parts summed
 //! by the host. Each layer's FFN half that is not the routed experts — the
 //! dense layers' MLP, the MoE layers' shared expert — is on the same card as
@@ -494,9 +494,11 @@ impl Placed for Cards {
         for (i, p) in lay.parts.iter().enumerate() {
             let c = &self.cards[p.card];
             let (mixed, fg, normed) = (&c.mixeds[i], &c.fgs[i], &c.normeds[i]);
-            // q | k | v as one launch, and the gates' second halves alongside it (the small projections completed before it launched)
+            // q | k | v as one launch, and the gates' second halves alongside it (the small projections completed
+            // before it launched): f_b over f_a's output, g_b over g_a's — two launches, two inputs
             self.rows(c, &c.rows_h, c.x.va, Some(p.input_ln.va), p.qkv.va, mixed.va, 3 * g::PART_QKV, H);
-            self.rows_free(c, &c.rows_d, c.small.va, None, p.fg.va, fg.va, 2 * g::PART_QKV, KDA_DIM);
+            self.rows_free(c, &c.rows_d, c.small.va, None, p.fg.va, fg.va, g::PART_QKV, KDA_DIM);
+            self.rows_free(c, &c.rows_d, c.small.at(KDA_DIM * 4), None, p.fg.at(g::PART_QKV * KDA_DIM * 2), fg.at(g::PART_QKV * 4), g::PART_QKV, KDA_DIM);
             let mut a = Args::new();
             a.ptr(mixed.va).ptr(p.taps.va).ptr(p.window.va).ptr(fg.va).ptr(p.dt_bias.va).ptr(p.a_log.va).ptr(c.small.at(2 * KDA_DIM * 4)).ptr(fg.at(g::PART_QKV * 4)).ptr(p.mem.va).ptr(p.o_norm.va).ptr(normed.va).u32(p.head0 as u32).u32(1);
             c.k.launch(&c.step, g::STEP_GRID, g::WG, g::STEP_LDS as u32, &a);
