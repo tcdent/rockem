@@ -1,35 +1,175 @@
 //! Construction: a sequence's state per layer, the scratch allocated once,
-//! the routed experts from the bundle's stream, and the CPU realization —
-//! every op in this process, the reference placement every card kernel is
-//! diffed against — with the step that ties the fused kernels together one
-//! token at a time. `std` only; nothing on the token path allocates.
+//! the routed experts from the bundle's stream, the thread pool, and the CPU
+//! realization — every op in this process, the reference placement every card
+//! kernel is diffed against — with the step that ties the fused kernels
+//! together one token at a time. `std` only; nothing on the token path allocates.
 
 use crate::ffn::Routed;
 use crate::layout::{self, KDA_MEMORY, KDA_WINDOW, MLA_ROW, POSITION};
 use crate::weights::{Attn, Ffn, Weights};
 use crate::*;
 use common::gemv::{self, widen};
+use common::pool::Pool;
 use common::rmsnorm::rmsnorm;
 use common::trace::{Trace, NONE};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Worker threads pinned to `cores`, spinning for work. A job is one
+/// allocation — the function, its item count, the item counter and the done
+/// counter — published through one atomic pointer, so whatever job a worker
+/// loads, it draws items from that job's own counter and counts completions
+/// there: a worker that wakes late to a finished job finds its counter spent
+/// and leaves. `run` publishes a new job only when no worker is registered
+/// (`active`), and frees a job one generation after replacing it, so a worker
+/// that registered during the swap never reads freed memory. Between jobs the
+/// workers spin for a while, then yield, so an idle node does not burn its sockets.
+pub struct Threads {
+    shared: std::sync::Arc<Shared>,
+    /// The job before the current one, freed at the next publish.
+    retired: std::sync::atomic::AtomicPtr<Job>,
+}
+struct Job {
+    f: *const (dyn Fn(usize) + Sync),
+    n: usize,
+    next: AtomicUsize,
+    done: AtomicUsize,
+}
+struct Shared {
+    job: std::sync::atomic::AtomicPtr<Job>,
+    active: AtomicUsize,
+    quit: std::sync::atomic::AtomicBool,
+}
+extern "C" {
+    fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
+}
+fn pin(core: usize) {
+    let mut mask = [0u64; 16];
+    mask[core / 64] |= 1 << (core % 64);
+    unsafe { sched_setaffinity(0, 128, mask.as_ptr()) };
+}
+/// Every item of `job` this thread can claim, in order.
+unsafe fn work(job: *const Job) {
+    let (f, n) = (&*(*job).f, (*job).n);
+    loop {
+        let i = (*job).next.fetch_add(1, Ordering::AcqRel);
+        if i >= n {
+            break;
+        }
+        f(i);
+        (*job).done.fetch_add(1, Ordering::AcqRel);
+    }
+}
+impl Threads {
+    /// One worker per core after the first; the calling thread, pinned to `cores[0]`, is the other.
+    pub fn new(cores: &[usize]) -> Self {
+        assert!(!cores.is_empty());
+        pin(cores[0]);
+        let shared = std::sync::Arc::new(Shared { job: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()), active: AtomicUsize::new(0), quit: std::sync::atomic::AtomicBool::new(false) });
+        for &core in &cores[1..] {
+            let sh = shared.clone();
+            std::thread::spawn(move || {
+                pin(core);
+                let mut seen: *mut Job = std::ptr::null_mut();
+                let mut idle = 0u32;
+                loop {
+                    if sh.job.load(Ordering::Acquire) == seen {
+                        if sh.quit.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        idle += 1;
+                        if idle < 20_000 {
+                            std::hint::spin_loop();
+                        } else {
+                            std::thread::sleep(std::time::Duration::from_micros(50));
+                        }
+                        continue;
+                    }
+                    idle = 0;
+                    // registered first, then the job as it is now: whatever it is, it is alive and its counters are its own
+                    sh.active.fetch_add(1, Ordering::AcqRel);
+                    let job = sh.job.load(Ordering::Acquire);
+                    seen = job;
+                    if !job.is_null() {
+                        unsafe { work(job) };
+                    }
+                    sh.active.fetch_sub(1, Ordering::AcqRel);
+                }
+            });
+        }
+        Threads { shared, retired: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }
+    }
+}
+impl Drop for Threads {
+    fn drop(&mut self) {
+        self.shared.quit.store(true, Ordering::Relaxed);
+    }
+}
+impl Pool for Threads {
+    fn run(&self, n: usize, f: &(dyn Fn(usize) + Sync)) {
+        if n <= 1 {
+            for i in 0..n {
+                f(i);
+            }
+            return;
+        }
+        let sh = &*self.shared;
+        while sh.active.load(Ordering::Acquire) != 0 {
+            std::hint::spin_loop();
+        }
+        // no worker is inside any job: the one retired at the last publish can go
+        let fp: *const (dyn Fn(usize) + Sync) = unsafe { std::mem::transmute(f) };
+        let job = Box::into_raw(Box::new(Job { f: fp, n, next: AtomicUsize::new(0), done: AtomicUsize::new(0) }));
+        let old = sh.job.swap(job, Ordering::AcqRel);
+        let older = self.retired.swap(old, Ordering::AcqRel);
+        if !older.is_null() {
+            drop(unsafe { Box::from_raw(older) });
+        }
+        unsafe { work(job) };
+        while unsafe { (*job).done.load(Ordering::Acquire) } != n {
+            std::hint::spin_loop();
+        }
+    }
+}
+
+/// The cores a pool on this machine should take: one per physical core (the
+/// first SMT sibling of each), every socket, as /sys lists them.
+pub fn physical_cores() -> Vec<usize> {
+    let mut cores = Vec::new();
+    let mut i = 0;
+    while let Ok(s) = std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{i}/topology/thread_siblings_list")) {
+        let first: usize = s.trim().split([',', '-']).next().unwrap().parse().unwrap();
+        if first == i {
+            cores.push(i);
+        }
+        i += 1;
+    }
+    if cores.is_empty() {
+        cores = (0..std::thread::available_parallelism().map_or(1, |t| t.get())).collect();
+    }
+    cores
+}
 
 /// The routed experts from the bundle's expert stream in this process's memory,
-/// one after another on this thread.
+/// one expert per pool item, each on its own scratch.
 pub struct CpuExperts<'a> {
     stream: &'a [u8],
-    scratch: expert::ScratchBuf,
+    pool: &'a dyn Pool,
+    scratch: Vec<std::sync::Mutex<expert::ScratchBuf>>,
 }
 impl<'a> CpuExperts<'a> {
-    pub fn new(stream: &'a [u8]) -> Self {
+    pub fn new(stream: &'a [u8], pool: &'a dyn Pool) -> Self {
         assert_eq!(stream.len(), layout::STREAM);
-        CpuExperts { stream, scratch: expert::ScratchBuf::new() }
+        CpuExperts { stream, pool, scratch: (0..TOP_K).map(|_| std::sync::Mutex::new(expert::ScratchBuf::new())).collect() }
     }
 }
 impl Routed for CpuExperts<'_> {
     fn run(&mut self, l: usize, idx: &[usize; TOP_K], x: &[f32], out: &mut [f32]) {
-        for k in 0..TOP_K {
-            let w = expert::Weights::from_record(&self.stream[layout::record(l, idx[k])]);
-            expert::forward(&w, x, &mut self.scratch.scratch(), &mut out[k * H..(k + 1) * H]);
-        }
+        let (stream, scratch, out_p) = (self.stream, &self.scratch, out.as_mut_ptr() as usize);
+        self.pool.run(TOP_K, &move |k| {
+            let w = expert::Weights::from_record(&stream[layout::record(l, idx[k])]);
+            let o = unsafe { std::slice::from_raw_parts_mut((out_p as *mut f32).add(k * H), H) };
+            expert::forward(&w, x, &mut scratch[k].lock().unwrap().scratch(), o);
+        });
     }
 }
 
@@ -40,8 +180,9 @@ pub enum LayerState {
     Mla { cache: Vec<f32>, pools: Vec<f32> },
 }
 
-pub struct CpuModel<R: Routed> {
+pub struct CpuModel<'p, R: Routed> {
     pub routed: R,
+    pub pool: &'p dyn Pool,
     pub max_ctx: usize,
     pub layers: Vec<LayerState>,
     /// The last step's logits, `[VOCAB_SIZE]`.
@@ -61,11 +202,7 @@ pub struct CpuModel<R: Routed> {
     k_ga: Vec<f32>,
     k_gate: Vec<f32>,
     k_normed: Vec<f32>,
-    k_qh: Vec<f32>,
-    k_kh: Vec<f32>,
-    k_delta: Vec<f32>,
-    k_o: Vec<f32>,
-    k_on: Vec<f32>,
+    k_heads: Vec<f32>,
     m_qr: Vec<f32>,
     m_qa: Vec<f32>,
     m_q: Vec<f32>,
@@ -75,10 +212,8 @@ pub struct CpuModel<R: Routed> {
     m_iw: Vec<f32>,
     m_pscore: Vec<f32>,
     m_sel: Vec<usize>,
-    m_att: Vec<f32>,
-    m_q_abs: Vec<f32>,
-    m_o_lat: Vec<f32>,
     m_heads: Vec<f32>,
+    m_hs: Vec<f32>,
     f_gu: Vec<f32>,
     f_h: Vec<f32>,
     f_expert_out: Vec<f32>,
@@ -86,8 +221,8 @@ pub struct CpuModel<R: Routed> {
     f_score: Vec<f32>,
 }
 
-impl<R: Routed> CpuModel<R> {
-    pub fn new(routed: R, max_ctx: usize) -> Self {
+impl<'p, R: Routed> CpuModel<'p, R> {
+    pub fn new(routed: R, pool: &'p dyn Pool, max_ctx: usize) -> Self {
         #[cfg(target_arch = "x86_64")]
         assert!(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma"), "the shipped realizations need AVX2+FMA");
         assert!(max_ctx >= FIRST_POS + 1);
@@ -96,6 +231,7 @@ impl<R: Routed> CpuModel<R> {
             .collect();
         CpuModel {
             routed,
+            pool,
             max_ctx,
             layers,
             logits: vec![0.0; VOCAB_SIZE],
@@ -114,11 +250,7 @@ impl<R: Routed> CpuModel<R> {
             k_ga: vec![0.0; KDA_DIM],
             k_gate: vec![0.0; KDA_QKV],
             k_normed: vec![0.0; KDA_QKV],
-            k_qh: vec![0.0; KDA_DIM],
-            k_kh: vec![0.0; KDA_DIM],
-            k_delta: vec![0.0; KDA_DIM],
-            k_o: vec![0.0; KDA_DIM],
-            k_on: vec![0.0; KDA_DIM],
+            k_heads: vec![0.0; KDA_HEADS * kda::HEAD_SCRATCH],
             m_qr: vec![0.0; Q_LORA_RANK],
             m_qa: vec![0.0; Q_LORA_RANK],
             m_q: vec![0.0; MLA_HEADS * Q_HEAD],
@@ -128,10 +260,8 @@ impl<R: Routed> CpuModel<R> {
             m_iw: vec![0.0; INDEX_N_HEADS],
             m_pscore: vec![0.0; max_ctx.div_ceil(INDEX_KPOOL) + 1],
             m_sel: vec![0; DENSE_BELOW],
-            m_att: vec![0.0; DENSE_BELOW],
-            m_q_abs: vec![0.0; KV_LORA_RANK],
-            m_o_lat: vec![0.0; KV_LORA_RANK],
             m_heads: vec![0.0; MLA_HEADS * V_HEAD_DIM],
+            m_hs: vec![0.0; MLA_HEADS * mla::HEAD_SCRATCH],
             f_gu: vec![0.0; 2 * INTERMEDIATE_SIZE],
             f_h: vec![0.0; INTERMEDIATE_SIZE],
             f_expert_out: vec![0.0; TOP_K * H],
@@ -215,17 +345,17 @@ impl<R: Routed> CpuModel<R> {
         for l in 0..NUM_HIDDEN_LAYERS {
             let lw = &w.layers[l];
             let mut hcs = hc::Scratch { flat: &mut s.hc_flat, coef: &mut s.hc_coef };
-            let mix = hc::pre(&lw.hc_attn, &s.streams, &mut hcs, &mut s.x);
+            let mix = hc::pre(&lw.hc_attn, &s.streams, &mut hcs, s.pool, &mut s.x);
             rmsnorm::<H>(&s.x, &lw.input_ln, RMS_NORM_EPS, &mut s.xn);
             tr.edge(l, "attn_in", &s.xn);
             match (&lw.attn, &mut s.layers[l]) {
                 (Attn::Kda(a), LayerState::Kda { window, mem }) => {
-                    let mut ks = kda::Scratch { mixed: &mut s.k_mixed, conv: &mut s.k_conv, fa: &mut s.k_fa, f: &mut s.k_f, beta: &mut s.k_beta, ga: &mut s.k_ga, gate: &mut s.k_gate, normed: &mut s.k_normed, qh: &mut s.k_qh, kh: &mut s.k_kh, delta: &mut s.k_delta, o: &mut s.k_o, on: &mut s.k_on };
-                    kda::step(l, a, &s.xn, window, mem, &mut ks, tr, &mut s.y);
+                    let mut ks = kda::Scratch { mixed: &mut s.k_mixed, conv: &mut s.k_conv, fa: &mut s.k_fa, f: &mut s.k_f, beta: &mut s.k_beta, ga: &mut s.k_ga, gate: &mut s.k_gate, normed: &mut s.k_normed, heads: &mut s.k_heads };
+                    kda::step(l, a, &s.xn, window, mem, &mut ks, s.pool, tr, &mut s.y);
                 }
                 (Attn::Mla(a), LayerState::Mla { cache, pools }) => {
-                    let mut ms = mla::Scratch { qr: &mut s.m_qr, qa: &mut s.m_qa, q: &mut s.m_q, kva: &mut s.m_kva, ik: &mut s.m_ik, iq: &mut s.m_iq, iw: &mut s.m_iw, pscore: &mut s.m_pscore, sel: &mut s.m_sel, att: &mut s.m_att, q_abs: &mut s.m_q_abs, o_lat: &mut s.m_o_lat, heads: &mut s.m_heads };
-                    mla::step(l, a, &s.xn, cache, pools, pos, &mut ms, tr, &mut s.y);
+                    let mut ms = mla::Scratch { qr: &mut s.m_qr, qa: &mut s.m_qa, q: &mut s.m_q, kva: &mut s.m_kva, ik: &mut s.m_ik, iq: &mut s.m_iq, iw: &mut s.m_iw, pscore: &mut s.m_pscore, sel: &mut s.m_sel, heads: &mut s.m_heads, hs: &mut s.m_hs };
+                    mla::step(l, a, &s.xn, cache, pools, pos, &mut ms, s.pool, tr, &mut s.y);
                 }
                 _ => unreachable!("a layer's state and weights disagree"),
             }
@@ -233,13 +363,13 @@ impl<R: Routed> CpuModel<R> {
             hc::post(&mix, &s.y, &mut s.streams);
 
             let mut hcs = hc::Scratch { flat: &mut s.hc_flat, coef: &mut s.hc_coef };
-            let mix = hc::pre(&lw.hc_ffn, &s.streams, &mut hcs, &mut s.x);
+            let mix = hc::pre(&lw.hc_ffn, &s.streams, &mut hcs, s.pool, &mut s.x);
             rmsnorm::<H>(&s.x, &lw.post_ln, RMS_NORM_EPS, &mut s.xn);
             tr.edge(l, "ffn_in", &s.xn);
             let mut fs = ffn::Scratch { gu: &mut s.f_gu, h: &mut s.f_h, expert_out: &mut s.f_expert_out, shared: &mut s.f_shared, score: &mut s.f_score };
             match &lw.ffn {
-                Ffn::Dense(d) => ffn::dense(l, d, &s.xn, &mut fs, tr, &mut s.y),
-                Ffn::Moe(m) => ffn::moe(l, m, &s.xn, &mut fs, &mut s.routed, forced.map(|f| &f[l - FIRST_K_DENSE_REPLACE]), tr, &mut s.y),
+                Ffn::Dense(d) => ffn::dense(l, d, &s.xn, &mut fs, s.pool, tr, &mut s.y),
+                Ffn::Moe(m) => ffn::moe(l, m, &s.xn, &mut fs, s.pool, &mut s.routed, forced.map(|f| &f[l - FIRST_K_DENSE_REPLACE]), tr, &mut s.y),
             }
             tr.edge(l, "ffn_out", &s.y);
             hc::post(&mix, &s.y, &mut s.streams);
@@ -253,7 +383,7 @@ impl<R: Routed> CpuModel<R> {
             tr.edge(l, "out", &s.mean);
         }
         rmsnorm::<H>(&s.mean, &w.norm, RMS_NORM_EPS, &mut s.xn);
-        gemv::bf16::<VOCAB_SIZE, H>(w.lm_head, &s.xn, &mut s.logits);
+        gemv::bf16_par::<VOCAB_SIZE, H>(w.lm_head, &s.xn, &mut s.logits, s.pool);
         tr.edge(NONE, "logits", &s.logits);
     }
 }

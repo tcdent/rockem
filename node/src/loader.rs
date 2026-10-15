@@ -1,6 +1,10 @@
 //! Bring a bundle file into memory the way the design says: a hugetlbfs
-//! file the size of the input, mapped, filled by the calling thread (so
-//! first-touch places every page on that thread's socket), locked. The
+//! file the size of the input, mapped, filled by the calling thread, locked.
+//! The hugetlbfs pages are interleaved over every NUMA node (`set_mempolicy`
+//! around the fill): a thread pool spanning both sockets then streams them at
+//! both sockets' bandwidth, where first-touch from one thread had put 177 GB
+//! on one node (metatron, 2026-10-15). Per-CCD placement is the later, measured
+//! refinement (l3-intentional expert path). The
 //! mapping outlives the process's use of it by construction — nothing here
 //! is ever unmapped. `Mem::Anon` is the dev-host substitute when there is no
 //! hugetlbfs; it is chosen explicitly, never fallen back to.
@@ -18,6 +22,16 @@ pub enum Mem {
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn mlock(addr: *const u8, len: usize) -> i32;
+    fn syscall(nr: i64, ...) -> i64;
+}
+const SYS_SET_MEMPOLICY: i64 = 238;
+const MPOL_DEFAULT: i32 = 0;
+const MPOL_INTERLEAVE: i32 = 3;
+/// Interleave this thread's new pages over every online node (all 64 bits set names more nodes than exist, which the kernel masks to the possible ones).
+fn interleave(on: bool) {
+    let mask: u64 = if on { u64::MAX } else { 0 };
+    let r = unsafe { syscall(SYS_SET_MEMPOLICY, if on { MPOL_INTERLEAVE } else { MPOL_DEFAULT }, if on { &mask as *const u64 } else { std::ptr::null() }, if on { 64u64 } else { 0 }) };
+    assert!(r == 0 || !on, "set_mempolicy: {}", std::io::Error::last_os_error());
 }
 const PROT_READ: i32 = 1;
 const PROT_WRITE: i32 = 2;
@@ -47,7 +61,10 @@ pub fn load(path: &std::path::Path, mem: Mem) -> &'static [u8] {
             p
         }
     };
-    // fill from this thread: this is the first touch
+    // fill from this thread: this is the first touch, interleaved over the nodes
+    if mem == Mem::Hugetlb {
+        interleave(true);
+    }
     let buf = unsafe { std::slice::from_raw_parts_mut(dst, len) };
     let (mut done, mut next_mark) = (0, GB);
     let t0 = std::time::Instant::now();
@@ -61,6 +78,7 @@ pub fn load(path: &std::path::Path, mem: Mem) -> &'static [u8] {
         }
     }
     if mem == Mem::Hugetlb {
+        interleave(false);
         assert_eq!(unsafe { mlock(dst, len) }, 0, "mlock: {}", std::io::Error::last_os_error());
     }
     unsafe { std::slice::from_raw_parts(dst, len) }

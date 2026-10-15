@@ -18,7 +18,12 @@ pub fn widen(w: u16) -> f32 {
 
 #[inline(always)]
 pub fn bf16_scalar<const M: usize, const K: usize>(w: &[u16], x: &[f32], out: &mut [f32]) {
-    for m in 0..M {
+    bf16_scalar_rows::<K>(w, x, out, 0, M)
+}
+/// Rows `m0..m1` only, into `out[m0..m1]`.
+#[inline(always)]
+pub fn bf16_scalar_rows<const K: usize>(w: &[u16], x: &[f32], out: &mut [f32], m0: usize, m1: usize) {
+    for m in m0..m1 {
         let row = &w[m * K..(m + 1) * K];
         let mut acc = 0f32;
         for k in 0..K {
@@ -35,10 +40,29 @@ pub fn bf16<const M: usize, const K: usize>(w: &[u16], x: &[f32], out: &mut [f32
     debug_assert!(w.len() >= M * K && x.len() >= K && out.len() >= M);
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        avx2::bf16::<M, K>(w.as_ptr(), x.as_ptr(), out.as_mut_ptr())
+        avx2::bf16_rows::<K>(w.as_ptr(), x.as_ptr(), out.as_mut_ptr(), 0, M)
     }
     #[cfg(not(target_arch = "x86_64"))]
     bf16_scalar::<M, K>(w, x, out)
+}
+
+/// `bf16` with the rows split over `pool` in `pool::ROWS`-row items: each item
+/// writes its own rows of `out`, so the result is the serial one exactly.
+#[inline(always)]
+pub fn bf16_par<const M: usize, const K: usize>(w: &[u16], x: &[f32], out: &mut [f32], pool: &dyn super::pool::Pool) {
+    debug_assert!(w.len() >= M * K && x.len() >= K && out.len() >= M);
+    let (wp, xp, op) = (w.as_ptr() as usize, x.as_ptr() as usize, out.as_mut_ptr() as usize);
+    pool.run(M.div_ceil(super::pool::ROWS), &move |i| {
+        let (m0, m1) = (i * super::pool::ROWS, ((i + 1) * super::pool::ROWS).min(M));
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            avx2::bf16_rows::<K>(wp as *const u16, xp as *const f32, op as *mut f32, m0, m1)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        unsafe {
+            bf16_scalar_rows::<K>(core::slice::from_raw_parts(wp as *const u16, M * K), core::slice::from_raw_parts(xp as *const f32, K), core::slice::from_raw_parts_mut(op as *mut f32, M), m0, m1)
+        }
+    });
 }
 
 /// FP8 e4m3fn → f32, exact: 1 sign, 4 exponent bits biased by 7, 3 mantissa
@@ -60,9 +84,13 @@ pub const FP8_BLOCK: usize = 128;
 /// `scales[(m / 128) · (K / 128) + k / 128]`: the checkpoint's `<name>_scale_inv`.
 #[inline(always)]
 pub fn fp8_scalar<const M: usize, const K: usize>(w: &[u8], scales: &[f32], x: &[f32], out: &mut [f32]) {
+    fp8_scalar_rows::<K>(w, scales, x, out, 0, M)
+}
+#[inline(always)]
+pub fn fp8_scalar_rows<const K: usize>(w: &[u8], scales: &[f32], x: &[f32], out: &mut [f32], m0: usize, m1: usize) {
     const { assert!(K % FP8_BLOCK == 0) };
     let kb = K / FP8_BLOCK;
-    for m in 0..M {
+    for m in m0..m1 {
         let row = &w[m * K..(m + 1) * K];
         let mut lanes = [0f32; 8];
         for g in 0..kb {
@@ -88,10 +116,28 @@ pub fn fp8<const M: usize, const K: usize>(w: &[u8], scales: &[f32], x: &[f32], 
     debug_assert!(w.len() >= M * K && scales.len() >= M.div_ceil(FP8_BLOCK) * (K / FP8_BLOCK) && x.len() >= K && out.len() >= M);
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        avx2::fp8::<M, K>(w.as_ptr(), scales.as_ptr(), x.as_ptr(), out.as_mut_ptr())
+        avx2::fp8_rows::<K>(w.as_ptr(), scales.as_ptr(), x.as_ptr(), out.as_mut_ptr(), 0, M)
     }
     #[cfg(not(target_arch = "x86_64"))]
     fp8_scalar::<M, K>(w, scales, x, out)
+}
+
+/// `fp8` with the rows split over `pool`, as `bf16_par`.
+#[inline(always)]
+pub fn fp8_par<const M: usize, const K: usize>(w: &[u8], scales: &[f32], x: &[f32], out: &mut [f32], pool: &dyn super::pool::Pool) {
+    debug_assert!(w.len() >= M * K && x.len() >= K && out.len() >= M);
+    let (wp, sp, xp, op) = (w.as_ptr() as usize, scales.as_ptr() as usize, x.as_ptr() as usize, out.as_mut_ptr() as usize);
+    pool.run(M.div_ceil(super::pool::ROWS), &move |i| {
+        let (m0, m1) = (i * super::pool::ROWS, ((i + 1) * super::pool::ROWS).min(M));
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            avx2::fp8_rows::<K>(wp as *const u8, sp as *const f32, xp as *const f32, op as *mut f32, m0, m1)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        unsafe {
+            fp8_scalar_rows::<K>(core::slice::from_raw_parts(wp as *const u8, M * K), core::slice::from_raw_parts(sp as *const f32, M.div_ceil(FP8_BLOCK) * (K / FP8_BLOCK)), core::slice::from_raw_parts(xp as *const f32, K), core::slice::from_raw_parts_mut(op as *mut f32, M), m0, m1)
+        }
+    });
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -115,8 +161,12 @@ pub mod avx2 {
 
     #[target_feature(enable = "avx2,fma")]
     pub unsafe fn bf16<const M: usize, const K: usize>(w: *const u16, x: *const f32, out: *mut f32) {
+        bf16_rows::<K>(w, x, out, 0, M)
+    }
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn bf16_rows<const K: usize>(w: *const u16, x: *const f32, out: *mut f32, m0: usize, m1: usize) {
         const { assert!(K % 32 == 0) };
-        for m in 0..M {
+        for m in m0..m1 {
             let row = w.add(m * K);
             let mut a0 = _mm256_setzero_ps();
             let mut a1 = _mm256_setzero_ps();
@@ -151,9 +201,13 @@ pub mod avx2 {
 
     #[target_feature(enable = "avx2,fma")]
     pub unsafe fn fp8<const M: usize, const K: usize>(w: *const u8, scales: *const f32, x: *const f32, out: *mut f32) {
+        fp8_rows::<K>(w, scales, x, out, 0, M)
+    }
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn fp8_rows<const K: usize>(w: *const u8, scales: *const f32, x: *const f32, out: *mut f32, m0: usize, m1: usize) {
         const { assert!(K % super::FP8_BLOCK == 0) };
         let kb = K / super::FP8_BLOCK;
-        for m in 0..M {
+        for m in m0..m1 {
             let row = w.add(m * K);
             let srow = scales.add((m / super::FP8_BLOCK) * kb);
             let mut lanes = _mm256_setzero_ps();
@@ -192,6 +246,25 @@ mod tests {
         for i in 0..M {
             assert!((a[i] - b[i]).abs() <= 1e-4 * a[i].abs().max(1.0), "{i}: {} vs {}", a[i], b[i]);
         }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn par_matches_serial_bitwise() {
+        const M: usize = 37 + 128;
+        const K: usize = 384;
+        let mut rng = crate::testing::Rng::new(0x9a11_e1e1_0000_0001);
+        let wb: Vec<u16> = (0..M * K).map(|_| (rng.unit().to_bits() >> 16) as u16).collect();
+        let w8: Vec<u8> = (0..M * K).map(|_| (rng.next() & 0x7e) as u8).collect();
+        let scales: Vec<f32> = (0..M.div_ceil(FP8_BLOCK) * (K / FP8_BLOCK)).map(|_| rng.unit() * 1e-3).collect();
+        let x: Vec<f32> = (0..K).map(|_| rng.unit()).collect();
+        let (mut a, mut b) = (std::vec![0f32; M], std::vec![0f32; M]);
+        bf16::<M, K>(&wb, &x, &mut a);
+        bf16_par::<M, K>(&wb, &x, &mut b, &crate::pool::Serial);
+        assert_eq!(a, b);
+        fp8::<M, K>(&w8, &scales, &x, &mut a);
+        fp8_par::<M, K>(&w8, &scales, &x, &mut b, &crate::pool::Serial);
+        assert_eq!(a, b);
     }
 
     #[test]

@@ -11,7 +11,7 @@
 use crate::engine::{Engine, Sampling};
 use crate::loader;
 use common::trace::{NoTrace, Trace, NONE};
-use glm_5_3_flash::construct::{CpuExperts, CpuModel};
+use glm_5_3_flash::construct::{physical_cores, CpuExperts, CpuModel, Threads};
 use glm_5_3_flash::layout::{self, POSITION, SNAPSHOT};
 use glm_5_3_flash::weights::Weights;
 use glm_5_3_flash::{EOS_TOKENS, FIRST_POS, H, NUM_HIDDEN_LAYERS, PREFIX_IDS, SAMPLING, SEED, TOKENS, TOP_K, VOCAB_SIZE};
@@ -39,7 +39,7 @@ impl Trace for DebugTrace {
 
 pub struct Glm {
     w: Weights<'static>,
-    model: CpuModel<CpuExperts<'static>>,
+    model: CpuModel<'static, CpuExperts<'static>>,
     prefix: &'static [f32],
     prefix_logits: Vec<f32>,
     /// The last step's logits, a row per token, and the position of its first token.
@@ -58,7 +58,11 @@ impl Glm {
         let prefix_b = loader::load(&bundle.join(layout::PREFIX_FILE), loader::Mem::Anon);
         let (p, prefix, q) = unsafe { prefix_b.align_to::<f32>() };
         assert!(p.is_empty() && q.is_empty() && prefix.len() == layout::PREFIX_LEN, "prefix file");
-        let mut model = CpuModel::new(CpuExperts::new(experts), max_ctx);
+        // the pool: a thread per physical core, every socket (the weights are interleaved over them)
+        let cores = physical_cores();
+        let pool: &'static Threads = Box::leak(Box::new(Threads::new(&cores)));
+        println!("threads  : {} pinned, one per physical core", cores.len());
+        let mut model = CpuModel::new(CpuExperts::new(experts, pool), pool, max_ctx);
         // the prefix from nothing: its logits, and the realization against the bundle's state
         let t1 = std::time::Instant::now();
         for (pos, &id) in PREFIX_IDS.iter().enumerate() {
@@ -77,7 +81,7 @@ impl Glm {
         let (ds, ms) = dev(&snap, psnap);
         println!("prefix   : {} tokens in {:.1}s; this realization vs the bundle's f32 state: rows {:.1e} of {:.1e}, memory {:.1e} of {:.1e}", FIRST_POS, t1.elapsed().as_secs_f32(), dr, mr, ds, ms);
         model.seed_prefix(&w, prefix);
-        println!("model    : glm-5.3-flash, ctx {max_ctx}, temperature {}, top-k {}, top-p {}, dense native, experts q4 in DRAM, every op on this CPU", SAMPLING.temperature, SAMPLING.top_k, SAMPLING.top_p);
+        println!("model    : glm-5.3-flash, ctx {max_ctx}, temperature {}, top-k {}, top-p {}, dense native, experts q4 in DRAM, every op on this CPU's cores", SAMPLING.temperature, SAMPLING.top_k, SAMPLING.top_p);
         Box::new(Glm {
             w,
             model,

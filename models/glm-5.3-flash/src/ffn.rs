@@ -10,6 +10,7 @@ use crate::hc::sigmoid;
 use crate::weights;
 use crate::*;
 use common::gemv;
+use common::pool::Pool;
 use common::swiglu::swiglu_clamped;
 use common::trace::Trace;
 
@@ -33,12 +34,12 @@ impl<R: Routed + ?Sized> Routed for Box<R> {
 }
 
 #[inline(always)]
-pub fn dense(l: usize, w: &weights::DenseFfn, xn: &[f32], s: &mut Scratch, tr: &mut impl Trace, out: &mut [f32]) {
+pub fn dense(l: usize, w: &weights::DenseFfn, xn: &[f32], s: &mut Scratch, pool: &dyn Pool, tr: &mut impl Trace, out: &mut [f32]) {
     const N: usize = INTERMEDIATE_SIZE;
-    gemv::fp8::<N, H>(w.gate.w, w.gate.s, xn, &mut s.gu[..N]);
-    gemv::fp8::<N, H>(w.up.w, w.up.s, xn, &mut s.gu[N..2 * N]);
+    gemv::fp8_par::<N, H>(w.gate.w, w.gate.s, xn, &mut s.gu[..N], pool);
+    gemv::fp8_par::<N, H>(w.up.w, w.up.s, xn, &mut s.gu[N..2 * N], pool);
     swiglu_clamped::<N>(s.gu, SWIGLU_LIMIT, s.h);
-    gemv::fp8::<H, N>(w.down.w, w.down.s, s.h, out);
+    gemv::fp8_par::<H, N>(w.down.w, w.down.s, s.h, out, pool);
     tr.edge(l, "mlp.out", out);
 }
 
@@ -48,8 +49,8 @@ pub fn dense(l: usize, w: &weights::DenseFfn, xn: &[f32], s: &mut Scratch, tr: &
 /// factor. `forced` (bring-up only) takes these picks instead, weights still
 /// computed: what separates a tie flip from everything else when diffing.
 #[inline(always)]
-pub fn route(l: usize, w: &weights::Moe, xn: &[f32], s: &mut Scratch, forced: Option<&[usize; TOP_K]>, tr: &mut impl Trace) -> ([usize; TOP_K], [f32; TOP_K]) {
-    gemv::bf16::<E, H>(w.router, xn, s.score);
+pub fn route(l: usize, w: &weights::Moe, xn: &[f32], s: &mut Scratch, pool: &dyn Pool, forced: Option<&[usize; TOP_K]>, tr: &mut impl Trace) -> ([usize; TOP_K], [f32; TOP_K]) {
+    gemv::bf16_par::<E, H>(w.router, xn, s.score, pool);
     for v in s.score.iter_mut() {
         *v = sigmoid(*v);
     }
@@ -84,8 +85,8 @@ pub fn route(l: usize, w: &weights::Moe, xn: &[f32], s: &mut Scratch, forced: Op
 }
 
 #[inline(always)]
-pub fn moe(l: usize, w: &weights::Moe, xn: &[f32], s: &mut Scratch, routed: &mut impl Routed, forced: Option<&[usize; TOP_K]>, tr: &mut impl Trace, out: &mut [f32]) {
-    let (idx, wt) = route(l, w, xn, s, forced, tr);
+pub fn moe(l: usize, w: &weights::Moe, xn: &[f32], s: &mut Scratch, pool: &dyn Pool, routed: &mut impl Routed, forced: Option<&[usize; TOP_K]>, tr: &mut impl Trace, out: &mut [f32]) {
+    let (idx, wt) = route(l, w, xn, s, pool, forced, tr);
     routed.run(l, &idx, xn, s.expert_out);
     for i in 0..H {
         out[i] = 0.0;
@@ -99,10 +100,10 @@ pub fn moe(l: usize, w: &weights::Moe, xn: &[f32], s: &mut Scratch, routed: &mut
     }
     tr.edge(l, "routed", out);
     const S: usize = N_SHARED_EXPERTS * D_FF;
-    gemv::fp8::<S, H>(w.shared_gate.w, w.shared_gate.s, xn, &mut s.gu[..S]);
-    gemv::fp8::<S, H>(w.shared_up.w, w.shared_up.s, xn, &mut s.gu[S..2 * S]);
+    gemv::fp8_par::<S, H>(w.shared_gate.w, w.shared_gate.s, xn, &mut s.gu[..S], pool);
+    gemv::fp8_par::<S, H>(w.shared_up.w, w.shared_up.s, xn, &mut s.gu[S..2 * S], pool);
     swiglu_clamped::<S>(s.gu, SWIGLU_LIMIT, &mut s.h[..S]);
-    gemv::fp8::<H, S>(w.shared_down.w, w.shared_down.s, &s.h[..S], s.shared);
+    gemv::fp8_par::<H, S>(w.shared_down.w, w.shared_down.s, &s.h[..S], s.shared, pool);
     tr.edge(l, "shared", s.shared);
     for i in 0..H {
         out[i] += s.shared[i];

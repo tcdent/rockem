@@ -8,6 +8,7 @@
 use crate::weights;
 use crate::*;
 use common::gemv;
+use common::pool::Pool;
 use common::math::{exp, sqrt};
 
 pub struct Scratch<'a> {
@@ -29,7 +30,7 @@ pub fn sigmoid(x: f32) -> f32 {
 
 /// `streams: [HC][H]` → the collapsed block input `x: [H]` and the mix.
 #[inline(always)]
-pub fn pre(w: &weights::Hc, streams: &[f32], s: &mut Scratch, x: &mut [f32]) -> Mix {
+pub fn pre(w: &weights::Hc, streams: &[f32], s: &mut Scratch, pool: &dyn Pool, x: &mut [f32]) -> Mix {
     let n = HC * H;
     let mut ss = 0f32;
     for &v in &streams[..n] {
@@ -39,7 +40,7 @@ pub fn pre(w: &weights::Hc, streams: &[f32], s: &mut Scratch, x: &mut [f32]) -> 
     for i in 0..n {
         s.flat[i] = streams[i] * r;
     }
-    gemv::bf16::<HC_COEFS, { HC * H }>(w.fn_, s.flat, s.coef);
+    gemv::bf16_par::<HC_COEFS, { HC * H }>(w.fn_, s.flat, s.coef, pool);
     let c = &*s.coef;
     let mut pre = [0f32; HC];
     let mut mix = Mix { post: [0.0; HC], comb: [[0.0; HC]; HC] };

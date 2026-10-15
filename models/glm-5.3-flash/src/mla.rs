@@ -18,6 +18,7 @@ use crate::weights;
 use crate::*;
 use common::gemv::{self, widen};
 use common::math::{exp, sqrt};
+use common::pool::Pool;
 use common::rmsnorm::rmsnorm;
 use common::softmax::softmax;
 use common::trace::Trace;
@@ -32,11 +33,11 @@ pub struct Scratch<'a> {
     pub iw: &'a mut [f32],     // INDEX_N_HEADS
     pub pscore: &'a mut [f32], // ≥ max_ctx / INDEX_KPOOL: a score per complete pool
     pub sel: &'a mut [usize],  // ≥ DENSE_BELOW: the positions attended, ascending
-    pub att: &'a mut [f32],    // ≥ DENSE_BELOW: a score per selected position
-    pub q_abs: &'a mut [f32],  // KV_LORA_RANK
-    pub o_lat: &'a mut [f32],  // KV_LORA_RANK
-    pub heads: &'a mut [f32],  // MLA_HEADS·V_HEAD_DIM
+    pub heads: &'a mut [f32],  // MLA_HEADS·V_HEAD_DIM: the heads' outputs
+    pub hs: &'a mut [f32],     // MLA_HEADS · HEAD_SCRATCH: per head, q_abs | o_lat | att
 }
+/// f32s of scratch a head's attention needs.
+pub const HEAD_SCRATCH: usize = 2 * KV_LORA_RANK + DENSE_BELOW;
 
 /// The complete pool `j`'s key from its positions' indexer keys and gates (`cache` rows):
 /// a per-channel softmax over the four gates plus the learned offset per slot.
@@ -124,12 +125,12 @@ fn select(pos: usize, iq: &[f32], iw: &[f32], pools: &[f32], pscore: &mut [f32],
 /// `xn` is the normed block input (`[H]`); the cache holds rows `0..pos` and
 /// gains row `pos`; `out` is the block output (`[H]`).
 #[inline(always)]
-pub fn step(l: usize, w: &weights::Mla, xn: &[f32], cache: &mut [f32], pools: &mut [f32], pos: usize, s: &mut Scratch, tr: &mut impl Trace, out: &mut [f32]) {
-    gemv::fp8::<Q_LORA_RANK, H>(w.q_a.w, w.q_a.s, xn, s.qa);
+pub fn step(l: usize, w: &weights::Mla, xn: &[f32], cache: &mut [f32], pools: &mut [f32], pos: usize, s: &mut Scratch, pool: &dyn Pool, tr: &mut impl Trace, out: &mut [f32]) {
+    gemv::fp8_par::<Q_LORA_RANK, H>(w.q_a.w, w.q_a.s, xn, s.qa, pool);
     rmsnorm::<Q_LORA_RANK>(s.qa, &w.q_a_ln, RMS_NORM_EPS, s.qr);
-    gemv::fp8::<{ MLA_HEADS * Q_HEAD }, Q_LORA_RANK>(w.q_b.w, w.q_b.s, s.qr, s.q);
+    gemv::fp8_par::<{ MLA_HEADS * Q_HEAD }, Q_LORA_RANK>(w.q_b.w, w.q_b.s, s.qr, s.q, pool);
     // this position's row: the normed latent, the indexer's key (LayerNorm, eps 1e-6) and gate
-    gemv::fp8::<KV_LORA_RANK, H>(w.kv_a.w, w.kv_a.s, xn, s.kva);
+    gemv::fp8_par::<KV_LORA_RANK, H>(w.kv_a.w, w.kv_a.s, xn, s.kva, pool);
     let row = &mut cache[pos * MLA_ROW..(pos + 1) * MLA_ROW];
     let (latent, rest) = row.split_at_mut(KV_LORA_RANK);
     let (ikey, igate) = rest.split_at_mut(INDEX_HEAD_DIM);
@@ -154,7 +155,7 @@ pub fn step(l: usize, w: &weights::Mla, xn: &[f32], cache: &mut [f32], pools: &m
         let (c, p) = (&*cache, &mut pools[j * INDEX_HEAD_DIM..(j + 1) * INDEX_HEAD_DIM]);
         pool_key(w, c, j, p);
     }
-    gemv::bf16::<{ INDEX_N_HEADS * INDEX_HEAD_DIM }, Q_LORA_RANK>(w.ix_wq_b, s.qr, s.iq);
+    gemv::bf16_par::<{ INDEX_N_HEADS * INDEX_HEAD_DIM }, Q_LORA_RANK>(w.ix_wq_b, s.qr, s.iq, pool);
     gemv::bf16::<INDEX_N_HEADS, H>(w.ix_weights, xn, s.iw);
     let wscale = 1.0 / sqrt(INDEX_N_HEADS as f32);
     for v in s.iw.iter_mut() {
@@ -163,43 +164,58 @@ pub fn step(l: usize, w: &weights::Mla, xn: &[f32], cache: &mut [f32], pools: &m
     let n = select(pos, s.iq, s.iw, pools, s.pscore, s.sel);
     tr.edge(l, "self_attn.indexer.count", &[n as f32]);
 
-    // absorbed MLA over the selected positions
-    let scale = 1.0 / sqrt(Q_HEAD as f32);
-    for h in 0..MLA_HEADS {
-        let qh = &s.q[h * Q_HEAD..(h + 1) * Q_HEAD];
-        let w_uk = &w.kv_b[h * KVB_HEAD * KV_LORA_RANK..(h * KVB_HEAD + QK_NOPE_HEAD_DIM) * KV_LORA_RANK];
-        let w_uv = &w.kv_b[(h * KVB_HEAD + QK_NOPE_HEAD_DIM) * KV_LORA_RANK..(h + 1) * KVB_HEAD * KV_LORA_RANK];
-        for j in 0..KV_LORA_RANK {
-            s.q_abs[j] = 0.0;
-        }
-        for i in 0..QK_NOPE_HEAD_DIM {
-            let wi = &w_uk[i * KV_LORA_RANK..(i + 1) * KV_LORA_RANK];
-            let qi = qh[i];
-            for j in 0..KV_LORA_RANK {
-                s.q_abs[j] += widen(wi[j]) * qi;
-            }
-        }
-        for (i, &t) in s.sel[..n].iter().enumerate() {
-            let lat = &cache[t * MLA_ROW..t * MLA_ROW + KV_LORA_RANK];
-            let mut acc = 0f32;
-            for j in 0..KV_LORA_RANK {
-                acc += s.q_abs[j] * lat[j];
-            }
-            s.att[i] = acc * scale;
-        }
-        softmax(&mut s.att[..n]);
-        for j in 0..KV_LORA_RANK {
-            s.o_lat[j] = 0.0;
-        }
-        for (i, &t) in s.sel[..n].iter().enumerate() {
-            let lat = &cache[t * MLA_ROW..t * MLA_ROW + KV_LORA_RANK];
-            let p = s.att[i];
-            for j in 0..KV_LORA_RANK {
-                s.o_lat[j] += p * lat[j];
-            }
-        }
-        gemv::bf16::<V_HEAD_DIM, KV_LORA_RANK>(w_uv, s.o_lat, &mut s.heads[h * V_HEAD_DIM..(h + 1) * V_HEAD_DIM]);
-    }
+    // absorbed MLA over the selected positions, a head per item on its own scratch and output
+    let (q, sel, cache_r) = (&*s.q, &s.sel[..n], &*cache);
+    let (heads_p, hs_p) = (s.heads.as_mut_ptr() as usize, s.hs.as_mut_ptr() as usize);
+    pool.run(MLA_HEADS, &move |h| {
+        let oh = unsafe { core::slice::from_raw_parts_mut((heads_p as *mut f32).add(h * V_HEAD_DIM), V_HEAD_DIM) };
+        let hs = unsafe { core::slice::from_raw_parts_mut((hs_p as *mut f32).add(h * HEAD_SCRATCH), HEAD_SCRATCH) };
+        let (q_abs, rest) = hs.split_at_mut(KV_LORA_RANK);
+        let (o_lat, att) = rest.split_at_mut(KV_LORA_RANK);
+        head(w, h, q, sel, cache_r, q_abs, o_lat, att, oh);
+    });
     tr.edge(l, "self_attn.o_proj.in", s.heads);
-    gemv::fp8::<H, { MLA_HEADS * V_HEAD_DIM }>(w.o.w, w.o.s, s.heads, out);
+    gemv::fp8_par::<H, { MLA_HEADS * V_HEAD_DIM }>(w.o.w, w.o.s, s.heads, out, pool);
+}
+
+/// One head over the selected positions: `q_abs = W_ukᵀ q`, scores against the
+/// latents, softmax, the latent mix, back through `W_uv`.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn head(w: &weights::Mla, h: usize, q: &[f32], sel: &[usize], cache: &[f32], q_abs: &mut [f32], o_lat: &mut [f32], att: &mut [f32], oh: &mut [f32]) {
+    let scale = 1.0 / sqrt(Q_HEAD as f32);
+    let qh = &q[h * Q_HEAD..(h + 1) * Q_HEAD];
+    let w_uk = &w.kv_b[h * KVB_HEAD * KV_LORA_RANK..(h * KVB_HEAD + QK_NOPE_HEAD_DIM) * KV_LORA_RANK];
+    let w_uv = &w.kv_b[(h * KVB_HEAD + QK_NOPE_HEAD_DIM) * KV_LORA_RANK..(h + 1) * KVB_HEAD * KV_LORA_RANK];
+    for j in 0..KV_LORA_RANK {
+        q_abs[j] = 0.0;
+    }
+    for i in 0..QK_NOPE_HEAD_DIM {
+        let wi = &w_uk[i * KV_LORA_RANK..(i + 1) * KV_LORA_RANK];
+        let qi = qh[i];
+        for j in 0..KV_LORA_RANK {
+            q_abs[j] += widen(wi[j]) * qi;
+        }
+    }
+    let n = sel.len();
+    for (i, &t) in sel.iter().enumerate() {
+        let lat = &cache[t * MLA_ROW..t * MLA_ROW + KV_LORA_RANK];
+        let mut acc = 0f32;
+        for j in 0..KV_LORA_RANK {
+            acc += q_abs[j] * lat[j];
+        }
+        att[i] = acc * scale;
+    }
+    softmax(&mut att[..n]);
+    for j in 0..KV_LORA_RANK {
+        o_lat[j] = 0.0;
+    }
+    for (i, &t) in sel.iter().enumerate() {
+        let lat = &cache[t * MLA_ROW..t * MLA_ROW + KV_LORA_RANK];
+        let p = att[i];
+        for j in 0..KV_LORA_RANK {
+            o_lat[j] += p * lat[j];
+        }
+    }
+    gemv::bf16::<V_HEAD_DIM, KV_LORA_RANK>(w_uv, o_lat, oh);
 }

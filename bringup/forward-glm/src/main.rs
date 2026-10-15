@@ -189,13 +189,14 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
     let w = glm_5_3_flash::weights::Weights::from_dense(&dense[..]);
     let prefix_b = std::fs::read(bundle.join(layout::PREFIX_FILE)).unwrap();
     let prefix: Vec<f32> = prefix_b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+    let pool = glm_5_3_flash::construct::Threads::new(&glm_5_3_flash::construct::physical_cores());
     let routed: Box<dyn glm_5_3_flash::ffn::Routed> = match experts_mode {
-        "a8" => Box::new(CpuExperts::new(&experts[..])),
+        "a8" => Box::new(CpuExperts::new(&experts[..], &pool)),
         "q4f32" => Box::new(F32Experts { get: Box::new(move |l, e| dequant_record(&experts[glm_5_3_flash::layout::record(l, e)])) }),
         "f32" => Box::new(F32Experts { get: Box::new(move |l, e| { let x = load_expert(l, e, &|n| ck.f32s(n)); (x.gate_up, x.down) }) }),
         m => panic!("--experts {m}: a8, q4f32 or f32"),
     };
-    let mut model = CpuModel::new(routed, n.max(FIRST_POS + 1));
+    let mut model = CpuModel::new(routed, &pool, n.max(FIRST_POS + 1));
     model.seed_prefix(&w, &prefix);
     for (t, &id) in ids.iter().enumerate().take(FIRST_POS) {
         assert_eq!(id as u32, PREFIX_IDS[t], "the passage does not start with the model's prefix");

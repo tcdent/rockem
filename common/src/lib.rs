@@ -49,6 +49,7 @@ pub mod gemv;
 #[cfg(any(test, feature = "std"))]
 pub mod linalg;
 pub mod math;
+pub mod pool;
 #[cfg(any(test, feature = "std"))]
 pub mod testing;
 pub mod q4;
