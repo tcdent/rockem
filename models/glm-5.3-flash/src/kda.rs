@@ -276,12 +276,14 @@ pub mod gfx11 {
     }
 
     /// One head of the layer through the step's `n` tokens, in order. Inputs
-    /// per token i: `mixed[i]` (`[3][KDA_QKV]`: the q, k, v projections),
-    /// `f[i]` and `gate[i]` (`[KDA_QKV]`), `beta[i]` (`[KDA_HEADS]`); the
+    /// per token i, the part's own: `mixed[i]` (`[3][PART_QKV]`: the q, k, v
+    /// projections of the part's heads), `f[i]` and `gate[i]` (`[PART_QKV]`);
+    /// the layer's `beta[i]` (`[KDA_HEADS]`); the
     /// layer's `taps` (`[3][KDA_QKV][CONV_TAPS]` bf16), `dt_bias`, `a_log`,
     /// `o_norm`; its state, `window` (`[CONV_TAPS-1][CONV_DIM]`) and `mem`
-    /// (`[KDA_HEADS][KDA_DIM][KDA_DIM]`), advanced by `n` positions; output
-    /// `normed[i]` (`[KDA_QKV]`), the gated-normed readouts. Thread `t` holds
+    /// (`[KDA_HEADS][KDA_DIM][KDA_DIM]`, the layer's, by head), advanced by `n`
+    /// positions; output `normed[i]` (`[PART_QKV]`, the part's), the
+    /// gated-normed readouts. Thread `t` holds
     /// column `t % KDA_DIM` of the memory over rows `(t / KDA_DIM) · 64 ..+64`,
     /// so a sweep's reduction over rows is 64 products in registers and one
     /// exchange of two partials per column. The sum order differs from the
@@ -290,7 +292,8 @@ pub mod gfx11 {
     #[no_mangle]
     pub extern "gpu-kernel" fn kda_step(mixed: *const f32, taps: *const u16, window: *mut f32, f: *const f32, dt_bias: *const f32, a_log: *const f32, beta: *const f32, gate: *const f32, mem: *mut f32, o_norm: *const f32, normed: *mut f32, head0: u32, n: u32) {
         unsafe {
-            let h = head0 as usize + workgroup_id_x() as usize;
+            let hl = workgroup_id_x() as usize; // the head within the part: its buffers' index
+            let h = head0 as usize + hl; // the head within the layer: the state's and the small tensors' index
             let tid = workitem_id_x();
             let t = tid as usize;
             let lane = tid % 32;
@@ -318,7 +321,7 @@ pub mod gfx11 {
                     let g = part * KDA_QKV + h * D + c % D;
                     let tp = taps.add((part * KDA_QKV + h * D + c % D) * CONV_TAPS);
                     let (w0, w1, w2) = (*window.add(g), *window.add(CONV_DIM + g), *window.add(2 * CONV_DIM + g));
-                    let x = *mixed.add(i * CONV_DIM + g);
+                    let x = *mixed.add(i * 3 * PART_QKV + part * PART_QKV + hl * D + c % D);
                     let acc = widen(*tp) * w0 + widen(*tp.add(1)) * w1 + widen(*tp.add(2)) * w2 + widen(*tp.add(3)) * x;
                     *conv.add(c) = silu(acc);
                     *window.add(g) = w1;
@@ -328,7 +331,7 @@ pub mod gfx11 {
                 }
                 // the forget factors: log-decay in (LOWER, 0) per key channel
                 if t < D {
-                    *e.add(t) = exp(LINEAR_GATE_LOWER_BOUND * sigmoid(decay * (*f.add(i * KDA_QKV + h * D + t) + *dt_bias.add(h * D + t))));
+                    *e.add(t) = exp(LINEAR_GATE_LOWER_BOUND * sigmoid(decay * (*f.add(i * PART_QKV + hl * D + t) + *dt_bias.add(h * D + t))));
                 }
                 workgroup_sync();
                 // l2-normed q (wave 0) and k (wave 1): four channels a lane
@@ -384,7 +387,7 @@ pub mod gfx11 {
                     workgroup_sync_waves4(red);
                     let total = *red.add(0) + *red.add(1) + *red.add(2) + *red.add(3);
                     let rn = rsqrt(total / D as f32 + RMS_NORM_EPS);
-                    *normed.add(i * KDA_QKV + h * D + vv) = *o_norm.add(vv) * (ov * rn) * sigmoid(*gate.add(i * KDA_QKV + h * D + vv));
+                    *normed.add(i * PART_QKV + hl * D + vv) = *o_norm.add(vv) * (ov * rn) * sigmoid(*gate.add(i * PART_QKV + hl * D + vv));
                 } else {
                     workgroup_sync_waves4(red);
                 }

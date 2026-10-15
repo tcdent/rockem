@@ -421,6 +421,23 @@ pub fn run(elf: Option<&[u8]>) {
             k.sync();
         }) * 1e6 - 600.0;
         println!("card {c}   : a sync with nothing pending {idle_sync:.0} µs; the shared expert's pair launched, 600 µs of other work, then its sync: {after_gap:.0} µs past the gap");
+        // the card's wake: a small launch and its sync after the card sat idle for a gap
+        let wake: Vec<String> = [0u64, 50, 100, 200, 400, 800, 1600, 3200]
+            .iter()
+            .map(|&gap| {
+                let t = best(iters, || {
+                    let t = std::time::Instant::now();
+                    while t.elapsed().as_micros() < gap as u128 {
+                        std::hint::spin_loop();
+                    }
+                    rows(&rows_h, x.va, Some(ln.va), w.va, proj.va, 8, H);
+                    k.sync();
+                }) * 1e6
+                    - gap as f64;
+                format!("{gap} µs idle → {t:.0}")
+            })
+            .collect();
+        println!("card {c}   : a small launch + sync after the card idled: {}", wake.join(", "));
         println!("card {c}   : FP8 rows — the shared expert's gate|up ({} MB) at {shared_gu:.0} GB/s, its down at {shared_down:.0}; a dense layer's gate|up ({} MB) at {dense_gu:.0}, its down at {dense_down:.0} (one launch + sync each)", SHARED_GU_ROWS * H / 1_000_000, DENSE_GU_ROWS * H / 1_000_000);
     }
 }
