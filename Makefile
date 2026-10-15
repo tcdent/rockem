@@ -27,7 +27,7 @@ initramfs: node   ## initramfs.cpio.zst for $(PROFILE)
 
 release: kernel initramfs  ## kernel + initramfs for $(PROFILE)
 
-publish:          ## push the staged $(PROFILE) release to registry.a10k.co/rockem/os as an OCI artifact (os/release/publish.sh)
+publish:          ## push the staged $(PROFILE) release to registry.a10k.co/rockem/os:latest as an OCI artifact (os/release/publish.sh)
 	os/release/publish.sh $(PROFILE)
 
 qemu:             ## boot the staged $(PROFILE) release on a serial console (ctrl-a x to quit); BUNDLE=bundles/<name> shares a bundle in

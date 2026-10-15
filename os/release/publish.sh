@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # publish.sh PROFILE [TAG] — push the staged release to the registry as one OCI artifact:
 #   bzImage, initramfs.cpio.zst, config (the kernel's), cmdline (os/release/PROFILE.cmdline).
-# Tags: PROFILE (moves) and TAG (default PROFILE-<date>-<commit>). Pull by the printed digest.
+# Tags: latest (moves; what the boot chain follows) and TAG (default PROFILE-<date>-<commit>, the history).
 set -euo pipefail
 PROFILE=${1:?profile}
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -20,8 +20,8 @@ pack() {
 }
 ANN=(--annotation "co.a10k.rockem.profile=$PROFILE" --annotation "co.a10k.rockem.commit=$COMMIT")
 pack "$REPO:$TAG";     podman artifact push -q "$REPO:$TAG"
-pack "$REPO:$PROFILE"; podman artifact push -q "$REPO:$PROFILE"
-echo "pushed   : $REPO:$TAG and :$PROFILE"
+pack "$REPO:latest";   podman artifact push -q "$REPO:latest"
+echo "pushed   : $REPO:$TAG and :latest"
 # what landed, read back from the registry: the manifest digest to pin, and each file's blob
 M=$(curl -sf -H 'Accept: application/vnd.oci.image.manifest.v1+json' "https://${REPO%%/*}/v2/${REPO#*/}/manifests/$TAG")
 echo "digest   : $REPO@sha256:$(printf %s "$M" | sha256sum | cut -d' ' -f1)"
