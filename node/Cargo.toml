@@ -2,8 +2,9 @@
 name = "node"
 version = "0.0.0"
 edition = "2021"
-description = "rockem node binary — PID 1 after /init: report the platform, load the bundle into hugetlbfs, construct the model, serve token ids on the console. Static musl; depends on the model crate and nothing else."
+description = "rockem node binary — PID 1 after /init: report the platform, load the bundle into hugetlbfs, construct the model, serve token ids on the console. Static musl; depends on the model crates and nothing else."
 
 [dependencies]
 common = { path = "../common" }
 deepseek_v2_lite = { path = "../models/deepseek-v2-lite", features = ["std"] }
+glm_5_3_flash = { path = "../models/glm-5.3-flash", features = ["std"] }

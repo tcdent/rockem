@@ -21,6 +21,7 @@
 //!   rockem.debug=<dir>         dev: write every position's logits as <dir>/pos<N>.f32 and print the top-2 margin
 //!   rockem.shell=1 / rockem.exit=1   dev conveniences (see os/qemu.sh)
 mod engine;
+mod glm;
 mod kfd;
 mod loader;
 mod platform;
@@ -511,6 +512,7 @@ fn main() {
     let (gpu, experts_host) = (config("rockem.gpu").is_some(), config("rockem.experts").as_deref() == Some("host"));
     let e: Box<dyn Engine> = match name.as_str() {
         "deepseek-v2-lite" => v2lite::V2Lite::open(bundle, mem, max_ctx, gpu, experts_host),
+        "glm-5.3-flash" => glm::Glm::open(bundle, mem, max_ctx),
         other => halt(&format!("the manifest names model {other:?}, which this node does not carry")),
     };
     assert!(max_ctx > e.first_pos(), "rockem.ctx must leave room after the prefix");
