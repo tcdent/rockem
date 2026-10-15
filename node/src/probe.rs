@@ -182,7 +182,10 @@ pub fn run(elf: Option<&[u8]>) {
         let vram = k.vram_visible(words * 4);
         let up = gbs(best(iters, || k.upload(&vram, 0, &host_src)));
         let mut back = vec![0u8; words * 4];
-        let down = gbs(best(iters, || kfd::read(&vram, 0, &mut back[..])));
+        let down = gbs(best(iters, || {
+            kfd::read(&vram, 0, &mut back[..]);
+            std::hint::black_box(&back);
+        }));
         let mut a = kfd::Args::new();
         a.ptr(vram.va).ptr(out.va);
         let vr = gbs(best(iters, || {
