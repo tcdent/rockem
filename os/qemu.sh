@@ -10,7 +10,8 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 S=$HERE/release/staging/$PROFILE
 CPU="-cpu max"; [ -w /dev/kvm ] && CPU="-enable-kvm -cpu host"
 SMP=${SMP:-4}; MEM=${MEM:-}
-EXTRA=(); APPEND=""
+# the LAN: QEMU user-mode net hands out an address over DHCP (rockem.net=dhcp); the dev telnet is host port 2323
+EXTRA=(-nic user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:2323-:23); APPEND=""
 if [ -n "${BUNDLE:-}" ]; then
   B=$(cd "$HERE/.." && cd "$BUNDLE" && pwd)
   EXTRA+=(-virtfs "local,path=$B,mount_tag=bundle,security_model=none,readonly=on")

@@ -2,7 +2,7 @@
 PROFILE ?= dev
 RUN = os/run.sh
 
-.PHONY: image configure kernel kernels node initramfs release qemu kvm clean gate-dump lasenora-vm
+.PHONY: image configure kernel kernels node initramfs release publish qemu kvm clean gate-dump lasenora-vm
 
 image:            ## build the pinned builder image
 	os/builder/build-image.sh
@@ -26,6 +26,9 @@ initramfs: node   ## initramfs.cpio.zst for $(PROFILE)
 	$(RUN) os/initramfs/build.sh $(PROFILE)
 
 release: kernel initramfs  ## kernel + initramfs for $(PROFILE)
+
+publish:          ## push the staged $(PROFILE) release to registry.a10k.co/rockem/os as an OCI artifact (os/release/publish.sh)
+	os/release/publish.sh $(PROFILE)
 
 qemu:             ## boot the staged $(PROFILE) release on a serial console (ctrl-a x to quit); BUNDLE=bundles/<name> shares a bundle in
 	BUNDLE=$(BUNDLE) MEM=$(MEM) SMP=$(SMP) $(RUN) os/qemu.sh $(PROFILE) $(ARGS)

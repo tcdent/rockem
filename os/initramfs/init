@@ -1,11 +1,29 @@
 #!/bin/sh
-# rockem /init — mount what the node binary needs, then become it.
+# rockem /init — mount what the node binary needs, bring up the LAN, mount the weights, then become the node.
+#   rockem.net=dhcp          DHCP on every ethernet link (busybox udhcpc, /etc/udhcpc.sh)
+#   rockem.nfs=<ip>:/<path>  the weights share, read-only at /bundle; rockem.bundle=/bundle/<name> picks one
+#   rockem.telnet=1          dev: a root shell on the LAN, port 23
 mount -t devtmpfs devtmpfs /dev 2>/dev/null
 mount -t proc     proc     /proc
 mount -t sysfs    sysfs    /sys
-mkdir -p /dev/hugepages /dev/shm /tmp
+mkdir -p /dev/hugepages /dev/shm /dev/pts /tmp /bundle
+mount -t devpts devpts /dev/pts
 mount -t hugetlbfs -o pagesize=1G hugetlbfs /dev/hugepages 2>/dev/null || mount -t hugetlbfs hugetlbfs /dev/hugepages 2>/dev/null
 mount -t tmpfs tmpfs /tmp
-# dev profile: a bundle shared in by QEMU over virtio-9p (see os/qemu.sh); production pulls over the network
-for t in $(cat /proc/cmdline); do case $t in rockem.bundle9p=*) mkdir -p /bundle; mount -t 9p -o trans=virtio,version=9p2000.L,msize=1048576 "${t#rockem.bundle9p=}" /bundle;; esac; done
+ip link set lo up
+arg() { for t in $(cat /proc/cmdline); do case $t in "$1"=*) echo "${t#"$1"=}";; esac; done; }
+
+if [ "$(arg rockem.net)" = dhcp ]; then
+  for d in /sys/class/net/*; do
+    n=${d##*/}; [ "$n" = lo ] && continue; [ -e "$d/device" ] || continue
+    ip link set "$n" up
+    udhcpc -i "$n" -s /etc/udhcpc.sh -n -q -t 10 -T 2 >/dev/null 2>&1 &
+  done
+  wait
+  ip -4 -o addr show scope global | sed 's/^/net      : /'
+fi
+# dev rung: a bundle shared in by QEMU over virtio-9p (see os/qemu.sh)
+p=$(arg rockem.bundle9p); [ -n "$p" ] && mount -t 9p -o trans=virtio,version=9p2000.L,msize=1048576 "$p" /bundle
+p=$(arg rockem.nfs);      [ -n "$p" ] && { mount -t nfs4 -o ro,nolock "$p" /bundle && echo "nfs      : $p at /bundle" || echo "nfs      : mount of $p failed"; }
+[ "$(arg rockem.telnet)" = 1 ] && telnetd -l /bin/sh && echo "telnet   : root shell on port 23"
 exec /node

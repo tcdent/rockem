@@ -11,7 +11,7 @@ BB=${BUSYBOX:-/opt/busybox/busybox}
 [ -x "$NODE" ] || { echo "build the node binary first: cargo build --release --target x86_64-unknown-linux-musl -p node"; exit 1; }
 file "$BB" | grep -q 'statically linked' || { echo "$BB is not static"; exit 1; }
 rm -rf "$STAGE"; mkdir -p "$STAGE"/{bin,dev,proc,sys,tmp,etc} "$OUT"
-cp "$HERE/init" "$STAGE/init"
+cp "$HERE/init" "$STAGE/init"; cp "$HERE/udhcpc.sh" "$STAGE/etc/udhcpc.sh"
 cp "$NODE" "$STAGE/node"
 cp "$BB" "$STAGE/bin/busybox"
 for a in $("$BB" --list); do ln -s busybox "$STAGE/bin/$a"; done
