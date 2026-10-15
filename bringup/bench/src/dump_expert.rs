@@ -29,14 +29,14 @@ fn write<T: Copy>(path: &Path, v: &[T]) {
 /// The scalar expert on one record; returns (gate_up, h, h quantized, down).
 fn scalar(w: &Weights, xa: &QAct) -> (Vec<f32>, Vec<f32>, Vec<i8>, Vec<f32>, Vec<i32>, Vec<f32>) {
     let mut gu = vec![0f32; 2 * D_FF];
-    gemv_scalar(H, 2 * D_FF, w.gate_up_w, w.gate_up_s, xa, &mut gu);
+    gemv_scalar(H, 2 * D_FF, w.gate_up_w, w.gate_up_s, &xa.act(), &mut gu);
     let mut h = vec![0f32; D_FF];
     swiglu::<D_FF>(&gu, &mut h);
     let (mut hq, mut hs, mut hg) = (vec![0i8; D_FF], vec![0f32; D_FF / GROUP], vec![0i32; D_FF / GROUP]);
     let mut ha = QAct { q: &mut hq, scale: &mut hs, gsum: &mut hg };
     ha.quantize(&h);
     let mut down = vec![0f32; H];
-    gemv_scalar(D_FF, H, w.down_w, w.down_s, &ha, &mut down);
+    gemv_scalar(D_FF, H, w.down_w, w.down_s, &ha.act(), &mut down);
     // (`expert::forward_scalar` opened up so its intermediates can be written out)
     (gu, h, hq, hs, hg, down)
 }

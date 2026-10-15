@@ -150,25 +150,73 @@ pub fn physical_cores() -> Vec<usize> {
 }
 
 /// The routed experts from the bundle's expert stream in this process's memory,
-/// one expert per pool item, each on its own scratch.
+/// each expert's rows split over the pool: first the gate/up rows in chunks of
+/// `CHUNK` hidden channels — a chunk's clamped SwiGLU and its INT8 groups are
+/// its own — then the down rows in chunks of `DOWN_CHUNK` over every expert's
+/// quantized hidden state. Every row's arithmetic is `expert::forward`'s
+/// exactly (the same tiles, groups and flush); only the cores differ.
 pub struct CpuExperts<'a> {
     stream: &'a [u8],
     pool: &'a dyn Pool,
-    scratch: Vec<std::sync::Mutex<expert::ScratchBuf>>,
+    xq: Vec<i8>,
+    xs: Vec<f32>,
+    xg: Vec<i32>,
+    hq: Vec<i8>,  // [TOP_K][D_FF]
+    hs: Vec<f32>, // [TOP_K][D_FF / GROUP]
+    hg: Vec<i32>,
 }
+/// Hidden channels an item takes: two INT8 groups, eight items an expert.
+const CHUNK: usize = 256;
+/// Output rows an item takes for the down projection: eight items an expert.
+const DOWN_CHUNK: usize = 512;
+const _: () = assert!(D_FF % CHUNK == 0 && CHUNK % common::q4::GROUP == 0 && CHUNK % common::q4::TILE == 0 && H % DOWN_CHUNK == 0 && DOWN_CHUNK % common::q4::TILE == 0);
+
 impl<'a> CpuExperts<'a> {
     pub fn new(stream: &'a [u8], pool: &'a dyn Pool) -> Self {
+        use common::q4::GROUP;
         assert_eq!(stream.len(), layout::STREAM);
-        CpuExperts { stream, pool, scratch: (0..TOP_K).map(|_| std::sync::Mutex::new(expert::ScratchBuf::new())).collect() }
+        CpuExperts { stream, pool, xq: vec![0; H], xs: vec![0.0; H / GROUP], xg: vec![0; H / GROUP], hq: vec![0; TOP_K * D_FF], hs: vec![0.0; TOP_K * D_FF / GROUP], hg: vec![0; TOP_K * D_FF / GROUP] }
     }
 }
 impl Routed for CpuExperts<'_> {
     fn run(&mut self, l: usize, idx: &[usize; TOP_K], x: &[f32], out: &mut [f32]) {
-        let (stream, scratch, out_p) = (self.stream, &self.scratch, out.as_mut_ptr() as usize);
-        self.pool.run(TOP_K, &move |k| {
+        use common::q4::{self, Act, QAct, GROUP, TILE};
+        use common::swiglu::swiglu_clamped;
+        QAct { q: &mut self.xq, scale: &mut self.xs, gsum: &mut self.xg }.quantize(&x[..H]);
+        let xa = Act { q: &self.xq, scale: &self.xs, gsum: &self.xg };
+        let stream = self.stream;
+        let (hq_p, hs_p, hg_p, out_p) = (self.hq.as_mut_ptr() as usize, self.hs.as_mut_ptr() as usize, self.hg.as_mut_ptr() as usize, out.as_mut_ptr() as usize);
+        // the gate/up rows: item (k, c) owns expert k's hidden channels c·CHUNK.. and their groups
+        self.pool.run(TOP_K * (D_FF / CHUNK), &move |i| {
+            let (k, c) = (i / (D_FF / CHUNK), i % (D_FF / CHUNK));
             let w = expert::Weights::from_record(&stream[layout::record(l, idx[k])]);
-            let o = unsafe { std::slice::from_raw_parts_mut((out_p as *mut f32).add(k * H), H) };
-            expert::forward(&w, x, &mut scratch[k].lock().unwrap().scratch(), o);
+            let rows = |r0: usize| (&w.gate_up_w[r0 / TILE * 2 * H..(r0 + CHUNK) / TILE * 2 * H], &w.gate_up_s[r0 / TILE * (H / GROUP) * TILE..(r0 + CHUNK) / TILE * (H / GROUP) * TILE]);
+            let mut gu = [0f32; 2 * CHUNK];
+            let (gw, gs) = rows(c * CHUNK);
+            q4::gemv::<H>(CHUNK, gw, gs, &xa, &mut gu[..CHUNK]);
+            let (uw, us) = rows(D_FF + c * CHUNK);
+            q4::gemv::<H>(CHUNK, uw, us, &xa, &mut gu[CHUNK..]);
+            let mut h = [0f32; CHUNK];
+            swiglu_clamped::<CHUNK>(&gu, SWIGLU_LIMIT, &mut h);
+            let (q, sc, g) = unsafe {
+                (
+                    std::slice::from_raw_parts_mut((hq_p as *mut i8).add(k * D_FF + c * CHUNK), CHUNK),
+                    std::slice::from_raw_parts_mut((hs_p as *mut f32).add(k * D_FF / GROUP + c * CHUNK / GROUP), CHUNK / GROUP),
+                    std::slice::from_raw_parts_mut((hg_p as *mut i32).add(k * D_FF / GROUP + c * CHUNK / GROUP), CHUNK / GROUP),
+                )
+            };
+            QAct { q, scale: sc, gsum: g }.quantize(&h);
+        });
+        // the down rows: item (k, c) owns rows c·DOWN_CHUNK.. of expert k's output over its whole hidden state
+        let (hq, hs, hg) = (&self.hq, &self.hs, &self.hg);
+        self.pool.run(TOP_K * (H / DOWN_CHUNK), &move |i| {
+            let (k, c) = (i / (H / DOWN_CHUNK), i % (H / DOWN_CHUNK));
+            let w = expert::Weights::from_record(&stream[layout::record(l, idx[k])]);
+            let ha = Act { q: &hq[k * D_FF..(k + 1) * D_FF], scale: &hs[k * D_FF / GROUP..(k + 1) * D_FF / GROUP], gsum: &hg[k * D_FF / GROUP..(k + 1) * D_FF / GROUP] };
+            let r0 = c * DOWN_CHUNK;
+            let (dw, ds) = (&w.down_w[r0 / TILE * 2 * D_FF..(r0 + DOWN_CHUNK) / TILE * 2 * D_FF], &w.down_s[r0 / TILE * (D_FF / GROUP) * TILE..(r0 + DOWN_CHUNK) / TILE * (D_FF / GROUP) * TILE]);
+            let o = unsafe { std::slice::from_raw_parts_mut((out_p as *mut f32).add(k * H + r0), DOWN_CHUNK) };
+            q4::gemv::<D_FF>(DOWN_CHUNK, dw, ds, &ha, o);
         });
     }
 }

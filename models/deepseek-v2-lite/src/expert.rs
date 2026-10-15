@@ -91,10 +91,10 @@ impl Default for ScratchBuf {
 #[inline(always)]
 pub fn forward(w: &Weights, x: &[f32], s: &mut Scratch, out: &mut [f32]) {
     s.xa.quantize(&x[..H]);
-    q4::gemv::<H>(2 * D_FF, w.gate_up_w, w.gate_up_s, &s.xa, s.gu);
+    q4::gemv::<H>(2 * D_FF, w.gate_up_w, w.gate_up_s, &s.xa.act(), s.gu);
     swiglu::<D_FF>(s.gu, s.h);
     s.ha.quantize(s.h);
-    q4::gemv::<D_FF>(H, w.down_w, w.down_s, &s.ha, out);
+    q4::gemv::<D_FF>(H, w.down_w, w.down_s, &s.ha.act(), out);
 }
 
 /// The same from an activation already quantized — the card's integers,
@@ -105,19 +105,19 @@ pub fn forward_q(w: &Weights, xq: &[i8], xs: &[f32], xg: &[i32], s: &mut Scratch
     s.xa.q.copy_from_slice(&xq[..H]);
     s.xa.scale.copy_from_slice(&xs[..H / q4::GROUP]);
     s.xa.gsum.copy_from_slice(&xg[..H / q4::GROUP]);
-    q4::gemv::<H>(2 * D_FF, w.gate_up_w, w.gate_up_s, &s.xa, s.gu);
+    q4::gemv::<H>(2 * D_FF, w.gate_up_w, w.gate_up_s, &s.xa.act(), s.gu);
     swiglu::<D_FF>(s.gu, s.h);
     s.ha.quantize(s.h);
-    q4::gemv::<D_FF>(H, w.down_w, w.down_s, &s.ha, out);
+    q4::gemv::<D_FF>(H, w.down_w, w.down_s, &s.ha.act(), out);
 }
 
 /// Same composition over the scalar inner loop, to diff against.
 pub fn forward_scalar(w: &Weights, x: &[f32], s: &mut Scratch, out: &mut [f32]) {
     s.xa.quantize(&x[..H]);
-    q4::gemv_scalar(H, 2 * D_FF, w.gate_up_w, w.gate_up_s, &s.xa, s.gu);
+    q4::gemv_scalar(H, 2 * D_FF, w.gate_up_w, w.gate_up_s, &s.xa.act(), s.gu);
     swiglu::<D_FF>(s.gu, s.h);
     s.ha.quantize(s.h);
-    q4::gemv_scalar(D_FF, H, w.down_w, w.down_s, &s.ha, out);
+    q4::gemv_scalar(D_FF, H, w.down_w, w.down_s, &s.ha.act(), out);
 }
 
 #[cfg(test)]

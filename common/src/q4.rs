@@ -145,6 +145,19 @@ pub struct QAct<'a> {
     pub scale: &'a mut [f32], // K / GROUP
     pub gsum: &'a mut [i32],  // K / GROUP
 }
+/// A quantized activation as the GEMVs read it: shared freely, by many rows on many cores.
+#[derive(Clone, Copy)]
+pub struct Act<'a> {
+    pub q: &'a [i8],
+    pub scale: &'a [f32],
+    pub gsum: &'a [i32],
+}
+impl QAct<'_> {
+    #[inline(always)]
+    pub fn act(&self) -> Act<'_> {
+        Act { q: self.q, scale: self.scale, gsum: self.gsum }
+    }
+}
 
 impl QAct<'_> {
     #[inline(always)]
@@ -176,7 +189,7 @@ impl QAct<'_> {
 /// y[0..m) = W[m × K] · a[K], scalar. Every fast realization must match
 /// this bit for bit: per-group i32 accumulation (exact in any order), one
 /// f32 flush per group in one fixed expression, groups summed in order.
-pub fn gemv_scalar(k: usize, m: usize, w: &[u8], ws: &[f32], act: &QAct, out: &mut [f32]) {
+pub fn gemv_scalar(k: usize, m: usize, w: &[u8], ws: &[f32], act: &Act, out: &mut [f32]) {
     let ng = k / GROUP;
     for row in 0..m {
         let (t, r) = (row / TILE, row % TILE);
@@ -201,7 +214,7 @@ pub fn gemv_scalar(k: usize, m: usize, w: &[u8], ws: &[f32], act: &QAct, out: &m
 
 /// The realization this target ships.
 #[inline(always)]
-pub fn gemv<const K: usize>(m: usize, w: &[u8], ws: &[f32], act: &QAct, out: &mut [f32]) {
+pub fn gemv<const K: usize>(m: usize, w: &[u8], ws: &[f32], act: &Act, out: &mut [f32]) {
     debug_assert!(w.len() >= m * K / 2 && out.len() >= m);
     #[cfg(target_arch = "x86_64")]
     unsafe {
@@ -217,7 +230,7 @@ pub mod avx2 {
     //! because four accumulators, four activation vectors, two constants and
     //! temporaries is what fits in sixteen `ymm` without spilling — a
     //! hardware constant, not a tuning knob.
-    use super::{QAct, GROUP, TILE, WBIAS};
+    use super::{Act, QAct, GROUP, TILE, WBIAS};
     use core::arch::x86_64::*;
 
     /// 64 MACs: one 32-byte load of packed weights against two 32-byte
@@ -247,7 +260,7 @@ pub mod avx2 {
     /// loop bound because one symbol serves gate_up (m = 2·D_FF) and down
     /// (m = D_MODEL).
     #[target_feature(enable = "avx2")]
-    pub unsafe fn gemv<const K: usize>(m: usize, w: *const u8, ws: *const f32, act: &QAct, out: *mut f32) {
+    pub unsafe fn gemv<const K: usize>(m: usize, w: *const u8, ws: *const f32, act: &Act, out: *mut f32) {
         const { assert!(K % GROUP == 0) };
         let ngroups = K / GROUP;
         let mask = _mm256_set1_epi8(0x0F);
@@ -356,8 +369,8 @@ mod tests {
         act.quantize(&x);
         let mut a = vec![0f32; M];
         let mut b = vec![0f32; M];
-        gemv_scalar(K, M, &pw, &ps, &act, &mut a);
-        gemv::<K>(M, &pw, &ps, &act, &mut b);
+        gemv_scalar(K, M, &pw, &ps, &act.act(), &mut a);
+        gemv::<K>(M, &pw, &ps, &act.act(), &mut b);
         assert_eq!(a, b, "the AVX2 realization must be bit-identical to the scalar one");
     }
 }
