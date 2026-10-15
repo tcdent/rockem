@@ -29,7 +29,7 @@ def logsoftmax(v):
     v = v.astype(np.float64); m = v.max(); return v - m - np.log(np.exp(v - m).sum())
 
 async def score(ids):
-    c = await Client.connect(addr, b.bos, b.eos, b.vocab_size, b.identity)
+    c = await Client.connect(addr, b.prefix, b.eos_tokens, b.vocab_size, b.identity)
     try:
         await c.prompt([])
         return await c.score(ids)

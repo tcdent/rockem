@@ -33,13 +33,13 @@ MODELS = HERE.parents[1] / "models"
 
 async def generate(addr: tuple[str, int], bundle: Bundle, edge: Edge, ids: list[int], stops: list[str], max_tokens: int) -> tuple[str, str, int]:
     """One prompt on a fresh connection: the completion text, why it ended, ids received."""
-    client = await Client.connect(addr, bundle.bos, bundle.eos, bundle.vocab_size, bundle.identity)
+    client = await Client.connect(addr, bundle.prefix, bundle.eos_tokens, bundle.vocab_size, bundle.identity)
     try:
         await client.prompt(ids)
         dec, st, text, n = edge.decoder(), Stops(stops), "", 0
         async for id in client.generate():
             n += 1
-            if id == bundle.eos:
+            if id in bundle.eos_tokens:
                 text += st.flush()
                 return text, "eos", n
             text += st.feed(dec.feed(id))
@@ -58,7 +58,7 @@ async def loglik(addr: tuple[str, int], bundle: Bundle, prompt_ids: list[int], c
     """ln p(continuation | prompt), summed over the continuation's ids, on a fresh
     connection. The prompt is fed unscored, so a repeated prompt is served from the
     node's store and only its last position is recomputed."""
-    client = await Client.connect(addr, bundle.bos, bundle.eos, bundle.vocab_size, bundle.identity)
+    client = await Client.connect(addr, bundle.prefix, bundle.eos_tokens, bundle.vocab_size, bundle.identity)
     try:
         await client.prompt(prompt_ids)
         return sum(await client.score(cont_ids))
