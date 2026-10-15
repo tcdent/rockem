@@ -21,6 +21,8 @@
 //!   rockem.cache=<GB>          host memory for cached contexts (default: half of what is free)
 //!   rockem.debug=<dir>         dev: write every position's logits as <dir>/pos<N>.f32 and print the top-2 margin
 //!   rockem.profile=N           GLM: a line of the token's time by phase every N tokens
+//!   rockem.probe=1             measure this box (DRAM, GEMV rates, each card's VRAM, link and BAR) with
+//!                              the bundle's code object if there is one, report, and idle: the baseline
 //!   rockem.shell=1 / rockem.exit=1   dev conveniences (see os/qemu.sh)
 mod engine;
 mod glm;
@@ -28,6 +30,7 @@ mod glm_kfd;
 mod kfd;
 mod loader;
 mod platform;
+mod probe;
 mod v2lite;
 mod v2lite_kfd;
 mod wire;
@@ -508,6 +511,14 @@ fn main() {
         use std::os::unix::process::CommandExt;
         let err = std::process::Command::new("/bin/sh").exec();
         eprintln!("exec /bin/sh failed: {err}");
+    }
+    if config("rockem.probe").as_deref() == Some("1") {
+        let elf = config("rockem.bundle").map(|b| std::path::Path::new(&b).join("kernels.gfx1100.elf")).filter(|p| p.exists()).map(|p| std::fs::read(p).unwrap());
+        probe::run(elf.as_deref());
+        if cmdline.split_whitespace().any(|t| t == "rockem.exit=1") || std::env::args().any(|t| t == "rockem.exit=1") {
+            std::process::exit(0);
+        }
+        halt("probe done");
     }
     let Some(bundle) = config("rockem.bundle") else {
         if cmdline.split_whitespace().any(|t| t == "rockem.exit=1") {

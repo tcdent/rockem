@@ -66,7 +66,3 @@ path = "src/repeat.rs"
 name = "bench-memtest"
 path = "src/memtest.rs"
 
-
-[[bin]]
-name = "bench-box"
-path = "src/box_.rs"

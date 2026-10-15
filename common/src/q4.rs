@@ -230,7 +230,7 @@ pub mod avx2 {
     //! because four accumulators, four activation vectors, two constants and
     //! temporaries is what fits in sixteen `ymm` without spilling — a
     //! hardware constant, not a tuning knob.
-    use super::{Act, QAct, GROUP, TILE, WBIAS};
+    use super::{Act, GROUP, TILE, WBIAS};
     use core::arch::x86_64::*;
 
     /// 64 MACs: one 32-byte load of packed weights against two 32-byte
