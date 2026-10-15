@@ -1,6 +1,6 @@
 #!/bin/sh
 # rockem /init — mount what the node binary needs, bring up the LAN, mount the weights, then become the node.
-#   rockem.net=dhcp          DHCP on every ethernet link (busybox udhcpc, /etc/udhcpc.sh)
+#   rockem.net=dhcp          DHCP on every ethernet link (busybox udhcpc, /etc/udhcpc.sh), clock from the lease's NTP servers
 #   rockem.nfs=<ip>:/<path>  the weights share, read-only at /bundle; rockem.bundle=/bundle/<name> picks one
 #   rockem.telnet=1          dev: a root shell on the LAN, port 23
 mount -t devtmpfs devtmpfs /dev 2>/dev/null
@@ -17,10 +17,16 @@ if [ "$(arg rockem.net)" = dhcp ]; then
   for d in /sys/class/net/*; do
     n=${d##*/}; [ "$n" = lo ] && continue; [ -e "$d/device" ] || continue
     ip link set "$n" up
-    udhcpc -i "$n" -s /etc/udhcpc.sh -n -q -t 10 -T 2 >/dev/null 2>&1 &
+    udhcpc -i "$n" -s /etc/udhcpc.sh -O ntpsrv -n -q -t 10 -T 2 >/dev/null 2>&1 &
   done
   wait
   ip -4 -o addr show scope global | sed 's/^/net      : /'
+  # the clock: set once from the lease's NTP servers before the node starts, then held by ntpd
+  if [ -s /etc/ntp-servers ]; then
+    P=$(sort -u /etc/ntp-servers | sed 's/^/-p /' | tr '\n' ' ')
+    timeout 15 ntpd -n -q $P >/dev/null 2>&1 && echo "clock    : $(date -u '+%Y-%m-%d %H:%M:%S') UTC" || echo "clock    : NTP failed; clock unset"
+    ntpd $P
+  fi
 fi
 # dev rung: a bundle shared in by QEMU over virtio-9p (see os/qemu.sh)
 p=$(arg rockem.bundle9p); [ -n "$p" ] && mount -t 9p -o trans=virtio,version=9p2000.L,msize=1048576 "$p" /bundle
