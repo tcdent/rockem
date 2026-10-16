@@ -219,13 +219,16 @@ pub mod gfx11_consts {
     pub const K_SLICE: usize = HC * H / SLICES;
     pub const PRE_GRID: u32 = (COEF_ROWS * SLICES) as u32;
     pub const PRE_LDS: u32 = 512;
-    /// `hc_pre`'s VRAM words: an arrival count a row, the launch's, then the mix's ready word; the counts 0 between launches.
-    pub const PRE_COUNTS: usize = COEF_ROWS + 2;
+    /// `hc_pre`'s VRAM words: an arrival count a row, the launch's, the mix's ready word, the collapse's
+    /// arrival count and ready word, the router's arrival count; the counts 0 between launches.
+    pub const PRE_COUNTS: usize = COEF_ROWS + 5;
+    /// Router rows a workgroup takes in `hc_pre`'s tail.
+    pub const ROUTER_ROWS_PER_WG: usize = E.div_ceil(COEF_ROWS * SLICES);
     /// `hc_pre`'s partials in VRAM: the coefficient dots `[COEF_ROWS][SLICES]`, then every workgroup's sum of squares of its channel slice.
     pub const PRE_PARTS: usize = COEF_ROWS * SLICES + COEF_ROWS * SLICES;
     /// Channels of the collapse a workgroup takes.
     pub const COLLAPSE: usize = H.div_ceil(COEF_ROWS * SLICES);
-    const _: () = assert!(HC * H % SLICES == 0 && K_SLICE % 256 == 0 && COEF_ROWS <= 256 && (16 + COEF_ROWS + 1) * 4 <= PRE_LDS as usize && COLLAPSE <= 256);
+    const _: () = assert!(HC * H % SLICES == 0 && K_SLICE % 256 == 0 && COEF_ROWS <= 256 && (16 + COEF_ROWS + 1) * 4 <= PRE_LDS as usize && COLLAPSE <= 256 && H % 256 == 0);
     /// The mix the card keeps between a block's two halves: pre `[HC]`, post `[HC]`, comb `[HC][HC]`.
     pub const MIX: usize = 2 * HC + HC * HC;
     /// `hc_post` and `hc_mean`: a thread a channel.
@@ -242,7 +245,8 @@ pub mod gfx11 {
     //! to the block input, written to VRAM and, when asked, to host memory for
     //! the routed experts), `hc_post` (the stream
     //! update from the block output), `hc_mean` (the streams' mean, the head's
-    //! input), and `hc_handoff` (the words between the cards and the host).
+    //! input). The handoffs ride inside `hc_pre` (the routers' logits and words) and
+    //! `hc_post` (block outputs out, the words, the wait).
     //! The per-element order is the host's (`pre`, `post`): multiply, then
     //! add, streams in order.
     pub use super::gfx11_consts::*;
@@ -267,11 +271,15 @@ pub mod gfx11 {
     /// `value` in `count[COEF_ROWS + 1]`; every workgroup waits for that word (all resident:
     /// the grid is a fraction of the card) and collapses its `COLLAPSE` channels,
     /// `x[d] = Σ_i pre_i · stream_i[d]`, into `x` and, when `x_host` is not null, there too (the
-    /// routed experts' input; the host's word follows in a later handoff). One workgroup doing
-    /// the collapse alone was the 50 µs (timeline 2026-10-16). Counts back at 0 when the launch
-    /// leaves. LDS: 512 bytes.
+    /// routed experts' input). One workgroup doing the collapse alone was the 50 µs (timeline
+    /// 2026-10-16). Then, when `router` is not null (the FFN card: the early router over the
+    /// attention block's input, or the FFN router over its own), the workgroups arrive again,
+    /// each norms `x` with `ln` and takes its `ROUTER_ROWS_PER_WG` rows of the `[E][H]` bf16
+    /// router straight into `scores` (host memory), and the last of them writes `value` to
+    /// `word`: the two launches and two handoffs a layer the routers cost are inside this one.
+    /// Counts back at 0 when the launch leaves. LDS: 512 bytes.
     #[no_mangle]
-    pub extern "gpu-kernel" fn hc_pre(streams: *const f32, w: *const u16, part: *mut f32, base: *const f32, scale: *const f32, mix: *mut f32, x: *mut f32, x_host: *mut f32, count: *mut u32, value: u32) {
+    pub extern "gpu-kernel" fn hc_pre(streams: *const f32, w: *const u16, part: *mut f32, base: *const f32, scale: *const f32, mix: *mut f32, x: *mut f32, x_host: *mut f32, count: *mut u32, value: u32, ln: *const u16, router: *const u16, scores: *mut f32, word: *mut u32) {
         unsafe {
             let t = workitem_id_x() as usize;
             let (wave, lane) = (t / 32, (t % 32) as u32);
@@ -461,13 +469,86 @@ pub mod gfx11 {
                 }
                 d += 256;
             }
+            if router.is_null() {
+                return;
+            }
+            // the collapse's arrival: this workgroup's channels to L2, the last publishes; every workgroup waits
+            let (arrive2, ready2, arrive3) = (count.add(COEF_ROWS + 2), count.add(COEF_ROWS + 3), count.add(COEF_ROWS + 4));
+            fence(Ordering::Release);
+            workgroup_sync();
+            if t == 0 {
+                if AtomicU32::from_ptr(arrive2).fetch_add(1, Ordering::AcqRel) == (COEF_ROWS * SLICES) as u32 - 1 {
+                    *arrive2 = 0;
+                    AtomicU32::from_ptr(ready2).store(value, Ordering::Release);
+                }
+                while AtomicU32::from_ptr(ready2).load(Ordering::Acquire) != value {}
+            }
+            workgroup_sync();
+            fence(Ordering::Acquire);
+            // the router over the normed block input: the norm from every channel, this workgroup's rows
+            let mut ss = 0f32;
+            let mut k = t;
+            while k < H {
+                let v = *x.add(k);
+                ss += v * v;
+                k += 256;
+            }
+            ss = wave_sum(lane, ss);
+            if lane == 0 {
+                *red.add(wave) = ss;
+            }
+            workgroup_sync();
+            let mut tot = 0f32;
+            let mut k = 0;
+            while k < 8 {
+                tot += *red.add(k);
+                k += 1;
+            }
+            let rr = 1.0 / sqrt(tot / H as f32 + RMS_NORM_EPS);
+            workgroup_sync(); // red is reused below
+            let mut r = 0;
+            while r < ROUTER_ROWS_PER_WG {
+                let row = wg + r * COEF_ROWS * SLICES;
+                if row < E {
+                    let wr = router.add(row * H);
+                    let mut acc = 0f32;
+                    let mut k = t;
+                    while k < H {
+                        acc += *x.add(k) * widen(*ln.add(k)) * widen(*wr.add(k));
+                        k += 256;
+                    }
+                    acc = wave_sum(lane, acc);
+                    if lane == 0 {
+                        *red.add(wave) = acc;
+                    }
+                    workgroup_sync();
+                    if t == 0 {
+                        let mut sum = 0f32;
+                        let mut k = 0;
+                        while k < 8 {
+                            sum += *red.add(k);
+                            k += 1;
+                        }
+                        *scores.add(row) = sum * rr;
+                    }
+                    workgroup_sync();
+                }
+                r += 1;
+            }
+            // the router's arrival: this workgroup's scores out over the link, the last says so
+            fence(Ordering::Release);
+            workgroup_sync();
+            if t == 0 && AtomicU32::from_ptr(arrive3).fetch_add(1, Ordering::AcqRel) == (COEF_ROWS * SLICES) as u32 - 1 {
+                *arrive3 = 0;
+                AtomicU32::from_ptr(word).store(value, Ordering::Release);
+            }
         }
     }
 
     /// `stream_j[d] = post_j · y[d] + Σ_i comb_ij · stream_i[d]`, a thread a channel, the block
     /// output `y` the sum of `ya` and `yb` (`yb` null for one source): the parts of a split
     /// attention block, or the shared expert's rows and the host's routed experts. The handoff
-    /// first (`hc_handoff`'s, so the update is one launch, not two): workgroup 0 copies this
+    /// first, so the update is one launch, not two: workgroup 0 copies this
     /// card's `n` floats from `src` out to `dst`, writes `value` to `mine`, holds until `w0` and
     /// `w1` (those not null) read `value`, then releases the other workgroups through `go`, a
     /// VRAM word (one poller over the link a card: sixteen slowed the host's experts by 0.5 ms a
@@ -539,40 +620,6 @@ pub mod gfx11 {
                 j += 1;
             }
             *mean.add(d) = acc / HC as f32;
-        }
-    }
-    /// The handoff between the cards and the host, one launch: once everything launched before it
-    /// has completed (the barrier bit), `n` floats from `src` (VRAM, a block output a kernel just
-    /// emitted there) to `dst` (uncached host memory every card sees) in wide coalesced stores —
-    /// a kernel emitting into uncached host memory row by row paid 200–300 µs a launch (timeline,
-    /// 2026-10-15) — then `value` into `mine` (when not null: this card's data is in), then the
-    /// queue holds until `w0` and `w1` (those not null) read `value`: the card waits for data,
-    /// not the host for the card. The words are uncached host memory too, every load a trip over
-    /// the link; one thread polls. Grid: 1.
-    #[no_mangle]
-    pub extern "gpu-kernel" fn hc_handoff(src: *const f32, dst: *mut f32, n: u32, mine: *mut u32, w0: *const u32, w1: *const u32, value: u32) {
-        unsafe {
-            let t = workitem_id_x();
-            if !src.is_null() {
-                let mut i = t;
-                while i < n {
-                    *dst.add(i as usize) = *src.add(i as usize);
-                    i += 256;
-                }
-                fence(Ordering::Release);
-                workgroup_sync();
-            }
-            if t == 0 {
-                if !mine.is_null() {
-                    AtomicU32::from_ptr(mine).store(value, Ordering::Release);
-                }
-                if !w0.is_null() {
-                    while AtomicU32::from_ptr(w0 as *mut u32).load(Ordering::Relaxed) != value {}
-                }
-                if !w1.is_null() {
-                    while AtomicU32::from_ptr(w1 as *mut u32).load(Ordering::Relaxed) != value {}
-                }
-            }
         }
     }
     const _: () = assert!(H % 256 == 0 && (HC * H) % 256 == 0 && HC * HC <= 256);
