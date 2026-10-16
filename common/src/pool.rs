@@ -32,10 +32,25 @@ pub trait Pool: Sync {
     fn prefetch(&self, n: usize, at: std::boxed::Box<dyn Fn(usize) -> *const u8 + Send + Sync>, ccd: std::boxed::Box<dyn Fn(usize) -> usize + Send + Sync>, f: std::boxed::Box<dyn Fn(usize) + Send + Sync>) {
         let _ = (n, at, ccd, f);
     }
+    /// The node whose memory holds `p` (0 when nothing is placed), and how many core complexes
+    /// a node has (1 where the pool does not tell them apart): what a caller needs to group
+    /// slices the way `run_at_ccd` will slot them.
+    fn node_of(&self, p: *const u8) -> usize {
+        let _ = p;
+        0
+    }
+    fn ccds_of(&self, node: usize) -> usize {
+        let _ = node;
+        1
+    }
     /// Of the last run's items, how many ran on a core of their preferred CCD, and how many
     /// there were (0, 0 for a pool that has no CCDs to prefer).
     fn locality(&self) -> (usize, usize) {
         (0, 0)
+    }
+    /// Whether the job now running has been overtaken: a long prefetch item asks between chunks and returns.
+    fn abandoned(&self) -> bool {
+        false
     }
     /// Of the last prefetch's items, how many were done before a run overtook it, and how many there were.
     fn prefetched(&self) -> (usize, usize) {

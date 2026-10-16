@@ -166,6 +166,8 @@ impl Engine for Glm {
         }
         if self.profile_every > 0 && self.model.profile.tokens >= self.profile_every {
             println!("profile  : {}", self.model.profile.line());
+            let c = self.model.coverage(&[8, 16, 32, 64]);
+            println!("experts  : since start, a layer's 8 / 16 / 32 / 64 most-picked experts took {:.0} / {:.0} / {:.0} / {:.0} % of its picks", 100.0 * c[0], 100.0 * c[1], 100.0 * c[2], 100.0 * c[3]);
             self.model.profile = Default::default();
         }
     }

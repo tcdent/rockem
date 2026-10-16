@@ -723,16 +723,33 @@ impl Kfd {
     /// (probe, 2026-10-15), so the packet that completes a launch sequence
     /// goes out with it. One completion outstanding at a time.
     pub fn fence(&self) {
-        let s = self.signal.ptr() as *const Signal;
-        unsafe { (*s).value.store(1, Ordering::Release) };
-        let idx = self.write_index.get();
-        let pkt = Packet { header: PACKET_INVALID, setup: 0, workgroup_size: [0; 3], reserved0: 0, grid_size: [0; 3], private_segment_size: 0, group_segment_size: 0, kernel_object: 0, kernarg_address: 0, reserved2: 0, completion_signal: self.signal.va as u64 };
-        self.post(idx, pkt, PACKET_BARRIER_AND | HEADER_BARRIER | (FENCE_SYSTEM << HEADER_ACQUIRE_SHIFT) | (FENCE_SYSTEM << HEADER_RELEASE_SHIFT));
-        self.fenced.set(idx);
+        self.fence_at(0);
     }
     /// Wait for the completion `fence` posted.
     pub fn wait(&self) {
-        let s = self.signal.ptr() as *const Signal;
+        self.wait_at(0);
+    }
+    /// A second completion, independent of `fence`/`wait`: for a launch whose result the
+    /// host reads while later launches are in flight (the early router's logits).
+    pub fn fence_early(&self) {
+        self.fence_at(64);
+    }
+    pub fn wait_early(&self) {
+        self.wait_at(64);
+    }
+    /// The signal at byte `off` of the signal page (its own cache line), armed and carried by a barrier packet.
+    fn fence_at(&self, off: usize) {
+        let s = self.signal.at(off) as *const Signal;
+        unsafe { (*s).value.store(1, Ordering::Release) };
+        let idx = self.write_index.get();
+        let pkt = Packet { header: PACKET_INVALID, setup: 0, workgroup_size: [0; 3], reserved0: 0, grid_size: [0; 3], private_segment_size: 0, group_segment_size: 0, kernel_object: 0, kernarg_address: 0, reserved2: 0, completion_signal: self.signal.at(off) as u64 };
+        self.post(idx, pkt, PACKET_BARRIER_AND | HEADER_BARRIER | (FENCE_SYSTEM << HEADER_ACQUIRE_SHIFT) | (FENCE_SYSTEM << HEADER_RELEASE_SHIFT));
+        if off == 0 {
+            self.fenced.set(idx);
+        }
+    }
+    fn wait_at(&self, off: usize) {
+        let s = self.signal.at(off) as *const Signal;
         let idx = self.fenced.get();
         let value = unsafe { &(*s).value };
         let t0 = std::time::Instant::now();
@@ -741,8 +758,10 @@ impl Kfd {
             assert!(t0.elapsed().as_secs() < 10, "gpu hang: packet {idx} never completed (read index {})", unsafe { (*(self.queue.ptr() as *const AmdQueue)).read_dispatch_id.load(Ordering::Relaxed) });
         }
         self.host_wrote.set(true); // the host reads and writes freely until the next launch
-        self.last_span.set((self.token_start.get(), idx));
-        self.token_start.set(idx + 1);
+        if off == 0 {
+            self.last_span.set((self.token_start.get(), idx));
+            self.token_start.set(idx + 1);
+        }
         self.touched.set(std::time::Instant::now());
     }
     /// The last token's statistics, per launch in order: kernel name, then

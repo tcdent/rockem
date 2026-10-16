@@ -333,6 +333,17 @@ impl Pool for Threads {
     fn run_at_ccd(&self, n: usize, at: &(dyn Fn(usize) -> *const u8 + Sync), ccd: &(dyn Fn(usize) -> usize + Sync), f: &(dyn Fn(usize) + Sync)) {
         self.publish(n, Some(at), Some(ccd), f)
     }
+    fn node_of(&self, p: *const u8) -> usize {
+        let p = p as usize;
+        self.placed.lock().unwrap().iter().find(|(base, len, _)| p >= *base && p < base + len).map_or(0, |(base, _, nodes)| nodes[(p - base) / PAGE] as usize)
+    }
+    fn ccds_of(&self, node: usize) -> usize {
+        self.node_ccds.get(node).map_or(1, |c| c.len().max(1))
+    }
+    fn abandoned(&self) -> bool {
+        let job = self.shared.job.load(Ordering::Acquire);
+        !job.is_null() && unsafe { (*job).stop.load(Ordering::Relaxed) }
+    }
     fn locality(&self) -> (usize, usize) {
         *self.locality.lock().unwrap()
     }
@@ -406,6 +417,9 @@ pub fn physical_cores() -> Vec<usize> {
 pub struct CpuExperts<'a> {
     stream: &'a [u8],
     pool: &'a dyn Pool,
+    /// The node of every slice of every expert record (`[MOE_LAYERS][E][SLICES]`), asked of the
+    /// pool once at construction, so slotting a prefetch is lookups, not a lock a slice.
+    slice_node: Vec<u8>,
     xq: Vec<i8>,
     xs: Vec<f32>,
     xg: Vec<i32>,
@@ -422,7 +436,25 @@ impl<'a> CpuExperts<'a> {
     pub fn new(stream: &'a [u8], pool: &'a dyn Pool) -> Self {
         use common::q4::GROUP;
         assert_eq!(stream.len(), layout::STREAM);
-        CpuExperts { stream, pool, xq: vec![0; H], xs: vec![0.0; H / GROUP], xg: vec![0; H / GROUP], h: vec![0.0; TOP_K * D_FF], elapsed: 0.0 }
+        use common::q4::TILE;
+        let (n_gu, n_down) = (D_FF / CHUNK, H / DOWN_CHUNK);
+        let mut slice_node = Vec::with_capacity(layout::MOE_LAYERS * E * (n_gu + n_down));
+        for l in FIRST_K_DENSE_REPLACE..NUM_HIDDEN_LAYERS {
+            for e in 0..E {
+                let w = expert::Weights::from_record(&stream[layout::record(l, e)]);
+                for j in 0..n_gu {
+                    slice_node.push(pool.node_of(w.gate_up_w[j * CHUNK / TILE * 2 * H..].as_ptr()) as u8);
+                }
+                for c in 0..n_down {
+                    slice_node.push(pool.node_of(w.down_w[c * DOWN_CHUNK / TILE * 2 * D_FF..].as_ptr()) as u8);
+                }
+            }
+        }
+        CpuExperts { stream, pool, slice_node, xq: vec![0; H], xs: vec![0.0; H / GROUP], xg: vec![0; H / GROUP], h: vec![0.0; TOP_K * D_FF], elapsed: 0.0 }
+    }
+    /// The node of slice `j` (gate/up slices first, then down) of expert `e` of layer `l`.
+    fn slice_node(&self, l: usize, e: usize, j: usize) -> usize {
+        self.slice_node[((l - FIRST_K_DENSE_REPLACE) * E + e) * (D_FF / CHUNK + H / DOWN_CHUNK) + j] as usize
     }
 }
 fn raw_f32(v: &[f32]) -> &[u8] {
@@ -475,38 +507,65 @@ impl Routed for CpuExperts<'_> {
         // the stream lives as long as the process (the node leaks it; the gate's outlives every token):
         // the job that owns these closures is gone within the token
         let stream: &'static [u8] = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(self.stream) };
-        let n_gu = TOP_K * (D_FF / CHUNK);
-        let n_down = TOP_K * (H / DOWN_CHUNK);
-        // the gate/up slices and the down slices, exactly as `run` cuts them, on the same CCDs
-        let at = move |i: usize| {
-            if i < n_gu {
-                let (k, c) = (i / (D_FF / CHUNK), i % (D_FF / CHUNK));
-                expert::Weights::from_record(&stream[layout::record(l, idx[k])]).gate_up_w[c * CHUNK / TILE * 2 * H..].as_ptr()
-            } else {
-                let i = i - n_gu;
-                let (k, c) = (i / (H / DOWN_CHUNK), i % (H / DOWN_CHUNK));
-                expert::Weights::from_record(&stream[layout::record(l, idx[k])]).down_w[c * DOWN_CHUNK / TILE * 2 * D_FF..].as_ptr()
-            }
-        };
-        let ccd = move |i: usize| if i < n_gu { idx[i / (D_FF / CHUNK)] * (D_FF / CHUNK) + i % (D_FF / CHUNK) } else { let i = i - n_gu; idx[i / (H / DOWN_CHUNK)] * (H / DOWN_CHUNK) + i % (H / DOWN_CHUNK) };
-        let f = move |i: usize| {
-            if i < n_gu {
-                let (k, c) = (i / (D_FF / CHUNK), i % (D_FF / CHUNK));
-                let w = expert::Weights::from_record(&stream[layout::record(l, idx[k])]);
-                for r0 in [c * CHUNK, D_FF + c * CHUNK] {
-                    touch(&w.gate_up_w[r0 / TILE * 2 * H..(r0 + CHUNK) / TILE * 2 * H]);
-                    touch(raw_f32(&w.gate_up_s[r0 / TILE * (H / GROUP) * TILE..(r0 + CHUNK) / TILE * (H / GROUP) * TILE]));
+        let pool = self.pool;
+        // an item an (expert, node, CCD): the slices of that expert the compute will slot there, in the
+        // compute's order — a slice's node from its rows' page, its CCD from the expert's id and the slice
+        let (n_gu, n_down) = (D_FF / CHUNK, H / DOWN_CHUNK);
+        let mut items: Vec<(usize, usize, usize, Vec<u32>)> = Vec::new(); // expert position, node, ccd, slice ids (gate/up first, then down + n_gu)
+        for k in 0..TOP_K {
+            for j in 0..n_gu + n_down {
+                let hash = if j < n_gu { idx[k] * n_gu + j } else { idx[k] * n_down + (j - n_gu) };
+                let d = self.slice_node(l, idx[k], j);
+                let c = hash % pool.ccds_of(d);
+                match items.iter_mut().find(|(kk, dd, cc, _)| *kk == k && *dd == d && *cc == c) {
+                    Some(it) => it.3.push(j as u32),
+                    None => items.push((k, d, c, vec![j as u32])),
                 }
-            } else {
-                let i = i - n_gu;
-                let (k, c) = (i / (H / DOWN_CHUNK), i % (H / DOWN_CHUNK));
-                let w = expert::Weights::from_record(&stream[layout::record(l, idx[k])]);
-                let r0 = c * DOWN_CHUNK;
-                touch(&w.down_w[r0 / TILE * 2 * D_FF..(r0 + DOWN_CHUNK) / TILE * 2 * D_FF]);
-                touch(raw_f32(&w.down_s[r0 / TILE * (D_FF / GROUP) * TILE..(r0 + DOWN_CHUNK) / TILE * (D_FF / GROUP) * TILE]));
+            }
+        }
+        let n = items.len();
+        let items = std::sync::Arc::new(items);
+        let (i1, i2, i3) = (items.clone(), items.clone(), items);
+        let first_slice = move |it: &(usize, usize, usize, Vec<u32>)| -> *const u8 {
+            let w = expert::Weights::from_record(&stream[layout::record(l, idx[it.0])]);
+            let j = it.3[0] as usize;
+            if j < n_gu { w.gate_up_w[j * CHUNK / TILE * 2 * H..].as_ptr() } else { w.down_w[(j - n_gu) * DOWN_CHUNK / TILE * 2 * D_FF..].as_ptr() }
+        };
+        let at = move |i: usize| first_slice(&i1[i]);
+        let ccd = move |i: usize| i2[i].2;
+        // the touching yields between 64 KB chunks once the job is overtaken: the run that overtakes it
+        // waits for the items in flight, and a megabyte of touching would be a quarter millisecond of stall
+        let pool_s: &'static dyn Pool = unsafe { std::mem::transmute::<&dyn Pool, &'static dyn Pool>(pool) };
+        let f = move |i: usize| {
+            let it = &i3[i];
+            let w = expert::Weights::from_record(&stream[layout::record(l, idx[it.0])]);
+            let touch_yielding = |b: &[u8]| -> bool {
+                for chunk in b.chunks(64 << 10) {
+                    if pool_s.abandoned() {
+                        return false;
+                    }
+                    touch(chunk);
+                }
+                true
+            };
+            for &j in &it.3 {
+                let j = j as usize;
+                let go = if j < n_gu {
+                    let mut go = true;
+                    for r0 in [j * CHUNK, D_FF + j * CHUNK] {
+                        go = go && touch_yielding(&w.gate_up_w[r0 / TILE * 2 * H..(r0 + CHUNK) / TILE * 2 * H]) && touch_yielding(raw_f32(&w.gate_up_s[r0 / TILE * (H / GROUP) * TILE..(r0 + CHUNK) / TILE * (H / GROUP) * TILE]));
+                    }
+                    go
+                } else {
+                    let r0 = (j - n_gu) * DOWN_CHUNK;
+                    touch_yielding(&w.down_w[r0 / TILE * 2 * D_FF..(r0 + DOWN_CHUNK) / TILE * 2 * D_FF]) && touch_yielding(raw_f32(&w.down_s[r0 / TILE * (D_FF / GROUP) * TILE..(r0 + DOWN_CHUNK) / TILE * (D_FF / GROUP) * TILE]))
+                };
+                if !go {
+                    return;
+                }
             }
         };
-        self.pool.prefetch(n_gu + n_down, Box::new(at), Box::new(ccd), Box::new(f));
+        self.pool.prefetch(n, Box::new(at), Box::new(ccd), Box::new(f));
     }
     fn run(&mut self, l: usize, idx: &[usize; TOP_K], x: &[f32], out: &mut [f32]) {
         use common::q4::{self, Act, QAct, GROUP, TILE};
@@ -569,7 +628,6 @@ impl Routed for CpuExperts<'_> {
 /// head over the streams' mean. A block the placement does not hold runs here.
 pub trait Placed {
     fn kda(&self, l: usize) -> bool;
-    fn kda_step(&mut self, l: usize, x: &[f32], out: &mut [f32]);
     fn seed(&mut self, l: usize, window: &[f32], mem: &[f32]);
     fn snapshot(&self, l: usize, window: &mut [f32], mem: &mut [f32]);
     fn ffn(&self, l: usize) -> bool;
@@ -578,7 +636,14 @@ pub trait Placed {
     /// Layer `l`'s router over the block input `x` normed with the FFN half's norm — the FFN
     /// half's router run early, on the attention block's input, as the prefetch's predictor:
     /// the logits into `logits` (`[E]`), waited for.
-    fn route_early(&mut self, l: usize, x: &[f32], logits: &mut [f32]);
+    fn route_early(&mut self, l: usize, x: &[f32]);
+    fn early_logits(&mut self, l: usize, logits: &mut [f32]);
+    /// The attention blocks posted, then waited for: between the two the host reads the early
+    /// router and starts the prefetch while the card works.
+    fn kda_post(&mut self, l: usize, x: &[f32]);
+    fn kda_wait(&mut self, l: usize, out: &mut [f32]);
+    fn mla_post(&mut self, l: usize, x: &[f32]);
+    fn mla_wait(&mut self, l: usize, kva: &mut [f32], ik: &mut [f32], igate: &mut [f32], iq: &mut [f32], iw: &mut [f32]);
     /// Keep layer `l`'s card awake while the host works: a trivial launch once it has been
     /// quiet a while (a card idle ≥ 400 µs pays ~100 µs on its next packet, probe 2026-10-15).
     fn heartbeat(&self, l: usize);
@@ -592,7 +657,6 @@ pub trait Placed {
     /// `out`. The latents live there too: `mla_seed` installs position
     /// `pos`'s when a sequence is seeded.
     fn mla(&self, l: usize) -> bool;
-    fn mla_project(&mut self, l: usize, x: &[f32], kva: &mut [f32], ik: &mut [f32], igate: &mut [f32], iq: &mut [f32], iw: &mut [f32]);
     fn mla_attend(&mut self, l: usize, pos: usize, latent: &[f32], sel: &[usize], out: &mut [f32]);
     fn mla_seed(&mut self, l: usize, pos: usize, latent: &[f32]);
 }
@@ -653,6 +717,8 @@ pub struct CpuModel<'p, R: Routed> {
     pub placed: Option<Box<dyn Placed>>,
     /// The previous token's expert picks by layer (`E` where none yet): the prefetch's predictor and its score.
     pub last_picks: Vec<[usize; TOP_K]>,
+    /// How often each expert of each layer was picked (`[NUM_HIDDEN_LAYERS][E]`): the data for placing the hot ones.
+    pub freq: Vec<u32>,
     pub max_ctx: usize,
     pub layers: Vec<LayerState>,
     /// The last step's logits, `[VOCAB_SIZE]`.
@@ -705,6 +771,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             profile: Profile::default(),
             placed: None,
             last_picks: vec![[E; TOP_K]; NUM_HIDDEN_LAYERS],
+            freq: vec![0; NUM_HIDDEN_LAYERS * E],
             max_ctx,
             layers,
             logits: vec![0.0; VOCAB_SIZE],
@@ -741,6 +808,22 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             f_shared: vec![0.0; H],
             f_score: vec![0.0; E],
         }
+    }
+
+    /// Of every pick so far, the share that went to each layer's `n` most-picked experts, for each `n` given:
+    /// how much of the routed stream a card holding the hot experts would serve.
+    pub fn coverage(&self, ns: &[usize]) -> Vec<f64> {
+        let mut covered = vec![0u64; ns.len()];
+        let mut total = 0u64;
+        for l in 0..NUM_HIDDEN_LAYERS {
+            let mut f: Vec<u32> = self.freq[l * E..(l + 1) * E].to_vec();
+            f.sort_unstable_by(|a, b| b.cmp(a));
+            total += f.iter().map(|&v| v as u64).sum::<u64>();
+            for (i, &n) in ns.iter().enumerate() {
+                covered[i] += f[..n.min(E)].iter().map(|&v| v as u64).sum::<u64>();
+            }
+        }
+        covered.iter().map(|&c| c as f64 / total.max(1) as f64).collect()
     }
 
     /// Install `rows` (`[n][POSITION]`) as positions `0..n` and `snap` (`[SNAPSHOT]`)
@@ -843,18 +926,26 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             let mix = hc::pre(&lw.hc_attn, &s.streams, &mut hcs, s.pool, &mut s.x);
             rmsnorm::<H>(&s.x, &lw.input_ln, RMS_NORM_EPS, &mut s.xn);
             tr.edge(l, "attn_in", &s.xn);
-            // the prefetch's predictor: the FFN half's router on the attention block's input, on the card where the
-            // FFN is placed; its picks, likeliest first, start the pull of their slices into the CCDs that will stream them
-            let mut pre_picks = [E; TOP_K];
-            if let (Ffn::Moe(m), Some(pl)) = (&lw.ffn, s.placed.as_mut().filter(|p| p.ffn(l))) {
-                pl.route_early(l, &s.x, &mut s.f_score);
-                pre_picks = ffn::picks(m, &mut s.f_score);
-                s.routed.prefetch(l, pre_picks);
+            // the prefetch's predictor: the FFN half's router on the attention block's input, posted on the card where
+            // the FFN is placed; read once the attention launches are posted, its picks, likeliest first, start the pull
+            let early = matches!(&lw.ffn, Ffn::Moe(_)) && s.placed.as_ref().is_some_and(|p| p.ffn(l));
+            if early {
+                s.placed.as_mut().unwrap().route_early(l, &s.x);
             }
+            let mut pre_picks = [E; TOP_K];
             lap(&mut p.hc);
             match (&lw.attn, &mut s.layers[l]) {
                 (Attn::Kda(_), _) if s.placed.as_ref().is_some_and(|p| p.kda(l)) => {
-                    s.placed.as_mut().unwrap().kda_step(l, &s.x, &mut s.y);
+                    let pl = s.placed.as_mut().unwrap();
+                    pl.kda_post(l, &s.x);
+                    if early {
+                        if let Ffn::Moe(m) = &lw.ffn {
+                            pl.early_logits(l, &mut s.f_score);
+                            pre_picks = ffn::picks(m, &mut s.f_score);
+                            s.routed.prefetch(l, pre_picks);
+                        }
+                    }
+                    pl.kda_wait(l, &mut s.y);
                     lap(&mut p.kda_card);
                 }
                 (Attn::Kda(a), LayerState::Kda { window, mem }) => {
@@ -868,7 +959,17 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     {
                         let (latent, ikey, igate) = mla::row(cache, pos);
                         match &mut placed_mla {
-                            Some(pl) => pl.mla_project(l, &s.x, ms.kva, ms.ik, igate, ms.iq, ms.iw),
+                            Some(pl) => {
+                                pl.mla_post(l, &s.x);
+                                if early {
+                                    if let Ffn::Moe(m) = &lw.ffn {
+                                        pl.early_logits(l, &mut s.f_score);
+                                        pre_picks = ffn::picks(m, &mut s.f_score);
+                                        s.routed.prefetch(l, pre_picks);
+                                    }
+                                }
+                                pl.mla_wait(l, ms.kva, ms.ik, igate, ms.iq, ms.iw);
+                            }
                             None => mla::project(a, &s.xn, &mut ms, igate, s.pool),
                         }
                         mla::finish_row(a, &ms, latent, ikey);
@@ -930,6 +1031,9 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     p.pre_agree += picks.iter().filter(|e| pre_picks.contains(e)).count();
                     p.moe_layers += 1;
                     s.last_picks[l] = picks;
+                    for &e in &picks {
+                        s.freq[l * E + e] += 1;
+                    }
                     let (local, items) = s.pool.locality();
                     p.local_items += local;
                     p.items += items;

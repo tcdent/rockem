@@ -454,13 +454,17 @@ impl Placed for Cards {
         self.rows8(c, down, c.gu.va, None, f.down_w.va, f.down_s.va, c.fy.va, H, k_width);
         c.k.fence(); // completed while the card is awake; the host waits later
     }
-    fn route_early(&mut self, l: usize, x: &[f32], logits: &mut [f32]) {
+    fn route_early(&mut self, l: usize, x: &[f32]) {
         let f = self.ffns[l].as_ref().unwrap();
         let c = &self.cards[f.card];
         let router = f.router.as_ref().expect("a MoE layer");
         c.k.upload(&c.fx, 0, raw(&x[..H]));
         self.rows(c, &c.rows_h, c.fx.va, Some(f.ln.va), router.va, c.scores.va, glm_5_3_flash::E, H);
-        c.k.sync();
+        c.k.fence_early();
+    }
+    fn early_logits(&mut self, l: usize, logits: &mut [f32]) {
+        let c = &self.cards[self.ffns[l].as_ref().unwrap().card];
+        c.k.wait_early();
         read(&c.scores, 0, &mut logits[..glm_5_3_flash::E]);
     }
     fn heartbeat(&self, l: usize) {
@@ -488,7 +492,7 @@ impl Placed for Cards {
     fn mla(&self, l: usize) -> bool {
         self.place.mla && self.mlas[l].is_some()
     }
-    fn mla_project(&mut self, l: usize, x: &[f32], kva: &mut [f32], ik: &mut [f32], igate: &mut [f32], iq: &mut [f32], iw: &mut [f32]) {
+    fn mla_post(&mut self, l: usize, x: &[f32]) {
         let m = self.mlas[l].as_ref().unwrap();
         let c = &self.cards[m.card];
         c.k.upload(&c.fx, 0, raw(&x[..H]));
@@ -501,6 +505,9 @@ impl Placed for Cards {
         let qln = Some(m.qa_ln.va);
         self.rows8(c, &c.mla_qb, c.mqa.va, qln, m.q_b.0.va, m.q_b.1.va, c.mq.va, MLA_HEADS * Q_HEAD, Q_LORA_RANK);
         self.rows_free(c, &c.mla_iq, c.mqa.va, qln, m.ix_wq_b.va, c.mproj.at(MIQ * 4), INDEX_N_HEADS * INDEX_HEAD_DIM, Q_LORA_RANK);
+    }
+    fn mla_wait(&mut self, l: usize, kva: &mut [f32], ik: &mut [f32], igate: &mut [f32], iq: &mut [f32], iw: &mut [f32]) {
+        let c = &self.cards[self.mlas[l].as_ref().unwrap().card];
         c.k.sync();
         read(&c.mproj, MKVA * 4, &mut kva[..KV_LORA_RANK]);
         read(&c.mproj, MIX * 4, &mut ik[..INDEX_HEAD_DIM]);
@@ -526,7 +533,7 @@ impl Placed for Cards {
         let m = self.mlas[l].as_ref().unwrap();
         self.cards[m.card].k.upload(&m.lat, pos * KV_LORA_RANK * 4, raw(&latent[..KV_LORA_RANK]));
     }
-    fn kda_step(&mut self, l: usize, x: &[f32], out: &mut [f32]) {
+    fn kda_post(&mut self, l: usize, x: &[f32]) {
         let lay = self.layers[l].as_ref().unwrap();
         // on each card a part uses: the block input, and the gates' first halves and beta (every head) over the normed input
         let mut seen = [usize::MAX; g::PARTS];
@@ -551,10 +558,15 @@ impl Placed for Cards {
             c.k.launch(&c.step, g::STEP_GRID, g::WG, g::STEP_LDS as u32, &a);
             self.rows(c, &c.rows_part, normed.va, None, p.o.va, c.ys[i].va, H, g::PART_QKV);
         }
+    }
+    fn kda_wait(&mut self, l: usize, out: &mut [f32]) {
+        let lay = self.layers[l].as_ref().unwrap();
+        let mut seen = [usize::MAX; g::PARTS];
         for (i, p) in lay.parts.iter().enumerate() {
             if !seen[..i].contains(&p.card) {
                 self.cards[p.card].k.sync();
             }
+            seen[i] = p.card;
         }
         // the block output is the parts' sum
         read(&self.cards[lay.parts[0].card].ys[0], 0, &mut out[..H]);
