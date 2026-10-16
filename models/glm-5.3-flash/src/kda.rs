@@ -192,7 +192,7 @@ pub mod gfx11 {
     //! `rows_h` (rows of a `[m][H]` bf16 matrix over `n` activations, each
     //! rms-normed with the layer's input weight as it is staged — the q, k, v
     //! projections, the forget and output gates' first halves, the beta rows),
-    //! `rows_d` (`[m][KDA_DIM]` rows: the gates' second halves), `kda_step` (a
+    //! `rows_d2` (`[m][KDA_DIM]` rows over two inputs: the gates' second halves), `kda_step` (a
     //! workgroup per head: the short convolution, the l2 norms, the bounded
     //! forget gate, the delta rule over the head's memory held in registers
     //! across the step's tokens, the gated norm) and `rows_qkv` (`[m][KDA_QKV]`
@@ -219,16 +219,6 @@ pub mod gfx11 {
         }
     }
 
-    /// `out[i][row] = W[row] · x[i]` for a `[m][KDA_DIM]` bf16 matrix over `x: [n][KDA_DIM]`. Grid: rows_grid(m).
-    #[no_mangle]
-    pub extern "gpu-kernel" fn rows_d(x: *const f32, w: *const u16, out: *mut f32, m: u32, n: u32) {
-        unsafe {
-            let tid = workitem_id_x();
-            let (m, n) = (m as usize, n as usize);
-            let t = tid as usize;
-            rows_over::<KDA_DIM, false>(tid, w, core::ptr::null(), m, n, 0.0, |i, s| if s * 256 + t < KDA_DIM { *x.add(i * KDA_DIM + s * 256 + t) } else { 0.0 }, || {}, |row, i, y| *out.add(i * m + row) = y);
-        }
-    }
 
     /// `out[i][row] = W[row] · x[i]` for a `[m][KDA_QKV]` bf16 matrix over `x: [n][KDA_QKV]`: the output projection. Grid: rows_grid(m).
     #[no_mangle]
@@ -238,6 +228,20 @@ pub mod gfx11 {
             let (m, n) = (m as usize, n as usize);
             let t = tid as usize;
             rows_over::<KDA_QKV, false>(tid, w, core::ptr::null(), m, n, 0.0, |i, s| *x.add(i * KDA_QKV + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
+        }
+    }
+
+    /// `rows_d` over two inputs: rows below `split` read `x[0..KDA_DIM]`, rows from `split` read
+    /// `x[KDA_DIM..2·KDA_DIM]` — f_b over f_a's output and g_b over g_a's as one launch (the
+    /// weights and the outputs back to back, `split` a multiple of a workgroup's 8 rows).
+    #[no_mangle]
+    pub extern "gpu-kernel" fn rows_d2(x: *const f32, w: *const u16, out: *mut f32, m: u32, n: u32, split: u32) {
+        unsafe {
+            let tid = workitem_id_x();
+            let (m, n) = (m as usize, n as usize);
+            let t = tid as usize;
+            let x = if core::arch::amdgpu::workgroup_id_x() * 8 >= split { x.add(KDA_DIM) } else { x };
+            rows_over::<KDA_DIM, false>(tid, w, core::ptr::null(), m, n, 0.0, |i, s| if s * 256 + t < KDA_DIM { *x.add(i * 2 * KDA_DIM + s * 256 + t) } else { 0.0 }, || {}, |row, i, y| *out.add(i * m + row) = y);
         }
     }
 

@@ -212,7 +212,8 @@ pub mod gfx11_consts {
     use crate::*;
     /// `hc_pre`: the coefficient rows over the flattened streams, each over `SLICES` workgroups of `K_SLICE` channels.
     pub const COEF_ROWS: usize = HC_COEFS;
-    pub const SLICES: usize = 8;
+    /// One workgroup a row: 192 slices serialized on the arrival atomic (49 µs a launch, timeline 2026-10-16); 24 cost ~5.
+    pub const SLICES: usize = 1;
     pub const K_SLICE: usize = HC * H / SLICES;
     pub const PRE_GRID: u32 = (COEF_ROWS * SLICES) as u32;
     pub const PRE_LDS: u32 = 512;
@@ -449,10 +450,42 @@ pub mod gfx11 {
 
     /// `stream_j[d] = post_j · y[d] + Σ_i comb_ij · stream_i[d]`, a thread a channel, the block
     /// output `y` the sum of `ya` and `yb` (`yb` null for one source): the parts of a split
-    /// attention block, or the shared expert's rows and the host's routed experts. Grid: CHANNEL_GRID.
+    /// attention block, or the shared expert's rows and the host's routed experts. The handoff
+    /// first (`hc_handoff`'s, so the update is one launch, not two): workgroup 0 copies this
+    /// card's `n` floats from `src` out to `dst` and writes `value` to `mine`; every workgroup
+    /// then holds until `w0` and `w1` (those not null) read `value`. Grid: CHANNEL_GRID.
     #[no_mangle]
-    pub extern "gpu-kernel" fn hc_post(mix: *const f32, ya: *const f32, yb: *const f32, streams: *mut f32) {
+    pub extern "gpu-kernel" fn hc_post(mix: *const f32, ya: *const f32, yb: *const f32, streams: *mut f32, src: *const f32, dst: *mut f32, n: u32, mine: *mut u32, w0: *const u32, w1: *const u32, value: u32) {
         unsafe {
+            let t = workitem_id_x();
+            if workgroup_id_x() == 0 {
+                if !src.is_null() {
+                    let mut i = t;
+                    while i < n {
+                        *dst.add(i as usize) = *src.add(i as usize);
+                        i += 256;
+                    }
+                    fence(Ordering::Release);
+                    workgroup_sync();
+                }
+                if t == 0 && !mine.is_null() {
+                    AtomicU32::from_ptr(mine).store(value, Ordering::Release);
+                }
+            }
+            // every workgroup waits for the words — this card's own included, so no workgroup reads
+            // the shared buffer before workgroup 0's copy is out
+            if t == 0 {
+                if !mine.is_null() {
+                    while AtomicU32::from_ptr(mine).load(Ordering::Relaxed) != value {}
+                }
+                if !w0.is_null() {
+                    while AtomicU32::from_ptr(w0 as *mut u32).load(Ordering::Relaxed) != value {}
+                }
+                if !w1.is_null() {
+                    while AtomicU32::from_ptr(w1 as *mut u32).load(Ordering::Relaxed) != value {}
+                }
+            }
+            workgroup_sync();
             let d = workgroup_id_x() as usize * 256 + workitem_id_x() as usize;
             let mut res = [0f32; HC];
             let mut i = 0;
