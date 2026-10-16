@@ -219,9 +219,13 @@ pub mod gfx11_consts {
     pub const K_SLICE: usize = HC * H / SLICES;
     pub const PRE_GRID: u32 = (COEF_ROWS * SLICES) as u32;
     pub const PRE_LDS: u32 = 512;
-    /// `hc_pre`'s arrival words in VRAM: one a row, then the launch's; all 0 between launches.
-    pub const PRE_COUNTS: usize = COEF_ROWS + 1;
-    const _: () = assert!(HC * H % SLICES == 0 && K_SLICE % 256 == 0 && COEF_ROWS <= 256 && (8 + COEF_ROWS + 1) * 4 <= PRE_LDS as usize);
+    /// `hc_pre`'s VRAM words: an arrival count a row, the launch's, then the mix's ready word; the counts 0 between launches.
+    pub const PRE_COUNTS: usize = COEF_ROWS + 2;
+    /// `hc_pre`'s partials in VRAM: the coefficient dots `[COEF_ROWS][SLICES]`, then every workgroup's sum of squares of its channel slice.
+    pub const PRE_PARTS: usize = COEF_ROWS * SLICES + COEF_ROWS * SLICES;
+    /// Channels of the collapse a workgroup takes.
+    pub const COLLAPSE: usize = H.div_ceil(COEF_ROWS * SLICES);
+    const _: () = assert!(HC * H % SLICES == 0 && K_SLICE % 256 == 0 && COEF_ROWS <= 256 && (16 + COEF_ROWS + 1) * 4 <= PRE_LDS as usize && COLLAPSE <= 256);
     /// The mix the card keeps between a block's two halves: pre `[HC]`, post `[HC]`, comb `[HC][HC]`.
     pub const MIX: usize = 2 * HC + HC * HC;
     /// `hc_post` and `hc_mean`: a thread a channel.
@@ -254,47 +258,58 @@ pub mod gfx11 {
         1.0 / (1.0 + exp(-x))
     }
 
-    /// The hyper-connection's input half as one launch over `COEF_ROWS · SLICES` workgroups:
-    /// workgroup (row, slice) takes the dot of its `K_SLICE` of row `row` with the raw stream
-    /// channels into `part[row][slice]` and counts its arrival (`count[row]`; the last of a row
-    /// counts in `count[COEF_ROWS]`, every word back at 0 when the launch leaves). The last
-    /// workgroup of all takes the rms of the channels once, sums each row's partials in slice
-    /// order (deterministic) scaled by it, makes the mix (`hc::pre`'s arithmetic) and the
-    /// collapsed block input `x[d] = Σ_i pre_i · stream_i[d]`, into `x` and, when `x_host` is
-    /// not null, there too (the routed experts' input; the host's word follows in a later
-    /// handoff). LDS: 512 bytes.
+    /// The hyper-connection's input half as one launch over `COEF_ROWS · SLICES` workgroups.
+    /// Workgroup (row, slice) takes the dot of its `K_SLICE` of row `row` with the raw stream
+    /// channels into `part[row][slice]`, and the sum of squares of those channels alongside
+    /// (the norm is a scalar), then counts its arrival (`count[row]`; the last of a row counts
+    /// in `count[COEF_ROWS]`). The last workgroup of all sums the squares and each row's
+    /// partials in fixed order, makes the mix (`hc::pre`'s arithmetic) into `mix` and publishes
+    /// `value` in `count[COEF_ROWS + 1]`; every workgroup waits for that word (all resident:
+    /// the grid is a fraction of the card) and collapses its `COLLAPSE` channels,
+    /// `x[d] = Σ_i pre_i · stream_i[d]`, into `x` and, when `x_host` is not null, there too (the
+    /// routed experts' input; the host's word follows in a later handoff). One workgroup doing
+    /// the collapse alone was the 50 µs (timeline 2026-10-16). Counts back at 0 when the launch
+    /// leaves. LDS: 512 bytes.
     #[no_mangle]
-    pub extern "gpu-kernel" fn hc_pre(streams: *const f32, w: *const u16, part: *mut f32, base: *const f32, scale: *const f32, mix: *mut f32, x: *mut f32, x_host: *mut f32, count: *mut u32) {
+    pub extern "gpu-kernel" fn hc_pre(streams: *const f32, w: *const u16, part: *mut f32, base: *const f32, scale: *const f32, mix: *mut f32, x: *mut f32, x_host: *mut f32, count: *mut u32, value: u32) {
         unsafe {
             let t = workitem_id_x() as usize;
             let (wave, lane) = (t / 32, (t % 32) as u32);
             let wg = workgroup_id_x() as usize;
             let (row, slice) = (wg / SLICES, wg % SLICES);
-            let red = lds::<f32>(); // [8] wave partials | [COEF_ROWS] coefficients | last
-            let coefs = red.add(8);
-            let last = red.add(8 + COEF_ROWS) as *mut u32;
-            // this slice of the row against the raw channels (the norm is a scalar: the last workgroup applies it)
+            let red = lds::<f32>(); // [8] dot partials | [8] square partials | [COEF_ROWS] coefficients | last
+            let red2 = red.add(8);
+            let coefs = red.add(16);
+            let last = red.add(16 + COEF_ROWS) as *mut u32;
+            let ready = count.add(COEF_ROWS + 1);
+            // this slice of the row against the raw channels, and the channels' squares
             let (w_row, c0) = (w.add(row * HC * H), slice * K_SLICE);
-            let mut acc = 0f32;
+            let (mut acc, mut ss) = (0f32, 0f32);
             let mut i = t;
             while i < K_SLICE {
-                acc += *streams.add(c0 + i) * widen(*w_row.add(c0 + i));
+                let v = *streams.add(c0 + i);
+                acc += v * widen(*w_row.add(c0 + i));
+                ss += v * v;
                 i += 256;
             }
             acc = wave_sum(lane, acc);
+            ss = wave_sum(lane, ss);
             if lane == 0 {
                 *red.add(wave) = acc;
+                *red2.add(wave) = ss;
             }
             workgroup_sync();
             if t == 0 {
-                let mut p = 0f32;
+                let (mut p, mut q) = (0f32, 0f32);
                 let mut k = 0;
                 while k < 8 {
                     p += *red.add(k);
+                    q += *red2.add(k);
                     k += 1;
                 }
-                // the partial past this CU's caches, then the arrivals: this row's, and for its last, the launch's
+                // the partials past this CU's caches, then the arrivals: this row's, and for its last, the launch's
                 AtomicU32::from_ptr(part.add(row * SLICES + slice) as *mut u32).store(p.to_bits(), Ordering::Release);
+                AtomicU32::from_ptr(part.add(COEF_ROWS * SLICES + wg) as *mut u32).store(q.to_bits(), Ordering::Release);
                 let row_done = AtomicU32::from_ptr(count.add(row)).fetch_add(1, Ordering::AcqRel) == SLICES as u32 - 1;
                 let mut is_last = 0u32;
                 if row_done {
@@ -304,137 +319,136 @@ pub mod gfx11 {
                 *last = is_last;
             }
             workgroup_sync();
-            if *last == 0 {
-                return;
-            }
-            if t == 0 {
-                *count.add(COEF_ROWS) = 0; // nothing else touches it until the next launch
-            }
-            // the norm, once: every channel's square, summed
-            let mut ss = 0f32;
-            let mut i = t;
-            while i < HC * H {
-                let v = *streams.add(i);
-                ss += v * v;
-                i += 256;
-            }
-            ss = wave_sum(lane, ss);
-            if lane == 0 {
-                *red.add(wave) = ss;
-            }
-            workgroup_sync();
-            let mut tot = 0f32;
-            let mut k = 0;
-            while k < 8 {
-                tot += *red.add(k);
-                k += 1;
-            }
-            let r = 1.0 / sqrt(tot / (HC * H) as f32 + RMS_NORM_EPS);
-            // the coefficients: the partials read past this CU's caches, summed in slice order, normed
-            if t < COEF_ROWS {
-                let mut sum = 0f32;
+            if *last != 0 {
+                if t == 0 {
+                    *count.add(COEF_ROWS) = 0; // nothing else touches it until the next launch
+                }
+                // the norm from one row's slices' squares (every row's slices read the same channels; one row
+                // covers them all), the coefficients from every row's partials: fixed order
+                let mut tot = 0f32;
                 let mut k = 0;
                 while k < SLICES {
-                    sum += f32::from_bits(AtomicU32::from_ptr(part.add(t * SLICES + k) as *mut u32).load(Ordering::Acquire));
+                    tot += f32::from_bits(AtomicU32::from_ptr(part.add(COEF_ROWS * SLICES + k) as *mut u32).load(Ordering::Acquire));
                     k += 1;
                 }
-                *coefs.add(t) = sum * r;
-            }
-            workgroup_sync();
-            // every thread computes the whole mix: a few hundred operations, no exchange needed
-            let c = |i: usize| *coefs.add(i);
-            let (s0, s1, s2) = (*scale, *scale.add(1), *scale.add(2));
-            let mut pre = [0f32; HC];
-            let mut post = [0f32; HC];
-            let mut cb = [[0f32; HC]; HC];
-            let mut i = 0;
-            while i < HC {
-                pre[i] = sigmoid(c(i) * s0 + *base.add(i)) + HC_EPS;
-                post[i] = 2.0 * sigmoid(c(HC + i) * s1 + *base.add(HC + i));
-                i += 1;
-            }
-            let mut i = 0;
-            while i < HC {
-                let mut row = [0f32; HC];
-                let mut mx = f32::NEG_INFINITY;
-                let mut j = 0;
-                while j < HC {
-                    row[j] = c(2 * HC + i * HC + j) * s2 + *base.add(2 * HC + i * HC + j);
-                    if row[j] > mx {
-                        mx = row[j];
-                    }
-                    j += 1;
-                }
-                let mut sum = 0f32;
-                let mut j = 0;
-                while j < HC {
-                    row[j] = exp(row[j] - mx);
-                    sum += row[j];
-                    j += 1;
-                }
-                let mut j = 0;
-                while j < HC {
-                    cb[i][j] = row[j] / sum + HC_EPS;
-                    j += 1;
-                }
-                i += 1;
-            }
-            // Sinkhorn-Knopp: columns first, then rows and columns HC_SINKHORN_ITERS - 1 times
-            let mut it = 0;
-            while it < HC_SINKHORN_ITERS {
-                if it > 0 {
-                    let mut i = 0;
-                    while i < HC {
-                        let mut sum = 0f32;
-                        let mut j = 0;
-                        while j < HC {
-                            sum += cb[i][j];
-                            j += 1;
-                        }
-                        let sum = sum + HC_EPS;
-                        let mut j = 0;
-                        while j < HC {
-                            cb[i][j] /= sum;
-                            j += 1;
-                        }
-                        i += 1;
-                    }
-                }
-                let mut j = 0;
-                while j < HC {
+                let r = 1.0 / sqrt(tot / (HC * H) as f32 + RMS_NORM_EPS);
+                if t < COEF_ROWS {
                     let mut sum = 0f32;
-                    let mut i = 0;
-                    while i < HC {
-                        sum += cb[i][j];
-                        i += 1;
+                    let mut k = 0;
+                    while k < SLICES {
+                        sum += f32::from_bits(AtomicU32::from_ptr(part.add(t * SLICES + k) as *mut u32).load(Ordering::Acquire));
+                        k += 1;
                     }
-                    let sum = sum + HC_EPS;
-                    let mut i = 0;
-                    while i < HC {
-                        cb[i][j] /= sum;
-                        i += 1;
-                    }
-                    j += 1;
+                    *coefs.add(t) = sum * r;
                 }
-                it += 1;
-            }
-            // one thread writes the mix, with constant indices (indexing the arrays by thread spilled them)
-            if t == 0 {
+                workgroup_sync();
+                // every thread computes the whole mix: a few hundred operations, no exchange needed
+                let c = |i: usize| *coefs.add(i);
+                let (s0, s1, s2) = (*scale, *scale.add(1), *scale.add(2));
+                let mut pre = [0f32; HC];
+                let mut post = [0f32; HC];
+                let mut cb = [[0f32; HC]; HC];
                 let mut i = 0;
                 while i < HC {
-                    *mix.add(i) = pre[i];
-                    *mix.add(HC + i) = post[i];
+                    pre[i] = sigmoid(c(i) * s0 + *base.add(i)) + HC_EPS;
+                    post[i] = 2.0 * sigmoid(c(HC + i) * s1 + *base.add(HC + i));
+                    i += 1;
+                }
+                let mut i = 0;
+                while i < HC {
+                    let mut row = [0f32; HC];
+                    let mut mx = f32::NEG_INFINITY;
                     let mut j = 0;
                     while j < HC {
-                        *mix.add(2 * HC + i * HC + j) = cb[i][j];
+                        row[j] = c(2 * HC + i * HC + j) * s2 + *base.add(2 * HC + i * HC + j);
+                        if row[j] > mx {
+                            mx = row[j];
+                        }
+                        j += 1;
+                    }
+                    let mut sum = 0f32;
+                    let mut j = 0;
+                    while j < HC {
+                        row[j] = exp(row[j] - mx);
+                        sum += row[j];
+                        j += 1;
+                    }
+                    let mut j = 0;
+                    while j < HC {
+                        cb[i][j] = row[j] / sum + HC_EPS;
                         j += 1;
                     }
                     i += 1;
                 }
+                // Sinkhorn-Knopp: columns first, then rows and columns HC_SINKHORN_ITERS - 1 times
+                let mut it = 0;
+                while it < HC_SINKHORN_ITERS {
+                    if it > 0 {
+                        let mut i = 0;
+                        while i < HC {
+                            let mut sum = 0f32;
+                            let mut j = 0;
+                            while j < HC {
+                                sum += cb[i][j];
+                                j += 1;
+                            }
+                            let sum = sum + HC_EPS;
+                            let mut j = 0;
+                            while j < HC {
+                                cb[i][j] /= sum;
+                                j += 1;
+                            }
+                            i += 1;
+                        }
+                    }
+                    let mut j = 0;
+                    while j < HC {
+                        let mut sum = 0f32;
+                        let mut i = 0;
+                        while i < HC {
+                            sum += cb[i][j];
+                            i += 1;
+                        }
+                        let sum = sum + HC_EPS;
+                        let mut i = 0;
+                        while i < HC {
+                            cb[i][j] /= sum;
+                            i += 1;
+                        }
+                        j += 1;
+                    }
+                    it += 1;
+                }
+                // one thread writes the mix past its caches, with constant indices, then publishes it
+                if t == 0 {
+                    let mut i = 0;
+                    while i < HC {
+                        AtomicU32::from_ptr(mix.add(i) as *mut u32).store(pre[i].to_bits(), Ordering::Relaxed);
+                        AtomicU32::from_ptr(mix.add(HC + i) as *mut u32).store(post[i].to_bits(), Ordering::Relaxed);
+                        let mut j = 0;
+                        while j < HC {
+                            AtomicU32::from_ptr(mix.add(2 * HC + i * HC + j) as *mut u32).store(cb[i][j].to_bits(), Ordering::Relaxed);
+                            j += 1;
+                        }
+                        i += 1;
+                    }
+                    AtomicU32::from_ptr(ready).store(value, Ordering::Release);
+                }
             }
-            // the collapse: this thread's channels
-            let mut d = t;
-            while d < H {
+            // every workgroup: the mix, then its channels of the collapse
+            if t == 0 {
+                while AtomicU32::from_ptr(ready).load(Ordering::Acquire) != value {}
+            }
+            workgroup_sync();
+            let mut pre = [0f32; HC];
+            let mut i = 0;
+            while i < HC {
+                pre[i] = f32::from_bits(AtomicU32::from_ptr(mix.add(i) as *mut u32).load(Ordering::Relaxed));
+                i += 1;
+            }
+            let d0 = wg * COLLAPSE;
+            let mut d = d0 + t;
+            while d < d0 + COLLAPSE && d < H {
                 let mut acc = 0f32;
                 let mut i = 0;
                 while i < HC {

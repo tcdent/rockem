@@ -37,7 +37,7 @@
 use crate::kfd::{read, Args, Kfd, Mem};
 use glm_5_3_flash::construct::Placed;
 use glm_5_3_flash::ffn::gfx11_consts::{DENSE_GU_ROWS, SHARED_GU_ROWS};
-use glm_5_3_flash::hc::gfx11_consts::{CHANNEL_GRID, COEF_ROWS, MIX as HC_MIX, PRE_COUNTS, PRE_GRID, PRE_LDS, SLICES as HC_SLICES};
+use glm_5_3_flash::hc::gfx11_consts::{CHANNEL_GRID, MIX as HC_MIX, PRE_COUNTS, PRE_GRID, PRE_LDS, PRE_PARTS};
 use glm_5_3_flash::kda::gfx11_consts as g;
 use glm_5_3_flash::layout::{KDA_MEMORY, KDA_WINDOW};
 use glm_5_3_flash::mla::gfx11_consts::{ATTEND_GRID, ATTEND_LDS, IX_ROWS, O_IN};
@@ -68,7 +68,7 @@ struct Card {
     hc_handoff: crate::kfd::Kernel,
     // the residual streams and the hyper-connection's scratch: this card's copy
     streams: Mem, // [HC][H] f32, host-visible: the embedding goes in through the BAR
-    part: Mem,    // [HC_COEFS][SLICES] f32: the coefficient GEMV's partials
+    part: Mem,    // [PRE_PARTS] f32: the coefficient GEMV's partials and the norm's
     count: Mem,   // [PRE_COUNTS] u32: `hc_pre`'s arrival counts, 0 between launches
     go: Mem,      // one u32: `hc_post`'s release word for its workgroups
     mix: Mem,     // [MIX] f32: pre | post | comb
@@ -240,7 +240,7 @@ impl Cards {
                     hc_mean: k.kernel("hc_mean"),
                     hc_handoff: k.kernel("hc_handoff"),
                     streams: alloc(HC * H),
-                    part: k.vram(COEF_ROWS * HC_SLICES * 4),
+                    part: k.vram(PRE_PARTS * 4),
                     count: {
                         let m = k.vram_visible(PRE_COUNTS * 4);
                         k.upload(&m, 0, &vec![0u8; PRE_COUNTS * 4]);
@@ -531,9 +531,9 @@ impl Cards {
     /// The hyper-connection's input half on card `c`, one launch: the coefficients over its streams,
     /// the mix, the collapse into the block input `x` — and into `x_host` for the routed experts when
     /// given (the host's word follows the router's logits, in the handoff after them).
-    fn hc_pre(&self, c: &Card, hc: &(Mem, Mem, Mem), x_host: Option<usize>) {
+    fn hc_pre(&self, c: &Card, hc: &(Mem, Mem, Mem), x_host: Option<usize>, value: u32) {
         let mut a = Args::new();
-        a.ptr(c.streams.va).ptr(hc.0.va).ptr(c.part.va).ptr(hc.1.va).ptr(hc.2.va).ptr(c.mix.va).ptr(c.x.va).ptr(x_host.unwrap_or(0)).ptr(c.count.va);
+        a.ptr(c.streams.va).ptr(hc.0.va).ptr(c.part.va).ptr(hc.1.va).ptr(hc.2.va).ptr(c.mix.va).ptr(c.x.va).ptr(x_host.unwrap_or(0)).ptr(c.count.va).u32(value);
         c.k.launch(&c.hc_pre, PRE_GRID, g::WG, PRE_LDS, &a);
     }
     /// The hyper-connection's output half on card `c`, the handoff first: this card's `copy`
@@ -636,7 +636,7 @@ impl Placed for Cards {
         self.half_seq[l][0] = value;
         let f = self.ffns[l].as_ref().unwrap();
         for c in &self.cards {
-            self.hc_pre(c, &f.hc[c.k.index][0], None);
+            self.hc_pre(c, &f.hc[c.k.index][0], None, value);
         }
         self.route_early(l, value);
         let lay = self.layers[l].as_ref().unwrap();
@@ -673,7 +673,7 @@ impl Placed for Cards {
         self.half_seq[l][0] = value;
         let f = self.ffns[l].as_ref().unwrap();
         for c in &self.cards {
-            self.hc_pre(c, &f.hc[c.k.index][0], None);
+            self.hc_pre(c, &f.hc[c.k.index][0], None, value);
         }
         self.route_early(l, value);
         let m = self.mlas[l].as_ref().unwrap();
@@ -730,7 +730,7 @@ impl Placed for Cards {
         for c in &self.cards {
             // the FFN card's collapse goes to the host too when the routed experts need it
             let to_host = (!f.dense && c.k.index == f.card).then_some(self.shared.xh.va);
-            self.hc_pre(c, &f.hc[c.k.index][1], to_host);
+            self.hc_pre(c, &f.hc[c.k.index][1], to_host, value);
         }
         let c = &self.cards[f.card];
         if let Some(router) = &f.router {
