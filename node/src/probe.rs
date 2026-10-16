@@ -46,6 +46,174 @@ fn pin(core: usize) {
     unsafe { sched_setaffinity(0, 128, mask.as_ptr()) };
 }
 
+
+/// `cores` stream `slices` (one each) together, after each has flushed its caches with 64 MB of
+/// something else: the first pass's aggregate GB/s (from DRAM), then the second pass's (from
+/// whatever the first left in the caches). With `readers` given, the second pass runs on those
+/// cores instead (the same slices, another CCD).
+fn l3_passes(cores: &[usize], readers: Option<&[usize]>, slices: &[&[u8]]) -> (f64, f64) {
+    let readers = readers.unwrap_or(cores);
+    assert!(slices.len() == cores.len() && readers.len() == cores.len());
+    let start = Barrier::new(cores.len());
+    let mid = Barrier::new(cores.len() * 2);
+    let bytes: usize = slices.iter().map(|s| s.len()).sum();
+    let (firsts, seconds): (Vec<f64>, Vec<f64>) = std::thread::scope(|sc| {
+        let a: Vec<_> = cores
+            .iter()
+            .zip(slices)
+            .map(|(&cpu, slice)| {
+                let (start, mid) = (&start, &mid);
+                sc.spawn(move || {
+                    pin(cpu);
+                    let other = vec![1u8; 64 << 20];
+                    std::hint::black_box(unsafe { stream_sum(other.as_ptr(), other.len()) });
+                    start.wait();
+                    let t0 = std::time::Instant::now();
+                    std::hint::black_box(unsafe { stream_sum(slice.as_ptr(), slice.len()) });
+                    let first = t0.elapsed().as_secs_f64();
+                    mid.wait();
+                    first
+                })
+            })
+            .collect();
+        let b: Vec<_> = readers
+            .iter()
+            .zip(slices)
+            .map(|(&cpu, slice)| {
+                let mid = &mid;
+                sc.spawn(move || {
+                    pin(cpu);
+                    mid.wait();
+                    let t1 = std::time::Instant::now();
+                    std::hint::black_box(unsafe { stream_sum(slice.as_ptr(), slice.len()) });
+                    t1.elapsed().as_secs_f64()
+                })
+            })
+            .collect();
+        (a.into_iter().map(|h| h.join().unwrap()).collect(), b.into_iter().map(|h| h.join().unwrap()).collect())
+    });
+    let worst = |v: &[f64]| v.iter().cloned().fold(0f64, f64::max);
+    (bytes as f64 / worst(&firsts) / 1e9, bytes as f64 / worst(&seconds) / 1e9)
+}
+
+/// Per-core slices of `mb` MB in all, each first-touched by its core (node-local).
+fn slices_for(cores: &[usize], mb: usize) -> Vec<&'static mut [u8]> {
+    let per = (mb << 20) / cores.len();
+    cores
+        .iter()
+        .map(|&cpu| {
+            std::thread::scope(|sc| {
+                sc.spawn(move || {
+                    pin(cpu);
+                    let b: &'static mut [u8] = Box::leak(vec![0u8; per].into_boxed_slice());
+                    for (i, v) in b.iter_mut().enumerate().step_by(4096) {
+                        *v = i as u8;
+                    }
+                    b
+                })
+                .join()
+                .unwrap()
+            })
+        })
+        .collect()
+}
+
+/// The L3 as a prefetch target, one question at a time: whether a CCD's cores find again what they
+/// streamed, over slice sizes; whether another CCD finds it; what the INT4 expert kernel runs at on
+/// one CCD from DRAM and from L3; what every CCD of the node re-reading its own slice runs at together.
+fn l3_probe(ccds: &[Vec<usize>], iters: usize) {
+    let ccd0 = &ccds[0];
+    // 1. one CCD, the second pass over the first, by size
+    let by_size: Vec<String> = [4usize, 8, 16, 24, 32, 48]
+        .iter()
+        .map(|&mb| {
+            let slices = slices_for(ccd0, mb);
+            let views: Vec<&[u8]> = slices.iter().map(|s| &**s).collect();
+            let mut best = (0f64, 0f64);
+            for _ in 0..iters {
+                let r = l3_passes(ccd0, None, &views);
+                if r.1 > best.1 {
+                    best = r;
+                }
+            }
+            format!("{mb} MB {:.0}→{:.0}", best.0, best.1)
+        })
+        .collect();
+    println!("l3       : CCD 0 ({} cores) streams a slice, then the same bytes again — DRAM→second pass GB/s: {}", ccd0.len(), by_size.join(", "));
+    // 2. another CCD of the node reads what CCD 0 streamed
+    if ccds.len() > 1 {
+        let slices = slices_for(ccd0, 11);
+        let views: Vec<&[u8]> = slices.iter().map(|s| &**s).collect();
+        let other = &ccds[1][..ccd0.len().min(ccds[1].len())];
+        let mut best = (0f64, 0f64);
+        for _ in 0..iters {
+            let r = l3_passes(&ccd0[..other.len()], Some(other), &views[..other.len()]);
+            if r.1 > best.1 {
+                best = r;
+            }
+        }
+        println!("l3       : CCD 0 streams 11 MB at {:.0} GB/s, then CCD 1 reads the same bytes at {:.0} GB/s", best.0, best.1);
+    }
+    // 3. the INT4 expert kernel on one CCD: a packed [4096][5120] matrix (10.5 MB), from DRAM then from L3
+    {
+        const K: usize = glm_5_3_flash::H;
+        const M: usize = 4096;
+        let (q, sc): (Vec<i8>, Vec<f32>) = ((0..M * K).map(|i| ((i * 2654435761) >> 9) as i8 % 8).collect(), vec![1e-3; M * K / 128]);
+        let (pw, ps) = common::q4::pack(M, K, &q, &sc);
+        let x: Vec<f32> = (0..K).map(|i| (i % 13) as f32 * 0.01).collect();
+        let (mut xq, mut xs, mut xg) = (vec![0i8; K], vec![0f32; K / 128], vec![0i32; K / 128]);
+        common::q4::QAct { q: &mut xq, scale: &mut xs, gsum: &mut xg }.quantize(&x);
+        let act = common::q4::Act { q: &xq, scale: &xs, gsum: &xg };
+        let rows_per = M / ccd0.len();
+        let start = Barrier::new(ccd0.len());
+        let mid = Barrier::new(ccd0.len());
+        let (pw_r, ps_r, act_r) = (&pw, &ps, &act);
+        let times: Vec<(f64, f64)> = std::thread::scope(|sc| {
+            let hs: Vec<_> = ccd0
+                .iter()
+                .enumerate()
+                .map(|(t, &cpu)| {
+                    let (start, mid) = (&start, &mid);
+                    sc.spawn(move || {
+                        pin(cpu);
+                        let r0 = t * rows_per;
+                        let mut out = vec![0f32; rows_per];
+                        let run = |out: &mut [f32]| common::q4::gemv::<K>(rows_per, &pw_r[r0 / 4 * 2 * K..(r0 + rows_per) / 4 * 2 * K], &ps_r[r0 / 4 * (K / 128) * 4..(r0 + rows_per) / 4 * (K / 128) * 4], act_r, out);
+                        let other = vec![1u8; 64 << 20];
+                        std::hint::black_box(unsafe { stream_sum(other.as_ptr(), other.len()) });
+                        start.wait();
+                        let t0 = std::time::Instant::now();
+                        run(&mut out);
+                        let first = t0.elapsed().as_secs_f64();
+                        mid.wait();
+                        let t1 = std::time::Instant::now();
+                        run(&mut out);
+                        (first, t1.elapsed().as_secs_f64())
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let worst = |f: &dyn Fn(&(f64, f64)) -> f64| times.iter().map(f).fold(0f64, f64::max);
+        let bytes = (M * K / 2) as f64;
+        println!("l3       : the INT4 expert kernel on CCD 0 over 10.5 MB: from DRAM {:.0} GB/s, the same rows again {:.0} GB/s", bytes / worst(&|t| t.0) / 1e9, bytes / worst(&|t| t.1) / 1e9);
+    }
+    // 4. every CCD of the node, its own 11 MB, the second pass together
+    {
+        let all: Vec<usize> = ccds.iter().flatten().copied().collect();
+        let slices: Vec<Vec<&'static mut [u8]>> = ccds.iter().map(|c| slices_for(c, 11)).collect();
+        let views: Vec<&[u8]> = slices.iter().flatten().map(|s| &**s).collect();
+        let mut best = (0f64, 0f64);
+        for _ in 0..iters {
+            let r = l3_passes(&all, None, &views);
+            if r.1 > best.1 {
+                best = r;
+            }
+        }
+        println!("l3       : every CCD of node 0 ({}) streams its own 11 MB — together {:.0} GB/s from DRAM, then {:.0} GB/s again", ccds.len(), best.0, best.1);
+    }
+}
+
 /// The physical cores of a node grouped by the L3 they share (a CCD each), from /sys.
 fn ccds_of(cores: &[usize]) -> Vec<Vec<usize>> {
     let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
@@ -340,46 +508,8 @@ pub fn run(elf: Option<&[u8]>) {
     let huge_rate = dram_pages(&nodes[0], mb, iters, false, true);
     println!("dram     : node 0 local, threads a CCD — {}; every SMT sibling ({}) {smt_rate:.0}; 48 threads on 2 MiB pages {huge_rate:.0} GB/s ({} CCDs)", per_ccd.join(", "), smt.len(), ccds.len());
     println!("dimms    : {}", dimms());
-    // the L3 as a prefetch target: one CCD's cores touch a slice the size of its share of a layer's
-    // experts (11 MB), then stream it again: what the second pass runs at against the first
-    {
-        let ccd = &ccds[0];
-        let mb = 11;
-        let n = mb << 20;
-        let start = Barrier::new(ccd.len());
-        let rates: Vec<(f64, f64)> = std::thread::scope(|sc| {
-            let hs: Vec<_> = ccd
-                .iter()
-                .enumerate()
-                .map(|(t, &cpu)| {
-                    let start = &start;
-                    let per = n / ccd.len();
-                    sc.spawn(move || {
-                        pin(cpu);
-                        let mut buf = vec![0u8; per];
-                        for (i, b) in buf.iter_mut().enumerate().step_by(4096) {
-                            *b = (i + t) as u8;
-                        }
-                        // flush what the fill left: stream 64 MB of something else
-                        let other = vec![1u8; 64 << 20];
-                        std::hint::black_box(unsafe { stream_sum(other.as_ptr(), other.len()) });
-                        start.wait();
-                        let t0 = std::time::Instant::now();
-                        std::hint::black_box(unsafe { stream_sum(buf.as_ptr(), per) });
-                        let first = t0.elapsed().as_secs_f64();
-                        start.wait();
-                        let t1 = std::time::Instant::now();
-                        std::hint::black_box(unsafe { stream_sum(buf.as_ptr(), per) });
-                        let second = t1.elapsed().as_secs_f64();
-                        (per as f64 / first / 1e9, per as f64 / second / 1e9)
-                    })
-                })
-                .collect();
-            hs.into_iter().map(|h| h.join().unwrap()).collect()
-        });
-        let (a, b): (f64, f64) = rates.iter().fold((0.0, 0.0), |(a, b), (x, y)| (a + x, b + y));
-        println!("l3       : CCD 0's {} cores stream {mb} MB from DRAM at {a:.0} GB/s, then the same bytes again at {b:.0} GB/s", ccd.len());
-    }
+    // the L3 as a prefetch target, one question at a time
+    l3_probe(&ccds, iters);
     let pool = Threads::new(&all);
     println!("{}", gemv_rates(&pool, iters, nodes.len(), false));
     if nodes.len() > 1 {

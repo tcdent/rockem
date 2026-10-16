@@ -405,16 +405,43 @@ impl<'a> CpuExperts<'a> {
 fn raw_f32(v: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
-/// Pull every cache line of `b` through this core: into its L2 and, as the core streams on, its CCD's L3.
+/// Pull every cache line of `b` through this core: into its L2 and, as the core streams on,
+/// its CCD's L3. One 32-byte AVX2 load a line, four lines in flight.
 #[inline(always)]
 fn touch(b: &[u8]) {
-    let mut acc = 0u64;
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        touch_avx2(b.as_ptr(), b.len())
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let mut acc = 0u64;
+        let mut i = 0;
+        while i + 8 <= b.len() {
+            acc ^= u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+            i += 64;
+        }
+        std::hint::black_box(acc);
+    }
+}
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn touch_avx2(p: *const u8, len: usize) {
+    use std::arch::x86_64::*;
+    let (mut a, mut b, mut c, mut d) = (_mm256_setzero_si256(), _mm256_setzero_si256(), _mm256_setzero_si256(), _mm256_setzero_si256());
     let mut i = 0;
-    while i + 8 <= b.len() {
-        acc ^= u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+    while i + 256 <= len {
+        a = _mm256_xor_si256(a, _mm256_loadu_si256(p.add(i) as *const __m256i));
+        b = _mm256_xor_si256(b, _mm256_loadu_si256(p.add(i + 64) as *const __m256i));
+        c = _mm256_xor_si256(c, _mm256_loadu_si256(p.add(i + 128) as *const __m256i));
+        d = _mm256_xor_si256(d, _mm256_loadu_si256(p.add(i + 192) as *const __m256i));
+        i += 256;
+    }
+    while i + 32 <= len {
+        a = _mm256_xor_si256(a, _mm256_loadu_si256(p.add(i) as *const __m256i));
         i += 64;
     }
-    std::hint::black_box(acc);
+    std::hint::black_box(_mm256_xor_si256(_mm256_xor_si256(a, b), _mm256_xor_si256(c, d)));
 }
 impl Routed for CpuExperts<'_> {
     fn elapsed(&mut self) -> f64 {
