@@ -749,6 +749,14 @@ impl Kfd {
         let s = self.signal.at(off) as *const Signal;
         unsafe { (*s).value.store(1, Ordering::Release) };
         let idx = self.write_index.get();
+        // the slot's stamp and name are a launch's: cleared so a timeline skips this packet
+        let slot = (idx as usize) % RING_PACKETS;
+        self.names.borrow_mut()[slot] = "";
+        unsafe {
+            let st = &mut *(self.stamps.ptr() as *mut Signal).add(slot);
+            st.start_ts = 0;
+            st.end_ts = 0;
+        }
         let pkt = Packet { header: PACKET_INVALID, setup: 0, workgroup_size: [0; 3], reserved0: 0, grid_size: [0; 3], private_segment_size: 0, group_segment_size: 0, kernel_object: 0, kernarg_address: 0, reserved2: 0, completion_signal: self.signal.at(off) as u64 };
         self.post(idx, pkt, PACKET_BARRIER_AND | HEADER_BARRIER | (FENCE_SYSTEM << HEADER_ACQUIRE_SHIFT) | (FENCE_SYSTEM << HEADER_RELEASE_SHIFT));
         if off == 0 {
@@ -802,6 +810,29 @@ impl Kfd {
                 (names[slot], s.start_ts, s.end_ts)
             })
             .collect()
+    }
+    /// The launches from packet `from` to the last posted, in order: name, start and end on the
+    /// card's 100 MHz clock (a barrier packet's name is ""). Valid after `sync`, while the ring holds them.
+    pub fn timeline_from(&self, from: u64) -> Vec<(&'static str, u64, u64)> {
+        assert!(self.instrument, "timeline: the launcher was opened without instrumentation");
+        let to = self.write_index.get();
+        assert!(to - from <= RING_PACKETS as u64, "timeline: more launches than the ring holds");
+        let names = self.names.borrow();
+        (from..to)
+            .map(|i| {
+                let slot = (i as usize) % RING_PACKETS;
+                let s = unsafe { &*(self.stamps.ptr() as *const Signal).add(slot) };
+                (names[slot], s.start_ts, s.end_ts)
+            })
+            .collect()
+    }
+    /// Whether the launches are stamped (`open`'s `instrument`).
+    pub fn instrumented(&self) -> bool {
+        self.instrument
+    }
+    /// The index the next launch takes.
+    pub fn posted(&self) -> u64 {
+        self.write_index.get()
     }
     /// Device timestamps of the last `sync`'s barrier packet, 100 MHz.
     #[allow(dead_code)]

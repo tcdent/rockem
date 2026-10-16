@@ -635,7 +635,10 @@ pub enum LayerState {
 #[derive(Default, Clone, Copy)]
 pub struct Profile {
     pub tokens: usize,
+    /// The hyper-connections on the host, or, with cards, the posting of a layer's launches.
     pub hc: f64,
+    /// With cards: the wait for the early router's logits, their picks, the prefetch's slotting.
+    pub early: f64,
     pub kda_card: f64,
     pub kda_cpu: f64,
     /// The MoE's time but the experts': the router and the routed sum (`route`), the shared expert's finish (`shared`).
@@ -666,8 +669,8 @@ impl Profile {
         let n = self.tokens.max(1) as f64 / 1e3;
         let mla = self.mla_proj + self.mla_attn + self.mla_out;
         let rs = self.route + self.shared;
-        let sum = self.hc + self.kda_card + self.kda_cpu + mla + self.dense_ffn + rs + self.experts + self.head;
-        format!("{} tokens: hc {:.1}  kda card {:.1}  kda cpu {:.1}  mla {:.1} (proj {:.1} attn {:.1} out {:.1})  dense ffn {:.1}  router+shared {:.1} (route {:.1} shared {:.1})  experts {:.1} (reused {:.2} of {} from the previous token, {:.2} named on the attention input; {:.0}% of the predicted slices pulled; {:.0}% of items on their CCD)  head {:.1}  = {:.1} ms a token", self.tokens, self.hc / n, self.kda_card / n, self.kda_cpu / n, mla / n, self.mla_proj / n, self.mla_attn / n, self.mla_out / n, self.dense_ffn / n, rs / n, self.route / n, self.shared / n, self.experts / n, self.reuse as f64 / self.moe_layers.max(1) as f64, TOP_K, self.pre_agree as f64 / self.moe_layers.max(1) as f64, 100.0 * self.prefetched as f64 / self.prefetch_items.max(1) as f64, 100.0 * self.local_items as f64 / self.items.max(1) as f64, self.head / n, sum / n)
+        let sum = self.hc + self.early + self.kda_card + self.kda_cpu + mla + self.dense_ffn + rs + self.experts + self.head;
+        format!("{} tokens: hc {:.1}  early {:.1}  kda card {:.1}  kda cpu {:.1}  mla {:.1} (proj {:.1} attn {:.1} out {:.1})  dense ffn {:.1}  router+shared {:.1} (route {:.1} shared {:.1})  experts {:.1} (reused {:.2} of {} from the previous token, {:.2} named on the attention input; {:.0}% of the predicted slices pulled; {:.0}% of items on their CCD)  head {:.1}  = {:.1} ms a token", self.tokens, self.hc / n, self.early / n, self.kda_card / n, self.kda_cpu / n, mla / n, self.mla_proj / n, self.mla_attn / n, self.mla_out / n, self.dense_ffn / n, rs / n, self.route / n, self.shared / n, self.experts / n, self.reuse as f64 / self.moe_layers.max(1) as f64, TOP_K, self.pre_agree as f64 / self.moe_layers.max(1) as f64, 100.0 * self.prefetched as f64 / self.prefetch_items.max(1) as f64, 100.0 * self.local_items as f64 / self.items.max(1) as f64, self.head / n, sum / n)
     }
 }
 
@@ -997,6 +1000,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             } else {
                 pl.attention(l);
             }
+            lap(&mut p.hc);
             // the prefetch's predictor: the FFN router over the attention block's input, read as soon as it is there
             let mut pre_picks = [E; TOP_K];
             if let Some(m) = moe {
@@ -1004,7 +1008,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 pre_picks = ffn::picks(m, &mut s.f_score);
                 s.routed.prefetch(l, pre_picks);
             }
-            lap(&mut p.hc);
+            lap(&mut p.early);
             if let (Attn::Mla(a), LayerState::Mla { cache, pools }) = (&lw.attn, &mut s.layers[l]) {
                 let mut ms = mla::Scratch { qr: &mut s.m_qr, qa: &mut s.m_qa, q: &mut s.m_q, kva: &mut s.m_kva, ik: &mut s.m_ik, iq: &mut s.m_iq, iw: &mut s.m_iw, pscore: &mut s.m_pscore, sel: &mut s.m_sel, heads: &mut s.m_heads, hs: &mut s.m_hs };
                 {

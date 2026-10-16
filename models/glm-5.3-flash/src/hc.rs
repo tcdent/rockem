@@ -437,14 +437,27 @@ pub mod gfx11 {
         }
     }
     /// The handoff between the cards and the host, one launch: once everything launched before it
-    /// has completed (the barrier bit), `value` into `mine` (when not null: this card's data is in),
-    /// then the queue holds until `w0` and `w1` (those not null) read `value` — the card waits for
-    /// data, not the host for the card. The words are uncached host memory (`Kfd::host_shared`),
-    /// every load a trip over the link; one thread. Grid: 1.
+    /// has completed (the barrier bit), `n` floats from `src` (VRAM, a block output a kernel just
+    /// emitted there) to `dst` (uncached host memory every card sees) in wide coalesced stores —
+    /// a kernel emitting into uncached host memory row by row paid 200–300 µs a launch (timeline,
+    /// 2026-10-15) — then `value` into `mine` (when not null: this card's data is in), then the
+    /// queue holds until `w0` and `w1` (those not null) read `value`: the card waits for data,
+    /// not the host for the card. The words are uncached host memory too, every load a trip over
+    /// the link; one thread polls. Grid: 1.
     #[no_mangle]
-    pub extern "gpu-kernel" fn hc_handoff(mine: *mut u32, w0: *const u32, w1: *const u32, value: u32) {
+    pub extern "gpu-kernel" fn hc_handoff(src: *const f32, dst: *mut f32, n: u32, mine: *mut u32, w0: *const u32, w1: *const u32, value: u32) {
         unsafe {
-            if workitem_id_x() == 0 {
+            let t = workitem_id_x();
+            if !src.is_null() {
+                let mut i = t;
+                while i < n {
+                    *dst.add(i as usize) = *src.add(i as usize);
+                    i += 256;
+                }
+                fence(Ordering::Release);
+                workgroup_sync();
+            }
+            if t == 0 {
                 if !mine.is_null() {
                     AtomicU32::from_ptr(mine).store(value, Ordering::Release);
                 }

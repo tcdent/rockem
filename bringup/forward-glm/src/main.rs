@@ -209,7 +209,7 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
     let mut model = CpuModel::new(routed, &pool, n.max(FIRST_POS + 1));
     if harness::flag("--gpu") {
         let elf = std::fs::read(bundle.join(layout::KERNELS_FILE)).unwrap_or_else(|e| panic!("{}: {e}", bundle.join(layout::KERNELS_FILE).display()));
-        model.placed = Some(Box::new(glm_kfd::Cards::new(&elf, &w, n.max(FIRST_POS + 1))));
+        model.placed = Some(Box::new(glm_kfd::Cards::new(&elf, &w, n.max(FIRST_POS + 1), false)));
     }
     model.seed_prefix(&w, &prefix);
     for (t, &id) in ids.iter().enumerate().take(FIRST_POS) {
