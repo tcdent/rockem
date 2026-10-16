@@ -25,21 +25,21 @@ guid = "3a997502-647a-4c82-998e-52ef9486a247"
 [[store]]
 name = "Setup"
 guid = "ec87d643-eba4-4bb5-a1e5-3f3e36b20da9"
-# AMI's own setup store.
+# AMI's own setup store — the Milan build's 290-byte layout (localai.hardware 2026-10-16).
 
 [[knob]]
 store = "Setup"
 name = "Variable protection"
-offset = 0x91
+offset = 0x4A
 value = 0
-why = "Disabled: the 'Password protection of Runtime Variables' knob, suspected as the lock behind SECURITY_VIOLATION on AmdSetup (2026-10-16 14:15). The live store (290 bytes, 14:35) reads 0 here already while AmdSetup still refuses, so either the Setup offsets do not fit this build or this knob is not the lock; its form (Advanced → UEFI Variables Protection) is hidden by the flag below."
+why = "Disabled: 'Password protection of Runtime Variables' (help text: through the System Admin Password), suspected as the lock behind SECURITY_VIOLATION on AmdSetup (2026-10-16); ships Enabled, and its form (Advanced → UEFI Variables Protection) is hidden by the flag below. Milan layout: the vendor image holds a Rome build (Setup 361 B) and a Milan build (290 B) and the 7R13s run the Milan one; the Rome offsets (0x91, 0xFF) read the Milan default blob's padding."
 
 [[knob]]
 store = "Setup"
 name = "Hide variable protection"
-offset = 0xFF
+offset = 0xB8
 report = true
-why = "The vendor's flag that suppresses the UEFI Variables Protection form in the setup UI (SuppressIf Setup[0xFF] == 1; no default of its own in the IFR). Read and reported only."
+why = "The vendor's hidden numeric that suppresses the UEFI Variables Protection form (and the debug-port, SIO, PCIe link-training and compliance pages) in the setup UI: SuppressIf == 1, ships 1. Read and reported only."
 
 [[knob]]
 store = "AmdSetup"
