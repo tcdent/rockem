@@ -10,6 +10,11 @@ mkdir -p /dev/hugepages /dev/shm /dev/pts /tmp /bundle
 mount -t devpts devpts /dev/pts
 mount -t hugetlbfs -o pagesize=2M hugetlbfs /dev/hugepages 2>/dev/null || mount -t hugetlbfs hugetlbfs /dev/hugepages 2>/dev/null
 mount -t tmpfs tmpfs /tmp
+# the firmware knobs stage (knobs.efi, chained by iPXE ahead of the kernel) leaves its report in a UEFI
+# variable the OS can read; into the kernel log, so the netconsole carries it
+mount -t efivarfs efivarfs /sys/firmware/efi/efivars 2>/dev/null
+k=/sys/firmware/efi/efivars/RockemKnobs-5d2a6b7e-8f30-4c1b-9a6e-0c6f1e2d3b4a
+[ -r "$k" ] && tail -c +5 "$k" | tr -d '\000' | sed 's/^/knobs    : /' > /dev/kmsg
 ip link set lo up
 # the last occurrence wins, as for the kernel's own parameters (the netboot line may repeat ours)
 arg() { v=; for t in $(cat /proc/cmdline); do case $t in "$1"=*) v=${t#"$1"=};; esac; done; echo "$v"; }

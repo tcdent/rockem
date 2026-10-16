@@ -117,20 +117,49 @@ mod heapless_str {
 }
 
 static mut BUF: [u8; 64 * 1024] = [0; 64 * 1024];
+static mut REPORT: [u8; 4096] = [0; 4096];
+
+/// The run's report, line by line, printed to the console and kept for the OS in a volatile UEFI
+/// variable of ours (`RockemKnobs`, read by the initramfs into the kernel log): the firmware console
+/// is the BMC's screen, the kernel's netconsole is where the box is watched from.
+struct Report {
+    len: usize,
+}
+impl core::fmt::Write for Report {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let buf = unsafe { &mut *core::ptr::addr_of_mut!(REPORT) };
+        for &b in s.as_bytes() {
+            if self.len < buf.len() {
+                buf[self.len] = b;
+                self.len += 1;
+            }
+        }
+        Ok(())
+    }
+}
+macro_rules! say {
+    ($r:expr, $($arg:tt)*) => {{
+        uefi::println!($($arg)*);
+        let _ = core::fmt::Write::write_fmt(&mut $r, format_args!($($arg)*));
+        let _ = core::fmt::Write::write_str(&mut $r, "\n");
+    }};
+}
+const REPORT_GUID: Guid = guid!("5d2a6b7e-8f30-4c1b-9a6e-0c6f1e2d3b4a");
 
 #[entry]
 fn main() -> Status {
     uefi::helpers::init().unwrap();
-    uefi::println!("knobs    : rockem's firmware knobs ({} in {} store{}){}", KNOBS.len(), STORES.len(), if STORES.len() == 1 { "" } else { "s" }, if READ_ONLY { ", read-only" } else { "" });
+    let mut r = Report { len: 0 };
+    say!(r, "knobs    : rockem's firmware knobs ({} in {} store{}){}", KNOBS.len(), STORES.len(), if STORES.len() == 1 { "" } else { "s" }, if READ_ONLY { ", read-only" } else { "" });
     // the board must be the one the table was checked against
     let fw_ok = match bios_strings() {
         Some((v, ver, date)) => {
             let ok = v.as_str() == FW_VENDOR && ver.as_str() == FW_VERSION && date.as_str() == FW_DATE;
-            uefi::println!("firmware : {} {} {} — {}", v.as_str(), ver.as_str(), date.as_str(), if ok { "the table's build" } else { "NOT the table's build: nothing is written" });
+            say!(r, "firmware : {} {} {} — {}", v.as_str(), ver.as_str(), date.as_str(), if ok { "the table's build" } else { "NOT the table's build: nothing is written" });
             ok
         }
         None => {
-            uefi::println!("firmware : no SMBIOS type 0 found: nothing is written");
+            say!(r, "firmware : no SMBIOS type 0 found: nothing is written");
             false
         }
     };
@@ -141,24 +170,24 @@ fn main() -> Status {
         let (data, attrs) = match runtime::get_variable(st.name, &vendor, buf) {
             Ok(x) => x,
             Err(e) => {
-                uefi::println!("store    : {} {}: not readable ({:?})", st.name, st.guid, e.status());
+                say!(r, "store    : {} {}: not readable ({:?})", st.name, st.guid, e.status());
                 continue;
             }
         };
-        uefi::println!("store    : {} {} — {} bytes, attributes {:?}", st.name, st.guid, data.len(), attrs);
+        say!(r, "store    : {} {} — {} bytes, attributes {:?}", st.name, st.guid, data.len(), attrs);
         let mut touched = false;
         for k in KNOBS.iter().filter(|k| k.store == si) {
             if k.offset >= data.len() {
-                uefi::println!("  {:<24} @ {:#06x}: past the store's end", k.name, k.offset);
+                say!(r, "  {:<24} @ {:#06x}: past the store's end", k.name, k.offset);
                 continue;
             }
             let cur = data[k.offset];
             if cur == k.value {
-                uefi::println!("  {:<24} @ {:#06x} = {:#04x}  as wanted", k.name, k.offset, cur);
+                say!(r, "  {:<24} @ {:#06x} = {:#04x}  as wanted", k.name, k.offset, cur);
             } else if READ_ONLY || !fw_ok {
-                uefi::println!("  {:<24} @ {:#06x} = {:#04x}  wanted {:#04x} — left as is", k.name, k.offset, cur, k.value);
+                say!(r, "  {:<24} @ {:#06x} = {:#04x}  wanted {:#04x} — left as is", k.name, k.offset, cur, k.value);
             } else {
-                uefi::println!("  {:<24} @ {:#06x} = {:#04x}  → {:#04x}: {}", k.name, k.offset, cur, k.value, k.why);
+                say!(r, "  {:<24} @ {:#06x} = {:#04x}  → {:#04x}: {}", k.name, k.offset, cur, k.value, k.why);
                 data[k.offset] = k.value;
                 touched = true;
             }
@@ -167,19 +196,21 @@ fn main() -> Status {
             let len = data.len();
             match runtime::set_variable(st.name, &vendor, attrs, &data[..len]) {
                 Ok(()) => {
-                    uefi::println!("store    : {} written", st.name);
+                    say!(r, "store    : {} written", st.name);
                     changed = true;
                 }
-                Err(e) => uefi::println!("store    : {} NOT written ({:?})", st.name, e.status()),
+                Err(e) => say!(r, "store    : {} NOT written ({:?})", st.name, e.status()),
             }
         }
     }
     if changed {
-        uefi::println!("knobs    : written; resetting so the firmware applies them");
+        say!(r, "knobs    : written; resetting so the firmware applies them");
         boot::stall(Duration::from_secs(3));
         runtime::reset(ResetType::COLD, Status::SUCCESS, None);
     }
-    uefi::println!("knobs    : nothing to change; on to the kernel");
+    say!(r, "knobs    : nothing to change; on to the kernel");
+    let report: &[u8] = unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(REPORT) as *const u8, r.len) };
+    let _ = runtime::set_variable(cstr16!("RockemKnobs"), &VariableVendor(REPORT_GUID), runtime::VariableAttributes::BOOTSERVICE_ACCESS | runtime::VariableAttributes::RUNTIME_ACCESS, report);
     boot::stall(Duration::from_millis(1500));
     Status::SUCCESS
 }
