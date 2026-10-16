@@ -25,6 +25,22 @@ pub unsafe fn workgroup_sync() {
     core::arch::asm!("", options(nostack));
 }
 
+/// Spin until the word (VRAM, polled through L2) reads `value`, a short sleep between looks:
+/// hundreds of waves polling one line back to back starve the workgroup they wait for
+/// (`hc_pre`, 2026-10-16).
+#[inline(always)]
+pub unsafe fn await_word(w: *const u32, value: u32) {
+    while core::sync::atomic::AtomicU32::from_ptr(w as *mut u32).load(core::sync::atomic::Ordering::Acquire) != value {
+        nap();
+    }
+}
+
+/// A short sleep between looks at a word another workgroup will write.
+#[inline(always)]
+pub unsafe fn nap() {
+    core::arch::asm!("s_sleep 1", options(nostack, nomem));
+}
+
 /// Sum of one f32 per lane across the wave; every lane gets the result.
 #[inline(always)]
 pub unsafe fn wave_sum(lane: u32, v: f32) -> f32 {
@@ -35,6 +51,37 @@ pub unsafe fn wave_sum(lane: u32, v: f32) -> f32 {
         m <<= 1;
     }
     v
+}
+
+/// Sum over the `n`-lane group a lane belongs to (`n` a power of two): lanes `lane & !(n-1) ..+n`.
+#[inline(always)]
+pub unsafe fn group_sum(lane: u32, v: f32, n: u32) -> f32 {
+    let mut v = v;
+    let mut m = 1;
+    while m < n {
+        v += f32::from_bits(ds_bpermute((lane ^ m) * 4, v.to_bits()));
+        m <<= 1;
+    }
+    v
+}
+/// Max over the `n`-lane group a lane belongs to.
+#[inline(always)]
+pub unsafe fn group_max(lane: u32, v: f32, n: u32) -> f32 {
+    let mut v = v;
+    let mut m = 1;
+    while m < n {
+        let o = f32::from_bits(ds_bpermute((lane ^ m) * 4, v.to_bits()));
+        if o > v {
+            v = o;
+        }
+        m <<= 1;
+    }
+    v
+}
+/// The value lane `src` holds, to every lane of the wave.
+#[inline(always)]
+pub unsafe fn lane_read(src: u32, v: f32) -> f32 {
+    f32::from_bits(ds_bpermute(src * 4, v.to_bits()))
 }
 
 /// Max of one f32 per lane across the wave; every lane gets the result.

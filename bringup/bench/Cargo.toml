@@ -69,3 +69,7 @@ path = "src/memtest.rs"
 [[bin]]
 name = "bench-churn"
 path = "src/churn.rs"
+
+[[bin]]
+name = "bench-hc"
+path = "src/hc.rs"

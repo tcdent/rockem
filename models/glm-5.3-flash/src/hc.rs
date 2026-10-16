@@ -219,16 +219,17 @@ pub mod gfx11_consts {
     pub const K_SLICE: usize = HC * H / SLICES;
     pub const PRE_GRID: u32 = (COEF_ROWS * SLICES) as u32;
     pub const PRE_LDS: u32 = 512;
-    /// `hc_pre`'s VRAM words: an arrival count a row, the launch's, the mix's ready word, the collapse's
-    /// arrival count and ready word, the router's arrival count; the counts 0 between launches.
-    pub const PRE_COUNTS: usize = COEF_ROWS + 5;
+    /// `hc_pre`'s VRAM words: for each of its three device barriers, an arrival count a row (0 between
+    /// launches) and a done word a row; then the mix's ready word and the collapse's.
+    pub const PRE_BARRIERS: usize = 3;
+    pub const PRE_COUNTS: usize = PRE_BARRIERS * 2 * COEF_ROWS + 2;
     /// Router rows a workgroup takes in `hc_pre`'s tail.
     pub const ROUTER_ROWS_PER_WG: usize = E.div_ceil(COEF_ROWS * SLICES);
     /// `hc_pre`'s partials in VRAM: the coefficient dots `[COEF_ROWS][SLICES]`, then every workgroup's sum of squares of its channel slice.
     pub const PRE_PARTS: usize = COEF_ROWS * SLICES + COEF_ROWS * SLICES;
     /// Channels of the collapse a workgroup takes.
     pub const COLLAPSE: usize = H.div_ceil(COEF_ROWS * SLICES);
-    const _: () = assert!(HC * H % SLICES == 0 && K_SLICE % 256 == 0 && COEF_ROWS <= 256 && (16 + COEF_ROWS + 1) * 4 <= PRE_LDS as usize && COLLAPSE <= 256 && H % 256 == 0);
+    const _: () = assert!(HC * H % SLICES == 0 && K_SLICE % 256 == 0 && COEF_ROWS <= 256 && (16 + COEF_ROWS + HC * HC) * 4 <= PRE_LDS as usize && COEF_ROWS <= 32 && COLLAPSE <= 256 && H % 256 == 0 && HC * HC <= 32 && HC.is_power_of_two());
     /// The mix the card keeps between a block's two halves: pre `[HC]`, post `[HC]`, comb `[HC][HC]`.
     pub const MIX: usize = 2 * HC + HC * HC;
     /// `hc_post` and `hc_mean`: a thread a channel.
@@ -252,7 +253,7 @@ pub mod gfx11 {
     pub use super::gfx11_consts::*;
     use crate::*;
     use common::gemv::widen;
-    use common::gfx11::{lds, wave_sum, workgroup_sync};
+    use common::gfx11::{await_word, group_max, group_sum, lane_read, lds, nap, wave_sum, workgroup_sync};
     use common::math::{exp, sqrt};
     use core::arch::amdgpu::{workgroup_id_x, workitem_id_x};
     use core::sync::atomic::{fence, AtomicU32, Ordering};
@@ -260,6 +261,36 @@ pub mod gfx11 {
     #[inline(always)]
     fn sigmoid(x: f32) -> f32 {
         1.0 / (1.0 + exp(-x))
+    }
+
+    /// A device-wide barrier over `hc_pre`'s `COEF_ROWS · SLICES` workgroups with no serialized step:
+    /// the workgroups of a row count on the row's word (`SLICES` arrivals, the rows in parallel), the
+    /// row's last resets it and writes `value` to the row's done word, and workgroup 0's wave 0 watches
+    /// the done words, a lane each, until all read `value`. Returns on workgroup 0 only, once every
+    /// workgroup has arrived; the others return from `await_word` on whatever workgroup 0 publishes.
+    /// `words`: `[COEF_ROWS]` counts then `[COEF_ROWS]` done words. Twenty-four arrivals serialized
+    /// on one word cost more than the dots they followed (bench-hc, 2026-10-16).
+    #[inline(always)]
+    unsafe fn arrive(words: *mut u32, row: usize, t: usize, wave: usize, lane: u32, value: u32) -> bool {
+        let wg0 = workgroup_id_x() == 0;
+        workgroup_sync();
+        if t == 0 {
+            if AtomicU32::from_ptr(words.add(row)).fetch_add(1, Ordering::AcqRel) == SLICES as u32 - 1 {
+                *words.add(row) = 0;
+                AtomicU32::from_ptr(words.add(COEF_ROWS + row)).store(value, Ordering::Release);
+            }
+        }
+        if wg0 && wave == 0 {
+            let w = words.add(COEF_ROWS + if (lane as usize) < COEF_ROWS { lane as usize } else { 0 });
+            loop {
+                let seen = AtomicU32::from_ptr(w).load(Ordering::Acquire) == value;
+                if wave_sum(lane, if seen { 1.0 } else { 0.0 }) >= 32.0 {
+                    break;
+                }
+                nap();
+            }
+        }
+        wg0
     }
 
     /// The hyper-connection's input half as one launch over `COEF_ROWS · SLICES` workgroups.
@@ -285,11 +316,11 @@ pub mod gfx11 {
             let (wave, lane) = (t / 32, (t % 32) as u32);
             let wg = workgroup_id_x() as usize;
             let (row, slice) = (wg / SLICES, wg % SLICES);
-            let red = lds::<f32>(); // [8] dot partials | [8] square partials | [COEF_ROWS] coefficients | last
+            let red = lds::<f32>(); // [8] dot partials | [8] square partials | [COEF_ROWS] coefficients | [HC·HC] transpose
             let red2 = red.add(8);
             let coefs = red.add(16);
-            let last = red.add(16 + COEF_ROWS) as *mut u32;
-            let ready = count.add(COEF_ROWS + 1);
+            let (b0, b1, b2) = (count, count.add(2 * COEF_ROWS), count.add(4 * COEF_ROWS));
+            let ready = count.add(PRE_BARRIERS * 2 * COEF_ROWS);
             // this slice of the row against the raw channels, and the channels' squares
             let (w_row, c0) = (w.add(row * HC * H), slice * K_SLICE);
             let (mut acc, mut ss) = (0f32, 0f32);
@@ -315,22 +346,11 @@ pub mod gfx11 {
                     q += *red2.add(k);
                     k += 1;
                 }
-                // the partials past this CU's caches, then the arrivals: this row's, and for its last, the launch's
+                // the partials past this CU's caches
                 AtomicU32::from_ptr(part.add(row * SLICES + slice) as *mut u32).store(p.to_bits(), Ordering::Release);
                 AtomicU32::from_ptr(part.add(COEF_ROWS * SLICES + wg) as *mut u32).store(q.to_bits(), Ordering::Release);
-                let row_done = AtomicU32::from_ptr(count.add(row)).fetch_add(1, Ordering::AcqRel) == SLICES as u32 - 1;
-                let mut is_last = 0u32;
-                if row_done {
-                    *count.add(row) = 0;
-                    is_last = (AtomicU32::from_ptr(count.add(COEF_ROWS)).fetch_add(1, Ordering::AcqRel) == COEF_ROWS as u32 - 1) as u32;
-                }
-                *last = is_last;
             }
-            workgroup_sync();
-            if *last != 0 {
-                if t == 0 {
-                    *count.add(COEF_ROWS) = 0; // nothing else touches it until the next launch
-                }
+            if arrive(b0, row, t, wave, lane, value) {
                 // the norm from one row's slices' squares (every row's slices read the same channels; one row
                 // covers them all), the coefficients from every row's partials: fixed order
                 let mut tot = 0f32;
@@ -350,102 +370,59 @@ pub mod gfx11 {
                     *coefs.add(t) = sum * r;
                 }
                 workgroup_sync();
-                // every thread computes the whole mix: a few hundred operations, no exchange needed
-                let c = |i: usize| *coefs.add(i);
-                let (s0, s1, s2) = (*scale, *scale.add(1), *scale.add(2));
-                let mut pre = [0f32; HC];
-                let mut post = [0f32; HC];
-                let mut cb = [[0f32; HC]; HC];
-                let mut i = 0;
-                while i < HC {
-                    pre[i] = sigmoid(c(i) * s0 + *base.add(i)) + HC_EPS;
-                    post[i] = 2.0 * sigmoid(c(HC + i) * s1 + *base.add(HC + i));
-                    i += 1;
-                }
-                let mut i = 0;
-                while i < HC {
-                    let mut row = [0f32; HC];
-                    let mut mx = f32::NEG_INFINITY;
-                    let mut j = 0;
-                    while j < HC {
-                        row[j] = c(2 * HC + i * HC + j) * s2 + *base.add(2 * HC + i * HC + j);
-                        if row[j] > mx {
-                            mx = row[j];
+                // the mix on wave 0, a lane an entry (lane = i·HC + j): the sigmoids on lanes 0..2·HC, the
+                // softmax rows and the Sinkhorn passes as group sums over the row's four lanes and the
+                // column's four (lanes j, j+HC, …: a transpose through LDS turns columns into rows). One
+                // thread computing the whole mix serially took 15 µs of the launch (bench-hc 2026-10-16).
+                if wave == 0 {
+                    let c = |i: usize| *coefs.add(i);
+                    let l = lane as usize;
+                    let (s0, s1, s2) = (*scale, *scale.add(1), *scale.add(2));
+                    let (li, lj) = (l / HC, l % HC);
+                    let inb = l < HC * HC;
+                    let small = if l < HC { l } else { 0 };
+                    let pre_v = sigmoid(c(small) * s0 + *base.add(small)) + HC_EPS; // lanes 0..HC: pre[lane]
+                    let post_v = 2.0 * sigmoid(c(HC + small) * s1 + *base.add(HC + small));
+                    let mut e = if inb { c(2 * HC + li * HC + lj) * s2 + *base.add(2 * HC + li * HC + lj) } else { f32::NEG_INFINITY };
+                    let mx = group_max(lane, e, HC as u32);
+                    e = if inb { exp(e - mx) } else { 0.0 };
+                    let sum = group_sum(lane, e, HC as u32);
+                    let mut cbv = if inb { e / sum + HC_EPS } else { 0.0 };
+                    // Sinkhorn-Knopp: columns first, then rows and columns HC_SINKHORN_ITERS - 1 times; a column
+                    // sum is a row sum of the transpose, kept in LDS as the lane's mirror entry (j, i)
+                    let tr = coefs.add(COEF_ROWS); // [HC·HC] scratch past the coefficients
+                    let mut it = 0;
+                    while it < HC_SINKHORN_ITERS {
+                        if it > 0 {
+                            let rs = group_sum(lane, cbv, HC as u32) + HC_EPS;
+                            cbv /= rs;
                         }
-                        j += 1;
-                    }
-                    let mut sum = 0f32;
-                    let mut j = 0;
-                    while j < HC {
-                        row[j] = exp(row[j] - mx);
-                        sum += row[j];
-                        j += 1;
-                    }
-                    let mut j = 0;
-                    while j < HC {
-                        cb[i][j] = row[j] / sum + HC_EPS;
-                        j += 1;
-                    }
-                    i += 1;
-                }
-                // Sinkhorn-Knopp: columns first, then rows and columns HC_SINKHORN_ITERS - 1 times
-                let mut it = 0;
-                while it < HC_SINKHORN_ITERS {
-                    if it > 0 {
-                        let mut i = 0;
-                        while i < HC {
-                            let mut sum = 0f32;
-                            let mut j = 0;
-                            while j < HC {
-                                sum += cb[i][j];
-                                j += 1;
-                            }
-                            let sum = sum + HC_EPS;
-                            let mut j = 0;
-                            while j < HC {
-                                cb[i][j] /= sum;
-                                j += 1;
-                            }
-                            i += 1;
+                        if inb {
+                            *tr.add(lj * HC + li) = cbv;
                         }
+                        // the column sum: the transpose's row sum, read back by each lane's (j, i)
+                        let mirror = if inb { *tr.add(lane as usize) } else { 0.0 }; // lane (li, lj) reads tr[li·HC+lj] = cb[lj][li]
+                        let cs_t = group_sum(lane, mirror, HC as u32) + HC_EPS; // the sum of column li, on lanes of row li
+                        // bring column j's sum to lane (i, j): it sits on lanes (j, *) — lane j·HC
+                        let cs = lane_read((lj * HC) as u32, cs_t);
+                        cbv /= cs;
+                        it += 1;
                     }
-                    let mut j = 0;
-                    while j < HC {
-                        let mut sum = 0f32;
-                        let mut i = 0;
-                        while i < HC {
-                            sum += cb[i][j];
-                            i += 1;
-                        }
-                        let sum = sum + HC_EPS;
-                        let mut i = 0;
-                        while i < HC {
-                            cb[i][j] /= sum;
-                            i += 1;
-                        }
-                        j += 1;
+                    if inb {
+                        AtomicU32::from_ptr(mix.add(2 * HC + lane as usize) as *mut u32).store(cbv.to_bits(), Ordering::Relaxed);
                     }
-                    it += 1;
-                }
-                // one thread writes the mix past its caches, with constant indices, then publishes it
-                if t == 0 {
-                    let mut i = 0;
-                    while i < HC {
-                        AtomicU32::from_ptr(mix.add(i) as *mut u32).store(pre[i].to_bits(), Ordering::Relaxed);
-                        AtomicU32::from_ptr(mix.add(HC + i) as *mut u32).store(post[i].to_bits(), Ordering::Relaxed);
-                        let mut j = 0;
-                        while j < HC {
-                            AtomicU32::from_ptr(mix.add(2 * HC + i * HC + j) as *mut u32).store(cb[i][j].to_bits(), Ordering::Relaxed);
-                            j += 1;
-                        }
-                        i += 1;
+                    if (lane as usize) < HC {
+                        AtomicU32::from_ptr(mix.add(lane as usize) as *mut u32).store(pre_v.to_bits(), Ordering::Relaxed);
+                        AtomicU32::from_ptr(mix.add(HC + lane as usize) as *mut u32).store(post_v.to_bits(), Ordering::Relaxed);
                     }
-                    AtomicU32::from_ptr(ready).store(value, Ordering::Release);
+                    if lane == 0 {
+                        AtomicU32::from_ptr(ready).store(value, Ordering::Release);
+                    }
                 }
             }
             // every workgroup: the mix, then its channels of the collapse
             if t == 0 {
-                while AtomicU32::from_ptr(ready).load(Ordering::Acquire) != value {}
+                await_word(ready, value);
             }
             workgroup_sync();
             let mut pre = [0f32; HC];
@@ -472,16 +449,14 @@ pub mod gfx11 {
             if router.is_null() {
                 return;
             }
-            // the collapse's arrival: this workgroup's channels to L2, the last publishes; every workgroup waits
-            let (arrive2, ready2, arrive3) = (count.add(COEF_ROWS + 2), count.add(COEF_ROWS + 3), count.add(COEF_ROWS + 4));
+            // the collapse's arrival: this workgroup's channels to L2; workgroup 0 publishes; every workgroup waits
+            let ready2 = ready.add(1);
             fence(Ordering::Release);
-            workgroup_sync();
+            if arrive(b1, row, t, wave, lane, value) && t == 0 {
+                AtomicU32::from_ptr(ready2).store(value, Ordering::Release);
+            }
             if t == 0 {
-                if AtomicU32::from_ptr(arrive2).fetch_add(1, Ordering::AcqRel) == (COEF_ROWS * SLICES) as u32 - 1 {
-                    *arrive2 = 0;
-                    AtomicU32::from_ptr(ready2).store(value, Ordering::Release);
-                }
-                while AtomicU32::from_ptr(ready2).load(Ordering::Acquire) != value {}
+                await_word(ready2, value);
             }
             workgroup_sync();
             fence(Ordering::Acquire);
@@ -535,11 +510,9 @@ pub mod gfx11 {
                 }
                 r += 1;
             }
-            // the router's arrival: this workgroup's scores out over the link, the last says so
+            // the router's arrival: this workgroup's scores out over the link; workgroup 0 says so
             fence(Ordering::Release);
-            workgroup_sync();
-            if t == 0 && AtomicU32::from_ptr(arrive3).fetch_add(1, Ordering::AcqRel) == (COEF_ROWS * SLICES) as u32 - 1 {
-                *arrive3 = 0;
+            if arrive(b2, row, t, wave, lane, value) && t == 0 {
                 AtomicU32::from_ptr(word).store(value, Ordering::Release);
             }
         }
@@ -583,7 +556,7 @@ pub mod gfx11 {
                     AtomicU32::from_ptr(go).store(value, Ordering::Release);
                 }
             } else if t == 0 {
-                while AtomicU32::from_ptr(go).load(Ordering::Acquire) != value {}
+                await_word(go, value);
             }
             workgroup_sync();
             let d = workgroup_id_x() as usize * 256 + workitem_id_x() as usize;
