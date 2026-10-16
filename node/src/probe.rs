@@ -118,11 +118,63 @@ fn slices_for(cores: &[usize], mb: usize) -> Vec<&'static mut [u8]> {
         .collect()
 }
 
+
+/// A resctrl monitoring group holding this process (mounted here if need be); `None` without the kernel's support.
+struct ResctrlGroup {
+    dir: std::path::PathBuf,
+}
+fn resctrl_group(name: &str) -> Option<ResctrlGroup> {
+    let root = std::path::Path::new("/sys/fs/resctrl");
+    if !root.join("info").exists() {
+        let _ = std::process::Command::new("mount").args(["-t", "resctrl", "resctrl", "/sys/fs/resctrl"]).status();
+    }
+    if !root.join("info").exists() {
+        return None;
+    }
+    let dir = root.join(name);
+    let _ = std::fs::create_dir(&dir);
+    std::fs::write(dir.join("tasks"), std::process::id().to_string()).ok()?;
+    Some(ResctrlGroup { dir })
+}
+impl ResctrlGroup {
+    fn read(p: std::path::PathBuf) -> String {
+        std::fs::read_to_string(p).unwrap_or_default().trim().replace('\n', " ")
+    }
+    fn describe(&self) -> String {
+        let info = std::path::Path::new("/sys/fs/resctrl/info");
+        let domains = std::fs::read_dir(self.dir.join("mon_data")).map(|d| d.count()).unwrap_or(0);
+        format!("L3 ways {} ({} classes), monitoring {} ({} RMIDs), MB granularity {} %; {domains} L3 domains", Self::read(info.join("L3/cbm_mask")), Self::read(info.join("L3/num_closids")), Self::read(info.join("L3_MON/mon_features")), Self::read(info.join("L3_MON/num_rmids")), Self::read(info.join("MB/bandwidth_gran")))
+    }
+    /// This group's L3 occupancy per domain, bytes.
+    fn occupancy(&self) -> Vec<(String, u64)> {
+        let mut v: Vec<(String, u64)> = std::fs::read_dir(self.dir.join("mon_data"))
+            .map(|d| d.flatten().map(|e| (e.file_name().to_string_lossy().replace("mon_L3_", "L3_"), Self::read(e.path().join("llc_occupancy")).parse().unwrap_or(0))).collect())
+            .unwrap_or_default();
+        v.sort();
+        v
+    }
+}
+
 /// The L3 as a prefetch target, one question at a time: whether a CCD's cores find again what they
 /// streamed, over slice sizes; whether another CCD finds it; what the INT4 expert kernel runs at on
 /// one CCD from DRAM and from L3; what every CCD of the node re-reading its own slice runs at together.
 fn l3_probe(ccds: &[Vec<usize>], iters: usize) {
     let ccd0 = &ccds[0];
+    // resctrl, when the kernel offers it: this process in a monitoring group, so the L3 says what it holds
+    let mon = resctrl_group("probe");
+    if let Some(m) = &mon {
+        println!("resctrl  : {}", m.describe());
+    }
+    if let Some(m) = &mon {
+        // what CCD 0's L3 holds after its cores streamed 11 MB once: the prefetch's question, asked of the hardware
+        let slices = slices_for(ccd0, 11);
+        let views: Vec<&[u8]> = slices.iter().map(|s| &**s).collect();
+        let before = m.occupancy();
+        let (first, second) = l3_passes(ccd0, None, &views);
+        let after = m.occupancy();
+        let dom = |v: &[(String, u64)]| v.iter().map(|(d, o)| format!("{d} {:.1}", *o as f64 / 1e6)).collect::<Vec<_>>().join(", ");
+        println!("resctrl  : L3 occupancy of this group by domain, MB — before: {}; after CCD 0 streamed 11 MB twice ({first:.0} then {second:.0} GB/s): {}", dom(&before), dom(&after));
+    }
     // 1. one CCD, the second pass over the first, by size
     let by_size: Vec<String> = [4usize, 8, 16, 24, 32, 48]
         .iter()
