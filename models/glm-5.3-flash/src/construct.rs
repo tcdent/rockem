@@ -124,16 +124,13 @@ thread_local! {
 }
 
 /// The slots a thread on CCD `ccd` of node `node` drains, in order: its own CCD's, its node's,
-/// its node's other CCDs', then the other nodes' (their node slot, then their CCDs').
+/// its node's other CCDs'. Never another node's: a stream from across the fabric is served at
+/// the cross-node rate (metatron: 165 GB/s for the box against 326 node-local), so idle cores
+/// stealing a straggling node's items slowed the run they meant to finish (NPS2, 2026-10-15:
+/// experts 30.5 → 23.1 ms a token without it). Work lands where its pages are.
 fn slot_order(node: usize, ccd: usize, node_ccds: &[Vec<usize>]) -> Vec<usize> {
     let mut o = vec![ccd, MAX_CCDS + node];
     o.extend(node_ccds[node].iter().filter(|&&c| c != ccd));
-    for d in (0..MAX_NODES).filter(|&d| d != node) {
-        o.push(MAX_CCDS + d);
-        if let Some(cs) = node_ccds.get(d) {
-            o.extend(cs.iter().copied());
-        }
-    }
     o
 }
 /// `work` with `tick` called between items.
