@@ -29,7 +29,11 @@ node:             ## the static node binary (musl)
 initramfs: node   ## initramfs.cpio.zst for $(PROFILE)
 	$(RUN) os/initramfs/build.sh $(PROFILE)
 
-release: kernel initramfs  ## kernel + initramfs for $(PROFILE)
+knobs:            ## knobs.efi: the firmware knobs (os/firmware/knobs.toml) applied ahead of the kernel; the host's toolchain (x86_64-unknown-uefi)
+	cd os/firmware/knobs && cargo build --release --target x86_64-unknown-uefi
+	cp os/firmware/knobs/target/x86_64-unknown-uefi/release/knobs.efi os/release/staging/$(PROFILE)/knobs.efi
+
+release: kernel initramfs knobs  ## kernel + initramfs + knobs.efi for $(PROFILE)
 
 publish:          ## push the staged $(PROFILE) release to registry.a10k.co/rockem/os:latest as an OCI artifact (os/release/publish.sh)
 	os/release/publish.sh $(PROFILE)

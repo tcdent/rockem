@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # publish.sh PROFILE — push the staged release to the registry as one OCI artifact:
-#   bzImage, initramfs.cpio.zst, config (the kernel's), cmdline (os/release/PROFILE.cmdline).
+#   bzImage, initramfs.cpio.zst, config (the kernel's), cmdline (os/release/PROFILE.cmdline),
+#   knobs.efi (the firmware knobs, os/firmware; iPXE chains it before the kernel).
 # One tag, latest: what the boot chain follows. The registry keeps only the eight most recently
 # pulled tags of a repository (zot retention, daily GC; tcdent 2026-10-15: no exception for latest),
 # so a dated tag per build crowded latest out once and left metatron with nothing to boot. The
@@ -13,12 +14,12 @@ REPO=${REPO:-registry.a10k.co/rockem/os}
 COMMIT=$(git -C "$HERE" rev-parse --short HEAD)$(git -C "$HERE" diff --quiet HEAD -- || echo -dirty)
 TAG=latest
 cp "$HERE/$PROFILE.cmdline" "$S/cmdline"
-for f in bzImage initramfs.cpio.zst config cmdline; do [ -r "$S/$f" ] || { echo "missing $S/$f: make release PROFILE=$PROFILE"; exit 1; }; done
+for f in bzImage initramfs.cpio.zst config cmdline knobs.efi; do [ -r "$S/$f" ] || { echo "missing $S/$f: make release PROFILE=$PROFILE"; exit 1; }; done
 # explicit file types: podman's guess for text carries a charset parameter, which the OCI schema (and zot) reject
 pack() {
   podman artifact rm "$1" >/dev/null 2>&1 || true
   ( cd "$S"
-    podman artifact add --type application/vnd.rockem.os.v1 --file-type application/octet-stream "${ANN[@]}" "$1" bzImage initramfs.cpio.zst >/dev/null
+    podman artifact add --type application/vnd.rockem.os.v1 --file-type application/octet-stream "${ANN[@]}" "$1" bzImage initramfs.cpio.zst knobs.efi >/dev/null
     podman artifact add --append --file-type text/plain "${ANN[@]}" "$1" config cmdline >/dev/null )
 }
 ANN=(--annotation "co.a10k.rockem.profile=$PROFILE" --annotation "co.a10k.rockem.commit=$COMMIT" --annotation "co.a10k.rockem.built=$(date -u +%Y-%m-%dT%H:%M:%SZ)")

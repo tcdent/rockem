@@ -1,0 +1,50 @@
+# metatron's firmware, as rockem wants it. `knobs.efi` (os/firmware/knobs) runs ahead of the
+# kernel on every boot: it reads each knob below out of its UEFI setup store, writes the ones
+# that differ, and resets if it wrote anything; otherwise it returns and iPXE boots the kernel.
+# The firmware's configuration is part of the image: a knob is a line here, a commit and a
+# publish (tcdent, 2026-10-16: "a standardized and documented place for us to maintain the
+# flags"). Offsets come from localai.hardware's parse of the vendor BIOS image
+# (~/Work/localai/motherboards/huananzhi-h12d-16d/artifacts/setup-knobs.csv, the GN = Milan
+# formset of the CBS store); the firmware block below is what the running board must report
+# before anything is written, since offsets from another build can leave the box unable to POST.
+
+[firmware]
+vendor = "American Megatrends International, LLC."
+version = "1.1"
+date = "04/23/2026"
+# The first run only reads and reports; flip once the read-back of the knobs tcdent set in the
+# setup UI (NPS2, APBDIS 1, SoC P0) matches the table at these offsets.
+read_only = true
+
+[[store]]
+name = "AmdSetup"
+guid = "3a997502-647a-4c82-998e-52ef9486a247"
+# AMD CBS, the GN (Milan) formset. AmdSetupSSP and AmdSetupZP share the GUID with other offsets.
+
+[[knob]]
+store = "AmdSetup"
+name = "NUMA nodes per socket"
+offset = 0xD1
+value = 2
+why = "NPS2: a node's four channels stream at 84–93 GB/s and the box's 16 at 334, against 306–314 as one node a socket; the expert stream is laid out in node runs (2026-10-15)."
+
+[[knob]]
+store = "AmdSetup"
+name = "APBDIS"
+offset = 0x1D0
+value = 1
+why = "The fabric's power-state algorithm off; with the SoC P-state pinned, socket 0's nodes went 84 → 93 GB/s (2026-10-16)."
+
+[[knob]]
+store = "AmdSetup"
+name = "Fixed SoC P-state"
+offset = 0x1D2
+value = 0
+why = "P0: the fabric clock pinned at its top (shown once APBDIS is 1)."
+
+[[knob]]
+store = "AmdSetup"
+name = "DF C-states"
+offset = 0x1D1
+value = 0
+why = "Disabled: the data fabric must not drop into power states between the host's expert bursts (the next knob to measure; socket 1's nodes have not moved)."

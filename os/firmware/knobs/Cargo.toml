@@ -1,0 +1,21 @@
+[package]
+name = "knobs"
+version = "0.0.0"
+edition = "2021"
+description = "metatron's firmware knobs applied ahead of the kernel at every boot: a UEFI application chained by iPXE, the knob table compiled in from os/firmware/knobs.toml."
+
+[dependencies]
+uefi = { version = "0.41", features = ["panic_handler", "logger"] }
+
+[build-dependencies]
+toml = "0.8"
+
+[profile.release]
+opt-level = "s"
+panic = "abort"
+lto = true
+
+[profile.dev]
+panic = "abort"
+
+[workspace]
