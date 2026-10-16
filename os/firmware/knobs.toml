@@ -22,6 +22,18 @@ name = "AmdSetup"
 guid = "3a997502-647a-4c82-998e-52ef9486a247"
 # AMD CBS, the GN (Milan) formset. AmdSetupSSP and AmdSetupZP share the GUID with other offsets.
 
+[[store]]
+name = "Setup"
+guid = "ec87d643-eba4-4bb5-a1e5-3f3e36b20da9"
+# AMI's own setup store.
+
+[[knob]]
+store = "Setup"
+name = "Variable protection"
+offset = 0x91
+value = 0
+why = "Disabled: with 'Password protection of Runtime Variables' on, the firmware refuses SetVariable on the setup stores even from this stage (SECURITY_VIOLATION, 2026-10-16 14:15); it ships Enabled and has to be turned off once in the setup UI, after which the stage keeps it off."
+
 [[knob]]
 store = "AmdSetup"
 name = "NUMA nodes per socket"
