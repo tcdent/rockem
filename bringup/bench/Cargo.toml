@@ -66,3 +66,6 @@ path = "src/repeat.rs"
 name = "bench-memtest"
 path = "src/memtest.rs"
 
+[[bin]]
+name = "bench-churn"
+path = "src/churn.rs"
