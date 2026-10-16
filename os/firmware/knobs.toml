@@ -75,3 +75,32 @@ name = "HSMP Support"
 offset = 0x1D4
 value = 1
 why = "Enabled: the host-to-SMU mailbox (/dev/hsmp); per-socket fabric and memory clocks, DDR bandwidth, DIMM thermals and a runtime DF P-state — the per-socket read that tells whether socket 1 followed the fabric pin (2026-10-16)."
+
+[[knob]]
+store = "AmdSetup"
+name = "DRAM Power Down Enable"
+offset = 0x11F
+value = 0
+why = "Disabled: the DIMMs must not enter power-down between the host's expert bursts (a burst every ~37 ms, the DRAM idle while the cards run attention); appliance principle, measured by the profile (2026-10-16)."
+
+[[knob]]
+store = "AmdSetup"
+name = "xGMI Link Width Control"
+offset = 0x1CB
+value = 1
+why = "Manual: dynamic link width management off; the token crosses sockets every phase (pool items on both sockets, the cards on socket 1, the shared host buffers) and a narrowed link re-widens with a latency we pay per handoff (2026-10-16)."
+
+[[knob]]
+store = "AmdSetup"
+name = "xGMI Force Link Width Control"
+offset = 0x1CD
+value = 1
+why = "Force: with the control Manual, hold the forced width below."
+
+[[knob]]
+store = "AmdSetup"
+name = "xGMI Force Link Width"
+offset = 0x1CC
+value = 2
+why = "2 = x16, the full width of every xGMI link."
+

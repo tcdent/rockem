@@ -81,6 +81,50 @@ pub const fn page_run(page: usize) -> usize {
     (page % (XBLOCK_BYTES / PAGE)) / RUN_PAGES
 }
 
+/// The items of expert `(l, e)` in the order the file holds them: run by run, each run's
+/// gate/up items then its down items — as `(j, byte range)`, `j` the item's index in
+/// `expert::Stream`'s table (gate/up items `0..GU_ITEMS`, then down items).
+#[cfg(feature = "std")]
+pub fn file_items(l: usize, e: usize) -> std::vec::Vec<(usize, core::ops::Range<usize>)> {
+    let mut v = std::vec::Vec::with_capacity(GU_ITEMS + DOWN_ITEMS);
+    for r in 0..RUNS {
+        for c in r * GU_PER_RUN..(r + 1) * GU_PER_RUN {
+            v.push((c, gu_item(l, e, c)));
+        }
+        for c in r * DOWN_PER_RUN..(r + 1) * DOWN_PER_RUN {
+            v.push((GU_ITEMS + c, down_item(l, e, c)));
+        }
+    }
+    v
+}
+
+/// Which node holds each item, `[MOE_LAYERS][E][GU_ITEMS + DOWN_ITEMS]`, for nodes whose
+/// stream rates are `rates` (GB/s, measured on the box at start): every expert's gate/up
+/// items and its down items are split in proportion to the rates — smooth weighted
+/// round-robin, the credit carried across experts, so a node's share of any run of items is
+/// within one item of its rate's share — and a layer's expert run ends on every node at once.
+#[cfg(feature = "std")]
+pub fn placement(rates: &[f64]) -> std::vec::Vec<u8> {
+    let total: f64 = rates.iter().sum();
+    let share: std::vec::Vec<f64> = rates.iter().map(|r| r / total).collect();
+    let mut credit = std::vec![0f64; rates.len()];
+    let mut out = std::vec::Vec::with_capacity(MOE_LAYERS * E * (GU_ITEMS + DOWN_ITEMS));
+    let pick = |credit: &mut [f64]| -> u8 {
+        for (c, s) in credit.iter_mut().zip(&share) {
+            *c += s;
+        }
+        let n = (0..credit.len()).max_by(|&a, &b| credit[a].partial_cmp(&credit[b]).unwrap().then(b.cmp(&a))).unwrap();
+        credit[n] -= 1.0;
+        n as u8
+    };
+    for _ in 0..MOE_LAYERS * E {
+        for _ in 0..GU_ITEMS + DOWN_ITEMS {
+            out.push(pick(&mut credit));
+        }
+    }
+    out
+}
+
 // --- the dense weights, native ---
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {

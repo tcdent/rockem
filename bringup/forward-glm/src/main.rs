@@ -200,9 +200,10 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
     let prefix_b = std::fs::read(bundle.join(layout::PREFIX_FILE)).unwrap();
     let prefix: Vec<f32> = prefix_b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
     let pool = glm_5_3_flash::construct::Threads::new(&glm_5_3_flash::construct::physical_cores());
+    let stream: &'static glm_5_3_flash::expert::Stream<'static> = Box::leak(Box::new(glm_5_3_flash::expert::Stream::file(Box::leak(Box::new(experts)))));
     let routed: Box<dyn glm_5_3_flash::ffn::Routed> = match experts_mode {
-        "a8" => Box::new(CpuExperts::new(&experts[..], &pool)),
-        "q4f32" => Box::new(F32Experts { get: Box::new(move |l, e| dequant_expert(&experts[..], l, e)) }),
+        "a8" => Box::new(CpuExperts::new(stream, &pool)),
+        "q4f32" => Box::new(F32Experts { get: Box::new(move |l, e| dequant_expert(stream, l, e)) }),
         "f32" => Box::new(F32Experts { get: Box::new(move |l, e| { let x = load_expert(l, e, &|n| ck.f32s(n)); (x.gate_up, x.down) }) }),
         m => panic!("--experts {m}: a8, q4f32 or f32"),
     };
@@ -286,7 +287,7 @@ impl glm_5_3_flash::ffn::Routed for F32Experts<'_> {
 }
 
 /// One `q4g128` record's weights back to f32: integer × scale, the oracle's dequantized INT4.
-fn dequant_expert(stream: &[u8], l: usize, e: usize) -> (Vec<f32>, Vec<f32>) {
+fn dequant_expert(stream: &glm_5_3_flash::expert::Stream, l: usize, e: usize) -> (Vec<f32>, Vec<f32>) {
     use common::q4::{self, GROUP};
     use glm_5_3_flash::expert::Weights;
     use glm_5_3_flash::layout::{DOWN_CHUNK, DOWN_ITEMS, GU_CHUNK, GU_ITEMS};

@@ -548,6 +548,13 @@ fn gemv_rates(pool: &Threads, iters: usize, nodes: usize, placed: bool) -> Strin
 }
 
 /// Every probe, printed; `elf` is a code object with the `stream` kernel for the cards' probes.
+/// Every node's local stream rate (GB/s, 24 threads a node, best of 3): the placement's shares.
+pub fn node_rates() -> Vec<f64> {
+    let nodes = nodes();
+    let all = nodes.iter().map(|n| n.len()).sum::<usize>().max(1);
+    let mb = (2048 / all).max(16);
+    nodes.iter().map(|cpus| dram(cpus, mb, 3, false)).collect()
+}
 /// The DRAM ceilings alone (`node probe dram` from the shell beside an idle serving node: no card is touched).
 pub fn dram_only() {
     let nodes = nodes();

@@ -55,8 +55,13 @@ impl Glm {
     pub fn open(bundle: &std::path::Path, mem: loader::Mem, max_ctx: usize, gpu: bool, profile_every: usize, timeline: bool) -> Box<dyn Engine> {
         let t0 = std::time::Instant::now();
         let dense = loader::load(&bundle.join(layout::DENSE_FILE), mem);
-        let experts = loader::load_placed(&bundle.join(layout::EXPERTS_FILE), mem, &layout::page_run);
-        println!("bundle   : {} loaded in {:.1}s ({:.1} GB)", bundle.display(), t0.elapsed().as_secs_f32(), (dense.len() + experts.len()) as f64 / 1e9);
+        // the experts placed by the box's own measurement: each node's share of every expert in
+        // proportion to its stream rate, so a layer's expert run ends on every node at once
+        let rates = crate::probe::node_rates();
+        let total: f64 = rates.iter().sum();
+        println!("placement: node streams {} GB/s → item shares {} %", rates.iter().map(|r| format!("{r:.0}")).collect::<Vec<_>>().join(" / "), rates.iter().map(|r| format!("{:.1}", 100.0 * r / total)).collect::<Vec<_>>().join(" / "));
+        let experts: &'static glm_5_3_flash::expert::Stream<'static> = Box::leak(Box::new(loader::load_placed(&bundle.join(layout::EXPERTS_FILE), mem, &layout::placement(&rates))));
+        println!("bundle   : {} loaded in {:.1}s ({:.1} GB)", bundle.display(), t0.elapsed().as_secs_f32(), (dense.len() + experts.bytes.len()) as f64 / 1e9);
         let w = Weights::from_dense(dense);
         let prefix_b = loader::load(&bundle.join(layout::PREFIX_FILE), loader::Mem::Anon);
         let (p, prefix, q) = unsafe { prefix_b.align_to::<f32>() };
@@ -65,7 +70,7 @@ impl Glm {
         let cores = physical_cores();
         let pool: &'static Threads = Box::leak(Box::new(Threads::new(&cores)));
         let mut by_node = [0usize; 8];
-        for buf in [dense, experts] {
+        for buf in [dense, experts.bytes] {
             let nodes = loader::placement(buf);
             for &d in &nodes {
                 by_node[d as usize] += 1;

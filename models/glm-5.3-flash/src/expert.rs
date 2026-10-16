@@ -10,9 +10,49 @@ use crate::{D_FF, H};
 use common::q4::{self, QAct};
 use common::swiglu::swiglu_clamped;
 
+/// The expert stream as it lies in memory: its bytes, and where every item is. In the file
+/// an item's place is `layout::gu_item` / `layout::down_item`; loaded, the items are packed
+/// into one region per NUMA node in the proportion of the nodes' measured stream rates
+/// (`layout::placement`), so the table is the one definition of where an item is and the
+/// file layout never has to change with the box (tcdent, 2026-10-16: the observed ratios
+/// place the experts so every node's share ends at once).
+pub struct Stream<'a> {
+    pub bytes: &'a [u8],
+    /// Byte offset in `bytes` of every item, `[MOE_LAYERS][E][ITEMS]` (gate/up items, then down).
+    pub addr: std::vec::Vec<u64>,
+}
+pub const ITEMS: usize = GU_ITEMS + DOWN_ITEMS;
+#[inline(always)]
+pub const fn item_index(l: usize, e: usize, j: usize) -> usize {
+    ((l - crate::FIRST_K_DENSE_REPLACE) * crate::E + e) * ITEMS + j
+}
+impl<'a> Stream<'a> {
+    /// The file's own layout: an item where `layout` puts it.
+    pub fn file(bytes: &'a [u8]) -> Self {
+        assert_eq!(bytes.len(), layout::STREAM);
+        let mut addr = std::vec::Vec::with_capacity(layout::MOE_LAYERS * crate::E * ITEMS);
+        for l in crate::FIRST_K_DENSE_REPLACE..crate::NUM_HIDDEN_LAYERS {
+            for e in 0..crate::E {
+                for c in 0..GU_ITEMS {
+                    addr.push(layout::gu_item(l, e, c).start as u64);
+                }
+                for c in 0..DOWN_ITEMS {
+                    addr.push(layout::down_item(l, e, c).start as u64);
+                }
+            }
+        }
+        Stream { bytes, addr }
+    }
+    /// A placed copy: the loader's regions, with the table it filled.
+    pub fn placed(bytes: &'a [u8], addr: std::vec::Vec<u64>) -> Self {
+        assert_eq!(addr.len(), layout::MOE_LAYERS * crate::E * ITEMS);
+        Stream { bytes, addr }
+    }
+}
+
 /// One expert of the stream, read by item (`layout`): the unit a core streams.
 pub struct Weights<'a> {
-    stream: &'a [u8],
+    stream: &'a Stream<'a>,
     l: usize,
     e: usize,
 }
@@ -24,11 +64,10 @@ fn f32s(b: &[u8]) -> &[f32] {
 }
 
 impl<'a> Weights<'a> {
-    /// Expert `e` of MoE layer `l` in `stream` (the whole experts file, 4-byte aligned).
+    /// Expert `e` of MoE layer `l` in `stream`.
     #[inline(always)]
-    pub fn at(stream: &'a [u8], l: usize, e: usize) -> Self {
-        debug_assert_eq!(stream.len(), layout::STREAM);
-        debug_assert_eq!(stream.as_ptr() as usize % 4, 0);
+    pub fn at(stream: &'a Stream<'a>, l: usize, e: usize) -> Self {
+        debug_assert_eq!(stream.bytes.as_ptr() as usize % 4, 0);
         Weights { stream, l, e }
     }
     /// Gate/up item `c`: (gate rows, up rows, gate scales, up scales) — each `q4` slices over `GU_CHUNK` rows of width `H`.
@@ -46,11 +85,13 @@ impl<'a> Weights<'a> {
     /// The item's bytes, for a core to pull through its caches.
     #[inline(always)]
     pub fn gu_bytes(&self, c: usize) -> &'a [u8] {
-        &self.stream[layout::gu_item(self.l, self.e, c)]
+        let a = self.stream.addr[item_index(self.l, self.e, c)] as usize;
+        &self.stream.bytes[a..a + layout::GU_ITEM]
     }
     #[inline(always)]
     pub fn down_bytes(&self, c: usize) -> &'a [u8] {
-        &self.stream[layout::down_item(self.l, self.e, c)]
+        let a = self.stream.addr[item_index(self.l, self.e, GU_ITEMS + c)] as usize;
+        &self.stream.bytes[a..a + layout::DOWN_ITEM]
     }
 }
 
