@@ -29,6 +29,7 @@
 mod engine;
 mod glm;
 mod glm_kfd;
+mod hsmp;
 mod kfd;
 mod loader;
 mod platform;
@@ -511,6 +512,11 @@ fn halt(msg: &str) -> ! {
 }
 
 fn main() {
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("hsmp") {
+        hsmp::cli(&argv[2..]);
+        return;
+    }
     platform::report();
     let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
     if cmdline.split_whitespace().any(|t| t == "rockem.shell=1") {

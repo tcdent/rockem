@@ -68,3 +68,10 @@ name = "DF C-states"
 offset = 0x1D1
 value = 0
 why = "Disabled: the data fabric must not drop into power states between the host's expert bursts (the next knob to measure; socket 1's nodes have not moved)."
+
+[[knob]]
+store = "AmdSetup"
+name = "HSMP Support"
+offset = 0x1D4
+value = 1
+why = "Enabled: the host-to-SMU mailbox (/dev/hsmp); per-socket fabric and memory clocks, DDR bandwidth, DIMM thermals and a runtime DF P-state — the per-socket read that tells whether socket 1 followed the fabric pin (2026-10-16)."

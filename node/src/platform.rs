@@ -32,4 +32,28 @@ pub fn report() {
         println!("{:<26} {}", d, exists(d));
     }
     println!("modules  : {}", if fs::metadata("/proc/modules").is_ok() { "loader present" } else { "no module loader" });
+    // DIMM temperature sensors (jc42 over the SMBus) and the memory controllers' EDAC view
+    let mut dimms = Vec::new();
+    if let Ok(d) = fs::read_dir("/sys/class/hwmon") {
+        for e in d.flatten() {
+            let p = e.path();
+            if read(&format!("{}/name", p.display())) == "jc42" {
+                dimms.push(format!("{} {}°C", p.file_name().unwrap().to_string_lossy(), read(&format!("{}/temp1_input", p.display())).parse::<f64>().unwrap_or(0.0) / 1000.0));
+            }
+        }
+    }
+    println!("dimm temp: {}", if dimms.is_empty() { "no jc42 sensors".to_string() } else { dimms.join(" · ") });
+    let mut edac = Vec::new();
+    if let Ok(d) = fs::read_dir("/sys/devices/system/edac/mc") {
+        let mut mcs: Vec<_> = d.flatten().map(|e| e.path()).filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("mc")).collect();
+        mcs.sort();
+        for mc in mcs {
+            let mut ds: Vec<_> = fs::read_dir(&mc).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("dimm")).collect();
+            ds.sort();
+            let parts: Vec<String> = ds.iter().map(|d| format!("{} {} MB ce {}", read(&format!("{}/dimm_label", d.display())), read(&format!("{}/size", d.display())), read(&format!("{}/dimm_ce_count", d.display())))).collect();
+            edac.push(format!("{} ({}): {}", mc.file_name().unwrap().to_string_lossy(), read(&format!("{}/mc_name", mc.display())), parts.join(", ")));
+        }
+    }
+    println!("edac     : {}", if edac.is_empty() { "no memory controllers registered".to_string() } else { edac.join(" | ") });
+    crate::hsmp::report();
 }
