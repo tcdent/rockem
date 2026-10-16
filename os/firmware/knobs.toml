@@ -12,9 +12,10 @@
 vendor = "American Megatrends International, LLC."
 version = "1.1"
 date = "04/23/2026"
-# The first run only reads and reports; flip once the read-back of the knobs tcdent set in the
-# setup UI (NPS2, APBDIS 1, SoC P0) matches the table at these offsets.
-read_only = true
+# The first run (2026-10-16 14:10) read the knobs tcdent had set in the setup UI — NPS2, APBDIS 1,
+# SoC P0 — back from exactly these offsets on this build: the table holds. From then on the
+# stage writes what differs.
+read_only = false
 
 [[store]]
 name = "AmdSetup"

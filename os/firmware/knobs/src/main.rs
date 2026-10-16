@@ -145,6 +145,9 @@ macro_rules! say {
     }};
 }
 const REPORT_GUID: Guid = guid!("5d2a6b7e-8f30-4c1b-9a6e-0c6f1e2d3b4a");
+/// Left (non-volatile) before a reset that follows a write: the boot after it reports a knob the
+/// firmware did not keep instead of writing it again — never a reset loop.
+const ATTEMPT: &CStr16 = cstr16!("RockemKnobsAttempt");
 
 #[entry]
 fn main() -> Status {
@@ -163,6 +166,15 @@ fn main() -> Status {
             false
         }
     };
+    // did the previous boot write and reset? then this boot writes nothing: what differs now, the firmware undid
+    let vendor_r = VariableVendor(REPORT_GUID);
+    let mut small = [0u8; 8];
+    let after_write = runtime::get_variable(ATTEMPT, &vendor_r, &mut small).is_ok();
+    if after_write {
+        let _ = runtime::delete_variable(ATTEMPT, &vendor_r);
+        say!(r, "knobs    : this boot follows a write and reset: a knob still differing is one the firmware did not keep");
+    }
+    let may_write = fw_ok && !READ_ONLY && !after_write;
     let mut changed = false;
     for (si, st) in STORES.iter().enumerate() {
         let vendor = VariableVendor(st.guid);
@@ -184,8 +196,8 @@ fn main() -> Status {
             let cur = data[k.offset];
             if cur == k.value {
                 say!(r, "  {:<24} @ {:#06x} = {:#04x}  as wanted", k.name, k.offset, cur);
-            } else if READ_ONLY || !fw_ok {
-                say!(r, "  {:<24} @ {:#06x} = {:#04x}  wanted {:#04x} — left as is", k.name, k.offset, cur, k.value);
+            } else if !may_write {
+                say!(r, "  {:<24} @ {:#06x} = {:#04x}  wanted {:#04x} — left as is{}", k.name, k.offset, cur, k.value, if after_write { " (NOT KEPT by the firmware)" } else { "" });
             } else {
                 say!(r, "  {:<24} @ {:#06x} = {:#04x}  → {:#04x}: {}", k.name, k.offset, cur, k.value, k.why);
                 data[k.offset] = k.value;
@@ -205,6 +217,7 @@ fn main() -> Status {
     }
     if changed {
         say!(r, "knobs    : written; resetting so the firmware applies them");
+        let _ = runtime::set_variable(ATTEMPT, &vendor_r, runtime::VariableAttributes::NON_VOLATILE | runtime::VariableAttributes::BOOTSERVICE_ACCESS | runtime::VariableAttributes::RUNTIME_ACCESS, &[1u8]);
         boot::stall(Duration::from_secs(3));
         runtime::reset(ResetType::COLD, Status::SUCCESS, None);
     }
