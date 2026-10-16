@@ -55,7 +55,7 @@ impl Glm {
     pub fn open(bundle: &std::path::Path, mem: loader::Mem, max_ctx: usize, gpu: bool, profile_every: usize, timeline: bool) -> Box<dyn Engine> {
         let t0 = std::time::Instant::now();
         let dense = loader::load(&bundle.join(layout::DENSE_FILE), mem);
-        let experts = loader::load(&bundle.join(layout::EXPERTS_FILE), mem);
+        let experts = loader::load_placed(&bundle.join(layout::EXPERTS_FILE), mem, &layout::page_run);
         println!("bundle   : {} loaded in {:.1}s ({:.1} GB)", bundle.display(), t0.elapsed().as_secs_f32(), (dense.len() + experts.len()) as f64 / 1e9);
         let w = Weights::from_dense(dense);
         let prefix_b = loader::load(&bundle.join(layout::PREFIX_FILE), loader::Mem::Anon);

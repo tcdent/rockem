@@ -11,26 +11,74 @@
 //! one definition; the names are the checkpoint's own, relative to the layer.
 
 use crate::*;
-use common::q4::GROUP;
+use common::q4::{GROUP, TILE};
 
 // --- the routed experts ---
-pub const GATE_UP_W: usize = 2 * D_FF * H / 2;
-pub const GATE_UP_S: usize = 2 * D_FF * (H / GROUP); // f32 count
-pub const DOWN_W: usize = H * D_FF / 2;
-pub const DOWN_S: usize = H * (D_FF / GROUP); // f32 count
-pub const RECORD: usize = GATE_UP_W + 4 * GATE_UP_S + DOWN_W + 4 * DOWN_S;
+//
+// The stream is laid out for the memory it is read from. Experts come in blocks of `XBLOCK`
+// (32); a block is `RUNS` runs of `RUN_PAGES` 2 MiB pages, one run per NUMA node of the
+// production box, and run `r` holds every expert's share `r`: `GU_PER_RUN` gate/up items
+// then `DOWN_PER_RUN` down items, back to back, expert after expert. An item is the unit one
+// core streams (`construct::CpuExperts`): a gate/up item is `GU_CHUNK` hidden rows of the gate
+// and the matching rows of the up projection with their scales, a down item `DOWN_CHUNK`
+// output rows with theirs — whole q4 tiles, whole 4 KiB blocks. 32 shares fill 51 pages to
+// the byte: no padding anywhere. Loaded with run `r` on node `r mod nodes`
+// (`page_run`), every node holds exactly its share of every expert and never reads another
+// node's bytes, so a layer's expert run ends on every node at once (tcdent, 2026-10-16:
+// "expert slices adjacent to the dies that access them").
+pub const PAGE: usize = 2 << 20;
+pub const RUNS: usize = 4;
+pub const XBLOCK: usize = 32;
+/// Hidden rows a gate/up item takes (its gate rows and the matching up rows); output rows a down item takes.
+pub const GU_CHUNK: usize = 64;
+pub const DOWN_CHUNK: usize = 256;
+pub const GU_ITEMS: usize = D_FF / GU_CHUNK;
+pub const DOWN_ITEMS: usize = H / DOWN_CHUNK;
+pub const GU_PER_RUN: usize = GU_ITEMS / RUNS;
+pub const DOWN_PER_RUN: usize = DOWN_ITEMS / RUNS;
+/// One matrix's share of a gate/up item: its int4 rows, and its f32 scales (count).
+pub const GU_W: usize = GU_CHUNK * H / 2;
+pub const GU_S: usize = GU_CHUNK * (H / GROUP);
+pub const GU_ITEM: usize = 2 * GU_W + 2 * 4 * GU_S;
+pub const DOWN_W: usize = DOWN_CHUNK * D_FF / 2;
+pub const DOWN_S: usize = DOWN_CHUNK * (D_FF / GROUP);
+pub const DOWN_ITEM: usize = DOWN_W + 4 * DOWN_S;
+/// One expert's share of one run, and the run and block that follow.
+pub const SHARE: usize = GU_PER_RUN * GU_ITEM + DOWN_PER_RUN * DOWN_ITEM;
+pub const RUN: usize = XBLOCK * SHARE;
+pub const RUN_PAGES: usize = RUN / PAGE;
+pub const XBLOCK_BYTES: usize = RUNS * RUN;
+/// An expert's bytes (the four shares), for sizing.
+pub const RECORD: usize = RUNS * SHARE;
 pub const LAYER: usize = E * RECORD;
 pub const MOE_LAYERS: usize = NUM_HIDDEN_LAYERS - FIRST_K_DENSE_REPLACE;
 pub const STREAM: usize = MOE_LAYERS * LAYER;
 pub const RECIPE_RTN: &str = "experts:q4g128-a8-rtn dense:native";
 
-const _: () = assert!(RECORD % 64 == 0 && H % GROUP == 0 && D_FF % GROUP == 0);
+const _: () = assert!(GU_ITEMS % RUNS == 0 && DOWN_ITEMS % RUNS == 0 && E % XBLOCK == 0 && RUN % PAGE == 0 && LAYER % PAGE == 0);
+const _: () = assert!(GU_ITEM % 4096 == 0 && DOWN_ITEM % 4096 == 0 && GU_CHUNK % TILE == 0 && DOWN_CHUNK % TILE == 0 && H % GROUP == 0 && D_FF % GROUP == 0);
 
-/// Byte range of expert `e` in MoE layer `l` within the stream.
+/// Byte offset in the stream of run `r`'s share of expert `e` in MoE layer `l`.
 #[inline(always)]
-pub const fn record(l: usize, e: usize) -> core::ops::Range<usize> {
-    let start = (l - FIRST_K_DENSE_REPLACE) * LAYER + e * RECORD;
-    start..start + RECORD
+pub const fn share(l: usize, e: usize, r: usize) -> usize {
+    (l - FIRST_K_DENSE_REPLACE) * LAYER + (e / XBLOCK) * XBLOCK_BYTES + r * RUN + (e % XBLOCK) * SHARE
+}
+/// Byte range in the stream of gate/up item `c` of expert `e` in layer `l`: gate rows, up rows, gate scales, up scales.
+#[inline(always)]
+pub const fn gu_item(l: usize, e: usize, c: usize) -> core::ops::Range<usize> {
+    let start = share(l, e, c / GU_PER_RUN) + (c % GU_PER_RUN) * GU_ITEM;
+    start..start + GU_ITEM
+}
+/// Byte range in the stream of down item `c` of expert `e` in layer `l`: rows, then scales.
+#[inline(always)]
+pub const fn down_item(l: usize, e: usize, c: usize) -> core::ops::Range<usize> {
+    let start = share(l, e, c / DOWN_PER_RUN) + GU_PER_RUN * GU_ITEM + (c % DOWN_PER_RUN) * DOWN_ITEM;
+    start..start + DOWN_ITEM
+}
+/// The run page `page` of the stream belongs to: the node that holds it is `run mod nodes`.
+#[inline(always)]
+pub const fn page_run(page: usize) -> usize {
+    (page % (XBLOCK_BYTES / PAGE)) / RUN_PAGES
 }
 
 // --- the dense weights, native ---

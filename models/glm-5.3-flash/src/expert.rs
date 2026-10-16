@@ -5,33 +5,89 @@
 //! thread; the GPU realization lands here as a grouped kernel over the same
 //! bytes.
 
-use crate::layout::{DOWN_W, GATE_UP_S, GATE_UP_W, RECORD};
+use crate::layout::{self, DOWN_ITEMS, GU_CHUNK, GU_ITEMS, GU_S, GU_W};
 use crate::{D_FF, H};
 use common::q4::{self, QAct};
 use common::swiglu::swiglu_clamped;
 
+/// One expert of the stream, read by item (`layout`): the unit a core streams.
 pub struct Weights<'a> {
-    pub gate_up_w: &'a [u8],
-    pub gate_up_s: &'a [f32],
-    pub down_w: &'a [u8],
-    pub down_s: &'a [f32],
+    stream: &'a [u8],
+    l: usize,
+    e: usize,
+}
+
+fn f32s(b: &[u8]) -> &[f32] {
+    let (p, m, q) = unsafe { b.align_to::<f32>() };
+    assert!(p.is_empty() && q.is_empty());
+    m
 }
 
 impl<'a> Weights<'a> {
-    /// Split one record (4-byte aligned) into its four streams.
-    pub fn from_record(rec: &'a [u8]) -> Self {
-        assert_eq!(rec.len(), RECORD);
-        assert_eq!(rec.as_ptr() as usize % 4, 0);
-        let f32s = |b: &'a [u8]| -> &'a [f32] {
-            let (p, m, q) = unsafe { b.align_to::<f32>() };
-            assert!(p.is_empty() && q.is_empty());
-            m
-        };
-        let (a, rest) = rec.split_at(GATE_UP_W);
-        let (b, rest) = rest.split_at(4 * GATE_UP_S);
-        let (c, d) = rest.split_at(DOWN_W);
-        Weights { gate_up_w: a, gate_up_s: f32s(b), down_w: c, down_s: f32s(d) }
+    /// Expert `e` of MoE layer `l` in `stream` (the whole experts file, 4-byte aligned).
+    #[inline(always)]
+    pub fn at(stream: &'a [u8], l: usize, e: usize) -> Self {
+        debug_assert_eq!(stream.len(), layout::STREAM);
+        debug_assert_eq!(stream.as_ptr() as usize % 4, 0);
+        Weights { stream, l, e }
     }
+    /// Gate/up item `c`: (gate rows, up rows, gate scales, up scales) — each `q4` slices over `GU_CHUNK` rows of width `H`.
+    #[inline(always)]
+    pub fn gu(&self, c: usize) -> (&'a [u8], &'a [u8], &'a [f32], &'a [f32]) {
+        let it = self.gu_bytes(c);
+        (&it[..GU_W], &it[GU_W..2 * GU_W], f32s(&it[2 * GU_W..2 * GU_W + 4 * GU_S]), f32s(&it[2 * GU_W + 4 * GU_S..]))
+    }
+    /// Down item `c`: (rows, scales) — `q4` slices over `DOWN_CHUNK` rows of width `D_FF`.
+    #[inline(always)]
+    pub fn down(&self, c: usize) -> (&'a [u8], &'a [f32]) {
+        let it = self.down_bytes(c);
+        (&it[..layout::DOWN_W], f32s(&it[layout::DOWN_W..]))
+    }
+    /// The item's bytes, for a core to pull through its caches.
+    #[inline(always)]
+    pub fn gu_bytes(&self, c: usize) -> &'a [u8] {
+        &self.stream[layout::gu_item(self.l, self.e, c)]
+    }
+    #[inline(always)]
+    pub fn down_bytes(&self, c: usize) -> &'a [u8] {
+        &self.stream[layout::down_item(self.l, self.e, c)]
+    }
+}
+
+/// An expert's items from whole `q4::pack`ed matrices — gate|up (`[2·D_FF][H]`, gate rows first)
+/// and down (`[H][D_FF]`) — as (offset in the stream, bytes), the bundle builder's and the
+/// relayout's one definition of the bytes.
+#[cfg(any(feature = "std", test))]
+pub fn pack_items(l: usize, e: usize, guw: &[u8], gus: &[f32], dw: &[u8], dsc: &[f32]) -> std::vec::Vec<(usize, std::vec::Vec<u8>)> {
+    use common::q4::{GROUP, TILE};
+    use layout::{DOWN_CHUNK, DOWN_W};
+    assert_eq!(guw.len(), 2 * D_FF * H / 2);
+    assert_eq!(gus.len(), 2 * D_FF * (H / GROUP));
+    assert_eq!(dw.len(), H * D_FF / 2);
+    assert_eq!(dsc.len(), H * (D_FF / GROUP));
+    let le = |v: &[f32]| -> std::vec::Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+    let mut items = std::vec::Vec::with_capacity(GU_ITEMS + DOWN_ITEMS);
+    for c in 0..GU_ITEMS {
+        let (g0, u0) = (c * GU_CHUNK, D_FF + c * GU_CHUNK);
+        let rows = |r0: usize| &guw[r0 / TILE * 2 * H..(r0 + GU_CHUNK) / TILE * 2 * H];
+        let scales = |r0: usize| &gus[r0 / TILE * (H / GROUP) * TILE..(r0 + GU_CHUNK) / TILE * (H / GROUP) * TILE];
+        let mut it = std::vec::Vec::with_capacity(layout::GU_ITEM);
+        it.extend_from_slice(rows(g0));
+        it.extend_from_slice(rows(u0));
+        it.extend_from_slice(&le(scales(g0)));
+        it.extend_from_slice(&le(scales(u0)));
+        assert_eq!(it.len(), layout::GU_ITEM);
+        items.push((layout::gu_item(l, e, c).start, it));
+    }
+    for c in 0..DOWN_ITEMS {
+        let r0 = c * DOWN_CHUNK;
+        let mut it = std::vec::Vec::with_capacity(layout::DOWN_ITEM);
+        it.extend_from_slice(&dw[r0 / TILE * 2 * D_FF..(r0 + DOWN_CHUNK) / TILE * 2 * D_FF]);
+        it.extend_from_slice(&le(&dsc[r0 / TILE * (D_FF / GROUP) * TILE..(r0 + DOWN_CHUNK) / TILE * (D_FF / GROUP) * TILE]));
+        assert_eq!(it.len(), DOWN_W + 4 * layout::DOWN_S);
+        items.push((layout::down_item(l, e, c).start, it));
+    }
+    items
 }
 
 /// Per-thread scratch, sized once at construction.
@@ -92,10 +148,19 @@ impl Default for ScratchBuf {
 #[inline(always)]
 pub fn forward(w: &Weights, x: &[f32], s: &mut Scratch, out: &mut [f32]) {
     s.xa.quantize(&x[..H]);
-    q4::gemv::<H>(2 * D_FF, w.gate_up_w, w.gate_up_s, &s.xa.act(), s.gu);
+    let xa = s.xa.act();
+    for c in 0..GU_ITEMS {
+        let (gw, uw, gs, us) = w.gu(c);
+        q4::gemv::<H>(GU_CHUNK, gw, gs, &xa, &mut s.gu[c * GU_CHUNK..(c + 1) * GU_CHUNK]);
+        q4::gemv::<H>(GU_CHUNK, uw, us, &xa, &mut s.gu[D_FF + c * GU_CHUNK..D_FF + (c + 1) * GU_CHUNK]);
+    }
     swiglu_clamped::<D_FF>(s.gu, crate::SWIGLU_LIMIT, s.h);
     s.ha.quantize(s.h);
-    q4::gemv::<D_FF>(H, w.down_w, w.down_s, &s.ha.act(), out);
+    let ha = s.ha.act();
+    for c in 0..DOWN_ITEMS {
+        let (dw, ds) = w.down(c);
+        q4::gemv::<D_FF>(layout::DOWN_CHUNK, dw, ds, &ha, &mut out[c * layout::DOWN_CHUNK..(c + 1) * layout::DOWN_CHUNK]);
+    }
 }
 
 /// The same from an activation already quantized — the card's integers,
@@ -106,19 +171,37 @@ pub fn forward_q(w: &Weights, xq: &[i8], xs: &[f32], xg: &[i32], s: &mut Scratch
     s.xa.q.copy_from_slice(&xq[..H]);
     s.xa.scale.copy_from_slice(&xs[..H / q4::GROUP]);
     s.xa.gsum.copy_from_slice(&xg[..H / q4::GROUP]);
-    q4::gemv::<H>(2 * D_FF, w.gate_up_w, w.gate_up_s, &s.xa.act(), s.gu);
+    let xa = s.xa.act();
+    for c in 0..GU_ITEMS {
+        let (gw, uw, gs, us) = w.gu(c);
+        q4::gemv::<H>(GU_CHUNK, gw, gs, &xa, &mut s.gu[c * GU_CHUNK..(c + 1) * GU_CHUNK]);
+        q4::gemv::<H>(GU_CHUNK, uw, us, &xa, &mut s.gu[D_FF + c * GU_CHUNK..D_FF + (c + 1) * GU_CHUNK]);
+    }
     swiglu_clamped::<D_FF>(s.gu, crate::SWIGLU_LIMIT, s.h);
     s.ha.quantize(s.h);
-    q4::gemv::<D_FF>(H, w.down_w, w.down_s, &s.ha.act(), out);
+    let ha = s.ha.act();
+    for c in 0..DOWN_ITEMS {
+        let (dw, ds) = w.down(c);
+        q4::gemv::<D_FF>(layout::DOWN_CHUNK, dw, ds, &ha, &mut out[c * layout::DOWN_CHUNK..(c + 1) * layout::DOWN_CHUNK]);
+    }
 }
 
 /// Same composition over the scalar inner loop, to diff against.
 pub fn forward_scalar(w: &Weights, x: &[f32], s: &mut Scratch, out: &mut [f32]) {
     s.xa.quantize(&x[..H]);
-    q4::gemv_scalar(H, 2 * D_FF, w.gate_up_w, w.gate_up_s, &s.xa.act(), s.gu);
+    let xa = s.xa.act();
+    for c in 0..GU_ITEMS {
+        let (gw, uw, gs, us) = w.gu(c);
+        q4::gemv_scalar(H, GU_CHUNK, gw, gs, &xa, &mut s.gu[c * GU_CHUNK..(c + 1) * GU_CHUNK]);
+        q4::gemv_scalar(H, GU_CHUNK, uw, us, &xa, &mut s.gu[D_FF + c * GU_CHUNK..D_FF + (c + 1) * GU_CHUNK]);
+    }
     swiglu_clamped::<D_FF>(s.gu, crate::SWIGLU_LIMIT, s.h);
     s.ha.quantize(s.h);
-    q4::gemv_scalar(D_FF, H, w.down_w, w.down_s, &s.ha.act(), out);
+    let ha = s.ha.act();
+    for c in 0..DOWN_ITEMS {
+        let (dw, ds) = w.down(c);
+        q4::gemv_scalar(D_FF, layout::DOWN_CHUNK, dw, ds, &ha, &mut out[c * layout::DOWN_CHUNK..(c + 1) * layout::DOWN_CHUNK]);
+    }
 }
 
 #[cfg(test)]
@@ -139,14 +222,14 @@ mod tests {
         };
         let (guw, gus) = mk(2 * D_FF, H, &mut rnd);
         let (dw, ds) = mk(H, D_FF, &mut rnd);
-        let mut rec = Vec::with_capacity(RECORD);
-        rec.extend_from_slice(&guw);
-        rec.extend(gus.iter().flat_map(|v| v.to_le_bytes()));
-        rec.extend_from_slice(&dw);
-        rec.extend(ds.iter().flat_map(|v| v.to_le_bytes()));
-        let rec: Vec<u32> = rec.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect(); // 4-aligned
-        let rec: &[u8] = unsafe { core::slice::from_raw_parts(rec.as_ptr() as *const u8, RECORD) };
-        let w = Weights::from_record(rec);
+        // one block's worth of stream, the expert at (FIRST_K_DENSE_REPLACE, 0): its items land inside it
+        let mut block = vec![0u32; layout::XBLOCK_BYTES / 4]; // 4-aligned
+        let stream: &mut [u8] = unsafe { core::slice::from_raw_parts_mut(block.as_mut_ptr() as *mut u8, layout::XBLOCK_BYTES) };
+        let (l, e) = (crate::FIRST_K_DENSE_REPLACE, 0);
+        for (off, it) in pack_items(l, e, &guw, &gus, &dw, &ds) {
+            stream[off..off + it.len()].copy_from_slice(&it);
+        }
+        let w = Weights { stream, l, e };
         let x: Vec<f32> = (0..H).map(|_| ((rnd() % 2000) as f32 - 1000.0) * 1e-3).collect();
 
         let run = |f: &dyn Fn(&Weights, &[f32], &mut Scratch, &mut [f32])| {

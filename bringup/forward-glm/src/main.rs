@@ -202,7 +202,7 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
     let pool = glm_5_3_flash::construct::Threads::new(&glm_5_3_flash::construct::physical_cores());
     let routed: Box<dyn glm_5_3_flash::ffn::Routed> = match experts_mode {
         "a8" => Box::new(CpuExperts::new(&experts[..], &pool)),
-        "q4f32" => Box::new(F32Experts { get: Box::new(move |l, e| dequant_record(&experts[glm_5_3_flash::layout::record(l, e)])) }),
+        "q4f32" => Box::new(F32Experts { get: Box::new(move |l, e| dequant_expert(&experts[..], l, e)) }),
         "f32" => Box::new(F32Experts { get: Box::new(move |l, e| { let x = load_expert(l, e, &|n| ck.f32s(n)); (x.gate_up, x.down) }) }),
         m => panic!("--experts {m}: a8, q4f32 or f32"),
     };
@@ -286,22 +286,29 @@ impl glm_5_3_flash::ffn::Routed for F32Experts<'_> {
 }
 
 /// One `q4g128` record's weights back to f32: integer × scale, the oracle's dequantized INT4.
-fn dequant_record(rec: &[u8]) -> (Vec<f32>, Vec<f32>) {
+fn dequant_expert(stream: &[u8], l: usize, e: usize) -> (Vec<f32>, Vec<f32>) {
     use common::q4::{self, GROUP};
-    use glm_5_3_flash::layout::{DOWN_W, GATE_UP_S, GATE_UP_W};
-    let f32s = |b: &[u8]| -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect() };
-    let (guw, rest) = rec.split_at(GATE_UP_W);
-    let (gus, rest) = rest.split_at(4 * GATE_UP_S);
-    let (dw, dsb) = rest.split_at(DOWN_W);
-    let (gus, ds) = (f32s(gus), f32s(dsb));
-    let expand = |m: usize, k: usize, w: &[u8], s: &[f32]| -> Vec<f32> {
-        let mut out = vec![0f32; m * k];
-        for r in 0..m {
+    use glm_5_3_flash::expert::Weights;
+    use glm_5_3_flash::layout::{DOWN_CHUNK, DOWN_ITEMS, GU_CHUNK, GU_ITEMS};
+    let w = Weights::at(stream, l, e);
+    // an item's rows expanded into their place in the full matrix (`[rows][k]`)
+    let expand = |rows: usize, k: usize, iw: &[u8], is: &[f32], r_base: usize, out: &mut [f32]| {
+        for r in 0..rows {
             for kk in 0..k {
-                out[r * k + kk] = q4::unpack(k, w, r, kk) as f32 * s[q4::scale_index(k, r, kk / GROUP)];
+                out[(r_base + r) * k + kk] = q4::unpack(k, iw, r, kk) as f32 * is[q4::scale_index(k, r, kk / GROUP)];
             }
         }
-        out
     };
-    (expand(2 * D_FF, H, guw, &gus), expand(H, D_FF, dw, &ds))
+    let mut gu = vec![0f32; 2 * D_FF * H];
+    for c in 0..GU_ITEMS {
+        let (gw, uw, gs, us) = w.gu(c);
+        expand(GU_CHUNK, H, gw, gs, c * GU_CHUNK, &mut gu);
+        expand(GU_CHUNK, H, uw, us, D_FF + c * GU_CHUNK, &mut gu);
+    }
+    let mut down = vec![0f32; H * D_FF];
+    for c in 0..DOWN_ITEMS {
+        let (dw, ds) = w.down(c);
+        expand(DOWN_CHUNK, D_FF, dw, ds, c * DOWN_CHUNK, &mut down);
+    }
+    (gu, down)
 }

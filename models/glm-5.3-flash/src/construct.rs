@@ -48,7 +48,7 @@ pub struct Threads {
     prefetched: std::sync::Mutex<(usize, usize)>,
 }
 /// The grain of placement: a region's node is known per 2 MiB page.
-pub const PAGE: usize = 2 << 20;
+pub use crate::layout::PAGE;
 const MAX_NODES: usize = 8;
 const MAX_CCDS: usize = 16;
 /// A job's items sit in slots: slot `c < MAX_CCDS` is CCD `c`'s (an item with a
@@ -90,7 +90,7 @@ struct Shared {
 extern "C" {
     fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
 }
-fn pin(core: usize) {
+pub fn pin(core: usize) {
     let mut mask = [0u64; 16];
     mask[core / 64] |= 1 << (core % 64);
     unsafe { sched_setaffinity(0, 128, mask.as_ptr()) };
@@ -347,6 +347,14 @@ pub fn ccd_key(core: usize) -> usize {
     std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{core}/cache/index3/shared_cpu_list")).ok().and_then(|s| s.trim().split([',', '-']).next().and_then(|v| v.parse().ok())).unwrap_or(core)
 }
 
+/// How many NUMA nodes /sys lists (1 where there is no NUMA).
+pub fn node_count() -> usize {
+    (0..MAX_NODES).take_while(|n| std::path::Path::new(&format!("/sys/devices/system/node/node{n}")).exists()).count().max(1)
+}
+/// The first core of node `node` (core 0 where there is no NUMA).
+pub fn first_core_of(node: usize) -> usize {
+    physical_cores().into_iter().find(|&c| node_of_core(c) == node).unwrap_or(0)
+}
 /// The NUMA node of a core, from /sys (0 where there is no NUMA).
 pub fn node_of_core(core: usize) -> usize {
     for n in 0..MAX_NODES {
@@ -402,27 +410,22 @@ pub struct CpuExperts<'a> {
     h: Vec<f32>, // [TOP_K][D_FF]: the experts' hidden states
     elapsed: f64,
 }
-/// Hidden channels an item takes: 32 items an expert.
-const CHUNK: usize = 64;
-/// Output rows an item takes for the down projection: 20 items an expert.
-const DOWN_CHUNK: usize = 256;
-const _: () = assert!(D_FF % CHUNK == 0 && CHUNK % common::q4::TILE == 0 && D_FF % common::q4::GROUP == 0 && H % DOWN_CHUNK == 0 && DOWN_CHUNK % common::q4::TILE == 0);
+/// An item is the record's (`layout::gu_item`, `layout::down_item`): 32 gate/up items and 20 down items an expert.
+use crate::layout::{DOWN_CHUNK, DOWN_ITEMS, GU_CHUNK as CHUNK, GU_ITEMS};
 
 impl<'a> CpuExperts<'a> {
     pub fn new(stream: &'a [u8], pool: &'a dyn Pool) -> Self {
         use common::q4::GROUP;
         assert_eq!(stream.len(), layout::STREAM);
-        use common::q4::TILE;
-        let (n_gu, n_down) = (D_FF / CHUNK, H / DOWN_CHUNK);
-        let mut slice_node = Vec::with_capacity(layout::MOE_LAYERS * E * (n_gu + n_down));
+        let mut slice_node = Vec::with_capacity(layout::MOE_LAYERS * E * (GU_ITEMS + DOWN_ITEMS));
         for l in FIRST_K_DENSE_REPLACE..NUM_HIDDEN_LAYERS {
             for e in 0..E {
-                let w = expert::Weights::from_record(&stream[layout::record(l, e)]);
-                for j in 0..n_gu {
-                    slice_node.push(pool.node_of(w.gate_up_w[j * CHUNK / TILE * 2 * H..].as_ptr()) as u8);
+                let w = expert::Weights::at(stream, l, e);
+                for j in 0..GU_ITEMS {
+                    slice_node.push(pool.node_of(w.gu_bytes(j).as_ptr()) as u8);
                 }
-                for c in 0..n_down {
-                    slice_node.push(pool.node_of(w.down_w[c * DOWN_CHUNK / TILE * 2 * D_FF..].as_ptr()) as u8);
+                for c in 0..DOWN_ITEMS {
+                    slice_node.push(pool.node_of(w.down_bytes(c).as_ptr()) as u8);
                 }
             }
         }
@@ -430,11 +433,8 @@ impl<'a> CpuExperts<'a> {
     }
     /// The node of slice `j` (gate/up slices first, then down) of expert `e` of layer `l`.
     fn slice_node(&self, l: usize, e: usize, j: usize) -> usize {
-        self.slice_node[((l - FIRST_K_DENSE_REPLACE) * E + e) * (D_FF / CHUNK + H / DOWN_CHUNK) + j] as usize
+        self.slice_node[((l - FIRST_K_DENSE_REPLACE) * E + e) * (GU_ITEMS + DOWN_ITEMS) + j] as usize
     }
-}
-fn raw_f32(v: &[f32]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 /// Pull every cache line of `b` through this core: into its L2 and, as the core streams on,
 /// its CCD's L3. One 32-byte AVX2 load a line, four lines in flight.
@@ -479,14 +479,13 @@ impl Routed for CpuExperts<'_> {
         std::mem::take(&mut self.elapsed)
     }
     fn prefetch(&self, l: usize, idx: [usize; TOP_K]) {
-        use common::q4::{GROUP, TILE};
         // the stream lives as long as the process (the node leaks it; the gate's outlives every token):
         // the job that owns these closures is gone within the token
         let stream: &'static [u8] = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(self.stream) };
         let pool = self.pool;
         // an item an (expert, node, CCD): the slices of that expert the compute will slot there, in the
         // compute's order — a slice's node from its rows' page, its CCD from the expert's id and the slice
-        let (n_gu, n_down) = (D_FF / CHUNK, H / DOWN_CHUNK);
+        let (n_gu, n_down) = (GU_ITEMS, DOWN_ITEMS);
         let mut items: Vec<(usize, usize, usize, Vec<u32>)> = Vec::new(); // expert position, node, ccd, slice ids (gate/up first, then down + n_gu)
         for k in 0..TOP_K {
             for j in 0..n_gu + n_down {
@@ -503,9 +502,9 @@ impl Routed for CpuExperts<'_> {
         let items = std::sync::Arc::new(items);
         let (i1, i2, i3) = (items.clone(), items.clone(), items);
         let first_slice = move |it: &(usize, usize, usize, Vec<u32>)| -> *const u8 {
-            let w = expert::Weights::from_record(&stream[layout::record(l, idx[it.0])]);
+            let w = expert::Weights::at(stream, l, idx[it.0]);
             let j = it.3[0] as usize;
-            if j < n_gu { w.gate_up_w[j * CHUNK / TILE * 2 * H..].as_ptr() } else { w.down_w[(j - n_gu) * DOWN_CHUNK / TILE * 2 * D_FF..].as_ptr() }
+            if j < n_gu { w.gu_bytes(j).as_ptr() } else { w.down_bytes(j - n_gu).as_ptr() }
         };
         let at = move |i: usize| first_slice(&i1[i]);
         let ccd = move |i: usize| i2[i].2;
@@ -514,7 +513,7 @@ impl Routed for CpuExperts<'_> {
         let pool_s: &'static dyn Pool = unsafe { std::mem::transmute::<&dyn Pool, &'static dyn Pool>(pool) };
         let f = move |i: usize| {
             let it = &i3[i];
-            let w = expert::Weights::from_record(&stream[layout::record(l, idx[it.0])]);
+            let w = expert::Weights::at(stream, l, idx[it.0]);
             let touch_yielding = |b: &[u8]| -> bool {
                 for chunk in b.chunks(64 << 10) {
                     if pool_s.abandoned() {
@@ -526,17 +525,7 @@ impl Routed for CpuExperts<'_> {
             };
             for &j in &it.3 {
                 let j = j as usize;
-                let go = if j < n_gu {
-                    let mut go = true;
-                    for r0 in [j * CHUNK, D_FF + j * CHUNK] {
-                        go = go && touch_yielding(&w.gate_up_w[r0 / TILE * 2 * H..(r0 + CHUNK) / TILE * 2 * H]) && touch_yielding(raw_f32(&w.gate_up_s[r0 / TILE * (H / GROUP) * TILE..(r0 + CHUNK) / TILE * (H / GROUP) * TILE]));
-                    }
-                    go
-                } else {
-                    let r0 = (j - n_gu) * DOWN_CHUNK;
-                    touch_yielding(&w.down_w[r0 / TILE * 2 * D_FF..(r0 + DOWN_CHUNK) / TILE * 2 * D_FF]) && touch_yielding(raw_f32(&w.down_s[r0 / TILE * (D_FF / GROUP) * TILE..(r0 + DOWN_CHUNK) / TILE * (D_FF / GROUP) * TILE]))
-                };
-                if !go {
+                if !touch_yielding(if j < n_gu { w.gu_bytes(j) } else { w.down_bytes(j - n_gu) }) {
                     return;
                 }
             }
@@ -544,7 +533,7 @@ impl Routed for CpuExperts<'_> {
         self.pool.prefetch(n, Box::new(at), Box::new(ccd), Box::new(f));
     }
     fn run(&mut self, l: usize, idx: &[usize; TOP_K], x: &[f32], out: &mut [f32]) {
-        use common::q4::{self, Act, QAct, GROUP, TILE};
+        use common::q4::{self, Act, QAct, GROUP};
         use common::swiglu::swiglu_clamped;
         let t0 = std::time::Instant::now();
         QAct { q: &mut self.xq, scale: &mut self.xs, gsum: &mut self.xg }.quantize(&x[..H]);
@@ -553,20 +542,18 @@ impl Routed for CpuExperts<'_> {
         let (h_p, out_p) = (self.h.as_mut_ptr() as usize, out.as_mut_ptr() as usize);
         // the gate/up rows: item (k, c) owns expert k's hidden channels c·CHUNK..
         let gate_rows = move |i: usize| {
-            let (k, c) = (i / (D_FF / CHUNK), i % (D_FF / CHUNK));
-            expert::Weights::from_record(&stream[layout::record(l, idx[k])]).gate_up_w[c * CHUNK / TILE * 2 * H..].as_ptr()
+            let (k, c) = (i / GU_ITEMS, i % GU_ITEMS);
+            expert::Weights::at(stream, l, idx[k]).gu_bytes(c).as_ptr()
         };
         // a slice's core complex within its node: a function of the EXPERT and the slice, never of the
         // expert's position among the picks, so a prefetch and the compute meet in one L3
-        let gate_ccd = move |i: usize| idx[i / (D_FF / CHUNK)] * (D_FF / CHUNK) + i % (D_FF / CHUNK);
-        self.pool.run_at_ccd(TOP_K * (D_FF / CHUNK), &gate_rows, &gate_ccd, &move |i| {
-            let (k, c) = (i / (D_FF / CHUNK), i % (D_FF / CHUNK));
-            let w = expert::Weights::from_record(&stream[layout::record(l, idx[k])]);
-            let rows = |r0: usize| (&w.gate_up_w[r0 / TILE * 2 * H..(r0 + CHUNK) / TILE * 2 * H], &w.gate_up_s[r0 / TILE * (H / GROUP) * TILE..(r0 + CHUNK) / TILE * (H / GROUP) * TILE]);
+        let gate_ccd = move |i: usize| idx[i / GU_ITEMS] * GU_ITEMS + i % GU_ITEMS;
+        self.pool.run_at_ccd(TOP_K * GU_ITEMS, &gate_rows, &gate_ccd, &move |i| {
+            let (k, c) = (i / GU_ITEMS, i % GU_ITEMS);
+            let w = expert::Weights::at(stream, l, idx[k]);
+            let (gw, uw, gs, us) = w.gu(c);
             let mut gu = [0f32; 2 * CHUNK];
-            let (gw, gs) = rows(c * CHUNK);
             q4::gemv::<H>(CHUNK, gw, gs, &xa, &mut gu[..CHUNK]);
-            let (uw, us) = rows(D_FF + c * CHUNK);
             q4::gemv::<H>(CHUNK, uw, us, &xa, &mut gu[CHUNK..]);
             let h = unsafe { std::slice::from_raw_parts_mut((h_p as *mut f32).add(k * D_FF + c * CHUNK), CHUNK) };
             swiglu_clamped::<CHUNK>(&gu, SWIGLU_LIMIT, h);
@@ -574,18 +561,18 @@ impl Routed for CpuExperts<'_> {
         // the down rows: item (k, c) owns rows c·DOWN_CHUNK.. of expert k's output over its whole hidden state, quantized here
         let h = &self.h;
         let down_rows = move |i: usize| {
-            let (k, c) = (i / (H / DOWN_CHUNK), i % (H / DOWN_CHUNK));
-            expert::Weights::from_record(&stream[layout::record(l, idx[k])]).down_w[c * DOWN_CHUNK / TILE * 2 * D_FF..].as_ptr()
+            let (k, c) = (i / DOWN_ITEMS, i % DOWN_ITEMS);
+            expert::Weights::at(stream, l, idx[k]).down_bytes(c).as_ptr()
         };
-        let down_ccd = move |i: usize| idx[i / (H / DOWN_CHUNK)] * (H / DOWN_CHUNK) + i % (H / DOWN_CHUNK);
-        self.pool.run_at_ccd(TOP_K * (H / DOWN_CHUNK), &down_rows, &down_ccd, &move |i| {
-            let (k, c) = (i / (H / DOWN_CHUNK), i % (H / DOWN_CHUNK));
-            let w = expert::Weights::from_record(&stream[layout::record(l, idx[k])]);
+        let down_ccd = move |i: usize| idx[i / DOWN_ITEMS] * DOWN_ITEMS + i % DOWN_ITEMS;
+        self.pool.run_at_ccd(TOP_K * DOWN_ITEMS, &down_rows, &down_ccd, &move |i| {
+            let (k, c) = (i / DOWN_ITEMS, i % DOWN_ITEMS);
+            let w = expert::Weights::at(stream, l, idx[k]);
             let (mut hq, mut hs, mut hg) = ([0i8; D_FF], [0f32; D_FF / GROUP], [0i32; D_FF / GROUP]);
             QAct { q: &mut hq, scale: &mut hs, gsum: &mut hg }.quantize(&h[k * D_FF..(k + 1) * D_FF]);
             let ha = Act { q: &hq, scale: &hs, gsum: &hg };
             let r0 = c * DOWN_CHUNK;
-            let (dw, ds) = (&w.down_w[r0 / TILE * 2 * D_FF..(r0 + DOWN_CHUNK) / TILE * 2 * D_FF], &w.down_s[r0 / TILE * (D_FF / GROUP) * TILE..(r0 + DOWN_CHUNK) / TILE * (D_FF / GROUP) * TILE]);
+            let (dw, ds) = w.down(c);
             let o = unsafe { std::slice::from_raw_parts_mut((out_p as *mut f32).add(k * H + r0), DOWN_CHUNK) };
             q4::gemv::<D_FF>(DOWN_CHUNK, dw, ds, &ha, o);
         });

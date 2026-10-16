@@ -10,6 +10,7 @@
 //! hugetlbfs; it is chosen explicitly, never fallen back to.
 
 use std::fs;
+use std::os::unix::fs::FileExt;
 use std::io::Read;
 use std::os::unix::io::AsRawFd;
 
@@ -59,7 +60,16 @@ pub fn placement(buf: &[u8]) -> Vec<u8> {
     nodes
 }
 
+/// `load`, with every 2 MiB page's node chosen: page `p` goes to node `run(p) mod nodes`,
+/// first-touched by a thread pinned to that node. The experts stream is laid out in node
+/// runs (`layout::page_run`), so each node's pages are its items' and nothing else's.
+pub fn load_placed(path: &std::path::Path, mem: Mem, run: &(dyn Fn(usize) -> usize + Sync)) -> &'static [u8] {
+    load_with(path, mem, Some(run))
+}
 pub fn load(path: &std::path::Path, mem: Mem) -> &'static [u8] {
+    load_with(path, mem, None)
+}
+fn load_with(path: &std::path::Path, mem: Mem, run: Option<&(dyn Fn(usize) -> usize + Sync)>) -> &'static [u8] {
     let mut src = fs::File::open(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let len = src.metadata().unwrap().len() as usize;
     let dst: *mut u8 = match mem {
@@ -78,24 +88,61 @@ pub fn load(path: &std::path::Path, mem: Mem) -> &'static [u8] {
             p
         }
     };
-    // fill from this thread: this is the first touch, interleaved over the nodes
-    if mem == Mem::Hugetlb {
-        interleave(true);
-    }
     let buf = unsafe { std::slice::from_raw_parts_mut(dst, len) };
-    let (mut done, mut next_mark) = (0, GB);
     let t0 = std::time::Instant::now();
-    while done < len {
-        let n = src.read(&mut buf[done..(done + 64 << 20).min(len)]).unwrap();
-        assert!(n > 0, "short read on {}", path.display());
-        done += n;
-        if done >= next_mark || done == len {
-            println!("loading  : {} {:.1}/{:.1} GB ({:.0} MB/s)", path.file_name().unwrap().to_string_lossy(), done as f64 / 1e9, len as f64 / 1e9, done as f64 / 1e6 / t0.elapsed().as_secs_f64());
-            next_mark += GB;
+    let name = path.file_name().unwrap().to_string_lossy().into_owned();
+    match (mem, run) {
+        (Mem::Hugetlb, Some(run)) => {
+            // placed: a thread per node, pinned there, first-touches the pages that are its node's
+            const PAGE: usize = glm_5_3_flash::layout::PAGE;
+            let nodes = glm_5_3_flash::construct::node_count();
+            let pages = len.div_ceil(PAGE);
+            let done = std::sync::atomic::AtomicUsize::new(0);
+            let dst_addr = dst as usize;
+            std::thread::scope(|sc| {
+                for node in 0..nodes {
+                    let (src, done, name) = (&src, &done, &name);
+                    sc.spawn(move || {
+                        glm_5_3_flash::construct::pin(glm_5_3_flash::construct::first_core_of(node));
+                        let mut next_mark = GB;
+                        for p in 0..pages {
+                            if run(p) % nodes != node {
+                                continue;
+                            }
+                            let (off, n) = (p * PAGE, PAGE.min(len - p * PAGE));
+                            let page = unsafe { std::slice::from_raw_parts_mut((dst_addr + off) as *mut u8, n) };
+                            src.read_exact_at(page, off as u64).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                            let d = done.fetch_add(n, std::sync::atomic::Ordering::Relaxed) + n;
+                            if node == 0 && (d >= next_mark || d == len) {
+                                println!("loading  : {name} {:.1}/{:.1} GB ({:.0} MB/s, placed by node)", d as f64 / 1e9, len as f64 / 1e9, d as f64 / 1e6 / t0.elapsed().as_secs_f64());
+                                next_mark += GB;
+                            }
+                        }
+                    });
+                }
+            });
+        }
+        _ => {
+            // fill from this thread: this is the first touch, interleaved over the nodes
+            if mem == Mem::Hugetlb {
+                interleave(true);
+            }
+            let (mut done, mut next_mark) = (0, GB);
+            while done < len {
+                let n = src.read(&mut buf[done..(done + 64 << 20).min(len)]).unwrap();
+                assert!(n > 0, "short read on {}", path.display());
+                done += n;
+                if done >= next_mark || done == len {
+                    println!("loading  : {name} {:.1}/{:.1} GB ({:.0} MB/s)", done as f64 / 1e9, len as f64 / 1e9, done as f64 / 1e6 / t0.elapsed().as_secs_f64());
+                    next_mark += GB;
+                }
+            }
+            if mem == Mem::Hugetlb {
+                interleave(false);
+            }
         }
     }
     if mem == Mem::Hugetlb {
-        interleave(false);
         assert_eq!(unsafe { mlock(dst, len) }, 0, "mlock: {}", std::io::Error::last_os_error());
     }
     unsafe { std::slice::from_raw_parts(dst, len) }
