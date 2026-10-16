@@ -37,7 +37,7 @@
 use crate::kfd::{read, Args, Kfd, Mem};
 use glm_5_3_flash::construct::Placed;
 use glm_5_3_flash::ffn::gfx11_consts::{DENSE_GU_ROWS, SHARED_GU_ROWS};
-use glm_5_3_flash::hc::gfx11_consts::{CHANNEL_GRID, COEF_ROWS, MIX as HC_MIX, PRE_GRID, PRE_LDS, SLICES as HC_SLICES};
+use glm_5_3_flash::hc::gfx11_consts::{CHANNEL_GRID, COEF_ROWS, MIX as HC_MIX, PRE_COUNTS, PRE_GRID, PRE_LDS, SLICES as HC_SLICES};
 use glm_5_3_flash::kda::gfx11_consts as g;
 use glm_5_3_flash::layout::{KDA_MEMORY, KDA_WINDOW};
 use glm_5_3_flash::mla::gfx11_consts::{ATTEND_GRID, ATTEND_LDS, IX_ROWS, O_IN};
@@ -69,7 +69,8 @@ struct Card {
     // the residual streams and the hyper-connection's scratch: this card's copy
     streams: Mem, // [HC][H] f32, host-visible: the embedding goes in through the BAR
     part: Mem,    // [HC_COEFS][SLICES] f32: the coefficient GEMV's partials
-    count: Mem,   // one u32: `hc_pre`'s arrival count, 0 between launches
+    count: Mem,   // [PRE_COUNTS] u32: `hc_pre`'s arrival counts, 0 between launches
+    go: Mem,      // one u32: `hc_post`'s release word for its workgroups
     mix: Mem,     // [MIX] f32: pre | post | comb
     mean: Mem,    // [H] f32, host memory: the streams' mean when bring-up asks for a layer's output
     // the step's buffers, one token deep; a set per part slot, for the parts on this card
@@ -241,6 +242,11 @@ impl Cards {
                     streams: alloc(HC * H),
                     part: k.vram(COEF_ROWS * HC_SLICES * 4),
                     count: {
+                        let m = k.vram_visible(PRE_COUNTS * 4);
+                        k.upload(&m, 0, &vec![0u8; PRE_COUNTS * 4]);
+                        m
+                    },
+                    go: {
                         let m = k.vram_visible(64);
                         k.upload(&m, 0, &[0u8; 64]);
                         m
@@ -538,7 +544,7 @@ impl Cards {
         let at = |w: Option<(usize, usize)>| w.map_or(0, |(k, d)| self.shared.words.at(word(k, d)));
         let (src, dst, n) = copy.unwrap_or((0, 0, 0));
         let mut a = Args::new();
-        a.ptr(c.mix.va).ptr(ya).ptr(yb.unwrap_or(0)).ptr(c.streams.va).ptr(src).ptr(dst).u32(n as u32).ptr(at(mine)).ptr(at(w0)).ptr(at(w1)).u32(value);
+        a.ptr(c.mix.va).ptr(ya).ptr(yb.unwrap_or(0)).ptr(c.streams.va).ptr(src).ptr(dst).u32(n as u32).ptr(at(mine)).ptr(at(w0)).ptr(at(w1)).u32(value).ptr(c.go.va);
         c.k.launch(&c.hc_post, CHANNEL_GRID, g::WG, 0, &a);
     }
     /// The early router on the FFN card: layer `l`'s FFN router over the attention block's input normed with the
