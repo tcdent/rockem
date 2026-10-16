@@ -26,6 +26,8 @@ pub struct Knob {
     name: &'static str,
     offset: usize,
     value: u8,
+    /// Read and reported, never written.
+    report: bool,
     why: &'static str,
 }
 include!(concat!(env!("OUT_DIR"), "/knobs_gen.rs"));
@@ -194,7 +196,9 @@ fn main() -> Status {
                 continue;
             }
             let cur = data[k.offset];
-            if cur == k.value {
+            if k.report {
+                say!(r, "  {:<24} @ {:#06x} = {:#04x}  (reported: {})", k.name, k.offset, cur, k.why);
+            } else if cur == k.value {
                 say!(r, "  {:<24} @ {:#06x} = {:#04x}  as wanted", k.name, k.offset, cur);
             } else if !may_write {
                 say!(r, "  {:<24} @ {:#06x} = {:#04x}  wanted {:#04x} — left as is{}", k.name, k.offset, cur, k.value, if after_write { " (NOT KEPT by the firmware)" } else { "" });

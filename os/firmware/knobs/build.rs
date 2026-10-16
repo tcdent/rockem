@@ -24,7 +24,9 @@ fn main() {
     for k in t["knob"].as_array().unwrap() {
         let k = k.as_table().unwrap();
         let store = stores.iter().position(|st| st.as_table().unwrap()["name"] == k["store"]).expect("a knob's store");
-        writeln!(out, "    Knob {{ store: {store}, name: {:?}, offset: {}, value: {}, why: {:?} }},", s(&k["name"]), k["offset"].as_integer().unwrap(), k["value"].as_integer().unwrap(), s(&k["why"])).unwrap();
+        let report = k.get("report").and_then(|v| v.as_bool()).unwrap_or(false);
+        let value = if report { 0 } else { k["value"].as_integer().unwrap() };
+        writeln!(out, "    Knob {{ store: {store}, name: {:?}, offset: {}, value: {}, report: {report}, why: {:?} }},", s(&k["name"]), k["offset"].as_integer().unwrap(), value, s(&k["why"])).unwrap();
     }
     writeln!(out, "];").unwrap();
     std::fs::write(format!("{}/knobs_gen.rs", std::env::var("OUT_DIR").unwrap()), out).unwrap();

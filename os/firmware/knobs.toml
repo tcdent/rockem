@@ -32,7 +32,14 @@ store = "Setup"
 name = "Variable protection"
 offset = 0x91
 value = 0
-why = "Disabled: with 'Password protection of Runtime Variables' on, the firmware refuses SetVariable on the setup stores even from this stage (SECURITY_VIOLATION, 2026-10-16 14:15); it ships Enabled and has to be turned off once in the setup UI, after which the stage keeps it off."
+why = "Disabled: with 'Password protection of Runtime Variables' on, the firmware refuses SetVariable on the setup stores even from this stage (SECURITY_VIOLATION, 2026-10-16 14:15); it ships Enabled, and its form (Advanced → UEFI Variables Protection) is hidden by the flag below."
+
+[[knob]]
+store = "Setup"
+name = "Hide variable protection"
+offset = 0xFF
+report = true
+why = "The vendor's flag that suppresses the UEFI Variables Protection form in the setup UI (SuppressIf Setup[0xFF] == 1; no default of its own in the IFR). Read and reported only."
 
 [[knob]]
 store = "AmdSetup"
