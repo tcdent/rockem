@@ -75,7 +75,13 @@ struct Job {
     n: usize,
     /// A prefetch's closure, owned by its job (the runs' closures are the caller's, alive through the run).
     _owned: Option<Box<dyn Fn(usize) + Send + Sync>>,
+    /// A prefetch: only the first `PREFETCH_CORES` cores of each CCD take its items, so the pull
+    /// leaves DRAM and the fabric room for the thread driving the cards.
+    light: bool,
 }
+/// Cores a CCD lends a prefetch (of its eight): a CCD's L3 fills at ~60 GB/s and four cores
+/// stream ~22 GB/s from DRAM, enough to pull a layer's share in the attention window.
+const PREFETCH_CORES: usize = 4;
 /// A counter on its own cache line: a node's cores share its `next`, nothing else bounces with it.
 #[repr(align(64))]
 struct Counter(AtomicUsize);
@@ -112,6 +118,11 @@ fn wait_on(job: &std::sync::atomic::AtomicPtr<Job>, seen: *mut Job) {
     }
 }
 
+thread_local! {
+    /// The job this thread is inside, for `Pool::abandoned`: an item asks about its own job, not the pool's current one.
+    static INSIDE: std::cell::Cell<*const Job> = const { std::cell::Cell::new(std::ptr::null()) };
+}
+
 /// The slots a thread on CCD `ccd` of node `node` drains, in order: its own CCD's, its node's,
 /// its node's other CCDs', then the other nodes' (their node slot, then their CCDs').
 fn slot_order(node: usize, ccd: usize, node_ccds: &[Vec<usize>]) -> Vec<usize> {
@@ -129,6 +140,7 @@ fn slot_order(node: usize, ccd: usize, node_ccds: &[Vec<usize>]) -> Vec<usize> {
 unsafe fn work_ticking(job: *const Job, order: &[usize], tick: &dyn Fn()) {
     let j = &*job;
     let f = &*j.f;
+    INSIDE.with(|c| c.set(job));
     let (mut mine, mut local) = (0, 0);
     for (k, &s) in order.iter().enumerate() {
         loop {
@@ -156,6 +168,7 @@ unsafe fn work_ticking(job: *const Job, order: &[usize], tick: &dyn Fn()) {
 unsafe fn work(job: *const Job, order: &[usize]) {
     let j = &*job;
     let f = &*j.f;
+    INSIDE.with(|c| c.set(job));
     let (mut mine, mut local) = (0, 0);
     for (k, &s) in order.iter().enumerate() {
         loop {
@@ -195,9 +208,13 @@ impl Threads {
             }
         }
         let shared = std::sync::Arc::new(Shared { job: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()), active: AtomicUsize::new(0), busy: std::sync::atomic::AtomicBool::new(false), quit: std::sync::atomic::AtomicBool::new(false) });
+        let mut seen_in_ccd = vec![0usize; ccd_keys.len()];
+        seen_in_ccd[ccd_of(cores[0])] += 1;
         for &core in &cores[1..] {
             let sh = shared.clone();
             let order = slot_order(node_of_core(core), ccd_of(core), &node_ccds);
+            let rank = seen_in_ccd[ccd_of(core)];
+            seen_in_ccd[ccd_of(core)] += 1;
             std::thread::spawn(move || {
                 pin(core);
                 let mut seen: *mut Job = std::ptr::null_mut();
@@ -217,7 +234,7 @@ impl Threads {
                     sh.active.fetch_add(1, Ordering::AcqRel);
                     let job = sh.job.load(Ordering::Acquire);
                     seen = job;
-                    if !job.is_null() {
+                    if !job.is_null() && !(unsafe { (*job).light } && rank >= PREFETCH_CORES) {
                         unsafe { work(job, &order) };
                     }
                     sh.active.fetch_sub(1, Ordering::AcqRel);
@@ -312,7 +329,8 @@ impl Threads {
         }
         // no worker is inside any job: the one retired at the last publish can go
         let fp: *const (dyn Fn(usize) + Sync) = unsafe { std::mem::transmute(f) };
-        let job = Box::into_raw(Box::new(Job { f: fp, order, next: std::array::from_fn(|s| Counter(AtomicUsize::new(start[s]))), start, done: Counter(AtomicUsize::new(0)), local: Counter(AtomicUsize::new(0)), stop: std::sync::atomic::AtomicBool::new(false), n, _owned: owned }));
+        let light = owned.is_some();
+        let job = Box::into_raw(Box::new(Job { f: fp, order, next: std::array::from_fn(|s| Counter(AtomicUsize::new(start[s]))), start, done: Counter(AtomicUsize::new(0)), local: Counter(AtomicUsize::new(0)), stop: std::sync::atomic::AtomicBool::new(false), n, _owned: owned, light }));
         let old = sh.job.swap(job, Ordering::AcqRel);
         let older = self.retired.swap(old, Ordering::AcqRel);
         if !older.is_null() {
@@ -341,7 +359,7 @@ impl Pool for Threads {
         self.node_ccds.get(node).map_or(1, |c| c.len().max(1))
     }
     fn abandoned(&self) -> bool {
-        let job = self.shared.job.load(Ordering::Acquire);
+        let job = INSIDE.with(|c| c.get());
         !job.is_null() && unsafe { (*job).stop.load(Ordering::Relaxed) }
     }
     fn locality(&self) -> (usize, usize) {
