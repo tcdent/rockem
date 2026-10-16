@@ -67,26 +67,10 @@ pub fn dense(l: usize, w: &weights::DenseFfn, xn: &[f32], s: &mut Scratch, pool:
 #[inline(always)]
 pub fn route(l: usize, w: &weights::Moe, xn: &[f32], s: &mut Scratch, pool: &dyn Pool, forced: Option<&[usize; TOP_K]>, tr: &mut impl Trace) -> ([usize; TOP_K], [f32; TOP_K]) {
     gemv::bf16_par::<E, H>(w.router, xn, s.score, pool);
-    for v in s.score.iter_mut() {
-        *v = sigmoid(*v);
-    }
-    let mut idx = [0usize; TOP_K];
-    match forced {
-        Some(f) => idx = *f,
-        None => {
-            let mut taken = [false; E];
-            for k in 0..TOP_K {
-                let mut best = usize::MAX;
-                for e in 0..E {
-                    if !taken[e] && (best == usize::MAX || s.score[e] + w.bias[e] > s.score[best] + w.bias[best]) {
-                        best = e;
-                    }
-                }
-                taken[best] = true;
-                idx[k] = best;
-            }
-        }
-    }
+    let mut idx = match forced {
+        Some(f) => *f,
+        None => picks(w, s.score),
+    };
     idx.sort_unstable();
     let mut sum = 1e-20f32;
     for &e in &idx {
@@ -102,6 +86,29 @@ pub fn route(l: usize, w: &weights::Moe, xn: &[f32], s: &mut Scratch, pool: &dyn
 
 /// The routed half of the MoE: the router's picks, the experts through
 /// `routed`, their weighted sum into `out`.
+/// The router's picks from its logits (`[E]`, turned into scores in place): the top `TOP_K`
+/// by score plus the selection bias, in the order taken (the best first).
+#[inline(always)]
+pub fn picks(w: &weights::Moe, logits: &mut [f32]) -> [usize; TOP_K] {
+    for v in logits.iter_mut() {
+        *v = sigmoid(*v);
+    }
+    let score = &*logits;
+    let mut idx = [0usize; TOP_K];
+    let mut taken = [false; E];
+    for k in 0..TOP_K {
+        let mut best = usize::MAX;
+        for e in 0..E {
+            if !taken[e] && (best == usize::MAX || score[e] + w.bias[e] > score[best] + w.bias[best]) {
+                best = e;
+            }
+        }
+        taken[best] = true;
+        idx[k] = best;
+    }
+    idx
+}
+
 #[inline(always)]
 pub fn moe_routed(l: usize, w: &weights::Moe, xn: &[f32], s: &mut Scratch, pool: &dyn Pool, routed: &mut impl Routed, forced: Option<&[usize; TOP_K]>, tr: &mut impl Trace, out: &mut [f32]) -> [usize; TOP_K] {
     let (idx, wt) = route(l, w, xn, s, pool, forced, tr);

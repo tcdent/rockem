@@ -63,6 +63,7 @@ struct Card {
     gu: Mem,     // [DENSE_GU_ROWS] f32: gate | up
     fy: Mem,     // [H] f32, host memory: the FFN's output
     lg: Mem,     // [VOCAB_SIZE] f32, host memory: the logits
+    scores: Mem, // [E] f32, host memory: the early router's logits
     // the MLA's
     mqa: Mem,    // [Q_LORA_RANK] f32: q_a's output, the input of q_b and the indexer's query
     mq: Mem,     // [MLA_HEADS·Q_HEAD] f32: the query, the attention's input
@@ -112,6 +113,8 @@ struct FfnOn {
     gu_s: Mem,
     down_w: Mem,
     down_s: Mem,
+    /// A MoE layer's router rows (`[E][H]` bf16), for the early routing.
+    router: Option<Mem>,
 }
 
 /// An MLA layer's projections on a card: q_a and kv_a (FP8, over the input-normed
@@ -206,6 +209,7 @@ impl Cards {
                     gu: alloc(DENSE_GU_ROWS),
                     fy: k.host(H * 4),
                     lg: k.host(VOCAB_SIZE * 4),
+                    scores: k.host(glm_5_3_flash::E * 4),
                     mqa: alloc(Q_LORA_RANK),
                     mq: alloc(MLA_HEADS * Q_HEAD),
                     mproj: k.host(MPROJ * 4),
@@ -320,17 +324,21 @@ impl Cards {
                 k.upload(&m, 0, raw(&bf16_of(w.layers[l].post_ln)));
                 m
             };
-            let (is_dense, (gu_w, gu_s), (down_w, down_s)) = match &w.layers[l].ffn {
-                Ffn::Dense(d) => (true, pair(d.gate, d.up), one(d.down)),
-                Ffn::Moe(m) => (false, pair(m.shared_gate, m.shared_up), one(m.shared_down)),
+            let (is_dense, (gu_w, gu_s), (down_w, down_s), router) = match &w.layers[l].ffn {
+                Ffn::Dense(d) => (true, pair(d.gate, d.up), one(d.down), None),
+                Ffn::Moe(m) => {
+                    let r = k.vram_visible(m.router.len() * 2);
+                    k.upload(&r, 0, raw(m.router));
+                    (false, pair(m.shared_gate, m.shared_up), one(m.shared_down), Some(r))
+                }
             };
             if is_dense {
                 dense += 1;
             } else {
                 shared += 1;
             }
-            bytes += gu_w.size + gu_s.size + down_w.size + down_s.size + ln.size;
-            ffns.push(Some(FfnOn { card, dense: is_dense, ln, gu_w, gu_s, down_w, down_s }));
+            bytes += gu_w.size + gu_s.size + down_w.size + down_s.size + ln.size + router.as_ref().map_or(0, |r| r.size);
+            ffns.push(Some(FfnOn { card, dense: is_dense, ln, gu_w, gu_s, down_w, down_s, router }));
         }
         // the MLA layers' projections
         let mut mlas: Vec<Option<MlaOn>> = (0..NUM_HIDDEN_LAYERS).map(|_| None).collect();
@@ -445,6 +453,15 @@ impl Placed for Cards {
         self.rows8(c, &c.ffn_gu, c.fx.va, Some(f.ln.va), f.gu_w.va, f.gu_s.va, c.gu.va, rows, H);
         self.rows8(c, down, c.gu.va, None, f.down_w.va, f.down_s.va, c.fy.va, H, k_width);
         c.k.fence(); // completed while the card is awake; the host waits later
+    }
+    fn route_early(&mut self, l: usize, x: &[f32], logits: &mut [f32]) {
+        let f = self.ffns[l].as_ref().unwrap();
+        let c = &self.cards[f.card];
+        let router = f.router.as_ref().expect("a MoE layer");
+        c.k.upload(&c.fx, 0, raw(&x[..H]));
+        self.rows(c, &c.rows_h, c.fx.va, Some(f.ln.va), router.va, c.scores.va, glm_5_3_flash::E, H);
+        c.k.sync();
+        read(&c.scores, 0, &mut logits[..glm_5_3_flash::E]);
     }
     fn heartbeat(&self, l: usize) {
         let c = &self.cards[self.ffns[l].as_ref().unwrap().card];

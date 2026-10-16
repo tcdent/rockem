@@ -488,7 +488,7 @@ impl Routed for CpuExperts<'_> {
                 expert::Weights::from_record(&stream[layout::record(l, idx[k])]).down_w[c * DOWN_CHUNK / TILE * 2 * D_FF..].as_ptr()
             }
         };
-        let ccd = move |i: usize| if i < n_gu { i } else { i - n_gu };
+        let ccd = move |i: usize| if i < n_gu { idx[i / (D_FF / CHUNK)] * (D_FF / CHUNK) + i % (D_FF / CHUNK) } else { let i = i - n_gu; idx[i / (H / DOWN_CHUNK)] * (H / DOWN_CHUNK) + i % (H / DOWN_CHUNK) };
         let f = move |i: usize| {
             if i < n_gu {
                 let (k, c) = (i / (D_FF / CHUNK), i % (D_FF / CHUNK));
@@ -521,8 +521,10 @@ impl Routed for CpuExperts<'_> {
             let (k, c) = (i / (D_FF / CHUNK), i % (D_FF / CHUNK));
             expert::Weights::from_record(&stream[layout::record(l, idx[k])]).gate_up_w[c * CHUNK / TILE * 2 * H..].as_ptr()
         };
-        // a slice's core complex within its node: stable in (expert, slice), so a prefetch and the compute meet in one L3
-        self.pool.run_at_ccd(TOP_K * (D_FF / CHUNK), &gate_rows, &|i| i, &move |i| {
+        // a slice's core complex within its node: a function of the EXPERT and the slice, never of the
+        // expert's position among the picks, so a prefetch and the compute meet in one L3
+        let gate_ccd = move |i: usize| idx[i / (D_FF / CHUNK)] * (D_FF / CHUNK) + i % (D_FF / CHUNK);
+        self.pool.run_at_ccd(TOP_K * (D_FF / CHUNK), &gate_rows, &gate_ccd, &move |i| {
             let (k, c) = (i / (D_FF / CHUNK), i % (D_FF / CHUNK));
             let w = expert::Weights::from_record(&stream[layout::record(l, idx[k])]);
             let rows = |r0: usize| (&w.gate_up_w[r0 / TILE * 2 * H..(r0 + CHUNK) / TILE * 2 * H], &w.gate_up_s[r0 / TILE * (H / GROUP) * TILE..(r0 + CHUNK) / TILE * (H / GROUP) * TILE]);
@@ -540,7 +542,8 @@ impl Routed for CpuExperts<'_> {
             let (k, c) = (i / (H / DOWN_CHUNK), i % (H / DOWN_CHUNK));
             expert::Weights::from_record(&stream[layout::record(l, idx[k])]).down_w[c * DOWN_CHUNK / TILE * 2 * D_FF..].as_ptr()
         };
-        self.pool.run_at_ccd(TOP_K * (H / DOWN_CHUNK), &down_rows, &|i| i, &move |i| {
+        let down_ccd = move |i: usize| idx[i / (H / DOWN_CHUNK)] * (H / DOWN_CHUNK) + i % (H / DOWN_CHUNK);
+        self.pool.run_at_ccd(TOP_K * (H / DOWN_CHUNK), &down_rows, &down_ccd, &move |i| {
             let (k, c) = (i / (H / DOWN_CHUNK), i % (H / DOWN_CHUNK));
             let w = expert::Weights::from_record(&stream[layout::record(l, idx[k])]);
             let (mut hq, mut hs, mut hg) = ([0i8; D_FF], [0f32; D_FF / GROUP], [0i32; D_FF / GROUP]);
@@ -572,6 +575,10 @@ pub trait Placed {
     fn ffn(&self, l: usize) -> bool;
     fn ffn_start(&mut self, l: usize, x: &[f32]);
     fn ffn_finish(&mut self, l: usize, out: &mut [f32]);
+    /// Layer `l`'s router over the block input `x` normed with the FFN half's norm — the FFN
+    /// half's router run early, on the attention block's input, as the prefetch's predictor:
+    /// the logits into `logits` (`[E]`), waited for.
+    fn route_early(&mut self, l: usize, x: &[f32], logits: &mut [f32]);
     /// Keep layer `l`'s card awake while the host works: a trivial launch once it has been
     /// quiet a while (a card idle ≥ 400 µs pays ~100 µs on its next packet, probe 2026-10-15).
     fn heartbeat(&self, l: usize);
@@ -621,8 +628,11 @@ pub struct Profile {
     /// Expert items (gate/up and down) that ran on their preferred CCD, and all of them.
     pub local_items: usize,
     pub items: usize,
-    /// How many of a layer's picks the router already names on the attention block's input (the prefetch predictor to beat).
+    /// How many of a layer's picks the router already names on the attention block's input (the prefetch's predictor).
     pub pre_agree: usize,
+    /// Prefetch slices done before the router's run overtook the prefetch, and the slices asked for.
+    pub prefetched: usize,
+    pub prefetch_items: usize,
 }
 impl Profile {
     /// One line of milliseconds a token, the phases in order and their sum.
@@ -631,7 +641,7 @@ impl Profile {
         let mla = self.mla_proj + self.mla_attn + self.mla_out;
         let rs = self.route + self.shared;
         let sum = self.hc + self.kda_card + self.kda_cpu + mla + self.dense_ffn + rs + self.experts + self.head;
-        format!("{} tokens: hc {:.1}  kda card {:.1}  kda cpu {:.1}  mla {:.1} (proj {:.1} attn {:.1} out {:.1})  dense ffn {:.1}  router+shared {:.1} (route {:.1} shared {:.1})  experts {:.1} (reused {:.2} of {} from the previous token, {:.2} named on the attention input; {:.0}% of items on their CCD)  head {:.1}  = {:.1} ms a token", self.tokens, self.hc / n, self.kda_card / n, self.kda_cpu / n, mla / n, self.mla_proj / n, self.mla_attn / n, self.mla_out / n, self.dense_ffn / n, rs / n, self.route / n, self.shared / n, self.experts / n, self.reuse as f64 / self.moe_layers.max(1) as f64, TOP_K, self.pre_agree as f64 / self.moe_layers.max(1) as f64, 100.0 * self.local_items as f64 / self.items.max(1) as f64, self.head / n, sum / n)
+        format!("{} tokens: hc {:.1}  kda card {:.1}  kda cpu {:.1}  mla {:.1} (proj {:.1} attn {:.1} out {:.1})  dense ffn {:.1}  router+shared {:.1} (route {:.1} shared {:.1})  experts {:.1} (reused {:.2} of {} from the previous token, {:.2} named on the attention input; {:.0}% of the predicted slices pulled; {:.0}% of items on their CCD)  head {:.1}  = {:.1} ms a token", self.tokens, self.hc / n, self.kda_card / n, self.kda_cpu / n, mla / n, self.mla_proj / n, self.mla_attn / n, self.mla_out / n, self.dense_ffn / n, rs / n, self.route / n, self.shared / n, self.experts / n, self.reuse as f64 / self.moe_layers.max(1) as f64, TOP_K, self.pre_agree as f64 / self.moe_layers.max(1) as f64, 100.0 * self.prefetched as f64 / self.prefetch_items.max(1) as f64, 100.0 * self.local_items as f64 / self.items.max(1) as f64, self.head / n, sum / n)
     }
 }
 
@@ -650,8 +660,6 @@ pub struct CpuModel<'p, R: Routed> {
     streams: Vec<f32>,
     x: Vec<f32>,
     xn: Vec<f32>,
-    /// The attention block's input under the FFN half's norm: the early router's input (a measurement).
-    pre_xn: Vec<f32>,
     y: Vec<f32>,
     mean: Vec<f32>,
     hc_flat: Vec<f32>,
@@ -703,7 +711,6 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             streams: vec![0.0; HC * H],
             x: vec![0.0; H],
             xn: vec![0.0; H],
-            pre_xn: vec![0.0; H],
             y: vec![0.0; H],
             mean: vec![0.0; H],
             hc_flat: vec![0.0; HC * H],
@@ -836,12 +843,13 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             let mix = hc::pre(&lw.hc_attn, &s.streams, &mut hcs, s.pool, &mut s.x);
             rmsnorm::<H>(&s.x, &lw.input_ln, RMS_NORM_EPS, &mut s.xn);
             tr.edge(l, "attn_in", &s.xn);
-            // the predictor under test: the router on the attention block's input, normed with the FFN half's norm
+            // the prefetch's predictor: the FFN half's router on the attention block's input, on the card where the
+            // FFN is placed; its picks, likeliest first, start the pull of their slices into the CCDs that will stream them
             let mut pre_picks = [E; TOP_K];
-            if let Ffn::Moe(m) = &lw.ffn {
-                rmsnorm::<H>(&s.x, &lw.post_ln, RMS_NORM_EPS, &mut s.pre_xn);
-                let mut fs = ffn::Scratch { gu: &mut s.f_gu, h: &mut s.f_h, expert_out: &mut s.f_expert_out, shared: &mut s.f_shared, score: &mut s.f_score };
-                pre_picks = ffn::route(l, m, &s.pre_xn, &mut fs, s.pool, None, &mut common::trace::NoTrace).0;
+            if let (Ffn::Moe(m), Some(pl)) = (&lw.ffn, s.placed.as_mut().filter(|p| p.ffn(l))) {
+                pl.route_early(l, &s.x, &mut s.f_score);
+                pre_picks = ffn::picks(m, &mut s.f_score);
+                s.routed.prefetch(l, pre_picks);
             }
             lap(&mut p.hc);
             match (&lw.attn, &mut s.layers[l]) {
@@ -925,6 +933,9 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     let (local, items) = s.pool.locality();
                     p.local_items += local;
                     p.items += items;
+                    let (done, of) = s.pool.prefetched();
+                    p.prefetched += done;
+                    p.prefetch_items += of;
                     let e = s.routed.elapsed();
                     p.experts += e;
                     lap(&mut p.route);
