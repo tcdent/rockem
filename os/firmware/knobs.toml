@@ -32,7 +32,7 @@ store = "Setup"
 name = "Variable protection"
 offset = 0x91
 value = 0
-why = "Disabled: with 'Password protection of Runtime Variables' on, the firmware refuses SetVariable on the setup stores even from this stage (SECURITY_VIOLATION, 2026-10-16 14:15); it ships Enabled, and its form (Advanced → UEFI Variables Protection) is hidden by the flag below."
+why = "Disabled: the 'Password protection of Runtime Variables' knob, suspected as the lock behind SECURITY_VIOLATION on AmdSetup (2026-10-16 14:15). The live store (290 bytes, 14:35) reads 0 here already while AmdSetup still refuses, so either the Setup offsets do not fit this build or this knob is not the lock; its form (Advanced → UEFI Variables Protection) is hidden by the flag below."
 
 [[knob]]
 store = "Setup"

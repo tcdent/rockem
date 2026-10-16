@@ -176,6 +176,16 @@ fn main() -> Status {
         let _ = runtime::delete_variable(ATTEMPT, &vendor_r);
         say!(r, "knobs    : this boot follows a write and reset: a knob still differing is one the firmware did not keep");
     }
+    // is it the setup stores the firmware protects, or every non-volatile write from a boot option?
+    let probe = cstr16!("RockemKnobsProbe");
+    let nv = runtime::VariableAttributes::NON_VOLATILE | runtime::VariableAttributes::BOOTSERVICE_ACCESS;
+    match runtime::set_variable(probe, &vendor_r, nv, &[1u8]) {
+        Ok(()) => {
+            let _ = runtime::delete_variable(probe, &vendor_r);
+            say!(r, "nv write : a non-volatile variable of our own: accepted");
+        }
+        Err(e) => say!(r, "nv write : a non-volatile variable of our own: refused ({:?})", e.status()),
+    }
     let may_write = fw_ok && !READ_ONLY && !after_write;
     let mut changed = false;
     for (si, st) in STORES.iter().enumerate() {
