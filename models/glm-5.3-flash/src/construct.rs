@@ -43,6 +43,9 @@ pub struct Threads {
     node_ccds: Vec<Vec<usize>>,
     /// The placed regions: base, length, the node of each `PAGE` of it.
     placed: std::sync::Mutex<Vec<(usize, usize, Vec<u8>)>>,
+    /// The last run's (local items, items) and the last prefetch's (done, items), for the profile.
+    locality: std::sync::Mutex<(usize, usize)>,
+    prefetched: std::sync::Mutex<(usize, usize)>,
     /// Called by the calling thread between its own items of a run while set (`tick`): the
     /// card's heartbeat during the expert phase.
     tick: std::sync::Mutex<Option<Tick>>,
@@ -65,8 +68,11 @@ struct Job {
     start: [usize; SLOTS + 1],
     next: [Counter; SLOTS],
     done: Counter,
+    /// Items done by a thread from its own first slot (its CCD's): the run's locality.
+    local: Counter,
     /// Set when the job is abandoned (a prefetch the next run overtakes): no more items are claimed.
     stop: std::sync::atomic::AtomicBool,
+    n: usize,
     /// A prefetch's closure, owned by its job (the runs' closures are the caller's, alive through the run).
     _owned: Option<Box<dyn Fn(usize) + Send + Sync>>,
 }
@@ -123,8 +129,8 @@ fn slot_order(node: usize, ccd: usize, node_ccds: &[Vec<usize>]) -> Vec<usize> {
 unsafe fn work_ticking(job: *const Job, order: &[usize], tick: &dyn Fn()) {
     let j = &*job;
     let f = &*j.f;
-    let mut mine = 0;
-    for &s in order {
+    let (mut mine, mut local) = (0, 0);
+    for (k, &s) in order.iter().enumerate() {
         loop {
             tick();
             if j.stop.load(Ordering::Relaxed) {
@@ -136,10 +142,12 @@ unsafe fn work_ticking(job: *const Job, order: &[usize], tick: &dyn Fn()) {
             }
             f(j.order[i] as usize);
             mine += 1;
+            local += (k == 0) as usize;
         }
     }
     if mine > 0 {
         j.done.0.fetch_add(mine, Ordering::AcqRel);
+        j.local.0.fetch_add(local, Ordering::Relaxed);
     }
 }
 
@@ -148,8 +156,8 @@ unsafe fn work_ticking(job: *const Job, order: &[usize], tick: &dyn Fn()) {
 unsafe fn work(job: *const Job, order: &[usize]) {
     let j = &*job;
     let f = &*j.f;
-    let mut mine = 0;
-    for &s in order {
+    let (mut mine, mut local) = (0, 0);
+    for (k, &s) in order.iter().enumerate() {
         loop {
             if j.stop.load(Ordering::Relaxed) {
                 break;
@@ -160,10 +168,12 @@ unsafe fn work(job: *const Job, order: &[usize]) {
             }
             f(j.order[i] as usize);
             mine += 1;
+            local += (k == 0) as usize;
         }
     }
     if mine > 0 {
         j.done.0.fetch_add(mine, Ordering::AcqRel);
+        j.local.0.fetch_add(local, Ordering::Relaxed);
     }
 }
 impl Threads {
@@ -215,7 +225,7 @@ impl Threads {
             });
         }
         let order = slot_order(node_of_core(cores[0]), ccd_of(cores[0]), &node_ccds);
-        Threads { shared, retired: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()), order, node_ccds, placed: std::sync::Mutex::new(Vec::new()), tick: std::sync::Mutex::new(None) }
+        Threads { shared, retired: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()), order, node_ccds, placed: std::sync::Mutex::new(Vec::new()), tick: std::sync::Mutex::new(None), locality: std::sync::Mutex::new((0, 0)), prefetched: std::sync::Mutex::new((0, 0)) }
     }
     /// Tell the pool where a region's memory lives: `nodes[p]` is the node of its `p`th `PAGE`.
     pub fn place(&self, base: usize, len: usize, nodes: Vec<u8>) {
@@ -247,6 +257,9 @@ impl Threads {
                 unsafe { (*t.0)() };
             }
             std::hint::spin_loop();
+        }
+        if ccd.is_some() {
+            *self.locality.lock().unwrap() = (unsafe { (*job).local.0.load(Ordering::Relaxed) }, n);
         }
     }
     /// The job slotted and published: the workers take it up; the job before it is stopped
@@ -293,9 +306,13 @@ impl Threads {
         while sh.active.load(Ordering::Acquire) != 0 {
             std::hint::spin_loop();
         }
+        if !current.is_null() && unsafe { (*current)._owned.is_some() } {
+            // a prefetch it overtook: what it managed
+            *self.prefetched.lock().unwrap() = unsafe { ((*current).done.0.load(Ordering::Relaxed), (*current).n) };
+        }
         // no worker is inside any job: the one retired at the last publish can go
         let fp: *const (dyn Fn(usize) + Sync) = unsafe { std::mem::transmute(f) };
-        let job = Box::into_raw(Box::new(Job { f: fp, order, next: std::array::from_fn(|s| Counter(AtomicUsize::new(start[s]))), start, done: Counter(AtomicUsize::new(0)), stop: std::sync::atomic::AtomicBool::new(false), _owned: owned }));
+        let job = Box::into_raw(Box::new(Job { f: fp, order, next: std::array::from_fn(|s| Counter(AtomicUsize::new(start[s]))), start, done: Counter(AtomicUsize::new(0)), local: Counter(AtomicUsize::new(0)), stop: std::sync::atomic::AtomicBool::new(false), n, _owned: owned }));
         let old = sh.job.swap(job, Ordering::AcqRel);
         let older = self.retired.swap(old, Ordering::AcqRel);
         if !older.is_null() {
@@ -315,6 +332,12 @@ impl Pool for Threads {
     }
     fn run_at_ccd(&self, n: usize, at: &(dyn Fn(usize) -> *const u8 + Sync), ccd: &(dyn Fn(usize) -> usize + Sync), f: &(dyn Fn(usize) + Sync)) {
         self.publish(n, Some(at), Some(ccd), f)
+    }
+    fn locality(&self) -> (usize, usize) {
+        *self.locality.lock().unwrap()
+    }
+    fn prefetched(&self) -> (usize, usize) {
+        *self.prefetched.lock().unwrap()
     }
     fn prefetch(&self, n: usize, at: Box<dyn Fn(usize) -> *const u8 + Send + Sync>, ccd: Box<dyn Fn(usize) -> usize + Send + Sync>, f: Box<dyn Fn(usize) + Send + Sync>) {
         if n > 1 {
@@ -595,6 +618,11 @@ pub struct Profile {
     /// (the ceiling of a same-layer prefetch), and the layers counted.
     pub reuse: usize,
     pub moe_layers: usize,
+    /// Expert items (gate/up and down) that ran on their preferred CCD, and all of them.
+    pub local_items: usize,
+    pub items: usize,
+    /// How many of a layer's picks the router already names on the attention block's input (the prefetch predictor to beat).
+    pub pre_agree: usize,
 }
 impl Profile {
     /// One line of milliseconds a token, the phases in order and their sum.
@@ -603,7 +631,7 @@ impl Profile {
         let mla = self.mla_proj + self.mla_attn + self.mla_out;
         let rs = self.route + self.shared;
         let sum = self.hc + self.kda_card + self.kda_cpu + mla + self.dense_ffn + rs + self.experts + self.head;
-        format!("{} tokens: hc {:.1}  kda card {:.1}  kda cpu {:.1}  mla {:.1} (proj {:.1} attn {:.1} out {:.1})  dense ffn {:.1}  router+shared {:.1} (route {:.1} shared {:.1})  experts {:.1} (reused {:.2} of {} from the previous token)  head {:.1}  = {:.1} ms a token", self.tokens, self.hc / n, self.kda_card / n, self.kda_cpu / n, mla / n, self.mla_proj / n, self.mla_attn / n, self.mla_out / n, self.dense_ffn / n, rs / n, self.route / n, self.shared / n, self.experts / n, self.reuse as f64 / self.moe_layers.max(1) as f64, TOP_K, self.head / n, sum / n)
+        format!("{} tokens: hc {:.1}  kda card {:.1}  kda cpu {:.1}  mla {:.1} (proj {:.1} attn {:.1} out {:.1})  dense ffn {:.1}  router+shared {:.1} (route {:.1} shared {:.1})  experts {:.1} (reused {:.2} of {} from the previous token, {:.2} named on the attention input; {:.0}% of items on their CCD)  head {:.1}  = {:.1} ms a token", self.tokens, self.hc / n, self.kda_card / n, self.kda_cpu / n, mla / n, self.mla_proj / n, self.mla_attn / n, self.mla_out / n, self.dense_ffn / n, rs / n, self.route / n, self.shared / n, self.experts / n, self.reuse as f64 / self.moe_layers.max(1) as f64, TOP_K, self.pre_agree as f64 / self.moe_layers.max(1) as f64, 100.0 * self.local_items as f64 / self.items.max(1) as f64, self.head / n, sum / n)
     }
 }
 
@@ -622,6 +650,8 @@ pub struct CpuModel<'p, R: Routed> {
     streams: Vec<f32>,
     x: Vec<f32>,
     xn: Vec<f32>,
+    /// The attention block's input under the FFN half's norm: the early router's input (a measurement).
+    pre_xn: Vec<f32>,
     y: Vec<f32>,
     mean: Vec<f32>,
     hc_flat: Vec<f32>,
@@ -673,6 +703,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             streams: vec![0.0; HC * H],
             x: vec![0.0; H],
             xn: vec![0.0; H],
+            pre_xn: vec![0.0; H],
             y: vec![0.0; H],
             mean: vec![0.0; H],
             hc_flat: vec![0.0; HC * H],
@@ -805,6 +836,13 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             let mix = hc::pre(&lw.hc_attn, &s.streams, &mut hcs, s.pool, &mut s.x);
             rmsnorm::<H>(&s.x, &lw.input_ln, RMS_NORM_EPS, &mut s.xn);
             tr.edge(l, "attn_in", &s.xn);
+            // the predictor under test: the router on the attention block's input, normed with the FFN half's norm
+            let mut pre_picks = [E; TOP_K];
+            if let Ffn::Moe(m) = &lw.ffn {
+                rmsnorm::<H>(&s.x, &lw.post_ln, RMS_NORM_EPS, &mut s.pre_xn);
+                let mut fs = ffn::Scratch { gu: &mut s.f_gu, h: &mut s.f_h, expert_out: &mut s.f_expert_out, shared: &mut s.f_shared, score: &mut s.f_score };
+                pre_picks = ffn::route(l, m, &s.pre_xn, &mut fs, s.pool, None, &mut common::trace::NoTrace).0;
+            }
             lap(&mut p.hc);
             match (&lw.attn, &mut s.layers[l]) {
                 (Attn::Kda(_), _) if s.placed.as_ref().is_some_and(|p| p.kda(l)) => {
@@ -881,8 +919,12 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                         s.pool.tick(None);
                     }
                     p.reuse += picks.iter().filter(|e| s.last_picks[l].contains(e)).count();
+                    p.pre_agree += picks.iter().filter(|e| pre_picks.contains(e)).count();
                     p.moe_layers += 1;
                     s.last_picks[l] = picks;
+                    let (local, items) = s.pool.locality();
+                    p.local_items += local;
+                    p.items += items;
                     let e = s.routed.elapsed();
                     p.experts += e;
                     lap(&mut p.route);

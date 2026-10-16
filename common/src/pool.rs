@@ -32,6 +32,15 @@ pub trait Pool: Sync {
     fn prefetch(&self, n: usize, at: std::boxed::Box<dyn Fn(usize) -> *const u8 + Send + Sync>, ccd: std::boxed::Box<dyn Fn(usize) -> usize + Send + Sync>, f: std::boxed::Box<dyn Fn(usize) + Send + Sync>) {
         let _ = (n, at, ccd, f);
     }
+    /// Of the last run's items, how many ran on a core of their preferred CCD, and how many
+    /// there were (0, 0 for a pool that has no CCDs to prefer).
+    fn locality(&self) -> (usize, usize) {
+        (0, 0)
+    }
+    /// Of the last prefetch's items, how many were done before a run overtook it, and how many there were.
+    fn prefetched(&self) -> (usize, usize) {
+        (0, 0)
+    }
     /// Run `f` between the calling thread's own items of the runs until `tick(None)`: a
     /// heartbeat for a device that must not fall asleep while the pool works. `f` must
     /// outlive those runs. A pool without a calling thread's loop ignores it.

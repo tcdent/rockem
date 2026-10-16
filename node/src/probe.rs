@@ -154,49 +154,65 @@ fn l3_probe(ccds: &[Vec<usize>], iters: usize) {
         }
         println!("l3       : CCD 0 streams 11 MB at {:.0} GB/s, then CCD 1 reads the same bytes at {:.0} GB/s", best.0, best.1);
     }
-    // 3. the INT4 expert kernel on one CCD: a packed [4096][5120] matrix (10.5 MB), from DRAM then from L3
+    // 3. does the INT4 kernel scale across one CCD's cores? 1, 2, 4, 8 cores, each over its own
+    // L3-resident 1.3 MB of rows (the second pass), beside the bf16 rows kernel and the plain stream
     {
         const K: usize = glm_5_3_flash::H;
-        const M: usize = 4096;
-        let (q, sc): (Vec<i8>, Vec<f32>) = ((0..M * K).map(|i| ((i * 2654435761) >> 9) as i8 % 8).collect(), vec![1e-3; M * K / 128]);
-        let (pw, ps) = common::q4::pack(M, K, &q, &sc);
+        const ROWS: usize = 512; // 1.3 MB of INT4 rows a core
         let x: Vec<f32> = (0..K).map(|i| (i % 13) as f32 * 0.01).collect();
         let (mut xq, mut xs, mut xg) = (vec![0i8; K], vec![0f32; K / 128], vec![0i32; K / 128]);
         common::q4::QAct { q: &mut xq, scale: &mut xs, gsum: &mut xg }.quantize(&x);
         let act = common::q4::Act { q: &xq, scale: &xs, gsum: &xg };
-        let rows_per = M / ccd0.len();
-        let start = Barrier::new(ccd0.len());
-        let mid = Barrier::new(ccd0.len());
-        let (pw_r, ps_r, act_r) = (&pw, &ps, &act);
-        let times: Vec<(f64, f64)> = std::thread::scope(|sc| {
-            let hs: Vec<_> = ccd0
-                .iter()
-                .enumerate()
-                .map(|(t, &cpu)| {
-                    let (start, mid) = (&start, &mid);
-                    sc.spawn(move || {
-                        pin(cpu);
-                        let r0 = t * rows_per;
-                        let mut out = vec![0f32; rows_per];
-                        let run = |out: &mut [f32]| common::q4::gemv::<K>(rows_per, &pw_r[r0 / 4 * 2 * K..(r0 + rows_per) / 4 * 2 * K], &ps_r[r0 / 4 * (K / 128) * 4..(r0 + rows_per) / 4 * (K / 128) * 4], act_r, out);
-                        let other = vec![1u8; 64 << 20];
-                        std::hint::black_box(unsafe { stream_sum(other.as_ptr(), other.len()) });
-                        start.wait();
-                        let t0 = std::time::Instant::now();
-                        run(&mut out);
-                        let first = t0.elapsed().as_secs_f64();
-                        mid.wait();
-                        let t1 = std::time::Instant::now();
-                        run(&mut out);
-                        (first, t1.elapsed().as_secs_f64())
+        let (act_r, x_r) = (&act, &x);
+        let mut lines = Vec::new();
+        for &nc in &[1usize, 2, 4, 8] {
+            if nc > ccd0.len() {
+                break;
+            }
+            let cores = &ccd0[..nc];
+            let start = Barrier::new(nc);
+            let per: Vec<(f64, f64, f64)> = std::thread::scope(|sc| {
+                let hs: Vec<_> = cores
+                    .iter()
+                    .map(|&cpu| {
+                        let start = &start;
+                        sc.spawn(move || {
+                            pin(cpu);
+                            // this core's own rows, made here (node-local), each kernel's second pass timed
+                            let (q, sc8): (Vec<i8>, Vec<f32>) = ((0..ROWS * K).map(|i| ((i * 2654435761) >> 9) as i8 % 8).collect(), vec![1e-3; ROWS * K / 128]);
+                            let (pw, ps) = common::q4::pack(ROWS, K, &q, &sc8);
+                            let w16: Vec<u16> = (0..ROWS * K / 4).map(|i| ((i * 2654435761) >> 7) as u16 & 0x3fff).collect(); // the same bytes as bf16: a quarter of the rows
+                            let mut out = vec![0f32; ROWS];
+                            let bytes = (ROWS * K / 2) as f64;
+                            let q4 = || common::q4::gemv::<K>(ROWS, &pw, &ps, act_r, &mut out[..]);
+                            let bf = |out: &mut [f32]| common::gemv::bf16_par::<{ ROWS / 4 }, K>(&w16, x_r, out, &common::pool::Serial);
+                            let st = || std::hint::black_box(unsafe { stream_sum(pw.as_ptr(), pw.len()) });
+                            let time = |f: &mut dyn FnMut()| {
+                                f(); // the first pass fills the L3
+                                start.wait();
+                                let t = std::time::Instant::now();
+                                f();
+                                t.elapsed().as_secs_f64()
+                            };
+                            let mut q4m = q4;
+                            let a = bytes / time(&mut q4m) / 1e9;
+                            let mut outb = vec![0f32; ROWS / 4];
+                            let mut bfm = || bf(&mut outb);
+                            let b = bytes / time(&mut bfm) / 1e9;
+                            let mut stm = || {
+                                st();
+                            };
+                            let c = bytes / time(&mut stm) / 1e9;
+                            (a, b, c)
+                        })
                     })
-                })
-                .collect();
-            hs.into_iter().map(|h| h.join().unwrap()).collect()
-        });
-        let worst = |f: &dyn Fn(&(f64, f64)) -> f64| times.iter().map(f).fold(0f64, f64::max);
-        let bytes = (M * K / 2) as f64;
-        println!("l3       : the INT4 expert kernel on CCD 0 over 10.5 MB: from DRAM {:.0} GB/s, the same rows again {:.0} GB/s", bytes / worst(&|t| t.0) / 1e9, bytes / worst(&|t| t.1) / 1e9);
+                    .collect();
+                hs.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            let sum = |f: &dyn Fn(&(f64, f64, f64)) -> f64| per.iter().map(f).sum::<f64>();
+            lines.push(format!("{nc} core{}: int4 {:.0}, bf16 {:.0}, stream {:.0}", if nc == 1 { "" } else { "s" }, sum(&|t| t.0), sum(&|t| t.1), sum(&|t| t.2)));
+        }
+        println!("l3       : CCD 0's cores over their own L3-resident 1.3 MB each, GB/s together — {}", lines.join("; "));
     }
     // 4. every CCD of the node, its own 11 MB, the second pass together
     {
