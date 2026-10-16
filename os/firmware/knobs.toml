@@ -67,7 +67,7 @@ store = "AmdSetup"
 name = "DF C-states"
 offset = 0x1D1
 value = 0
-why = "Disabled: the data fabric must not drop into power states between the host's expert bursts (the next knob to measure; socket 1's nodes have not moved)."
+why = "Disabled: the data fabric must not drop into power states between the host's expert bursts. Measured 2026-10-16 (probe boots before/after): no change in any node's stream rate (84–92 / 83–92 / 79 / 86 GB/s, 321–323 total); kept off on the appliance principle — nothing of ours wants the fabric asleep."
 
 [[knob]]
 store = "AmdSetup"
