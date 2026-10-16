@@ -225,6 +225,8 @@ const KERNARG_SLOTS: usize = RING_PACKETS;
 pub struct Mem {
     pub va: usize,
     pub size: usize,
+    /// KFD's handle, for mapping the same memory on another card (`host_shared`).
+    handle: u64,
 }
 impl Mem {
     pub fn ptr(&self) -> *mut c_void {
@@ -289,6 +291,8 @@ pub struct Kfd {
     kfd: std::fs::File,
     drm: std::fs::File,
     gpu_id: u32,
+    /// This card's place among the gfx1100 cards, in topology order.
+    pub index: usize,
     pub visible_vram: usize,
     ring: Mem,
     queue: Mem, // AmdQueue
@@ -299,7 +303,6 @@ pub struct Kfd {
     /// The index of the barrier packet `fence` posted last.
     fenced: Cell<u64>,
     /// When a packet was last posted or a completion seen: how long the card has been quiet.
-    touched: Cell<std::time::Instant>,
     /// The host has written GPU-visible memory since the last launch: the next
     /// dispatch acquires at system scope (an L2 invalidate); the ones after it
     /// at agent scope, since kernels only hand each other what the card wrote.
@@ -375,24 +378,24 @@ impl Kfd {
             kfd,
             drm,
             gpu_id,
+            index,
             visible_vram,
-            ring: Mem { va: 0, size: 0 },
-            queue: Mem { va: 0, size: 0 },
-            kernargs: Mem { va: 0, size: 0 },
-            signal: Mem { va: 0, size: 0 },
+            ring: Mem { va: 0, size: 0, handle: 0 },
+            queue: Mem { va: 0, size: 0, handle: 0 },
+            kernargs: Mem { va: 0, size: 0, handle: 0 },
+            signal: Mem { va: 0, size: 0, handle: 0 },
             doorbell: std::ptr::null_mut(),
             write_index: Cell::new(0),
             fenced: Cell::new(0),
-            touched: Cell::new(std::time::Instant::now()),
             host_wrote: Cell::new(true),
             instrument,
-            stamps: Mem { va: 0, size: 0 },
+            stamps: Mem { va: 0, size: 0, handle: 0 },
             names: std::cell::RefCell::new(vec![""; RING_PACKETS]),
             grids: std::cell::RefCell::new(vec![0; RING_PACKETS]),
             stats: None,
             token_start: Cell::new(0),
             last_span: Cell::new((0, 0)),
-            code: Mem { va: 0, size: 0 },
+            code: Mem { va: 0, size: 0, handle: 0 },
             elf: elf.to_vec(),
         };
         // the queue's memory: ring (doubled by KFD so the wrap is contiguous), the queue
@@ -513,7 +516,7 @@ impl Kfd {
         let ids = [self.gpu_id];
         let mut m = MapArgs { handle: a.handle, device_ids_array_ptr: ids.as_ptr() as u64, n_devices: 1, n_success: 0 };
         Self::call(&self.kfd, IOC_MAP, &mut m, "map to gpu");
-        Mem { va, size }
+        Mem { va, size, handle: a.handle }
     }
     /// VRAM the host writes (weights, cache, tables): through the BAR.
     pub fn vram_visible(&self, size: usize) -> Mem {
@@ -533,6 +536,18 @@ impl Kfd {
     /// valid words), every load a trip over the link.
     pub fn host_coherent(&self, size: usize) -> Mem {
         self.alloc(size, MEM_GTT | MEM_COHERENT | MEM_WRITABLE, true, size)
+    }
+    /// `host_coherent` memory every card of `others` sees too, at the same address: the
+    /// cards' handoffs (block outputs a card produces and another consumes, and the words
+    /// that say they are there). One process holds every card, so KFD maps one handle on each.
+    pub fn host_shared(&self, size: usize, others: &[&Kfd]) -> Mem {
+        let m = self.host_coherent(size);
+        for o in others {
+            let ids = [o.gpu_id];
+            let mut a = MapArgs { handle: m.handle, device_ids_array_ptr: ids.as_ptr() as u64, n_devices: 1, n_success: 0 };
+            Self::call(&self.kfd, IOC_MAP, &mut a, "map to the other gpu");
+        }
+        m
     }
     /// Host → card through the BAR, streamed (`common::copy`): a weight
     /// upload, a context swap-in.
@@ -729,14 +744,6 @@ impl Kfd {
     pub fn wait(&self) {
         self.wait_at(0);
     }
-    /// A second completion, independent of `fence`/`wait`: for a launch whose result the
-    /// host reads while later launches are in flight (the early router's logits).
-    pub fn fence_early(&self) {
-        self.fence_at(64);
-    }
-    pub fn wait_early(&self) {
-        self.wait_at(64);
-    }
     /// The signal at byte `off` of the signal page (its own cache line), armed and carried by a barrier packet.
     fn fence_at(&self, off: usize) {
         let s = self.signal.at(off) as *const Signal;
@@ -762,7 +769,6 @@ impl Kfd {
             self.last_span.set((self.token_start.get(), idx));
             self.token_start.set(idx + 1);
         }
-        self.touched.set(std::time::Instant::now());
     }
     /// The last token's statistics, per launch in order: kernel name, then
     /// per slot the values every wave wrote (`common::gfx11` stats; empty
@@ -824,11 +830,6 @@ impl Kfd {
             std::ptr::write_volatile(self.doorbell, idx);
         }
         self.write_index.set(idx + 1);
-        self.touched.set(std::time::Instant::now());
-    }
-    /// How long since this queue last posted a packet or saw a completion.
-    pub fn quiet_for(&self) -> std::time::Duration {
-        self.touched.get().elapsed()
     }
 }
 
@@ -866,6 +867,22 @@ fn mwaitx_supported() -> bool {
 /// pass. Arm the monitor, re-check (a store between the check and the wait
 /// would otherwise be missed), then wait.
 #[inline(always)]
+/// Wait until the word at `w` (host memory a card writes with `hc_signal`) reads `value`:
+/// MWAITX on its line, as the completion signals are waited for.
+pub fn wait_word(w: *const AtomicU32, value: u32) {
+    let w = unsafe { &*w };
+    let t0 = std::time::Instant::now();
+    while w.load(Ordering::Acquire) != value {
+        assert!(t0.elapsed().as_secs() < 10, "handoff hang: the word at {:#x} reads {}, {value} expected", w as *const AtomicU32 as usize, w.load(Ordering::Relaxed));
+        unsafe {
+            core::arch::asm!("monitorx", in("rax") w as *const AtomicU32, in("ecx") 0u32, in("edx") 0u32, options(nostack, preserves_flags));
+            if w.load(Ordering::Acquire) != value {
+                core::arch::asm!("push rbx", "mov ebx, {t:e}", "mwaitx", "pop rbx", t = in(reg) 100_000u32, in("eax") 0u32, in("ecx") 2u32, options(nostack, preserves_flags));
+            }
+        }
+    }
+}
+
 unsafe fn wait_on(value: &AtomicI64) {
     core::arch::asm!("monitorx", in("rax") value as *const AtomicI64, in("ecx") 0u32, in("edx") 0u32, options(nostack, preserves_flags));
     if value.load(Ordering::Acquire) != 0 {

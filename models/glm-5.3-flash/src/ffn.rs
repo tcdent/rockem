@@ -67,9 +67,12 @@ pub fn dense(l: usize, w: &weights::DenseFfn, xn: &[f32], s: &mut Scratch, pool:
 #[inline(always)]
 pub fn route(l: usize, w: &weights::Moe, xn: &[f32], s: &mut Scratch, pool: &dyn Pool, forced: Option<&[usize; TOP_K]>, tr: &mut impl Trace) -> ([usize; TOP_K], [f32; TOP_K]) {
     gemv::bf16_par::<E, H>(w.router, xn, s.score, pool);
+    // the scores weight the picks whoever makes them (forced picks skipped the sigmoid from
+    // 1cc1e03 to ebfe97a: the gate failed, serving — the router's own picks — was unaffected)
+    scores(s.score);
     let mut idx = match forced {
         Some(f) => *f,
-        None => picks(w, s.score),
+        None => top(w, s.score),
     };
     idx.sort_unstable();
     let mut sum = 1e-20f32;
@@ -90,10 +93,19 @@ pub fn route(l: usize, w: &weights::Moe, xn: &[f32], s: &mut Scratch, pool: &dyn
 /// by score plus the selection bias, in the order taken (the best first).
 #[inline(always)]
 pub fn picks(w: &weights::Moe, logits: &mut [f32]) -> [usize; TOP_K] {
+    scores(logits);
+    top(w, logits)
+}
+/// The router's logits into its scores, in place.
+#[inline(always)]
+fn scores(logits: &mut [f32]) {
     for v in logits.iter_mut() {
         *v = sigmoid(*v);
     }
-    let score = &*logits;
+}
+/// The top `TOP_K` scores plus the selection bias, in the order taken.
+#[inline(always)]
+fn top(w: &weights::Moe, score: &[f32]) -> [usize; TOP_K] {
     let mut idx = [0usize; TOP_K];
     let mut taken = [false; E];
     for k in 0..TOP_K {

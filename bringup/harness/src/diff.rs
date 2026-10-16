@@ -15,6 +15,9 @@ pub struct Collect {
 }
 
 impl Trace for Collect {
+    fn wants_edges(&self) -> bool {
+        true
+    }
     fn edge(&mut self, layer: usize, name: &str, data: &[f32]) {
         let key = if layer == NONE { name.to_string() } else { format!("model.layers.{layer}.{name}") };
         self.edges.push((key, data.to_vec()));

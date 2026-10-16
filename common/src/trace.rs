@@ -7,6 +7,11 @@ pub const NONE: usize = usize::MAX;
 
 pub trait Trace {
     fn edge(&mut self, layer: usize, name: &str, data: &[f32]);
+    /// Whether edges are collected at all: a realization that must fetch an edge from a
+    /// card (a layer's output off its streams) asks first.
+    fn wants_edges(&self) -> bool {
+        false
+    }
     fn topk(&mut self, layer: usize, idx: &[usize], weight: &[f32]);
     fn routed(&mut self, layer: usize, k: usize, data: &[f32]);
 }
@@ -15,6 +20,10 @@ impl<T: Trace + ?Sized> Trace for &mut T {
     #[inline(always)]
     fn edge(&mut self, layer: usize, name: &str, data: &[f32]) {
         (**self).edge(layer, name, data)
+    }
+    #[inline(always)]
+    fn wants_edges(&self) -> bool {
+        (**self).wants_edges()
     }
     #[inline(always)]
     fn topk(&mut self, layer: usize, idx: &[usize], weight: &[f32]) {

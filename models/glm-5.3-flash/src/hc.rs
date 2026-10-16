@@ -365,9 +365,11 @@ pub mod gfx11 {
         }
     }
 
-    /// `stream_j[d] = post_j · y[d] + Σ_i comb_ij · stream_i[d]`, a thread a channel. Grid: CHANNEL_GRID.
+    /// `stream_j[d] = post_j · y[d] + Σ_i comb_ij · stream_i[d]`, a thread a channel, the block
+    /// output `y` the sum of `ya` and `yb` (`yb` null for one source): the parts of a split
+    /// attention block, or the shared expert's rows and the host's routed experts. Grid: CHANNEL_GRID.
     #[no_mangle]
-    pub extern "gpu-kernel" fn hc_post(mix: *const f32, y: *const f32, streams: *mut f32) {
+    pub extern "gpu-kernel" fn hc_post(mix: *const f32, ya: *const f32, yb: *const f32, streams: *mut f32) {
         unsafe {
             let d = workgroup_id_x() as usize * 256 + workitem_id_x() as usize;
             let mut res = [0f32; HC];
@@ -376,7 +378,7 @@ pub mod gfx11 {
                 res[i] = *streams.add(i * H + d);
                 i += 1;
             }
-            let yd = *y.add(d);
+            let yd = *ya.add(d) + if yb.is_null() { 0.0 } else { *yb.add(d) };
             let mut j = 0;
             while j < HC {
                 let mut acc = 0f32;
@@ -403,6 +405,30 @@ pub mod gfx11 {
                 j += 1;
             }
             *mean.add(d) = acc / HC as f32;
+        }
+    }
+    /// The handoff between the cards and the host: `hc_signal` writes `value` to a word in
+    /// host memory once everything launched before it (the barrier bit) has completed;
+    /// `hc_wait` holds the queue until `w0` (and `w1`, when not null) read `value` — the
+    /// card waits for data, not the host for the card. The words are uncached host memory
+    /// (`Kfd::host_shared`), every load a trip over the link; one thread polls. Grid: 1.
+    #[no_mangle]
+    pub extern "gpu-kernel" fn hc_signal(word: *mut u32, value: u32) {
+        unsafe {
+            if workitem_id_x() == 0 {
+                core::sync::atomic::AtomicU32::from_ptr(word).store(value, core::sync::atomic::Ordering::Release);
+            }
+        }
+    }
+    #[no_mangle]
+    pub extern "gpu-kernel" fn hc_wait(w0: *const u32, w1: *const u32, value: u32) {
+        unsafe {
+            if workitem_id_x() == 0 {
+                while core::sync::atomic::AtomicU32::from_ptr(w0 as *mut u32).load(core::sync::atomic::Ordering::Relaxed) != value {}
+                if !w1.is_null() {
+                    while core::sync::atomic::AtomicU32::from_ptr(w1 as *mut u32).load(core::sync::atomic::Ordering::Relaxed) != value {}
+                }
+            }
         }
     }
     const _: () = assert!(H % 256 == 0 && (HC * H) % 256 == 0 && HC * HC <= 256);

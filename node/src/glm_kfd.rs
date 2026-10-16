@@ -1,39 +1,51 @@
-//! GLM-5.3-Flash's blocks on the cards, behind `construct::Placed`. Each
-//! KDA layer is split by heads into `PARTS` parts, one card each where there
-//! are two: a part holds its heads' projections, the layer's small tensors
-//! and the state, and a step runs on each card the normed projections
+//! GLM-5.3-Flash's blocks on the cards, behind `construct::Placed` — every
+//! block but the routed experts, and the residual streams themselves. Each
+//! card keeps its own copy of the four streams and runs the hyper-connection
+//! on them (`hc_coef`, `hc_mix`: the block input into VRAM, where the block
+//! reads it; `hc_post`: the block output back into the streams), so a token
+//! is a sequence of launches per card the host posts a layer at a time and
+//! waits for only where it has work of its own: the routed experts.
+//!
+//! Each KDA layer is split by heads into `PARTS` parts, one card each where
+//! there are two: a part holds its heads' projections, the layer's small
+//! tensors and the state, and a step runs on each card the normed projections
 //! (`rows_h`: the gates' first halves and beta once a card, then the part's
 //! q, k and v rows as one launch), the gates' second halves (`rows_d`, f_b
 //! over f_a's output and g_b over g_a's, alongside the first), the delta rule
 //! with the heads' memory resident in registers (`kda_step` over the part's
-//! heads), and the part's half of the output projection (`rows_part`): five
-//! launches a part and one a card, the cards waited for, the parts summed
-//! by the host. Each layer's FFN half that is not the routed experts — the
-//! dense layers' MLP, the MoE layers' shared expert — is on the same card as
-//! FP8 rows: a gate|up launch over the normed block input and a down launch
-//! over its SwiGLU (`ffn_gu`, `ffn_down_*`), started before the routed
-//! experts run on the host and finished after them. The head is the final
-//! norm and lm_head as one `rows_h` launch over the vocabulary.
+//! heads), and the part's half of the output projection (`rows_part`) into
+//! host memory every card sees. Each layer's FFN half that is not the routed
+//! experts — the dense layers' MLP, the MoE layers' shared expert — is on the
+//! card of the KDA layer at or before it as FP8 rows (`ffn_gu`, `ffn_down_*`);
+//! the MLA layers' projections and attention likewise. The head is the final
+//! norm and lm_head as one `rows_h` launch over the streams' mean.
 //!
-//! Block inputs come in through host-visible VRAM (a BAR write streams at 16
-//! GB/s); every output goes out through host memory the last launch writes
-//! across the link, because the host reads its BAR at 10–30 MB/s — 470–690 µs
-//! for 20 KB, against 0.2 µs from host memory (probe, 2026-10-15). The
-//! residual streams stay on the host, where the hyper-connections run. The
-//! layers split in order between the cards the topology lists, by their KDA
-//! layers; a layer's FFN sits with the KDA layer at or before it, the head
-//! with the last layer.
+//! What crosses between the cards, or between a card and the host, goes
+//! through uncached host memory mapped on every card (`Kfd::host_shared`): a
+//! block output's parts, the FFN half's input for the host's experts and
+//! their output back, the early router's logits. A word per handoff says the
+//! data is there: the producer's queue writes it after the data (`hc_signal`),
+//! the consumer's queue holds until it reads the value (`hc_wait`) — the card
+//! waits for data, never the host for a card except to read. The sequence
+//! number a half of a layer carries is the value. Block outputs the host
+//! would read through the BAR come this way too (the host reads its BAR at
+//! 10–30 MB/s; probe 2026-10-15); block inputs the host writes (the embedding
+//! into the streams, a latent, a selection) stream in through the BAR at 16 GB/s.
+//! The layers split in order between the cards the topology lists, by their
+//! KDA layers; the head sits with the last layer.
 
 use crate::kfd::{read, Args, Kfd, Mem};
 use glm_5_3_flash::construct::Placed;
 use glm_5_3_flash::ffn::gfx11_consts::{DENSE_GU_ROWS, SHARED_GU_ROWS};
+use glm_5_3_flash::hc::gfx11_consts::{CHANNEL_GRID, COEF_ROWS, MIX as HC_MIX};
 use glm_5_3_flash::kda::gfx11_consts as g;
 use glm_5_3_flash::layout::{KDA_MEMORY, KDA_WINDOW};
 use glm_5_3_flash::mla::gfx11_consts::{ATTEND_GRID, ATTEND_LDS, IX_ROWS, O_IN};
 use glm_5_3_flash::DENSE_BELOW;
 use glm_5_3_flash::{INDEX_HEAD_DIM, INDEX_N_HEADS, KV_LORA_RANK, Q_LORA_RANK};
 use glm_5_3_flash::weights::{Attn, Ffn, Fp8, Weights};
-use glm_5_3_flash::{CONV_DIM, CONV_TAPS, D_FF, H, INTERMEDIATE_SIZE, KDA_DIM, KDA_HEADS, KDA_QKV, LINEAR_ATTENTION, MLA_HEADS, NUM_HIDDEN_LAYERS, N_SHARED_EXPERTS, Q_HEAD, VOCAB_SIZE};
+use glm_5_3_flash::{CONV_DIM, CONV_TAPS, D_FF, H, HC, HC_COEFS, INTERMEDIATE_SIZE, KDA_DIM, KDA_HEADS, KDA_QKV, LINEAR_ATTENTION, MLA_HEADS, NUM_HIDDEN_LAYERS, N_SHARED_EXPERTS, Q_HEAD, VOCAB_SIZE};
+use std::sync::atomic::AtomicU32;
 use std::rc::Rc;
 
 struct Card {
@@ -50,28 +62,62 @@ struct Card {
     mla_iq: crate::kfd::Kernel,
     mla_attend: crate::kfd::Kernel,
     mla_o: crate::kfd::Kernel,
+    hc_coef: crate::kfd::Kernel,
+    hc_mix: crate::kfd::Kernel,
+    hc_post: crate::kfd::Kernel,
+    hc_mean: crate::kfd::Kernel,
+    hc_signal: crate::kfd::Kernel,
+    hc_wait: crate::kfd::Kernel,
+    // the residual streams and the hyper-connection's scratch: this card's copy
+    streams: Mem, // [HC][H] f32, host-visible: the embedding goes in through the BAR
+    ones: Mem,    // [HC·H] bf16 ones: the coefficient GEMV's norm has no weight
+    coef: Mem,    // [HC_COEFS] f32
+    mix: Mem,     // [MIX] f32: pre | post | comb
+    mean: Mem,    // [H] f32, host memory: the streams' mean when bring-up asks for a layer's output
     // the step's buffers, one token deep; a set per part slot, for the parts on this card
-    x: Mem,      // [H] f32, host-visible: the block input
+    x: Mem,      // [H] f32: the block input, the hyper-connection's collapse
     small: Mem,  // [KDA_DIM] fa | [KDA_DIM] ga | [KDA_HEADS] beta
     mixeds: Vec<Mem>,  // [PARTS][3][PART_QKV] f32: a part's q | k | v
     fgs: Vec<Mem>,     // [PARTS][2][PART_QKV]: a part's f | gate
     normeds: Vec<Mem>, // [PARTS][PART_QKV]
-    ys: Vec<Mem>, // [PARTS][H] f32, host memory: each part's share of the block output
     snap: Mem,   // [KDA_WINDOW + KDA_MEMORY] f32, host memory: a layer's state on its way out
     // the FFN's and the head's
-    fx: Mem,     // [H] f32, host-visible: the FFN's block input, or the streams' mean
+    fx: Mem,     // [H] f32: the streams' mean, the head's input
     gu: Mem,     // [DENSE_GU_ROWS] f32: gate | up
-    fy: Mem,     // [H] f32, host memory: the FFN's output
     lg: Mem,     // [VOCAB_SIZE] f32, host memory: the logits
-    scores: Mem, // [E] f32, host memory: the early router's logits
     // the MLA's
     mqa: Mem,    // [Q_LORA_RANK] f32: q_a's output, the input of q_b and the indexer's query
     mq: Mem,     // [MLA_HEADS·Q_HEAD] f32: the query, the attention's input
     mproj: Mem,  // host memory: kva [KV_LORA_RANK] | ix [IX_ROWS] | iq [INDEX_N_HEADS·INDEX_HEAD_DIM]
     msel: Mem,   // [DENSE_BELOW] u32, host-visible: the positions attended
     mheads: Mem, // [O_IN] f32: the heads' outputs, the output projection's input
-    my: Mem,     // [H] f32, host memory: the output projection
 }
+/// Host memory every card and the host see (`Kfd::host_shared`): what one produces and
+/// another consumes within a token. A layer's buffers alternate by its parity, so a
+/// producer a layer ahead never overwrites what a consumer has yet to read (the handoff
+/// chain keeps them within one layer of each other).
+struct Shared {
+    ys: Vec<Mem>,  // [PARTS][2][H] f32: a KDA part's share of the block output, by layer parity
+    fy: [Mem; 2],  // [H] f32: the FFN card's rows (the dense MLP or the shared expert)
+    my: [Mem; 2],  // [H] f32: the MLA card's output projection
+    yexp: [Mem; 2], // [H] f32: the host's routed experts
+    xh: Mem,       // [H] f32: a MoE layer's FFN input for the host
+    scores: Mem,   // [E] f32: the early router's logits for the host
+    words: Mem,    // the handoff words, a cache line each: `word()`
+}
+/// A handoff word's byte offset in `Shared::words`: the kind, and the card for a block output.
+const fn word(kind: usize, card: usize) -> usize {
+    (kind * MAX_CARDS + card) * 64
+}
+const MAX_CARDS: usize = 4;
+/// The attention block's output is in (a card's), the early router's logits are in (the FFN card's),
+/// the FFN half's input is in (the FFN card's), the FFN rows are in (the FFN card's), the host's experts are in.
+const W_Y: usize = 0;
+const W_ROUTE: usize = 1;
+const W_X: usize = 2;
+const W_FFN: usize = 3;
+const W_EXPERTS: usize = 4;
+const W_KINDS: usize = 5;
 const MKVA: usize = 0;
 const MIX: usize = MKVA + KV_LORA_RANK;
 const MIQ: usize = MIX + IX_ROWS;
@@ -109,6 +155,8 @@ struct FfnOn {
     card: usize,
     dense: bool,
     ln: Mem,
+    /// The layer's hyper-connections, on every card: (attention half, FFN half) × (fn rows bf16, base f32, scale f32).
+    hc: Vec<[(Mem, Mem, Mem); 2]>,
     gu_w: Mem,
     gu_s: Mem,
     down_w: Mem,
@@ -134,34 +182,17 @@ struct MlaOn {
     o: (Mem, Mem),
 }
 
-/// Which blocks the cards answer for — every one when serving; a bring-up gate
-/// (`forward-glm --place`) narrows it to find a wrong one. The blocks are still
-/// loaded; only the `Placed` predicates change.
-#[derive(Clone, Copy)]
-pub struct Place {
-    pub kda: bool,
-    pub ffn: bool,
-    pub mla: bool,
-    pub head: bool,
-}
-impl Place {
-    pub const ALL: Place = Place { kda: true, ffn: true, mla: true, head: true };
-    /// `kda,ffn,mla,head` in any subset (the bring-up gate's flag).
-    #[allow(dead_code)]
-    pub fn parse(s: &str) -> Place {
-        let has = |n: &str| s.split(',').any(|p| p.trim() == n);
-        Place { kda: has("kda"), ffn: has("ffn"), mla: has("mla"), head: has("head") }
-    }
-}
-
 pub struct Cards {
-    place: Place,
     cards: Vec<Card>,
+    shared: Shared,
     layers: Vec<Option<Layer>>,
     ffns: Vec<Option<FfnOn>>,
     mlas: Vec<Option<MlaOn>>,
     /// The head's card, the final norm (bf16) and lm_head.
-    head: Option<(usize, Mem, Mem)>,
+    head: (usize, Mem, Mem),
+    /// The handoff sequence: a value a half of a layer's words carry, and each layer's (attention, FFN) values this token.
+    seq: u32,
+    half_seq: Vec<[u32; 2]>,
 }
 
 fn raw<T>(v: &[T]) -> &[u8] {
@@ -177,7 +208,7 @@ impl Cards {
     /// Open every gfx1100 card, load the code object on each, and place the
     /// blocks on them in order: the KDA layers an equal share each, every
     /// layer's FFN half with the KDA layer at or before it, the head last.
-    pub fn new(elf: &[u8], w: &Weights, max_ctx: usize, place: Place) -> Self {
+    pub fn new(elf: &[u8], w: &Weights, max_ctx: usize) -> Self {
         let n = Kfd::cards().len();
         assert!(n > 0, "rockem.gpu: no gfx1100 card");
         let t0 = std::time::Instant::now();
@@ -198,29 +229,60 @@ impl Cards {
                     mla_iq: k.kernel("mla_iq"),
                     mla_attend: k.kernel("mla_attend"),
                     mla_o: k.kernel("mla_o"),
-                    x: alloc(H),
+                    hc_coef: k.kernel("hc_coef"),
+                    hc_mix: k.kernel("hc_mix"),
+                    hc_post: k.kernel("hc_post"),
+                    hc_mean: k.kernel("hc_mean"),
+                    hc_signal: k.kernel("hc_signal"),
+                    hc_wait: k.kernel("hc_wait"),
+                    streams: alloc(HC * H),
+                    ones: {
+                        let m = k.vram_visible(HC * H * 2);
+                        k.upload(&m, 0, raw(&vec![0x3f80u16; HC * H]));
+                        m
+                    },
+                    coef: k.vram(HC_COEFS * 4),
+                    mix: k.vram(HC_MIX * 4),
+                    mean: k.host(H * 4),
+                    x: k.vram(H * 4),
                     small: alloc(SMALL_ROWS),
                     mixeds: (0..g::PARTS).map(|_| alloc(3 * g::PART_QKV)).collect(),
                     fgs: (0..g::PARTS).map(|_| alloc(2 * g::PART_QKV)).collect(),
                     normeds: (0..g::PARTS).map(|_| alloc(g::PART_QKV)).collect(),
-                    ys: (0..g::PARTS).map(|_| k.host(H * 4)).collect(),
                     snap: k.host((KDA_WINDOW + KDA_MEMORY) * 4),
-                    fx: alloc(H),
+                    fx: k.vram(H * 4),
                     gu: alloc(DENSE_GU_ROWS),
-                    fy: k.host(H * 4),
                     lg: k.host(VOCAB_SIZE * 4),
-                    scores: k.host(glm_5_3_flash::E * 4),
                     mqa: alloc(Q_LORA_RANK),
                     mq: alloc(MLA_HEADS * Q_HEAD),
                     mproj: k.host(MPROJ * 4),
                     msel: alloc(DENSE_BELOW),
                     mheads: alloc(O_IN),
-                    my: k.host(H * 4),
                     k,
                 }
             })
             .collect();
+        assert!(n <= MAX_CARDS, "{n} cards: the handoff words are laid out for {MAX_CARDS}");
         Kfd::clocks_high();
+        // the handoffs: host memory card 0 allocates and every other card maps too
+        let shared = {
+            let k0 = &cards[0].k;
+            let others: Vec<&Kfd> = cards[1..].iter().map(|c| &*c.k).collect();
+            let buf = || k0.host_shared(H * 4, &others);
+            Shared {
+                ys: (0..g::PARTS * 2).map(|_| buf()).collect(),
+                fy: [buf(), buf()],
+                my: [buf(), buf()],
+                yexp: [buf(), buf()],
+                xh: buf(),
+                scores: k0.host_shared(glm_5_3_flash::E * 4, &others),
+                words: {
+                    let m = k0.host_shared(word(W_KINDS, 0), &others);
+                    unsafe { std::ptr::write_bytes(m.ptr() as *mut u8, 0, m.size) };
+                    m
+                },
+            }
+        };
         let kda_layers: Vec<usize> = (0..NUM_HIDDEN_LAYERS).filter(|&l| LINEAR_ATTENTION[l]).collect();
         let per = kda_layers.len().div_ceil(n);
         // a layer's card: that of the KDA layer at or before it (the first card before any)
@@ -299,7 +361,7 @@ impl Cards {
         }
         // every layer's FFN half but the routed experts
         let mut ffns: Vec<Option<FfnOn>> = Vec::with_capacity(NUM_HIDDEN_LAYERS);
-        let (mut dense, mut shared) = (0, 0);
+        let (mut dense, mut shared_n) = (0, 0);
         for l in 0..NUM_HIDDEN_LAYERS {
             let card = card_of(l);
             let k = &cards[card].k;
@@ -335,10 +397,27 @@ impl Cards {
             if is_dense {
                 dense += 1;
             } else {
-                shared += 1;
+                shared_n += 1;
             }
             bytes += gu_w.size + gu_s.size + down_w.size + down_s.size + ln.size + router.as_ref().map_or(0, |r| r.size);
-            ffns.push(Some(FfnOn { card, dense: is_dense, ln, gu_w, gu_s, down_w, down_s, router }));
+            // the layer's hyper-connections on every card: each runs them over its own streams
+            let hc: Vec<[(Mem, Mem, Mem); 2]> = cards
+                .iter()
+                .map(|c| {
+                    let one = |h: &glm_5_3_flash::weights::Hc| {
+                        let f = c.k.vram_visible(h.fn_.len() * 2);
+                        c.k.upload(&f, 0, raw(h.fn_));
+                        let b = c.k.vram_visible(h.base.len() * 4);
+                        c.k.upload(&b, 0, raw(h.base));
+                        let sc = c.k.vram_visible(h.scale.len() * 4);
+                        c.k.upload(&sc, 0, raw(h.scale));
+                        (f, b, sc)
+                    };
+                    [one(&w.layers[l].hc_attn), one(&w.layers[l].hc_ffn)]
+                })
+                .collect();
+            bytes += hc.iter().flatten().map(|(f, b, sc)| f.size + b.size + sc.size).sum::<usize>();
+            ffns.push(Some(FfnOn { card, dense: is_dense, ln, hc, gu_w, gu_s, down_w, down_s, router }));
         }
         // the MLA layers' projections
         let mut mlas: Vec<Option<MlaOn>> = (0..NUM_HIDDEN_LAYERS).map(|_| None).collect();
@@ -380,10 +459,66 @@ impl Cards {
             let lm = k.vram_visible(w.lm_head.len() * 2);
             k.upload(&lm, 0, raw(w.lm_head));
             bytes += norm.size + lm.size;
-            Some((card, norm, lm))
+            (card, norm, lm)
         };
-        println!("gpu      : {} KDA layers, {mla_n} MLA layers (their latents to {max_ctx} positions), {dense} dense FFNs, {shared} shared experts and the head on {} card{} ({:.1} GB with their state) in {:.1}s", kda_layers.len(), n, if n == 1 { "" } else { "s" }, bytes as f64 / 1e9, t0.elapsed().as_secs_f32());
-        Cards { place, cards, layers, ffns, mlas, head }
+        println!("gpu      : {} KDA layers, {mla_n} MLA layers (their latents to {max_ctx} positions), {dense} dense FFNs, {shared_n} shared experts, the hyper-connections, the streams and the head on {} card{} ({:.1} GB with their state) in {:.1}s", kda_layers.len(), n, if n == 1 { "" } else { "s" }, bytes as f64 / 1e9, t0.elapsed().as_secs_f32());
+        Cards { cards, shared, layers, ffns, mlas, head, seq: 0, half_seq: vec![[0; 2]; NUM_HIDDEN_LAYERS] }
+    }
+
+    /// The next handoff value: never 0, which the words start at.
+    fn next_seq(&mut self) -> u32 {
+        self.seq = self.seq.wrapping_add(1).max(1);
+        self.seq
+    }
+    /// The host-side atomic of a handoff word.
+    fn word_ptr(&self, kind: usize, card: usize) -> *const AtomicU32 {
+        self.shared.words.at(word(kind, card)) as *const AtomicU32
+    }
+    /// Card `c`'s queue writes `value` to a handoff word once everything before it is done.
+    fn signal(&self, c: &Card, kind: usize, card: usize, value: u32) {
+        let mut a = Args::new();
+        a.ptr(self.shared.words.at(word(kind, card))).u32(value);
+        c.k.launch(&c.hc_signal, 1, g::WG, 0, &a);
+    }
+    /// Card `c`'s queue holds until the words read `value`.
+    fn wait_for(&self, c: &Card, w0: (usize, usize), w1: Option<(usize, usize)>, value: u32) {
+        let mut a = Args::new();
+        a.ptr(self.shared.words.at(word(w0.0, w0.1))).ptr(w1.map_or(0, |(k, d)| self.shared.words.at(word(k, d)))).u32(value);
+        c.k.launch(&c.hc_wait, 1, g::WG, 0, &a);
+    }
+    /// The hyper-connection's input half on card `c`: the coefficients over its streams, the mix,
+    /// the collapse into the block input `x` (and into `x_host` for the routed experts when given).
+    fn hc_pre(&self, c: &Card, hc: &(Mem, Mem, Mem), x_host: Option<usize>) {
+        let mut a = Args::new();
+        a.ptr(c.streams.va).ptr(c.ones.va).ptr(hc.0.va).ptr(c.coef.va).u32(COEF_ROWS as u32).u32(1);
+        c.k.launch(&c.hc_coef, g::rows_grid(COEF_ROWS), g::WG, g::normed_rows_lds(HC * H, 1) as u32, &a);
+        let mut a = Args::new();
+        a.ptr(c.coef.va).ptr(hc.1.va).ptr(hc.2.va).ptr(c.streams.va).ptr(c.mix.va).ptr(c.x.va).ptr(x_host.unwrap_or(0));
+        c.k.launch(&c.hc_mix, 1, g::WG, 0, &a);
+    }
+    /// The hyper-connection's output half on card `c`: the block output (`ya` + `yb`) into its streams.
+    fn hc_post(&self, c: &Card, ya: usize, yb: Option<usize>) {
+        let mut a = Args::new();
+        a.ptr(c.mix.va).ptr(ya).ptr(yb.unwrap_or(0)).ptr(c.streams.va);
+        c.k.launch(&c.hc_post, CHANNEL_GRID, g::WG, 0, &a);
+    }
+    /// The early router on the FFN card: layer `l`'s FFN router over the attention block's input normed with the
+    /// FFN half's norm, its logits to the host with the half's word.
+    fn route_early(&self, l: usize, value: u32) {
+        let f = self.ffns[l].as_ref().unwrap();
+        if let Some(router) = &f.router {
+            let c = &self.cards[f.card];
+            self.rows(c, &c.rows_h, c.x.va, Some(f.ln.va), router.va, self.shared.scores.va, glm_5_3_flash::E, H);
+            self.signal(c, W_ROUTE, f.card, value);
+        }
+    }
+    /// After an attention block's output is in the shared buffers (`sources`, with their producers' cards), every
+    /// card waits for the producers' words and folds it into its streams.
+    fn attention_out(&self, value: u32, producers: &[usize], ya: usize, yb: Option<usize>) {
+        for c in &self.cards {
+            self.wait_for(c, (W_Y, producers[0]), producers.get(1).map(|&p| (W_Y, p)), value);
+            self.hc_post(c, ya, yb);
+        }
     }
 
     /// One FP8 rows launch on card `c`: `out[row] = W[row] · x` (normed with `ln` when given) for `m` rows of width `k_width`, scales `s`.
@@ -436,111 +571,31 @@ impl Cards {
 }
 
 impl Placed for Cards {
-    fn kda(&self, l: usize) -> bool {
-        self.place.kda && self.layers[l].is_some()
-    }
-    fn ffn(&self, l: usize) -> bool {
-        self.place.ffn && self.ffns[l].is_some()
-    }
-    fn head(&self) -> bool {
-        self.place.head && self.head.is_some()
-    }
-    fn ffn_start(&mut self, l: usize, x: &[f32]) {
-        let f = self.ffns[l].as_ref().unwrap();
-        let c = &self.cards[f.card];
-        c.k.upload(&c.fx, 0, raw(&x[..H]));
-        let (rows, down, k_width) = if f.dense { (DENSE_GU_ROWS, &c.ffn_down_dense, INTERMEDIATE_SIZE) } else { (SHARED_GU_ROWS, &c.ffn_down_shared, N_SHARED_EXPERTS * D_FF) };
-        self.rows8(c, &c.ffn_gu, c.fx.va, Some(f.ln.va), f.gu_w.va, f.gu_s.va, c.gu.va, rows, H);
-        self.rows8(c, down, c.gu.va, None, f.down_w.va, f.down_s.va, c.fy.va, H, k_width);
-        c.k.fence(); // completed while the card is awake; the host waits later
-    }
-    fn route_early(&mut self, l: usize, x: &[f32]) {
-        let f = self.ffns[l].as_ref().unwrap();
-        let c = &self.cards[f.card];
-        let router = f.router.as_ref().expect("a MoE layer");
-        c.k.upload(&c.fx, 0, raw(&x[..H]));
-        self.rows(c, &c.rows_h, c.fx.va, Some(f.ln.va), router.va, c.scores.va, glm_5_3_flash::E, H);
-        c.k.fence_early();
-    }
-    fn early_logits(&mut self, l: usize, logits: &mut [f32]) {
-        let c = &self.cards[self.ffns[l].as_ref().unwrap().card];
-        c.k.wait_early();
-        read(&c.scores, 0, &mut logits[..glm_5_3_flash::E]);
-    }
-    fn heartbeat(&self, l: usize) {
-        let c = &self.cards[self.ffns[l].as_ref().unwrap().card];
-        if c.k.quiet_for() >= std::time::Duration::from_micros(250) {
-            let mut a = Args::new();
-            a.ptr(c.snap.va).ptr(c.snap.va).u32(0);
-            c.k.launch(&c.copy, 1, g::WG, 0, &a); // nothing to copy: a packet, so the card stays awake
+    fn begin(&mut self, row: &[f32]) {
+        // every card: the token's handoffs restart, the embedding into each stream
+        let mut streams = Vec::with_capacity(HC * H);
+        for _ in 0..HC {
+            streams.extend_from_slice(&row[..H]);
+        }
+        for c in &self.cards {
+            c.k.upload(&c.streams, 0, raw(&streams));
         }
     }
-    fn ffn_finish(&mut self, l: usize, out: &mut [f32]) {
+    fn attention(&mut self, l: usize) {
+        let value = self.next_seq();
+        self.half_seq[l][0] = value;
         let f = self.ffns[l].as_ref().unwrap();
-        let c = &self.cards[f.card];
-        c.k.wait();
-        read(&c.fy, 0, &mut out[..H]);
-    }
-    fn logits(&mut self, mean: &[f32], logits: &mut [f32]) {
-        let (card, norm, lm) = self.head.as_ref().unwrap();
-        let c = &self.cards[*card];
-        c.k.upload(&c.fx, 0, raw(&mean[..H]));
-        self.rows(c, &c.rows_h, c.fx.va, Some(norm.va), lm.va, c.lg.va, VOCAB_SIZE, H);
-        c.k.sync();
-        read(&c.lg, 0, &mut logits[..VOCAB_SIZE]);
-    }
-    fn mla(&self, l: usize) -> bool {
-        self.place.mla && self.mlas[l].is_some()
-    }
-    fn mla_post(&mut self, l: usize, x: &[f32]) {
-        let m = self.mlas[l].as_ref().unwrap();
-        let c = &self.cards[m.card];
-        c.k.upload(&c.fx, 0, raw(&x[..H]));
-        let ln = Some(m.input_ln.va);
-        // over the normed block input: q_a into VRAM for the next two, kv_a and the indexer's three out to the host
-        self.rows8(c, &c.ffn_gu, c.fx.va, ln, m.q_a.0.va, m.q_a.1.va, c.mqa.va, Q_LORA_RANK, H);
-        self.rows8_free(c, &c.ffn_gu, c.fx.va, ln, m.kv_a.0.va, m.kv_a.1.va, c.mproj.at(MKVA * 4), KV_LORA_RANK, H);
-        self.rows_free(c, &c.rows_h, c.fx.va, ln, m.ix.va, c.mproj.at(MIX * 4), IX_ROWS, H);
-        // over q_a's output normed with q_a's norm: the query and, alongside it, the indexer's query
-        let qln = Some(m.qa_ln.va);
-        self.rows8(c, &c.mla_qb, c.mqa.va, qln, m.q_b.0.va, m.q_b.1.va, c.mq.va, MLA_HEADS * Q_HEAD, Q_LORA_RANK);
-        self.rows_free(c, &c.mla_iq, c.mqa.va, qln, m.ix_wq_b.va, c.mproj.at(MIQ * 4), INDEX_N_HEADS * INDEX_HEAD_DIM, Q_LORA_RANK);
-    }
-    fn mla_wait(&mut self, l: usize, kva: &mut [f32], ik: &mut [f32], igate: &mut [f32], iq: &mut [f32], iw: &mut [f32]) {
-        let c = &self.cards[self.mlas[l].as_ref().unwrap().card];
-        c.k.sync();
-        read(&c.mproj, MKVA * 4, &mut kva[..KV_LORA_RANK]);
-        read(&c.mproj, MIX * 4, &mut ik[..INDEX_HEAD_DIM]);
-        read(&c.mproj, (MIX + INDEX_HEAD_DIM) * 4, &mut igate[..INDEX_HEAD_DIM]);
-        read(&c.mproj, (MIX + 2 * INDEX_HEAD_DIM) * 4, &mut iw[..INDEX_N_HEADS]);
-        read(&c.mproj, MIQ * 4, &mut iq[..INDEX_N_HEADS * INDEX_HEAD_DIM]);
-    }
-    fn mla_attend(&mut self, l: usize, pos: usize, latent: &[f32], sel: &[usize], out: &mut [f32]) {
-        let m = self.mlas[l].as_ref().unwrap();
-        let c = &self.cards[m.card];
-        // the position's latent into the mirror, the selection, the heads, the output projection
-        c.k.upload(&m.lat, pos * KV_LORA_RANK * 4, raw(&latent[..KV_LORA_RANK]));
-        let sel32: Vec<u32> = sel.iter().map(|&p| p as u32).collect();
-        c.k.upload(&c.msel, 0, raw(&sel32));
-        let mut a = Args::new();
-        a.ptr(c.mq.va).ptr(m.kv_b.va).ptr(m.lat.va).ptr(c.msel.va).u32(sel.len() as u32).ptr(c.mheads.va);
-        c.k.launch(&c.mla_attend, ATTEND_GRID, g::WG, ATTEND_LDS as u32, &a);
-        self.rows8(c, &c.mla_o, c.mheads.va, None, m.o.0.va, m.o.1.va, c.my.va, H, O_IN);
-        c.k.sync();
-        read(&c.my, 0, &mut out[..H]);
-    }
-    fn mla_seed(&mut self, l: usize, pos: usize, latent: &[f32]) {
-        let m = self.mlas[l].as_ref().unwrap();
-        self.cards[m.card].k.upload(&m.lat, pos * KV_LORA_RANK * 4, raw(&latent[..KV_LORA_RANK]));
-    }
-    fn kda_post(&mut self, l: usize, x: &[f32]) {
+        for c in &self.cards {
+            self.hc_pre(c, &f.hc[c.k.index][0], None);
+        }
+        self.route_early(l, value);
         let lay = self.layers[l].as_ref().unwrap();
-        // on each card a part uses: the block input, and the gates' first halves and beta (every head) over the normed input
+        let parity = l % 2;
+        // on each card a part uses: the gates' first halves and beta (every head) over the normed input
         let mut seen = [usize::MAX; g::PARTS];
         for (i, p) in lay.parts.iter().enumerate() {
             if !seen[..i].contains(&p.card) {
                 let c = &self.cards[p.card];
-                c.k.upload(&c.x, 0, raw(&x[..H]));
                 self.rows(c, &c.rows_h, c.x.va, Some(p.input_ln.va), p.small.va, c.small.va, SMALL_ROWS, H);
             }
             seen[i] = p.card;
@@ -556,27 +611,136 @@ impl Placed for Cards {
             let mut a = Args::new();
             a.ptr(mixed.va).ptr(p.taps.va).ptr(p.window.va).ptr(fg.va).ptr(p.dt_bias.va).ptr(p.a_log.va).ptr(c.small.at(2 * KDA_DIM * 4)).ptr(fg.at(g::PART_QKV * 4)).ptr(p.mem.va).ptr(p.o_norm.va).ptr(normed.va).u32(p.head0 as u32).u32(1);
             c.k.launch(&c.step, g::STEP_GRID, g::WG, g::STEP_LDS as u32, &a);
-            self.rows(c, &c.rows_part, normed.va, None, p.o.va, c.ys[i].va, H, g::PART_QKV);
+            self.rows(c, &c.rows_part, normed.va, None, p.o.va, self.shared.ys[i * 2 + parity].va, H, g::PART_QKV);
+        }
+        // each card says its parts' shares are in; every card folds the sum into its streams
+        let mut producers: Vec<usize> = lay.parts.iter().map(|p| p.card).collect();
+        producers.dedup();
+        for &card in &producers {
+            self.signal(&self.cards[card], W_Y, card, value);
+        }
+        self.attention_out(value, &producers, self.shared.ys[parity].va, Some(self.shared.ys[2 + parity].va));
+    }
+    fn early_logits(&mut self, l: usize, logits: &mut [f32]) {
+        let f = self.ffns[l].as_ref().unwrap();
+        crate::kfd::wait_word(self.word_ptr(W_ROUTE, f.card), self.half_seq[l][0]);
+        read(&self.shared.scores, 0, &mut logits[..glm_5_3_flash::E]);
+    }
+    fn mla_post(&mut self, l: usize) {
+        let value = self.next_seq();
+        self.half_seq[l][0] = value;
+        let f = self.ffns[l].as_ref().unwrap();
+        for c in &self.cards {
+            self.hc_pre(c, &f.hc[c.k.index][0], None);
+        }
+        self.route_early(l, value);
+        let m = self.mlas[l].as_ref().unwrap();
+        let c = &self.cards[m.card];
+        let ln = Some(m.input_ln.va);
+        // over the normed block input: q_a into VRAM for the next two, kv_a and the indexer's three out to the host
+        self.rows8(c, &c.ffn_gu, c.x.va, ln, m.q_a.0.va, m.q_a.1.va, c.mqa.va, Q_LORA_RANK, H);
+        self.rows8_free(c, &c.ffn_gu, c.x.va, ln, m.kv_a.0.va, m.kv_a.1.va, c.mproj.at(MKVA * 4), KV_LORA_RANK, H);
+        self.rows_free(c, &c.rows_h, c.x.va, ln, m.ix.va, c.mproj.at(MIX * 4), IX_ROWS, H);
+        // over q_a's output normed with q_a's norm: the query and, alongside it, the indexer's query
+        let qln = Some(m.qa_ln.va);
+        self.rows8(c, &c.mla_qb, c.mqa.va, qln, m.q_b.0.va, m.q_b.1.va, c.mq.va, MLA_HEADS * Q_HEAD, Q_LORA_RANK);
+        self.rows_free(c, &c.mla_iq, c.mqa.va, qln, m.ix_wq_b.va, c.mproj.at(MIQ * 4), INDEX_N_HEADS * INDEX_HEAD_DIM, Q_LORA_RANK);
+        c.k.fence();
+        // the other cards fold the output in once it is there (posted now: they wait for the word)
+        for (i, o) in self.cards.iter().enumerate() {
+            if i != m.card {
+                self.wait_for(o, (W_Y, m.card), None, value);
+                self.hc_post(o, self.shared.my[l % 2].va, None);
+            }
         }
     }
-    fn kda_wait(&mut self, l: usize, out: &mut [f32]) {
-        let lay = self.layers[l].as_ref().unwrap();
-        let mut seen = [usize::MAX; g::PARTS];
-        for (i, p) in lay.parts.iter().enumerate() {
-            if !seen[..i].contains(&p.card) {
-                self.cards[p.card].k.sync();
+    fn mla_wait(&mut self, l: usize, kva: &mut [f32], ik: &mut [f32], igate: &mut [f32], iq: &mut [f32], iw: &mut [f32]) {
+        let c = &self.cards[self.mlas[l].as_ref().unwrap().card];
+        c.k.wait();
+        read(&c.mproj, MKVA * 4, &mut kva[..KV_LORA_RANK]);
+        read(&c.mproj, MIX * 4, &mut ik[..INDEX_HEAD_DIM]);
+        read(&c.mproj, (MIX + INDEX_HEAD_DIM) * 4, &mut igate[..INDEX_HEAD_DIM]);
+        read(&c.mproj, (MIX + 2 * INDEX_HEAD_DIM) * 4, &mut iw[..INDEX_N_HEADS]);
+        read(&c.mproj, MIQ * 4, &mut iq[..INDEX_N_HEADS * INDEX_HEAD_DIM]);
+    }
+    fn mla_attend(&mut self, l: usize, pos: usize, latent: &[f32], sel: &[usize]) {
+        let m = self.mlas[l].as_ref().unwrap();
+        let c = &self.cards[m.card];
+        // the position's latent into the mirror, the selection, the heads, the output projection, the streams
+        c.k.upload(&m.lat, pos * KV_LORA_RANK * 4, raw(&latent[..KV_LORA_RANK]));
+        let sel32: Vec<u32> = sel.iter().map(|&p| p as u32).collect();
+        c.k.upload(&c.msel, 0, raw(&sel32));
+        let mut a = Args::new();
+        a.ptr(c.mq.va).ptr(m.kv_b.va).ptr(m.lat.va).ptr(c.msel.va).u32(sel.len() as u32).ptr(c.mheads.va);
+        c.k.launch(&c.mla_attend, ATTEND_GRID, g::WG, ATTEND_LDS as u32, &a);
+        let my = self.shared.my[l % 2].va;
+        self.rows8(c, &c.mla_o, c.mheads.va, None, m.o.0.va, m.o.1.va, my, H, O_IN);
+        self.signal(c, W_Y, m.card, self.half_seq[l][0]);
+        self.hc_post(c, my, None);
+    }
+    fn mla_seed(&mut self, l: usize, pos: usize, latent: &[f32]) {
+        let m = self.mlas[l].as_ref().unwrap();
+        self.cards[m.card].k.upload(&m.lat, pos * KV_LORA_RANK * 4, raw(&latent[..KV_LORA_RANK]));
+    }
+    fn ffn(&mut self, l: usize) {
+        let value = self.next_seq();
+        self.half_seq[l][1] = value;
+        let f = self.ffns[l].as_ref().unwrap();
+        let parity = l % 2;
+        for c in &self.cards {
+            // the FFN card's collapse goes to the host too when the routed experts need it
+            let to_host = (!f.dense && c.k.index == f.card).then_some(self.shared.xh.va);
+            self.hc_pre(c, &f.hc[c.k.index][1], to_host);
+            if to_host.is_some() {
+                self.signal(c, W_X, f.card, value);
             }
-            seen[i] = p.card;
         }
-        // the block output is the parts' sum
-        read(&self.cards[lay.parts[0].card].ys[0], 0, &mut out[..H]);
-        let mut part = [0f32; H];
-        for (i, p) in lay.parts.iter().enumerate().skip(1) {
-            read(&self.cards[p.card].ys[i], 0, &mut part[..]);
-            for d in 0..H {
-                out[d] += part[d];
+        let c = &self.cards[f.card];
+        let (rows, down, k_width) = if f.dense { (DENSE_GU_ROWS, &c.ffn_down_dense, INTERMEDIATE_SIZE) } else { (SHARED_GU_ROWS, &c.ffn_down_shared, N_SHARED_EXPERTS * D_FF) };
+        let fy = self.shared.fy[parity].va;
+        self.rows8(c, &c.ffn_gu, c.x.va, Some(f.ln.va), f.gu_w.va, f.gu_s.va, c.gu.va, rows, H);
+        self.rows8(c, down, c.gu.va, None, f.down_w.va, f.down_s.va, fy, H, k_width);
+        self.signal(c, W_FFN, f.card, value);
+        for o in &self.cards {
+            if f.dense {
+                self.wait_for(o, (W_FFN, f.card), None, value);
+                self.hc_post(o, fy, None);
+            } else {
+                self.wait_for(o, (W_FFN, f.card), Some((W_EXPERTS, 0)), value);
+                self.hc_post(o, fy, Some(self.shared.yexp[parity].va));
             }
         }
+    }
+    fn ffn_input(&mut self, l: usize, x: &mut [f32]) {
+        let f = self.ffns[l].as_ref().unwrap();
+        crate::kfd::wait_word(self.word_ptr(W_X, f.card), self.half_seq[l][1]);
+        read(&self.shared.xh, 0, &mut x[..H]);
+    }
+    fn ffn_routed(&mut self, l: usize, y: &[f32]) {
+        let buf = &self.shared.yexp[l % 2];
+        unsafe { std::ptr::copy_nonoverlapping(y.as_ptr(), buf.ptr() as *mut f32, H) };
+        unsafe { &*self.word_ptr(W_EXPERTS, 0) }.store(self.half_seq[l][1], std::sync::atomic::Ordering::Release);
+    }
+    fn layer_out(&mut self, _l: usize, mean: &mut [f32]) {
+        let c = &self.cards[0];
+        let mut a = Args::new();
+        a.ptr(c.streams.va).ptr(c.mean.va);
+        c.k.launch(&c.hc_mean, CHANNEL_GRID, g::WG, 0, &a);
+        c.k.sync();
+        read(&c.mean, 0, &mut mean[..H]);
+    }
+    fn logits(&mut self, logits: &mut [f32]) {
+        let (card, norm, lm) = &self.head;
+        let c = &self.cards[*card];
+        let mut a = Args::new();
+        a.ptr(c.streams.va).ptr(c.fx.va);
+        c.k.launch(&c.hc_mean, CHANNEL_GRID, g::WG, 0, &a);
+        self.rows(c, &c.rows_h, c.fx.va, Some(norm.va), lm.va, c.lg.va, VOCAB_SIZE, H);
+        // the token ends when every card is done with its streams: the next begins by overwriting them
+        for c in &self.cards {
+            c.k.sync();
+        }
+        read(&c.lg, 0, &mut logits[..VOCAB_SIZE]);
     }
     fn seed(&mut self, l: usize, window: &[f32], mem: &[f32]) {
         // every part holds the full state buffers; each touches only its heads' entries
