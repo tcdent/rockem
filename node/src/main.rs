@@ -426,6 +426,10 @@ fn serve(listen: &str, session: &mut Session, identity: u64) {
     let listener = std::net::TcpListener::bind(listen).unwrap();
     println!("ready    : wire on {listen}, identity {identity:016x}");
     let (bos, vocab_size, tokens, first) = (session.e.bos(), session.e.vocab_size(), session.e.tokens(), session.first_pos());
+    // between connections (the API opens one a request) the engine's threads rest: without this the last run's
+    // busy state held 95 workers in MWAITX, 100 % user time to the kernel, on an idle node (2026-10-15). The
+    // accept blocks inside `incoming()`, so the call goes before the loop and after each connection's end.
+    session.e.idle();
     for conn in listener.incoming() {
         let Ok(mut s) = conn else { continue };
         s.set_nodelay(true).unwrap();
@@ -493,6 +497,7 @@ fn serve(listen: &str, session: &mut Session, identity: u64) {
                 break;
             }
         }
+        session.e.idle();
     }
 }
 

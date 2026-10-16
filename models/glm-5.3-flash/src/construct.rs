@@ -226,7 +226,9 @@ impl Threads {
                         if sh.busy.load(Ordering::Relaxed) {
                             wait_on(&sh.job, seen);
                         } else {
-                            std::thread::sleep(std::time::Duration::from_micros(50));
+                            // idle: a look a millisecond, so 95 sleeping threads cost the kernel nothing and
+                            // the first run of a request waits at most that long for them
+                            std::thread::sleep(std::time::Duration::from_millis(1));
                         }
                         continue;
                     }
