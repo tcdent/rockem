@@ -221,51 +221,72 @@ pub mod gfx11_consts {
 #[cfg(target_arch = "amdgpu")]
 pub mod gfx11 {
     //! The hyper-connections on the card, where the residual streams live
-    //! (`[HC][H]` f32): `hc_coef` (the coefficient GEMV over the flattened
+    //! (`[HC][H]` f32): `hc_pre` (the coefficient GEMV over the flattened
     //! streams rms-normed without a weight as they are staged — `rows_h`'s
-    //! skeleton with a row of ones), `hc_mix` (one workgroup: the sigmoids, the
-    //! softmax rows and Sinkhorn into the mix, then the collapse to the block
-    //! input, written to VRAM and, when asked, to host memory for the routed
-    //! experts), `hc_post` (the stream update from the block output), and
-    //! `hc_mean` (the streams' mean, the head's input). The per-element order
-    //! is the host's (`pre`, `post`): multiply, then add, streams in order.
+    //! skeleton with a row of ones — then, in the last workgroup done, the
+    //! sigmoids, the softmax rows and Sinkhorn into the mix and the collapse
+    //! to the block input, written to VRAM and, when asked, to host memory for
+    //! the routed experts with a word that says so), `hc_post` (the stream
+    //! update from the block output), `hc_mean` (the streams' mean, the head's
+    //! input), and `hc_handoff` (the words between the cards and the host).
+    //! The per-element order is the host's (`pre`, `post`): multiply, then
+    //! add, streams in order.
     pub use super::gfx11_consts::*;
+    use crate::kda::gfx11_consts::{normed_rows_lds, rows_grid};
     use crate::*;
     use common::gemv::gfx11::rows_over;
+    use common::gfx11::{lds, workgroup_sync};
     use common::math::exp;
     use core::arch::amdgpu::{workgroup_id_x, workitem_id_x};
+    use core::sync::atomic::{fence, AtomicU32, Ordering};
 
     #[inline(always)]
     fn sigmoid(x: f32) -> f32 {
         1.0 / (1.0 + exp(-x))
     }
 
-    /// `coef[row] = W[row] · rmsnorm(streams)` over all `HC·H` channels (`ones` the norm's weight). Grid: rows_grid(COEF_ROWS).
+    /// The hyper-connection's input half as one launch: `coef[row] = W[row] · rmsnorm(streams)`
+    /// over all `HC·H` channels (`ones` the norm's weight), `rows_grid(COEF_ROWS)` workgroups;
+    /// the last one done (`count`, a VRAM word back at 0 when it leaves) reads the coefficients
+    /// past its CU's caches and makes the mix (`hc::pre`'s arithmetic) and the collapsed block
+    /// input `x[d] = Σ_i pre_i · stream_i[d]`, into `x` and, when `x_host` is not null, there too,
+    /// then writes `value` to `xword` (when not null) once every thread's `x_host` is out: the
+    /// FFN input's handoff to the host. LDS: `normed_rows_lds(HC·H, 1)` + 64.
     #[no_mangle]
-    pub extern "gpu-kernel" fn hc_coef(streams: *const f32, ones: *const u16, w: *const u16, coef: *mut f32, m: u32, n: u32) {
+    pub extern "gpu-kernel" fn hc_pre(streams: *const f32, ones: *const u16, w: *const u16, coef: *mut f32, m: u32, n: u32, base: *const f32, scale: *const f32, mix: *mut f32, x: *mut f32, x_host: *mut f32, xword: *mut u32, value: u32, count: *mut u32) {
         unsafe {
             let tid = workitem_id_x();
             let (m, n) = (m as usize, n as usize);
             let t = tid as usize;
             rows_over::<{ HC * H }, true>(tid, w, ones, m, n, RMS_NORM_EPS, |i, s| *streams.add(i * HC * H + s * 256 + t), || {}, |row, i, y| *coef.add(i * m + row) = y);
-        }
-    }
-
-    /// The mix from the coefficients (`hc::pre`'s arithmetic), and the collapsed block input
-    /// `x[d] = Σ_i pre_i · stream_i[d]`, into `x` and, when `x_host` is not null, there too. Grid: 1.
-    #[no_mangle]
-    pub extern "gpu-kernel" fn hc_mix(coef: *const f32, base: *const f32, scale: *const f32, streams: *const f32, mix: *mut f32, x: *mut f32, x_host: *mut f32) {
-        unsafe {
-            let t = workitem_id_x() as usize;
-            // every thread computes the whole mix: a few hundred operations, no exchange needed
+            // the launch's arrival: this workgroup's coefficients to L2, one atomic, `last` through LDS
+            let last = (lds::<u8>() as *mut u8).add(normed_rows_lds(HC * H, 1)) as *mut u32;
+            fence(Ordering::Release);
+            workgroup_sync();
+            if t == 0 {
+                let arrived = AtomicU32::from_ptr(count).fetch_add(1, Ordering::AcqRel);
+                *last = (arrived == rows_grid(COEF_ROWS) - 1) as u32;
+            }
+            workgroup_sync();
+            if *last == 0 {
+                return;
+            }
+            fence(Ordering::Acquire);
+            if t == 0 {
+                *count = 0; // nothing else touches it until the next launch
+            }
+            // every thread computes the whole mix: a few hundred operations, no exchange needed; the
+            // coefficients read past this CU's caches (a plain read after the acquire came back stale
+            // one run in ~15 on V2-Lite's router, 2026-09-19)
+            let c = |i: usize| f32::from_bits(AtomicU32::from_ptr(coef.add(i) as *mut u32).load(Ordering::Relaxed));
             let (s0, s1, s2) = (*scale, *scale.add(1), *scale.add(2));
             let mut pre = [0f32; HC];
             let mut post = [0f32; HC];
             let mut cb = [[0f32; HC]; HC];
             let mut i = 0;
             while i < HC {
-                pre[i] = sigmoid(*coef.add(i) * s0 + *base.add(i)) + HC_EPS;
-                post[i] = 2.0 * sigmoid(*coef.add(HC + i) * s1 + *base.add(HC + i));
+                pre[i] = sigmoid(c(i) * s0 + *base.add(i)) + HC_EPS;
+                post[i] = 2.0 * sigmoid(c(HC + i) * s1 + *base.add(HC + i));
                 i += 1;
             }
             let mut i = 0;
@@ -274,7 +295,7 @@ pub mod gfx11 {
                 let mut mx = f32::NEG_INFINITY;
                 let mut j = 0;
                 while j < HC {
-                    row[j] = *coef.add(2 * HC + i * HC + j) * s2 + *base.add(2 * HC + i * HC + j);
+                    row[j] = c(2 * HC + i * HC + j) * s2 + *base.add(2 * HC + i * HC + j);
                     if row[j] > mx {
                         mx = row[j];
                     }
@@ -362,6 +383,14 @@ pub mod gfx11 {
                 }
                 d += 256;
             }
+            // the host's handoff: every thread's channels out, then the word
+            if !xword.is_null() {
+                fence(Ordering::Release);
+                workgroup_sync();
+                if t == 0 {
+                    AtomicU32::from_ptr(xword).store(value, Ordering::Release);
+                }
+            }
         }
     }
 
@@ -407,26 +436,23 @@ pub mod gfx11 {
             *mean.add(d) = acc / HC as f32;
         }
     }
-    /// The handoff between the cards and the host: `hc_signal` writes `value` to a word in
-    /// host memory once everything launched before it (the barrier bit) has completed;
-    /// `hc_wait` holds the queue until `w0` (and `w1`, when not null) read `value` — the
-    /// card waits for data, not the host for the card. The words are uncached host memory
-    /// (`Kfd::host_shared`), every load a trip over the link; one thread polls. Grid: 1.
+    /// The handoff between the cards and the host, one launch: once everything launched before it
+    /// has completed (the barrier bit), `value` into `mine` (when not null: this card's data is in),
+    /// then the queue holds until `w0` and `w1` (those not null) read `value` — the card waits for
+    /// data, not the host for the card. The words are uncached host memory (`Kfd::host_shared`),
+    /// every load a trip over the link; one thread. Grid: 1.
     #[no_mangle]
-    pub extern "gpu-kernel" fn hc_signal(word: *mut u32, value: u32) {
+    pub extern "gpu-kernel" fn hc_handoff(mine: *mut u32, w0: *const u32, w1: *const u32, value: u32) {
         unsafe {
             if workitem_id_x() == 0 {
-                core::sync::atomic::AtomicU32::from_ptr(word).store(value, core::sync::atomic::Ordering::Release);
-            }
-        }
-    }
-    #[no_mangle]
-    pub extern "gpu-kernel" fn hc_wait(w0: *const u32, w1: *const u32, value: u32) {
-        unsafe {
-            if workitem_id_x() == 0 {
-                while core::sync::atomic::AtomicU32::from_ptr(w0 as *mut u32).load(core::sync::atomic::Ordering::Relaxed) != value {}
+                if !mine.is_null() {
+                    AtomicU32::from_ptr(mine).store(value, Ordering::Release);
+                }
+                if !w0.is_null() {
+                    while AtomicU32::from_ptr(w0 as *mut u32).load(Ordering::Relaxed) != value {}
+                }
                 if !w1.is_null() {
-                    while core::sync::atomic::AtomicU32::from_ptr(w1 as *mut u32).load(core::sync::atomic::Ordering::Relaxed) != value {}
+                    while AtomicU32::from_ptr(w1 as *mut u32).load(Ordering::Relaxed) != value {}
                 }
             }
         }

@@ -62,16 +62,15 @@ struct Card {
     mla_iq: crate::kfd::Kernel,
     mla_attend: crate::kfd::Kernel,
     mla_o: crate::kfd::Kernel,
-    hc_coef: crate::kfd::Kernel,
-    hc_mix: crate::kfd::Kernel,
+    hc_pre: crate::kfd::Kernel,
     hc_post: crate::kfd::Kernel,
     hc_mean: crate::kfd::Kernel,
-    hc_signal: crate::kfd::Kernel,
-    hc_wait: crate::kfd::Kernel,
+    hc_handoff: crate::kfd::Kernel,
     // the residual streams and the hyper-connection's scratch: this card's copy
     streams: Mem, // [HC][H] f32, host-visible: the embedding goes in through the BAR
     ones: Mem,    // [HC·H] bf16 ones: the coefficient GEMV's norm has no weight
     coef: Mem,    // [HC_COEFS] f32
+    count: Mem,   // one u32: `hc_pre`'s arrival count, 0 between launches
     mix: Mem,     // [MIX] f32: pre | post | comb
     mean: Mem,    // [H] f32, host memory: the streams' mean when bring-up asks for a layer's output
     // the step's buffers, one token deep; a set per part slot, for the parts on this card
@@ -229,12 +228,10 @@ impl Cards {
                     mla_iq: k.kernel("mla_iq"),
                     mla_attend: k.kernel("mla_attend"),
                     mla_o: k.kernel("mla_o"),
-                    hc_coef: k.kernel("hc_coef"),
-                    hc_mix: k.kernel("hc_mix"),
+                    hc_pre: k.kernel("hc_pre"),
                     hc_post: k.kernel("hc_post"),
                     hc_mean: k.kernel("hc_mean"),
-                    hc_signal: k.kernel("hc_signal"),
-                    hc_wait: k.kernel("hc_wait"),
+                    hc_handoff: k.kernel("hc_handoff"),
                     streams: alloc(HC * H),
                     ones: {
                         let m = k.vram_visible(HC * H * 2);
@@ -242,6 +239,11 @@ impl Cards {
                         m
                     },
                     coef: k.vram(HC_COEFS * 4),
+                    count: {
+                        let m = k.vram_visible(64);
+                        k.upload(&m, 0, &[0u8; 64]);
+                        m
+                    },
                     mix: k.vram(HC_MIX * 4),
                     mean: k.host(H * 4),
                     x: k.vram(H * 4),
@@ -474,27 +476,22 @@ impl Cards {
     fn word_ptr(&self, kind: usize, card: usize) -> *const AtomicU32 {
         self.shared.words.at(word(kind, card)) as *const AtomicU32
     }
-    /// Card `c`'s queue writes `value` to a handoff word once everything before it is done.
-    fn signal(&self, c: &Card, kind: usize, card: usize, value: u32) {
+    /// Card `c`'s handoff launch: `value` into word `mine` (when given) once everything before
+    /// it is done, then the queue holds until the words `w0` and `w1` (those given) read `value`.
+    fn handoff(&self, c: &Card, mine: Option<(usize, usize)>, w0: Option<(usize, usize)>, w1: Option<(usize, usize)>, value: u32) {
+        let at = |w: Option<(usize, usize)>| w.map_or(0, |(k, d)| self.shared.words.at(word(k, d)));
         let mut a = Args::new();
-        a.ptr(self.shared.words.at(word(kind, card))).u32(value);
-        c.k.launch(&c.hc_signal, 1, g::WG, 0, &a);
+        a.ptr(at(mine)).ptr(at(w0)).ptr(at(w1)).u32(value);
+        c.k.launch(&c.hc_handoff, 1, g::WG, 0, &a);
     }
-    /// Card `c`'s queue holds until the words read `value`.
-    fn wait_for(&self, c: &Card, w0: (usize, usize), w1: Option<(usize, usize)>, value: u32) {
+    /// The hyper-connection's input half on card `c`, one launch: the coefficients over its streams,
+    /// the mix, the collapse into the block input `x` — and into `x_host` for the routed experts when
+    /// given, with `value` into the host's word after it.
+    fn hc_pre(&self, c: &Card, hc: &(Mem, Mem, Mem), x_host: Option<(usize, (usize, usize), u32)>) {
+        let (xh, xword, value) = x_host.map_or((0, 0, 0), |(xh, (k, d), v)| (xh, self.shared.words.at(word(k, d)), v));
         let mut a = Args::new();
-        a.ptr(self.shared.words.at(word(w0.0, w0.1))).ptr(w1.map_or(0, |(k, d)| self.shared.words.at(word(k, d)))).u32(value);
-        c.k.launch(&c.hc_wait, 1, g::WG, 0, &a);
-    }
-    /// The hyper-connection's input half on card `c`: the coefficients over its streams, the mix,
-    /// the collapse into the block input `x` (and into `x_host` for the routed experts when given).
-    fn hc_pre(&self, c: &Card, hc: &(Mem, Mem, Mem), x_host: Option<usize>) {
-        let mut a = Args::new();
-        a.ptr(c.streams.va).ptr(c.ones.va).ptr(hc.0.va).ptr(c.coef.va).u32(COEF_ROWS as u32).u32(1);
-        c.k.launch(&c.hc_coef, g::rows_grid(COEF_ROWS), g::WG, g::normed_rows_lds(HC * H, 1) as u32, &a);
-        let mut a = Args::new();
-        a.ptr(c.coef.va).ptr(hc.1.va).ptr(hc.2.va).ptr(c.streams.va).ptr(c.mix.va).ptr(c.x.va).ptr(x_host.unwrap_or(0));
-        c.k.launch(&c.hc_mix, 1, g::WG, 0, &a);
+        a.ptr(c.streams.va).ptr(c.ones.va).ptr(hc.0.va).ptr(c.coef.va).u32(COEF_ROWS as u32).u32(1).ptr(hc.1.va).ptr(hc.2.va).ptr(c.mix.va).ptr(c.x.va).ptr(xh).ptr(xword).u32(value).ptr(c.count.va);
+        c.k.launch(&c.hc_pre, g::rows_grid(COEF_ROWS), g::WG, (g::normed_rows_lds(HC * H, 1) + 64) as u32, &a);
     }
     /// The hyper-connection's output half on card `c`: the block output (`ya` + `yb`) into its streams.
     fn hc_post(&self, c: &Card, ya: usize, yb: Option<usize>) {
@@ -509,14 +506,15 @@ impl Cards {
         if let Some(router) = &f.router {
             let c = &self.cards[f.card];
             self.rows(c, &c.rows_h, c.x.va, Some(f.ln.va), router.va, self.shared.scores.va, glm_5_3_flash::E, H);
-            self.signal(c, W_ROUTE, f.card, value);
+            self.handoff(c, Some((W_ROUTE, f.card)), None, None, value);
         }
     }
-    /// After an attention block's output is in the shared buffers (`sources`, with their producers' cards), every
-    /// card waits for the producers' words and folds it into its streams.
+    /// An attention block's output into every card's streams: each card says its share is in (a
+    /// producer's word), waits for the producers' words, and folds the sum in.
     fn attention_out(&self, value: u32, producers: &[usize], ya: usize, yb: Option<usize>) {
         for c in &self.cards {
-            self.wait_for(c, (W_Y, producers[0]), producers.get(1).map(|&p| (W_Y, p)), value);
+            let mine = producers.contains(&c.k.index).then_some((W_Y, c.k.index));
+            self.handoff(c, mine, Some((W_Y, producers[0])), producers.get(1).map(|&p| (W_Y, p)), value);
             self.hc_post(c, ya, yb);
         }
     }
@@ -616,9 +614,6 @@ impl Placed for Cards {
         // each card says its parts' shares are in; every card folds the sum into its streams
         let mut producers: Vec<usize> = lay.parts.iter().map(|p| p.card).collect();
         producers.dedup();
-        for &card in &producers {
-            self.signal(&self.cards[card], W_Y, card, value);
-        }
         self.attention_out(value, &producers, self.shared.ys[parity].va, Some(self.shared.ys[2 + parity].va));
     }
     fn early_logits(&mut self, l: usize, logits: &mut [f32]) {
@@ -649,7 +644,7 @@ impl Placed for Cards {
         // the other cards fold the output in once it is there (posted now: they wait for the word)
         for (i, o) in self.cards.iter().enumerate() {
             if i != m.card {
-                self.wait_for(o, (W_Y, m.card), None, value);
+                self.handoff(o, None, Some((W_Y, m.card)), None, value);
                 self.hc_post(o, self.shared.my[l % 2].va, None);
             }
         }
@@ -675,7 +670,7 @@ impl Placed for Cards {
         c.k.launch(&c.mla_attend, ATTEND_GRID, g::WG, ATTEND_LDS as u32, &a);
         let my = self.shared.my[l % 2].va;
         self.rows8(c, &c.mla_o, c.mheads.va, None, m.o.0.va, m.o.1.va, my, H, O_IN);
-        self.signal(c, W_Y, m.card, self.half_seq[l][0]);
+        self.handoff(c, Some((W_Y, m.card)), None, None, self.half_seq[l][0]);
         self.hc_post(c, my, None);
     }
     fn mla_seed(&mut self, l: usize, pos: usize, latent: &[f32]) {
@@ -689,24 +684,21 @@ impl Placed for Cards {
         let parity = l % 2;
         for c in &self.cards {
             // the FFN card's collapse goes to the host too when the routed experts need it
-            let to_host = (!f.dense && c.k.index == f.card).then_some(self.shared.xh.va);
+            let to_host = (!f.dense && c.k.index == f.card).then_some((self.shared.xh.va, (W_X, f.card), value));
             self.hc_pre(c, &f.hc[c.k.index][1], to_host);
-            if to_host.is_some() {
-                self.signal(c, W_X, f.card, value);
-            }
         }
         let c = &self.cards[f.card];
         let (rows, down, k_width) = if f.dense { (DENSE_GU_ROWS, &c.ffn_down_dense, INTERMEDIATE_SIZE) } else { (SHARED_GU_ROWS, &c.ffn_down_shared, N_SHARED_EXPERTS * D_FF) };
         let fy = self.shared.fy[parity].va;
         self.rows8(c, &c.ffn_gu, c.x.va, Some(f.ln.va), f.gu_w.va, f.gu_s.va, c.gu.va, rows, H);
         self.rows8(c, down, c.gu.va, None, f.down_w.va, f.down_s.va, fy, H, k_width);
-        self.signal(c, W_FFN, f.card, value);
         for o in &self.cards {
+            let mine = (o.k.index == f.card).then_some((W_FFN, f.card));
             if f.dense {
-                self.wait_for(o, (W_FFN, f.card), None, value);
+                self.handoff(o, mine, Some((W_FFN, f.card)), None, value);
                 self.hc_post(o, fy, None);
             } else {
-                self.wait_for(o, (W_FFN, f.card), Some((W_EXPERTS, 0)), value);
+                self.handoff(o, mine, Some((W_FFN, f.card)), Some((W_EXPERTS, 0)), value);
                 self.hc_post(o, fy, Some(self.shared.yexp[parity].va));
             }
         }
