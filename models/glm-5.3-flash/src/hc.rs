@@ -210,8 +210,13 @@ mod avx2 {
 
 pub mod gfx11_consts {
     use crate::*;
-    /// `hc_coef`: the coefficient rows over the flattened streams, `rows_grid(HC_COEFS)` workgroups.
+    /// `hc_pre`: the coefficient rows over the flattened streams, each over `SLICES` workgroups of `K_SLICE` channels.
     pub const COEF_ROWS: usize = HC_COEFS;
+    pub const SLICES: usize = 8;
+    pub const K_SLICE: usize = HC * H / SLICES;
+    pub const PRE_GRID: u32 = (COEF_ROWS * SLICES) as u32;
+    pub const PRE_LDS: u32 = 512;
+    const _: () = assert!(HC * H % SLICES == 0 && K_SLICE % 256 == 0 && COEF_ROWS <= 256 && (8 + COEF_ROWS + 1) * 4 <= PRE_LDS as usize);
     /// The mix the card keeps between a block's two halves: pre `[HC]`, post `[HC]`, comb `[HC][HC]`.
     pub const MIX: usize = 2 * HC + HC * HC;
     /// `hc_post` and `hc_mean`: a thread a channel.
@@ -232,11 +237,10 @@ pub mod gfx11 {
     //! The per-element order is the host's (`pre`, `post`): multiply, then
     //! add, streams in order.
     pub use super::gfx11_consts::*;
-    use crate::kda::gfx11_consts::{normed_rows_lds, rows_grid};
     use crate::*;
-    use common::gemv::gfx11::rows_over;
-    use common::gfx11::{lds, workgroup_sync};
-    use common::math::exp;
+    use common::gemv::widen;
+    use common::gfx11::{lds, wave_sum, workgroup_sync};
+    use common::math::{exp, sqrt};
     use core::arch::amdgpu::{workgroup_id_x, workitem_id_x};
     use core::sync::atomic::{fence, AtomicU32, Ordering};
 
@@ -245,27 +249,74 @@ pub mod gfx11 {
         1.0 / (1.0 + exp(-x))
     }
 
-    /// The hyper-connection's input half as one launch: `coef[row] = W[row] · rmsnorm(streams)`
-    /// over all `HC·H` channels (`ones` the norm's weight), `rows_grid(COEF_ROWS)` workgroups;
-    /// the last one done (`count`, a VRAM word back at 0 when it leaves) reads the coefficients
-    /// past its CU's caches and makes the mix (`hc::pre`'s arithmetic) and the collapsed block
-    /// input `x[d] = Σ_i pre_i · stream_i[d]`, into `x` and, when `x_host` is not null, there too
-    /// (the routed experts' input; the host's word follows in a later handoff). LDS:
-    /// `normed_rows_lds(HC·H, 1)` + 64.
+    /// The hyper-connection's input half as one launch over `COEF_ROWS · SLICES` workgroups:
+    /// workgroup (row, slice) takes the rms of all `HC·H` stream channels (every workgroup its
+    /// own, 80 KB from L2) and the dot of its `K_SLICE` of row `row` with the normed channels
+    /// into `part[row][slice]`; the last workgroup done (`count`, a VRAM word back at 0 when it
+    /// leaves) sums the partials in slice order (deterministic), makes the mix (`hc::pre`'s
+    /// arithmetic) and the collapsed block input `x[d] = Σ_i pre_i · stream_i[d]`, into `x`
+    /// and, when `x_host` is not null, there too (the routed experts' input; the host's word
+    /// follows in a later handoff). 24 rows on 3 workgroups of the rows skeleton took 54 µs
+    /// (timeline, 2026-10-15): one wave a row over 40 KB. LDS: 512 bytes.
     #[no_mangle]
-    pub extern "gpu-kernel" fn hc_pre(streams: *const f32, ones: *const u16, w: *const u16, coef: *mut f32, m: u32, n: u32, base: *const f32, scale: *const f32, mix: *mut f32, x: *mut f32, x_host: *mut f32, count: *mut u32) {
+    pub extern "gpu-kernel" fn hc_pre(streams: *const f32, w: *const u16, part: *mut f32, base: *const f32, scale: *const f32, mix: *mut f32, x: *mut f32, x_host: *mut f32, count: *mut u32) {
         unsafe {
-            let tid = workitem_id_x();
-            let (m, n) = (m as usize, n as usize);
-            let t = tid as usize;
-            rows_over::<{ HC * H }, true>(tid, w, ones, m, n, RMS_NORM_EPS, |i, s| *streams.add(i * HC * H + s * 256 + t), || {}, |row, i, y| *coef.add(i * m + row) = y);
-            // the launch's arrival: this workgroup's coefficients to L2, one atomic, `last` through LDS
-            let last = (lds::<u8>() as *mut u8).add(normed_rows_lds(HC * H, 1)) as *mut u32;
+            let t = workitem_id_x() as usize;
+            let (wave, lane) = (t / 32, (t % 32) as u32);
+            let wg = workgroup_id_x() as usize;
+            let (row, slice) = (wg / SLICES, wg % SLICES);
+            let red = lds::<f32>(); // [8] wave partials | [COEF_ROWS] coefficients | last
+            let coefs = red.add(8);
+            let last = red.add(8 + COEF_ROWS) as *mut u32;
+            // the norm: every channel's square, summed
+            let mut ss = 0f32;
+            let mut i = t;
+            while i < HC * H {
+                let v = *streams.add(i);
+                ss += v * v;
+                i += 256;
+            }
+            ss = wave_sum(lane, ss);
+            if lane == 0 {
+                *red.add(wave) = ss;
+            }
+            workgroup_sync();
+            let mut tot = 0f32;
+            let mut k = 0;
+            while k < 8 {
+                tot += *red.add(k);
+                k += 1;
+            }
+            let r = 1.0 / sqrt(tot / (HC * H) as f32 + RMS_NORM_EPS);
+            workgroup_sync(); // red is reused below
+            // this slice of the row against the normed channels
+            let (w_row, c0) = (w.add(row * HC * H), slice * K_SLICE);
+            let mut acc = 0f32;
+            let mut i = t;
+            while i < K_SLICE {
+                acc += *streams.add(c0 + i) * r * widen(*w_row.add(c0 + i));
+                i += 256;
+            }
+            acc = wave_sum(lane, acc);
+            if lane == 0 {
+                *red.add(wave) = acc;
+            }
+            workgroup_sync();
+            if t == 0 {
+                let mut p = 0f32;
+                let mut k = 0;
+                while k < 8 {
+                    p += *red.add(k);
+                    k += 1;
+                }
+                *part.add(row * SLICES + slice) = p;
+            }
+            // the launch's arrival: this workgroup's partial to L2, one atomic, `last` through LDS
             fence(Ordering::Release);
             workgroup_sync();
             if t == 0 {
                 let arrived = AtomicU32::from_ptr(count).fetch_add(1, Ordering::AcqRel);
-                *last = (arrived == rows_grid(COEF_ROWS) - 1) as u32;
+                *last = (arrived == (COEF_ROWS * SLICES) as u32 - 1) as u32;
             }
             workgroup_sync();
             if *last == 0 {
@@ -275,10 +326,20 @@ pub mod gfx11 {
             if t == 0 {
                 *count = 0; // nothing else touches it until the next launch
             }
-            // every thread computes the whole mix: a few hundred operations, no exchange needed; the
-            // coefficients read past this CU's caches (a plain read after the acquire came back stale
-            // one run in ~15 on V2-Lite's router, 2026-09-19)
-            let c = |i: usize| f32::from_bits(AtomicU32::from_ptr(coef.add(i) as *mut u32).load(Ordering::Relaxed));
+            // the coefficients: the partials read past this CU's caches (a plain read after the acquire
+            // came back stale one run in ~15 on V2-Lite's router, 2026-09-19), summed in slice order
+            if t < COEF_ROWS {
+                let mut sum = 0f32;
+                let mut k = 0;
+                while k < SLICES {
+                    sum += f32::from_bits(AtomicU32::from_ptr(part.add(t * SLICES + k) as *mut u32).load(Ordering::Relaxed));
+                    k += 1;
+                }
+                *coefs.add(t) = sum;
+            }
+            workgroup_sync();
+            // every thread computes the whole mix: a few hundred operations, no exchange needed
+            let c = |i: usize| *coefs.add(i);
             let (s0, s1, s2) = (*scale, *scale.add(1), *scale.add(2));
             let mut pre = [0f32; HC];
             let mut post = [0f32; HC];

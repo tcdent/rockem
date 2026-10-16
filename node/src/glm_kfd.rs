@@ -37,14 +37,14 @@
 use crate::kfd::{read, Args, Kfd, Mem};
 use glm_5_3_flash::construct::Placed;
 use glm_5_3_flash::ffn::gfx11_consts::{DENSE_GU_ROWS, SHARED_GU_ROWS};
-use glm_5_3_flash::hc::gfx11_consts::{CHANNEL_GRID, COEF_ROWS, MIX as HC_MIX};
+use glm_5_3_flash::hc::gfx11_consts::{CHANNEL_GRID, COEF_ROWS, MIX as HC_MIX, PRE_GRID, PRE_LDS, SLICES as HC_SLICES};
 use glm_5_3_flash::kda::gfx11_consts as g;
 use glm_5_3_flash::layout::{KDA_MEMORY, KDA_WINDOW};
 use glm_5_3_flash::mla::gfx11_consts::{ATTEND_GRID, ATTEND_LDS, IX_ROWS, O_IN};
 use glm_5_3_flash::DENSE_BELOW;
 use glm_5_3_flash::{INDEX_HEAD_DIM, INDEX_N_HEADS, KV_LORA_RANK, Q_LORA_RANK};
 use glm_5_3_flash::weights::{Attn, Ffn, Fp8, Weights};
-use glm_5_3_flash::{CONV_DIM, CONV_TAPS, D_FF, H, HC, HC_COEFS, INTERMEDIATE_SIZE, KDA_DIM, KDA_HEADS, KDA_QKV, LINEAR_ATTENTION, MLA_HEADS, NUM_HIDDEN_LAYERS, N_SHARED_EXPERTS, Q_HEAD, VOCAB_SIZE};
+use glm_5_3_flash::{CONV_DIM, CONV_TAPS, D_FF, H, HC, INTERMEDIATE_SIZE, KDA_DIM, KDA_HEADS, KDA_QKV, LINEAR_ATTENTION, MLA_HEADS, NUM_HIDDEN_LAYERS, N_SHARED_EXPERTS, Q_HEAD, VOCAB_SIZE};
 use std::sync::atomic::AtomicU32;
 use std::rc::Rc;
 
@@ -68,8 +68,7 @@ struct Card {
     hc_handoff: crate::kfd::Kernel,
     // the residual streams and the hyper-connection's scratch: this card's copy
     streams: Mem, // [HC][H] f32, host-visible: the embedding goes in through the BAR
-    ones: Mem,    // [HC·H] bf16 ones: the coefficient GEMV's norm has no weight
-    coef: Mem,    // [HC_COEFS] f32
+    part: Mem,    // [HC_COEFS][SLICES] f32: the coefficient GEMV's partials
     count: Mem,   // one u32: `hc_pre`'s arrival count, 0 between launches
     mix: Mem,     // [MIX] f32: pre | post | comb
     mean: Mem,    // [H] f32, host memory: the streams' mean when bring-up asks for a layer's output
@@ -242,12 +241,7 @@ impl Cards {
                     hc_mean: k.kernel("hc_mean"),
                     hc_handoff: k.kernel("hc_handoff"),
                     streams: alloc(HC * H),
-                    ones: {
-                        let m = k.vram_visible(HC * H * 2);
-                        k.upload(&m, 0, raw(&vec![0x3f80u16; HC * H]));
-                        m
-                    },
-                    coef: k.vram(HC_COEFS * 4),
+                    part: k.vram(COEF_ROWS * HC_SLICES * 4),
                     count: {
                         let m = k.vram_visible(64);
                         k.upload(&m, 0, &[0u8; 64]);
@@ -541,8 +535,8 @@ impl Cards {
     /// given (the host's word follows the router's logits, in the handoff after them).
     fn hc_pre(&self, c: &Card, hc: &(Mem, Mem, Mem), x_host: Option<usize>) {
         let mut a = Args::new();
-        a.ptr(c.streams.va).ptr(c.ones.va).ptr(hc.0.va).ptr(c.coef.va).u32(COEF_ROWS as u32).u32(1).ptr(hc.1.va).ptr(hc.2.va).ptr(c.mix.va).ptr(c.x.va).ptr(x_host.unwrap_or(0)).ptr(c.count.va);
-        c.k.launch(&c.hc_pre, g::rows_grid(COEF_ROWS), g::WG, (g::normed_rows_lds(HC * H, 1) + 64) as u32, &a);
+        a.ptr(c.streams.va).ptr(hc.0.va).ptr(c.part.va).ptr(hc.1.va).ptr(hc.2.va).ptr(c.mix.va).ptr(c.x.va).ptr(x_host.unwrap_or(0)).ptr(c.count.va);
+        c.k.launch(&c.hc_pre, PRE_GRID, g::WG, PRE_LDS, &a);
     }
     /// The hyper-connection's output half on card `c`: the block output (`ya` + `yb`) into its streams.
     fn hc_post(&self, c: &Card, ya: usize, yb: Option<usize>) {
