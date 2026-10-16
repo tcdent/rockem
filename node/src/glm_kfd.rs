@@ -107,6 +107,7 @@ struct Shared {
     yexp: [Mem; 2], // [H] f32: the host's routed experts
     xh: Mem,       // [H] f32: a MoE layer's FFN input for the host
     scores: Mem,   // [E] f32: the early router's logits for the host
+    scores_ffn: Mem, // [E] f32: the FFN half's router over its input, for the host's picks
     words: Mem,    // the handoff words, a cache line each: `word()`
 }
 /// A handoff word's byte offset in `Shared::words`: the kind, and the card for a block output.
@@ -290,6 +291,7 @@ impl Cards {
                 yexp: [buf(), buf()],
                 xh: buf(),
                 scores: k0.host_shared(glm_5_3_flash::E * 4, &others),
+                scores_ffn: k0.host_shared(glm_5_3_flash::E * 4, &others),
                 words: {
                     let m = k0.host_shared(word(W_KINDS, 0), &others);
                     unsafe { std::ptr::write_bytes(m.ptr() as *mut u8, 0, m.size) };
@@ -536,11 +538,10 @@ impl Cards {
     }
     /// The hyper-connection's input half on card `c`, one launch: the coefficients over its streams,
     /// the mix, the collapse into the block input `x` — and into `x_host` for the routed experts when
-    /// given, with `value` into the host's word after it.
-    fn hc_pre(&self, c: &Card, hc: &(Mem, Mem, Mem), x_host: Option<(usize, (usize, usize), u32)>) {
-        let (xh, xword, value) = x_host.map_or((0, 0, 0), |(xh, (k, d), v)| (xh, self.shared.words.at(word(k, d)), v));
+    /// given (the host's word follows the router's logits, in the handoff after them).
+    fn hc_pre(&self, c: &Card, hc: &(Mem, Mem, Mem), x_host: Option<usize>) {
         let mut a = Args::new();
-        a.ptr(c.streams.va).ptr(c.ones.va).ptr(hc.0.va).ptr(c.coef.va).u32(COEF_ROWS as u32).u32(1).ptr(hc.1.va).ptr(hc.2.va).ptr(c.mix.va).ptr(c.x.va).ptr(xh).ptr(xword).u32(value).ptr(c.count.va);
+        a.ptr(c.streams.va).ptr(c.ones.va).ptr(hc.0.va).ptr(c.coef.va).u32(COEF_ROWS as u32).u32(1).ptr(hc.1.va).ptr(hc.2.va).ptr(c.mix.va).ptr(c.x.va).ptr(x_host.unwrap_or(0)).ptr(c.count.va);
         c.k.launch(&c.hc_pre, g::rows_grid(COEF_ROWS), g::WG, (g::normed_rows_lds(HC * H, 1) + 64) as u32, &a);
     }
     /// The hyper-connection's output half on card `c`: the block output (`ya` + `yb`) into its streams.
@@ -741,10 +742,15 @@ impl Placed for Cards {
         let parity = l % 2;
         for c in &self.cards {
             // the FFN card's collapse goes to the host too when the routed experts need it
-            let to_host = (!f.dense && c.k.index == f.card).then_some((self.shared.xh.va, (W_X, f.card), value));
+            let to_host = (!f.dense && c.k.index == f.card).then_some(self.shared.xh.va);
             self.hc_pre(c, &f.hc[c.k.index][1], to_host);
         }
         let c = &self.cards[f.card];
+        if let Some(router) = &f.router {
+            // the router over the normed FFN input, its logits to the host with the input's word
+            self.rows(c, &c.rows_h, c.x.va, Some(f.ln.va), router.va, c.scv.va, glm_5_3_flash::E, H);
+            self.handoff(c, Some((c.scv.va, self.shared.scores_ffn.va, glm_5_3_flash::E)), Some((W_X, f.card)), None, None, value);
+        }
         let (rows, down, k_width) = if f.dense { (DENSE_GU_ROWS, &c.ffn_down_dense, INTERMEDIATE_SIZE) } else { (SHARED_GU_ROWS, &c.ffn_down_shared, N_SHARED_EXPERTS * D_FF) };
         let fy = self.shared.fy[parity].va;
         self.rows8(c, &c.ffn_gu, c.x.va, Some(f.ln.va), f.gu_w.va, f.gu_s.va, c.gu.va, rows, H);
@@ -762,10 +768,11 @@ impl Placed for Cards {
             }
         }
     }
-    fn ffn_input(&mut self, l: usize, x: &mut [f32]) {
+    fn ffn_input(&mut self, l: usize, x: &mut [f32], logits: &mut [f32]) {
         let f = self.ffns[l].as_ref().unwrap();
         crate::kfd::wait_word(self.word_ptr(W_X, f.card), self.half_seq[l][1]);
         read(&self.shared.xh, 0, &mut x[..H]);
+        read(&self.shared.scores_ffn, 0, &mut logits[..glm_5_3_flash::E]);
     }
     fn ffn_routed(&mut self, l: usize, y: &[f32]) {
         let buf = &self.shared.yexp[l % 2];

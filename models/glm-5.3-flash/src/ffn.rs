@@ -67,6 +67,11 @@ pub fn dense(l: usize, w: &weights::DenseFfn, xn: &[f32], s: &mut Scratch, pool:
 #[inline(always)]
 pub fn route(l: usize, w: &weights::Moe, xn: &[f32], s: &mut Scratch, pool: &dyn Pool, forced: Option<&[usize; TOP_K]>, tr: &mut impl Trace) -> ([usize; TOP_K], [f32; TOP_K]) {
     gemv::bf16_par::<E, H>(w.router, xn, s.score, pool);
+    route_logits(l, w, s, forced, tr)
+}
+/// `route` from the router's logits already in `s.score` (a card ran the GEMV).
+#[inline(always)]
+pub fn route_logits(l: usize, w: &weights::Moe, s: &mut Scratch, forced: Option<&[usize; TOP_K]>, tr: &mut impl Trace) -> ([usize; TOP_K], [f32; TOP_K]) {
     // the scores weight the picks whoever makes them (forced picks skipped the sigmoid from
     // 1cc1e03 to ebfe97a: the gate failed, serving — the router's own picks — was unaffected)
     scores(s.score);
@@ -124,6 +129,16 @@ fn top(w: &weights::Moe, score: &[f32]) -> [usize; TOP_K] {
 #[inline(always)]
 pub fn moe_routed(l: usize, w: &weights::Moe, xn: &[f32], s: &mut Scratch, pool: &dyn Pool, routed: &mut impl Routed, forced: Option<&[usize; TOP_K]>, tr: &mut impl Trace, out: &mut [f32]) -> [usize; TOP_K] {
     let (idx, wt) = route(l, w, xn, s, pool, forced, tr);
+    moe_run(l, xn, idx, wt, s, routed, tr, out)
+}
+/// `moe_routed` with the router's logits already in `s.score` (a card ran the GEMV over its own copy of the normed input).
+#[inline(always)]
+pub fn moe_routed_logits(l: usize, w: &weights::Moe, xn: &[f32], s: &mut Scratch, routed: &mut impl Routed, forced: Option<&[usize; TOP_K]>, tr: &mut impl Trace, out: &mut [f32]) -> [usize; TOP_K] {
+    let (idx, wt) = route_logits(l, w, s, forced, tr);
+    moe_run(l, xn, idx, wt, s, routed, tr, out)
+}
+#[inline(always)]
+fn moe_run(l: usize, xn: &[f32], idx: [usize; TOP_K], wt: [f32; TOP_K], s: &mut Scratch, routed: &mut impl Routed, tr: &mut impl Trace, out: &mut [f32]) -> [usize; TOP_K] {
     routed.run(l, &idx, xn, s.expert_out);
     for i in 0..H {
         out[i] = 0.0;

@@ -226,7 +226,7 @@ pub mod gfx11 {
     //! skeleton with a row of ones — then, in the last workgroup done, the
     //! sigmoids, the softmax rows and Sinkhorn into the mix and the collapse
     //! to the block input, written to VRAM and, when asked, to host memory for
-    //! the routed experts with a word that says so), `hc_post` (the stream
+    //! the routed experts), `hc_post` (the stream
     //! update from the block output), `hc_mean` (the streams' mean, the head's
     //! input), and `hc_handoff` (the words between the cards and the host).
     //! The per-element order is the host's (`pre`, `post`): multiply, then
@@ -249,11 +249,11 @@ pub mod gfx11 {
     /// over all `HC·H` channels (`ones` the norm's weight), `rows_grid(COEF_ROWS)` workgroups;
     /// the last one done (`count`, a VRAM word back at 0 when it leaves) reads the coefficients
     /// past its CU's caches and makes the mix (`hc::pre`'s arithmetic) and the collapsed block
-    /// input `x[d] = Σ_i pre_i · stream_i[d]`, into `x` and, when `x_host` is not null, there too,
-    /// then writes `value` to `xword` (when not null) once every thread's `x_host` is out: the
-    /// FFN input's handoff to the host. LDS: `normed_rows_lds(HC·H, 1)` + 64.
+    /// input `x[d] = Σ_i pre_i · stream_i[d]`, into `x` and, when `x_host` is not null, there too
+    /// (the routed experts' input; the host's word follows in a later handoff). LDS:
+    /// `normed_rows_lds(HC·H, 1)` + 64.
     #[no_mangle]
-    pub extern "gpu-kernel" fn hc_pre(streams: *const f32, ones: *const u16, w: *const u16, coef: *mut f32, m: u32, n: u32, base: *const f32, scale: *const f32, mix: *mut f32, x: *mut f32, x_host: *mut f32, xword: *mut u32, value: u32, count: *mut u32) {
+    pub extern "gpu-kernel" fn hc_pre(streams: *const f32, ones: *const u16, w: *const u16, coef: *mut f32, m: u32, n: u32, base: *const f32, scale: *const f32, mix: *mut f32, x: *mut f32, x_host: *mut f32, count: *mut u32) {
         unsafe {
             let tid = workitem_id_x();
             let (m, n) = (m as usize, n as usize);
@@ -382,14 +382,6 @@ pub mod gfx11 {
                     *x_host.add(d) = acc;
                 }
                 d += 256;
-            }
-            // the host's handoff: every thread's channels out, then the word
-            if !xword.is_null() {
-                fence(Ordering::Release);
-                workgroup_sync();
-                if t == 0 {
-                    AtomicU32::from_ptr(xword).store(value, Ordering::Release);
-                }
             }
         }
     }

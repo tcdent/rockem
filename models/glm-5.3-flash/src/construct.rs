@@ -615,7 +615,8 @@ pub trait Placed {
     fn mla_attend(&mut self, l: usize, pos: usize, latent: &[f32], sel: &[usize]);
     fn mla_seed(&mut self, l: usize, pos: usize, latent: &[f32]);
     fn ffn(&mut self, l: usize);
-    fn ffn_input(&mut self, l: usize, x: &mut [f32]);
+    /// A MoE layer's block input and its router's logits, waited for: the routed experts' input and picks.
+    fn ffn_input(&mut self, l: usize, x: &mut [f32], logits: &mut [f32]);
     fn ffn_routed(&mut self, l: usize, y: &[f32]);
     fn layer_out(&mut self, l: usize, mean: &mut [f32]);
     fn logits(&mut self, logits: &mut [f32]);
@@ -1024,12 +1025,12 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             }
             pl.ffn(l);
             if let Some(m) = moe {
-                pl.ffn_input(l, &mut s.x);
+                pl.ffn_input(l, &mut s.x, &mut s.f_score);
                 lap(&mut p.kda_card);
                 rmsnorm::<H>(&s.x, &lw.post_ln, RMS_NORM_EPS, &mut s.xn);
                 tr.edge(l, "ffn_in", &s.xn);
                 let mut fs = ffn::Scratch { gu: &mut s.f_gu, h: &mut s.f_h, expert_out: &mut s.f_expert_out, shared: &mut s.f_shared, score: &mut s.f_score };
-                let picks = ffn::moe_routed(l, m, &s.xn, &mut fs, s.pool, &mut s.routed, forced.map(|f| &f[l - FIRST_K_DENSE_REPLACE]), tr, &mut s.y);
+                let picks = ffn::moe_routed_logits(l, m, &s.xn, &mut fs, &mut s.routed, forced.map(|f| &f[l - FIRST_K_DENSE_REPLACE]), tr, &mut s.y);
                 pl.ffn_routed(l, &s.y);
                 account(p, &mut s.last_picks, &mut s.freq, s.pool, l, picks, pre_picks);
                 let e = s.routed.elapsed();
