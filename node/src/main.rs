@@ -517,6 +517,10 @@ fn main() {
         hsmp::cli(&argv[2..]);
         return;
     }
+    if argv.get(1).map(String::as_str) == Some("probe") && argv.get(2).map(String::as_str) == Some("dram") {
+        probe::dram_only();
+        return;
+    }
     platform::report();
     let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
     if cmdline.split_whitespace().any(|t| t == "rockem.shell=1") {

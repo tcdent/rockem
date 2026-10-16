@@ -548,19 +548,29 @@ fn gemv_rates(pool: &Threads, iters: usize, nodes: usize, placed: bool) -> Strin
 }
 
 /// Every probe, printed; `elf` is a code object with the `stream` kernel for the cards' probes.
+/// The DRAM ceilings alone (`node probe dram` from the shell beside an idle serving node: no card is touched).
+pub fn dram_only() {
+    let nodes = nodes();
+    let all: Vec<usize> = nodes.iter().flatten().copied().collect();
+    let mb = (2048 / all.len().max(1)).max(16);
+    dram_section(&nodes, &all, mb, 3);
+}
+fn dram_section(nodes: &[Vec<usize>], all: &[usize], mb: usize, iters: usize) {
+    for (i, cpus) in nodes.iter().enumerate() {
+        println!("dram     : node {i} local, {} threads: {:.0} GB/s", cpus.len(), dram(cpus, mb, iters, false));
+    }
+    if nodes.len() > 1 {
+        println!("dram     : every node local, {} threads: {:.0} GB/s", all.len(), dram(all, mb, iters, false));
+        println!("dram     : interleaved pages, {} threads: {:.0} GB/s (the loader's placement)", all.len(), dram(all, mb, iters, true));
+    }
+}
 pub fn run(elf: Option<&[u8]>) {
     let iters = 3;
     let nodes = nodes();
     let all: Vec<usize> = nodes.iter().flatten().copied().collect();
     println!("probe    : {} NUMA nodes, {} physical cores", nodes.len(), all.len());
     let mb = (2048 / all.len().max(1)).max(16);
-    for (i, cpus) in nodes.iter().enumerate() {
-        println!("dram     : node {i} local, {} threads: {:.0} GB/s", cpus.len(), dram(cpus, mb, iters, false));
-    }
-    if nodes.len() > 1 {
-        println!("dram     : every node local, {} threads: {:.0} GB/s", all.len(), dram(&all, mb, iters, false));
-        println!("dram     : interleaved pages, {} threads: {:.0} GB/s (the loader's placement)", all.len(), dram(&all, mb, iters, true));
-    }
+    dram_section(&nodes, &all, mb, iters);
     // the sweep toward the channels' peak, on node 0: threads a CCD, SMT siblings, 2 MiB pages
     let ccds = ccds_of(&nodes[0]);
     let per_ccd: Vec<String> = [1usize, 2, 4, 8]

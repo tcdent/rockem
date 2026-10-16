@@ -48,8 +48,8 @@ pub fn report() {
         let mut mcs: Vec<_> = d.flatten().map(|e| e.path()).filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("mc")).collect();
         mcs.sort();
         for mc in mcs {
-            let mut ds: Vec<_> = fs::read_dir(&mc).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("dimm")).collect();
-            ds.sort();
+            let mut ds: Vec<_> = fs::read_dir(&mc).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| { let n = p.file_name().unwrap().to_string_lossy().to_string(); n.starts_with("dimm") || n.starts_with("rank") }).collect();
+            ds.sort_by_key(|p| p.file_name().unwrap().to_string_lossy().trim_start_matches(|c: char| c.is_alphabetic()).parse::<usize>().unwrap_or(0));
             let parts: Vec<String> = ds.iter().map(|d| format!("{} {} MB ce {}", read(&format!("{}/dimm_label", d.display())), read(&format!("{}/size", d.display())), read(&format!("{}/dimm_ce_count", d.display())))).collect();
             edac.push(format!("{} ({}): {}", mc.file_name().unwrap().to_string_lossy(), read(&format!("{}/mc_name", mc.display())), parts.join(", ")));
         }

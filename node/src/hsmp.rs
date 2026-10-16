@@ -79,19 +79,27 @@ pub fn report() {
         let smu = call(s, GET_SMU_VER, &[], 1).map(|a| format!("{}.{}.{}", a[0] >> 16 & 0xff, a[0] >> 8 & 0xff, a[0] & 0xff)).unwrap_or_else(|e| e);
         let clk = call(s, GET_FCLK_MCLK, &[], 2).map(|a| format!("fclk {} mclk {} MHz", a[0], a[1])).unwrap_or_else(|e| e);
         let bw = call(s, GET_DDR_BANDWIDTH, &[], 1).map(|a| format!("ddr max {} GB/s, used {} ({}%)", a[0] >> 20, a[0] >> 8 & 0xfff, a[0] & 0xff)).unwrap_or_else(|e| e);
-        let temp = call(s, GET_TEMP_MONITOR, &[], 1).map(|a| format!("{}.{:03} °C", a[0] >> 8 & 0xff, (a[0] >> 5 & 7) * 125)).unwrap_or_else(|e| e);
+        // the socket and DIMM thermal messages arrived with proto 3+ (Genoa); Milan's SMU refuses them
+        let temp = if proto >= 3 { call(s, GET_TEMP_MONITOR, &[], 1).map(|a| format!("{}.{:03} °C", a[0] >> 8 & 0xff, (a[0] >> 5 & 7) * 125)).unwrap_or_else(|e| e) } else { "no socket temperature message on this proto".to_string() };
         let power = call(s, GET_SOCKET_POWER, &[], 1).map(|a| format!("{:.1} W", a[0] as f64 / 1000.0)).unwrap_or_else(|e| e);
         let limit = call(s, GET_SOCKET_POWER_LIMIT, &[], 1).map(|a| format!("{:.0} W", a[0] as f64 / 1000.0)).unwrap_or_else(|e| e);
         println!("hsmp     : socket {s}: proto {proto}, smu {smu} — {clk}; {bw}; {temp}; {power} of {limit}");
         // the DIMM sensors: every address that answers
         let mut dimms = Vec::new();
         for addr in 0..32u32 {
-            if let Ok(a) = call(s, GET_DIMM_THERMAL, &[addr], 1) {
-                let t = (a[0] >> 21) as f64 * 0.25;
-                let range = call(s, GET_DIMM_TEMP_RANGE, &[addr], 1).map(|r| format!("range {}{}", r[0] & 7, if r[0] & 8 != 0 { " 2x-refresh" } else { "" })).unwrap_or_default();
-                if a[0] & 0xff == addr || t > 0.0 {
-                    dimms.push(format!("{addr:#04x}: {t:.2} °C {range}"));
+            if proto < 3 {
+                break;
+            }
+            match call(s, GET_DIMM_THERMAL, &[addr], 1) {
+                Ok(a) => {
+                    let t = (a[0] >> 21) as f64 * 0.25;
+                    let range = call(s, GET_DIMM_TEMP_RANGE, &[addr], 1).map(|r| format!("range {}{}", r[0] & 7, if r[0] & 8 != 0 { " 2x-refresh" } else { "" })).unwrap_or_default();
+                    if a[0] & 0xff == addr || t > 0.0 {
+                        dimms.push(format!("{addr:#04x}: {t:.2} °C {range}"));
+                    }
                 }
+                Err(e) if e.contains("does not know") => break,
+                Err(_) => {}
             }
         }
         if !dimms.is_empty() {
