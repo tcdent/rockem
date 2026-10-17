@@ -435,6 +435,17 @@ pub fn node_count() -> usize {
 pub fn first_core_of(node: usize) -> usize {
     physical_cores().into_iter().find(|&c| node_of_core(c) == node).unwrap_or(0)
 }
+/// A kernel cpu list ("1-23,25-47") as the cores it names.
+pub fn cpu_list(s: &str) -> Vec<usize> {
+    let mut v = Vec::new();
+    for part in s.trim().split(',').filter(|p| !p.is_empty()) {
+        match part.split_once('-') {
+            Some((a, b)) => v.extend(a.parse::<usize>().unwrap()..=b.parse::<usize>().unwrap()),
+            None => v.push(part.parse().unwrap()),
+        }
+    }
+    v
+}
 /// The NUMA node of a core, from /sys (0 where there is no NUMA).
 pub fn node_of_core(core: usize) -> usize {
     for n in 0..MAX_NODES {
@@ -450,13 +461,16 @@ pub fn node_of_core(core: usize) -> usize {
 }
 
 /// The cores a pool on this machine should take: one per physical core (the
-/// first SMT sibling of each), every socket, as /sys lists them.
+/// first SMT sibling of each), every socket, as /sys lists them — within the kernel's
+/// tickless set when the image isolates cores (`nohz_full=` on the cmdline: the kernel's
+/// own work stays on the housekeeping cores, the pool's never see a tick or an interrupt).
 pub fn physical_cores() -> Vec<usize> {
+    let isolated = cpu_list(&std::fs::read_to_string("/sys/devices/system/cpu/nohz_full").unwrap_or_default());
     let mut cores = Vec::new();
     let mut i = 0;
     while let Ok(s) = std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{i}/topology/thread_siblings_list")) {
         let first: usize = s.trim().split([',', '-']).next().unwrap().parse().unwrap();
-        if first == i {
+        if first == i && (isolated.is_empty() || isolated.contains(&i)) {
             cores.push(i);
         }
         i += 1;
