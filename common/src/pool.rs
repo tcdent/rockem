@@ -25,6 +25,17 @@ pub trait Pool: Sync {
         let _ = ccd;
         self.run_at(n, at, f)
     }
+    /// `run_at_ccd` for a caller that already knows each item's node: `node(i)` instead of an
+    /// address to look up, so slotting an item costs nothing. The default ignores both.
+    fn run_on(&self, n: usize, node: &(dyn Fn(usize) -> usize + Sync), ccd: &(dyn Fn(usize) -> usize + Sync), f: &(dyn Fn(usize) + Sync)) {
+        let _ = (node, ccd);
+        self.run(n, f)
+    }
+    /// `prefetch` for a caller that knows each item's node (as `run_on`).
+    #[cfg(feature = "std")]
+    fn prefetch_on(&self, n: usize, node: std::boxed::Box<dyn Fn(usize) -> usize + Send + Sync>, ccd: std::boxed::Box<dyn Fn(usize) -> usize + Send + Sync>, f: std::boxed::Box<dyn Fn(usize) + Send + Sync>) {
+        let _ = (n, node, ccd, f);
+    }
     /// Start `f` over `n` items (slotted as `run_at_ccd`) on the pool's threads and return at
     /// once; the items are a hint — the next run abandons whatever has not been claimed. The
     /// pool owns the closures until the job is gone. A pool without its own threads does nothing.

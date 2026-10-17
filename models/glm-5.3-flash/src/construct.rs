@@ -239,14 +239,14 @@ impl Threads {
     /// The items by slot (a counting sort over the placement: the node of each item's rows,
     /// and its preferred CCD within that node when it names one; every item is node 0's when
     /// nothing is placed or named), published, worked and waited for.
-    fn publish(&self, n: usize, at: Option<&(dyn Fn(usize) -> *const u8 + Sync)>, ccd: Option<&(dyn Fn(usize) -> usize + Sync)>, f: &(dyn Fn(usize) + Sync)) {
+    fn publish(&self, n: usize, at: Option<&(dyn Fn(usize) -> *const u8 + Sync)>, node: Option<&(dyn Fn(usize) -> usize + Sync)>, ccd: Option<&(dyn Fn(usize) -> usize + Sync)>, f: &(dyn Fn(usize) + Sync)) {
         if n <= 1 {
             for i in 0..n {
                 f(i);
             }
             return;
         }
-        let job = self.post(n, at, ccd, f, None);
+        let job = self.post(n, at, node, ccd, f, None);
         unsafe { work(job, &self.order, self.node) };
         while unsafe { (*job).done.0.load(Ordering::Acquire) } != n {
             std::hint::spin_loop();
@@ -266,21 +266,24 @@ impl Threads {
     }
     /// The job slotted and published: the workers take it up; the job before it is stopped
     /// (a prefetch still running gives up its unclaimed items) and freed a generation late.
-    fn post(&self, n: usize, at: Option<&(dyn Fn(usize) -> *const u8 + Sync)>, ccd: Option<&(dyn Fn(usize) -> usize + Sync)>, f: &(dyn Fn(usize) + Sync), owned: Option<Box<dyn Fn(usize) + Send + Sync>>) -> *mut Job {
+    fn post(&self, n: usize, at: Option<&(dyn Fn(usize) -> *const u8 + Sync)>, node: Option<&(dyn Fn(usize) -> usize + Sync)>, ccd: Option<&(dyn Fn(usize) -> usize + Sync)>, f: &(dyn Fn(usize) + Sync), owned: Option<Box<dyn Fn(usize) + Send + Sync>>) -> *mut Job {
         let mut start = [0usize; SLOTS + 1];
         let mut order = vec![0u32; n];
         let mut item_slot = Vec::new();
-        if let Some(at) = at {
+        let slot = |i: usize, d: usize| match ccd {
+            Some(c) if !self.node_ccds[d].is_empty() => self.node_ccds[d][c(i) % self.node_ccds[d].len()] as u8,
+            _ => (MAX_CCDS + d) as u8,
+        };
+        if let Some(node) = node {
+            item_slot = (0..n).map(|i| slot(i, node(i))).collect();
+        } else if let Some(at) = at {
             let placed = self.placed.lock().unwrap();
             if !placed.is_empty() {
                 item_slot = (0..n)
                     .map(|i| {
                         let p = at(i) as usize;
                         let d = placed.iter().find(|(base, len, _)| p >= *base && p < base + len).map_or(0, |(base, _, nodes)| nodes[(p - base) / PAGE] as usize);
-                        match ccd {
-                            Some(c) if !self.node_ccds[d].is_empty() => self.node_ccds[d][c(i) % self.node_ccds[d].len()] as u8,
-                            _ => (MAX_CCDS + d) as u8,
-                        }
+                        slot(i, d)
                     })
                     .collect();
             }
@@ -331,10 +334,19 @@ impl Drop for Threads {
 }
 impl Pool for Threads {
     fn run(&self, n: usize, f: &(dyn Fn(usize) + Sync)) {
-        self.publish(n, None, None, f)
+        self.publish(n, None, None, None, f)
     }
     fn run_at_ccd(&self, n: usize, at: &(dyn Fn(usize) -> *const u8 + Sync), ccd: &(dyn Fn(usize) -> usize + Sync), f: &(dyn Fn(usize) + Sync)) {
-        self.publish(n, Some(at), Some(ccd), f)
+        self.publish(n, Some(at), None, Some(ccd), f)
+    }
+    fn run_on(&self, n: usize, node: &(dyn Fn(usize) -> usize + Sync), ccd: &(dyn Fn(usize) -> usize + Sync), f: &(dyn Fn(usize) + Sync)) {
+        self.publish(n, None, Some(node), Some(ccd), f)
+    }
+    fn prefetch_on(&self, n: usize, node: Box<dyn Fn(usize) -> usize + Send + Sync>, ccd: Box<dyn Fn(usize) -> usize + Send + Sync>, f: Box<dyn Fn(usize) + Send + Sync>) {
+        if n > 1 {
+            let fr: &(dyn Fn(usize) + Sync) = unsafe { &*(&*f as *const (dyn Fn(usize) + Send + Sync)) };
+            self.post(n, None, Some(&*node), Some(&*ccd), fr, Some(f));
+        }
     }
     fn node_of(&self, p: *const u8) -> usize {
         let p = p as usize;
@@ -360,11 +372,11 @@ impl Pool for Threads {
         if n > 1 {
             // the job owns `f`; `at` and `ccd` are needed only to slot the items here
             let fr: &(dyn Fn(usize) + Sync) = unsafe { &*(&*f as *const (dyn Fn(usize) + Send + Sync)) };
-            self.post(n, Some(&*at), Some(&*ccd), fr, Some(f));
+            self.post(n, Some(&*at), None, Some(&*ccd), fr, Some(f));
         }
     }
     fn run_at(&self, n: usize, at: &(dyn Fn(usize) -> *const u8 + Sync), f: &(dyn Fn(usize) + Sync)) {
-        self.publish(n, Some(at), None, f)
+        self.publish(n, Some(at), None, None, f)
     }
 }
 
@@ -519,26 +531,24 @@ impl Routed for CpuExperts<'_> {
         // compute's order — a slice's node from its rows' page, its CCD from the expert's id and the slice
         let (n_gu, n_down) = (GU_ITEMS, DOWN_ITEMS);
         let mut items: Vec<(usize, usize, usize, Vec<u32>)> = Vec::new(); // expert position, node, ccd, slice ids (gate/up first, then down + n_gu)
+        let mut group = [usize::MAX; TOP_K * MAX_NODES * MAX_CCDS]; // (k, node, ccd) → its item
         for k in 0..TOP_K {
             for j in 0..n_gu + n_down {
                 let hash = if j < n_gu { idx[k] * n_gu + j } else { idx[k] * n_down + (j - n_gu) };
                 let d = self.slice_node(l, idx[k], j);
                 let c = hash % pool.ccds_of(d);
-                match items.iter_mut().find(|(kk, dd, cc, _)| *kk == k && *dd == d && *cc == c) {
-                    Some(it) => it.3.push(j as u32),
-                    None => items.push((k, d, c, vec![j as u32])),
+                let g = &mut group[(k * MAX_NODES + d) * MAX_CCDS + c];
+                if *g == usize::MAX {
+                    *g = items.len();
+                    items.push((k, d, c, Vec::with_capacity(16)));
                 }
+                items[*g].3.push(j as u32);
             }
         }
         let n = items.len();
         let items = std::sync::Arc::new(items);
         let (i1, i2, i3) = (items.clone(), items.clone(), items);
-        let first_slice = move |it: &(usize, usize, usize, Vec<u32>)| -> *const u8 {
-            let w = expert::Weights::at(stream, l, idx[it.0]);
-            let j = it.3[0] as usize;
-            if j < n_gu { w.gu_bytes(j).as_ptr() } else { w.down_bytes(j - n_gu).as_ptr() }
-        };
-        let at = move |i: usize| first_slice(&i1[i]);
+        let node = move |i: usize| i1[i].1;
         let ccd = move |i: usize| i2[i].2;
         // the touching yields between 64 KB chunks once the job is overtaken: the run that overtakes it
         // waits for the items in flight, and a megabyte of touching would be a quarter millisecond of stall
@@ -562,7 +572,7 @@ impl Routed for CpuExperts<'_> {
                 }
             }
         };
-        self.pool.prefetch(n, Box::new(at), Box::new(ccd), Box::new(f));
+        self.pool.prefetch_on(n, Box::new(node), Box::new(ccd), Box::new(f));
     }
     fn run(&mut self, l: usize, idx: &[usize; TOP_K], x: &[f32], out: &mut [f32]) {
         use common::q4::{self, Act, QAct, GROUP};
@@ -572,15 +582,14 @@ impl Routed for CpuExperts<'_> {
         let xa = Act { q: &self.xq, scale: &self.xs, gsum: &self.xg };
         let stream = self.stream;
         let (h_p, out_p) = (self.h.as_mut_ptr() as usize, out.as_mut_ptr() as usize);
-        // the gate/up rows: item (k, c) owns expert k's hidden channels c·CHUNK..
-        let gate_rows = move |i: usize| {
-            let (k, c) = (i / GU_ITEMS, i % GU_ITEMS);
-            expert::Weights::at(stream, l, idx[k]).gu_bytes(c).as_ptr()
-        };
+        let slice_node = &self.slice_node;
+        let node_of = |e: usize, j: usize| slice_node[((l - FIRST_K_DENSE_REPLACE) * E + e) * (GU_ITEMS + DOWN_ITEMS) + j] as usize;
+        // the gate/up rows: item (k, c) owns expert k's hidden channels c·CHUNK..; its node from the table
+        let gate_node = move |i: usize| node_of(idx[i / GU_ITEMS], i % GU_ITEMS);
         // a slice's core complex within its node: a function of the EXPERT and the slice, never of the
         // expert's position among the picks, so a prefetch and the compute meet in one L3
         let gate_ccd = move |i: usize| idx[i / GU_ITEMS] * GU_ITEMS + i % GU_ITEMS;
-        self.pool.run_at_ccd(TOP_K * GU_ITEMS, &gate_rows, &gate_ccd, &move |i| {
+        self.pool.run_on(TOP_K * GU_ITEMS, &gate_node, &gate_ccd, &move |i| {
             let (k, c) = (i / GU_ITEMS, i % GU_ITEMS);
             let w = expert::Weights::at(stream, l, idx[k]);
             let (gw, uw, gs, us) = w.gu(c);
@@ -592,12 +601,9 @@ impl Routed for CpuExperts<'_> {
         });
         // the down rows: item (k, c) owns rows c·DOWN_CHUNK.. of expert k's output over its whole hidden state, quantized here
         let h = &self.h;
-        let down_rows = move |i: usize| {
-            let (k, c) = (i / DOWN_ITEMS, i % DOWN_ITEMS);
-            expert::Weights::at(stream, l, idx[k]).down_bytes(c).as_ptr()
-        };
+        let down_node = move |i: usize| node_of(idx[i / DOWN_ITEMS], GU_ITEMS + i % DOWN_ITEMS);
         let down_ccd = move |i: usize| idx[i / DOWN_ITEMS] * DOWN_ITEMS + i % DOWN_ITEMS;
-        self.pool.run_at_ccd(TOP_K * DOWN_ITEMS, &down_rows, &down_ccd, &move |i| {
+        self.pool.run_on(TOP_K * DOWN_ITEMS, &down_node, &down_ccd, &move |i| {
             let (k, c) = (i / DOWN_ITEMS, i % DOWN_ITEMS);
             let w = expert::Weights::at(stream, l, idx[k]);
             let (mut hq, mut hs, mut hg) = ([0i8; D_FF], [0f32; D_FF / GROUP], [0i32; D_FF / GROUP]);

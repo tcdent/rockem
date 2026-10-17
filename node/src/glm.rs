@@ -64,7 +64,7 @@ impl Glm {
         let dense = loader::load(&bundle.join(layout::DENSE_FILE), mem);
         // the experts, placed equally first; the pool then measures where each node ends its runs
         // and the items move so every node ends at once (below, once the pool is up)
-        let stream = loader::load_placed(&bundle.join(layout::EXPERTS_FILE), mem, &layout::placement(&vec![1.0; glm_5_3_flash::construct::node_count() as usize]));
+        let stream = loader::load_placed(&bundle.join(layout::EXPERTS_FILE), mem, &layout::placement_runs(glm_5_3_flash::construct::node_count()));
         println!("bundle   : {} loaded in {:.1}s ({:.1} GB)", bundle.display(), t0.elapsed().as_secs_f32(), (dense.len() + stream.bytes.len()) as f64 / 1e9);
         let w = Weights::from_dense(dense);
         let prefix_b = loader::load(&bundle.join(layout::PREFIX_FILE), loader::Mem::Anon);

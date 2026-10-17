@@ -103,6 +103,24 @@ pub fn file_items(l: usize, e: usize) -> std::vec::Vec<(usize, core::ops::Range<
 /// items and its down items are split in proportion to the rates — smooth weighted
 /// round-robin, the credit carried across experts, so a node's share of any run of items is
 /// within one item of its rate's share — and a layer's expert run ends on every node at once.
+/// The file's own assignment as a placement: run `r`'s items on node `r mod nodes` — each node
+/// holds a contiguous block of every expert's gate/up rows and of its down rows, as the stream
+/// was laid out for it; the training moves items from the ends of those blocks.
+#[cfg(feature = "std")]
+pub fn placement_runs(nodes: usize) -> std::vec::Vec<u8> {
+    let items = GU_ITEMS + DOWN_ITEMS;
+    let mut out = std::vec::Vec::with_capacity(MOE_LAYERS * E * items);
+    for _ in 0..MOE_LAYERS * E {
+        for c in 0..GU_ITEMS {
+            out.push(((c / GU_PER_RUN) % nodes) as u8);
+        }
+        for c in 0..DOWN_ITEMS {
+            out.push(((c / DOWN_PER_RUN) % nodes) as u8);
+        }
+    }
+    out
+}
+
 /// The placement `rates` ask for, reached from `old` by moving only the difference: each node's
 /// count of gate/up items and of down items goes to its share of the total, one item at a time
 /// from a node over its count to a node under it, taken from the experts where the giver holds
