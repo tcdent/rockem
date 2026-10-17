@@ -808,8 +808,9 @@ pub trait Placed {
     fn mla_post(&mut self, l: usize, n: usize);
     /// Token `i`'s projections of the step (the launch waited for at `i == 0`).
     fn mla_wait(&mut self, l: usize, i: usize, kva: &mut [f32], ik: &mut [f32], igate: &mut [f32], iq: &mut [f32], iw: &mut [f32]);
-    /// Token `i` (at `pos`) attends over its selection; its latent into the mirror first.
-    fn mla_attend(&mut self, l: usize, i: usize, pos: usize, latent: &[f32], sel: &[usize]);
+    /// The step's `n` tokens (at `pos..`) attend over their selections (`sels: [n][DENSE_BELOW]`,
+    /// `counts[i]` positions each), one launch; their latents (`[n][KV_LORA_RANK]`) into the mirror first.
+    fn mla_attend(&mut self, l: usize, n: usize, pos: usize, latents: &[f32], sels: &[usize], counts: &[usize]);
     /// The output projection over the step's heads, into the streams.
     fn mla_out(&mut self, l: usize, n: usize);
     fn mla_seed(&mut self, l: usize, pos: usize, latent: &[f32]);
@@ -957,6 +958,7 @@ pub struct CpuModel<'p, R: Routed> {
     b_pidx: Vec<u32>,
     b_sel: Vec<usize>,
     b_seln: Vec<usize>,
+    b_lat: Vec<f32>,
     m_heads: Vec<f32>,
     m_hs: Vec<f32>,
     f_gu: Vec<f32>,
@@ -1023,6 +1025,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             b_pidx: vec![0; STEP * max_ctx.div_ceil(INDEX_KPOOL)],
             b_sel: vec![0; STEP * DENSE_BELOW],
             b_seln: vec![0; STEP],
+            b_lat: vec![0.0; STEP * KV_LORA_RANK],
             m_heads: vec![0.0; MLA_HEADS * V_HEAD_DIM],
             m_hs: vec![0.0; MLA_HEADS * mla::HEAD_SCRATCH],
             f_gu: vec![0.0; 2 * INTERMEDIATE_SIZE],
@@ -1323,9 +1326,11 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     tr.edge(l, "self_attn.indexer.count", &[s.b_seln[0] as f32]);
                 }
                 lap(&mut p.mla_attn);
+                // the step's latents gathered off the cache rows; every token's attention in one launch
                 for i in 0..n {
-                    pl.mla_attend(l, i, pos + i, &cache[(pos + i) * MLA_ROW..(pos + i) * MLA_ROW + KV_LORA_RANK], &s.b_sel[i * DENSE_BELOW..i * DENSE_BELOW + s.b_seln[i]]);
+                    s.b_lat[i * KV_LORA_RANK..(i + 1) * KV_LORA_RANK].copy_from_slice(&cache[(pos + i) * MLA_ROW..(pos + i) * MLA_ROW + KV_LORA_RANK]);
                 }
+                pl.mla_attend(l, n, pos, &s.b_lat[..n * KV_LORA_RANK], &s.b_sel[..n * DENSE_BELOW], &s.b_seln[..n]);
                 pl.mla_out(l, n);
                 lap(&mut p.mla_out);
             }

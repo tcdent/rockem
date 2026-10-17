@@ -426,26 +426,29 @@ pub mod gfx11 {
     }
     const _: () = assert!(Q_LORA_RANK % 256 == 0 && O_IN % 256 == 0);
 
-    /// Absorbed MLA for one head over the `n` selected positions (`sel`), the
-    /// latents resident (`lat: [ctx][KV_LORA_RANK]`): `q_abs = W_ukᵀ q` (each
-    /// thread two latent channels, the products summed over the query's
-    /// channels in order, as the host does), the scores (a thread a position),
-    /// the softmax, the latent mix (a thread two channels, the positions in
-    /// order), and `W_uv` over it a wave-row at a time into `heads[h]`. Grid:
-    /// ATTEND_GRID; LDS: ATTEND_LDS. `q: [MLA_HEADS][Q_HEAD]`, `kvb` the layer's
-    /// `[MLA_HEADS][KVB_HEAD][KV_LORA_RANK]` bf16, `heads: [MLA_HEADS][V_HEAD_DIM]`.
+    /// Absorbed MLA for one (token, head) over the token's selected positions (`sel[i]`, `counts[i]`
+    /// of them), the latents resident (`lat: [ctx][KV_LORA_RANK]`): `q_abs = W_ukᵀ q` (each thread
+    /// two latent channels, the products summed over the query's channels in order, as the host
+    /// does), the scores (a thread a position), the softmax, the latent mix (a thread two channels,
+    /// the positions in order), and `W_uv` over it a wave-row at a time into `heads[i][h]`. Grid:
+    /// ATTEND_GRID × the step's tokens (a workgroup a head of a token: a token's launch alone was
+    /// 128 workgroups on 84 CUs, 2026-10-17); LDS: ATTEND_LDS. `q: [tokens][MLA_HEADS][Q_HEAD]`,
+    /// `kvb` the layer's `[MLA_HEADS][KVB_HEAD][KV_LORA_RANK]` bf16, `sel: [tokens][DENSE_BELOW]`,
+    /// `heads: [tokens][MLA_HEADS][V_HEAD_DIM]`.
     #[no_mangle]
-    pub extern "gpu-kernel" fn mla_attend(q: *const f32, kvb: *const u16, lat: *const f32, sel: *const u32, n: u32, heads: *mut f32) {
+    pub extern "gpu-kernel" fn mla_attend(q: *const f32, kvb: *const u16, lat: *const f32, sel: *const u32, counts: *const u32, heads: *mut f32) {
         unsafe {
             use common::gemv::gfx11::bf16_row;
             use common::gfx11::{lds, wave_max, wave_sum, workgroup_sync};
             use core::arch::amdgpu::workgroup_id_x;
             const D: usize = KV_LORA_RANK;
-            let h = workgroup_id_x() as usize;
+            let wg = workgroup_id_x() as usize;
+            let (i, h) = (wg / MLA_HEADS, wg % MLA_HEADS);
+            let (q, sel, heads) = (q.add(i * MLA_HEADS * Q_HEAD), sel.add(i * DENSE_BELOW), heads.add(i * MLA_HEADS * V_HEAD_DIM));
+            let n = *counts.add(i) as usize;
             let tid = workitem_id_x();
             let t = tid as usize;
             let (lane, wave) = (tid % 32, (tid / 32) as usize);
-            let n = n as usize;
             let l: *mut f32 = lds();
             let (qh, qabs, olat, att, red) = (l.add(AT_Q), l.add(AT_QABS), l.add(AT_OLAT), l.add(AT_ATT), l.add(AT_RED));
             let w_uk = kvb.add(h * KVB_HEAD * D);

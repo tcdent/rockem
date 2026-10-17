@@ -90,7 +90,8 @@ struct Card {
     mqa: Mem,    // [STEP][Q_LORA_RANK] f32: q_a's output, the input of q_b and the indexer's query
     mq: Mem,     // [STEP][MLA_HEADS·Q_HEAD] f32: the query, the attention's input
     mproj: Mem,  // host memory: kva [STEP][KV_LORA_RANK] | ix [STEP][IX_ROWS] | iq [STEP][INDEX_N_HEADS·INDEX_HEAD_DIM]
-    msel: Mem,   // [STEP][DENSE_BELOW] u32, host-visible: the positions each token of the step attends (a list a token: the launch reading one is queued when the next is uploaded)
+    msel: Mem,   // [STEP][DENSE_BELOW] u32, host-visible: the positions each token of the step attends
+    mseln: Mem,  // [STEP] u32: how many each token attends
     mheads: Mem, // [STEP][O_IN] f32: the heads' outputs, the output projection's input
 }
 /// Host memory every card and the host see (`Kfd::host_shared`): what one produces and
@@ -267,6 +268,7 @@ impl Cards {
                     mq: alloc(STEP * MLA_HEADS * Q_HEAD),
                     mproj: k.host(MPROJ * 4),
                     msel: alloc(STEP * DENSE_BELOW),
+                    mseln: alloc(STEP),
                     mheads: alloc(STEP * O_IN),
                     k,
                 }
@@ -734,16 +736,24 @@ impl Placed for Cards {
         read(&c.mproj, (ix + 2 * INDEX_HEAD_DIM) * 4, &mut iw[..INDEX_N_HEADS]);
         read(&c.mproj, (MIQ + i * INDEX_N_HEADS * INDEX_HEAD_DIM) * 4, &mut iq[..INDEX_N_HEADS * INDEX_HEAD_DIM]);
     }
-    fn mla_attend(&mut self, l: usize, i: usize, pos: usize, latent: &[f32], sel: &[usize]) {
+    fn mla_attend(&mut self, l: usize, n: usize, pos: usize, latents: &[f32], sels: &[usize], counts: &[usize]) {
         let m = self.mlas[l].as_ref().unwrap();
         let c = &self.cards[m.card];
-        // the position's latent into the mirror, the selection, the heads of token i
-        c.k.upload(&m.lat, pos * KV_LORA_RANK * 4, raw(&latent[..KV_LORA_RANK]));
-        let sel32: Vec<u32> = sel.iter().map(|&p| p as u32).collect();
-        c.k.upload(&c.msel, i * DENSE_BELOW * 4, raw(&sel32));
+        // the step's latents into the mirror, each token's selection and count, one launch over (token, head)
+        c.k.upload(&m.lat, pos * KV_LORA_RANK * 4, raw(&latents[..n * KV_LORA_RANK]));
+        let mut sel32 = [0u32; DENSE_BELOW];
+        let mut n32 = [0u32; STEP];
+        for i in 0..n {
+            for (d, &p) in sel32.iter_mut().zip(&sels[i * DENSE_BELOW..i * DENSE_BELOW + counts[i]]) {
+                *d = p as u32;
+            }
+            c.k.upload(&c.msel, i * DENSE_BELOW * 4, raw(&sel32[..counts[i]]));
+            n32[i] = counts[i] as u32;
+        }
+        c.k.upload(&c.mseln, 0, raw(&n32[..n]));
         let mut a = Args::new();
-        a.ptr(c.mq.at(i * MLA_HEADS * Q_HEAD * 4)).ptr(m.kv_b.va).ptr(m.lat.va).ptr(c.msel.at(i * DENSE_BELOW * 4)).u32(sel.len() as u32).ptr(c.mheads.at(i * O_IN * 4));
-        c.k.launch(&c.mla_attend, ATTEND_GRID, g::WG, ATTEND_LDS as u32, &a);
+        a.ptr(c.mq.va).ptr(m.kv_b.va).ptr(m.lat.va).ptr(c.msel.va).ptr(c.mseln.va).ptr(c.mheads.va);
+        c.k.launch(&c.mla_attend, ATTEND_GRID * n as u32, g::WG, ATTEND_LDS as u32, &a);
     }
     fn mla_out(&mut self, l: usize, n: usize) {
         let m = self.mlas[l].as_ref().unwrap();
