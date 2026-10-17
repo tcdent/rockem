@@ -32,6 +32,7 @@ pub struct Scratch<'a> {
     pub iq: &'a mut [f32],     // INDEX_N_HEADS·INDEX_HEAD_DIM
     pub iw: &'a mut [f32],     // INDEX_N_HEADS
     pub pscore: &'a mut [f32], // ≥ max_ctx / INDEX_KPOOL: a score per complete pool
+    pub pidx: &'a mut [u32],   // ≥ max_ctx / INDEX_KPOOL: the selection's pool order
     pub sel: &'a mut [usize],  // ≥ DENSE_BELOW: the positions attended, ascending
     pub heads: &'a mut [f32],  // MLA_HEADS·V_HEAD_DIM: the heads' outputs
     pub hs: &'a mut [f32],     // MLA_HEADS · HEAD_SCRATCH: per head, q_abs | o_lat | att
@@ -65,51 +66,67 @@ pub fn pool_key(w: &weights::Mla, cache: &[f32], j: usize, out: &mut [f32]) {
     }
 }
 
-/// The positions query `pos` attends, ascending, into `sel`; how many.
+/// Pools one scoring item takes (`score_pools` over the thread pool).
+pub const SCORE_BLOCK: usize = 128;
+/// Pools kept by the selection.
+pub const KEEP: usize = INDEX_TOPK / INDEX_KPOOL;
+
+/// The indexer's score of pools `j0..j1` for one query (`iq`, its head weights `iw` scaled by
+/// `head_scale`): per pool, the heads' ReLU'd dots with the pool key, weighted. One token's pools
+/// go in blocks over the thread pool; the dot's order is the definition's whichever block runs it.
 #[inline(always)]
-fn select(pos: usize, iq: &[f32], iw: &[f32], pools: &[f32], pscore: &mut [f32], sel: &mut [usize]) -> usize {
+pub fn score_pools(iq: &[f32], iw: &[f32], pools: &[f32], j0: usize, j1: usize, pscore: &mut [f32]) {
+    let scale = 1.0 / sqrt(INDEX_HEAD_DIM as f32);
+    for j in j0..j1 {
+        let key = &pools[j * INDEX_HEAD_DIM..(j + 1) * INDEX_HEAD_DIM];
+        let mut sc = 0f32;
+        for h in 0..INDEX_N_HEADS {
+            let qh = &iq[h * INDEX_HEAD_DIM..(h + 1) * INDEX_HEAD_DIM];
+            let mut d = 0f32;
+            for c in 0..INDEX_HEAD_DIM {
+                d += qh[c] * key[c];
+            }
+            let d = d * scale;
+            sc += iw[h] * if d > 0.0 { d } else { 0.0 };
+        }
+        pscore[j] = sc;
+    }
+}
+/// The head weights' scale, applied once to a token's `iw` before its scores.
+#[inline(always)]
+pub fn head_scale(iw: &mut [f32]) {
+    let wscale = 1.0 / sqrt(INDEX_N_HEADS as f32);
+    for v in iw.iter_mut() {
+        *v *= wscale;
+    }
+}
+/// Whether query `pos` selects among its pools (past `KEEP` complete ones) or attends them all.
+#[inline(always)]
+pub fn selects(pos: usize) -> bool {
+    (pos + 1) / INDEX_KPOOL > KEEP
+}
+/// The positions query `pos` attends, ascending, into `sel`; how many. Among more than `KEEP`
+/// complete pools, the `KEEP` best by score, lower index first on a tie (`pidx` is the scratch:
+/// one partition at the `KEEP`th, then the picks sorted), then the incomplete tail's positions.
+#[inline(always)]
+pub fn pick(pos: usize, pscore: &[f32], pidx: &mut [u32], sel: &mut [usize]) -> usize {
     let visible = (pos + 1) / INDEX_KPOOL;
-    let keep = INDEX_TOPK / INDEX_KPOOL;
     let mut n = 0;
-    if visible <= keep {
+    if visible <= KEEP {
         for p in 0..visible * INDEX_KPOOL {
             sel[n] = p;
             n += 1;
         }
     } else {
-        let scale = 1.0 / sqrt(INDEX_HEAD_DIM as f32);
         for j in 0..visible {
-            let key = &pools[j * INDEX_HEAD_DIM..(j + 1) * INDEX_HEAD_DIM];
-            let mut sc = 0f32;
-            for h in 0..INDEX_N_HEADS {
-                let qh = &iq[h * INDEX_HEAD_DIM..(h + 1) * INDEX_HEAD_DIM];
-                let mut d = 0f32;
-                for c in 0..INDEX_HEAD_DIM {
-                    d += qh[c] * key[c];
-                }
-                let d = d * scale;
-                sc += iw[h] * if d > 0.0 { d } else { 0.0 };
-            }
-            pscore[j] = sc;
+            pidx[j] = j as u32;
         }
-        // the `keep` best pools by score, lower index first on a tie, in index order: a
-        // selection pass per winner (O(keep · visible), fine here), a taken pool marked −∞
-        let mut taken = 0;
-        let mut picks = [0usize; INDEX_TOPK / INDEX_KPOOL];
-        while taken < keep {
-            let mut best = usize::MAX;
-            for j in 0..visible {
-                if pscore[j] != f32::NEG_INFINITY && (best == usize::MAX || pscore[j] > pscore[best]) {
-                    best = j;
-                }
-            }
-            picks[taken] = best;
-            pscore[best] = f32::NEG_INFINITY;
-            taken += 1;
-        }
-        picks.sort_unstable();
-        for &j in &picks {
-            for p in j * INDEX_KPOOL..(j + 1) * INDEX_KPOOL {
+        // score descending, index ascending: a total order on finite scores
+        let by = |a: &u32, b: &u32| pscore[*b as usize].partial_cmp(&pscore[*a as usize]).unwrap_or(core::cmp::Ordering::Equal).then(a.cmp(b));
+        pidx[..visible].select_nth_unstable_by(KEEP - 1, by);
+        pidx[..KEEP].sort_unstable();
+        for &j in &pidx[..KEEP] {
+            for p in j as usize * INDEX_KPOOL..(j as usize + 1) * INDEX_KPOOL {
                 sel[n] = p;
                 n += 1;
             }
@@ -120,6 +137,14 @@ fn select(pos: usize, iq: &[f32], iw: &[f32], pools: &[f32], pscore: &mut [f32],
         n += 1;
     }
     n
+}
+/// `score_pools` over every complete pool when the query selects, then `pick`.
+#[inline(always)]
+fn select(pos: usize, iq: &[f32], iw: &[f32], pools: &[f32], pscore: &mut [f32], pidx: &mut [u32], sel: &mut [usize]) -> usize {
+    if selects(pos) {
+        score_pools(iq, iw, pools, 0, (pos + 1) / INDEX_KPOOL, pscore);
+    }
+    pick(pos, pscore, pidx, sel)
 }
 
 // The step is its parts, composed by the caller so a placement can take the
@@ -153,20 +178,28 @@ pub fn project(w: &weights::Mla, xn: &[f32], s: &mut Scratch, igate: &mut [f32],
 
 /// The cache row's normed latent and the indexer's key (LayerNorm, eps 1e-6) from the projections.
 #[inline(always)]
-pub fn finish_row(w: &weights::Mla, s: &Scratch, latent: &mut [f32], ikey: &mut [f32]) {
-    rmsnorm::<KV_LORA_RANK>(s.kva, &w.kv_a_ln, RMS_NORM_EPS, latent);
+pub fn finish_row(w: &weights::Mla, kva: &[f32], ik: &[f32], latent: &mut [f32], ikey: &mut [f32]) {
+    rmsnorm::<KV_LORA_RANK>(kva, &w.kv_a_ln, RMS_NORM_EPS, latent);
     let mut mean = 0f32;
-    for &v in s.ik.iter() {
+    for &v in ik.iter() {
         mean += v;
     }
     let mean = mean / INDEX_HEAD_DIM as f32;
     let mut var = 0f32;
-    for &v in s.ik.iter() {
+    for &v in ik.iter() {
         var += (v - mean) * (v - mean);
     }
     let rs = 1.0 / sqrt(var / INDEX_HEAD_DIM as f32 + 1e-6);
     for c in 0..INDEX_HEAD_DIM {
-        ikey[c] = (s.ik[c] - mean) * rs * w.ix_k_norm_w[c] + w.ix_k_norm_b[c];
+        ikey[c] = (ik[c] - mean) * rs * w.ix_k_norm_w[c] + w.ix_k_norm_b[c];
+    }
+}
+/// The pool position `pos` completes, if any, gains its key (`pool_key`).
+#[inline(always)]
+pub fn pool_done(w: &weights::Mla, cache: &[f32], pools: &mut [f32], pos: usize) {
+    if (pos + 1) % INDEX_KPOOL == 0 {
+        let j = (pos + 1) / INDEX_KPOOL - 1;
+        pool_key(w, cache, j, &mut pools[j * INDEX_HEAD_DIM..(j + 1) * INDEX_HEAD_DIM]);
     }
 }
 
@@ -174,16 +207,9 @@ pub fn finish_row(w: &weights::Mla, s: &Scratch, latent: &mut [f32], ikey: &mut 
 /// positions attended, ascending.
 #[inline(always)]
 pub fn select_at(l: usize, w: &weights::Mla, cache: &[f32], pools: &mut [f32], pos: usize, s: &mut Scratch, tr: &mut impl Trace) -> usize {
-    if (pos + 1) % INDEX_KPOOL == 0 {
-        let j = (pos + 1) / INDEX_KPOOL - 1;
-        let p = &mut pools[j * INDEX_HEAD_DIM..(j + 1) * INDEX_HEAD_DIM];
-        pool_key(w, cache, j, p);
-    }
-    let wscale = 1.0 / sqrt(INDEX_N_HEADS as f32);
-    for v in s.iw.iter_mut() {
-        *v *= wscale;
-    }
-    let n = select(pos, s.iq, s.iw, pools, s.pscore, s.sel);
+    pool_done(w, cache, pools, pos);
+    head_scale(s.iw);
+    let n = select(pos, s.iq, s.iw, pools, s.pscore, s.pidx, s.sel);
     tr.edge(l, "self_attn.indexer.count", &[n as f32]);
     n
 }

@@ -948,7 +948,15 @@ pub struct CpuModel<'p, R: Routed> {
     m_iq: Vec<f32>,
     m_iw: Vec<f32>,
     m_pscore: Vec<f32>,
+    m_pidx: Vec<u32>,
     m_sel: Vec<usize>,
+    // a step's MLA selection, a token a row: indexer queries, head weights, pool scores, the pick's scratch, the selections and their lengths
+    b_iq: Vec<f32>,
+    b_iw: Vec<f32>,
+    b_pscore: Vec<f32>,
+    b_pidx: Vec<u32>,
+    b_sel: Vec<usize>,
+    b_seln: Vec<usize>,
     m_heads: Vec<f32>,
     m_hs: Vec<f32>,
     f_gu: Vec<f32>,
@@ -1007,7 +1015,14 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             m_iq: vec![0.0; INDEX_N_HEADS * INDEX_HEAD_DIM],
             m_iw: vec![0.0; INDEX_N_HEADS],
             m_pscore: vec![0.0; max_ctx.div_ceil(INDEX_KPOOL) + 1],
+            m_pidx: vec![0; max_ctx.div_ceil(INDEX_KPOOL) + 1],
             m_sel: vec![0; DENSE_BELOW],
+            b_iq: vec![0.0; STEP * INDEX_N_HEADS * INDEX_HEAD_DIM],
+            b_iw: vec![0.0; STEP * INDEX_N_HEADS],
+            b_pscore: vec![0.0; STEP * max_ctx.div_ceil(INDEX_KPOOL)],
+            b_pidx: vec![0; STEP * max_ctx.div_ceil(INDEX_KPOOL)],
+            b_sel: vec![0; STEP * DENSE_BELOW],
+            b_seln: vec![0; STEP],
             m_heads: vec![0.0; MLA_HEADS * V_HEAD_DIM],
             m_hs: vec![0.0; MLA_HEADS * mla::HEAD_SCRATCH],
             f_gu: vec![0.0; 2 * INTERMEDIATE_SIZE],
@@ -1151,11 +1166,11 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     lap(&mut p.kda_cpu);
                 }
                 (Attn::Mla(a), LayerState::Mla { cache, pools }) => {
-                    let mut ms = mla::Scratch { qr: &mut s.m_qr, qa: &mut s.m_qa, q: &mut s.m_q, kva: &mut s.m_kva, ik: &mut s.m_ik, iq: &mut s.m_iq, iw: &mut s.m_iw, pscore: &mut s.m_pscore, sel: &mut s.m_sel, heads: &mut s.m_heads, hs: &mut s.m_hs };
+                    let mut ms = mla::Scratch { qr: &mut s.m_qr, qa: &mut s.m_qa, q: &mut s.m_q, kva: &mut s.m_kva, ik: &mut s.m_ik, iq: &mut s.m_iq, iw: &mut s.m_iw, pscore: &mut s.m_pscore, pidx: &mut s.m_pidx, sel: &mut s.m_sel, heads: &mut s.m_heads, hs: &mut s.m_hs };
                     {
                         let (latent, ikey, igate) = mla::row(cache, pos);
                         mla::project(a, &s.xn, &mut ms, igate, s.pool);
-                        mla::finish_row(a, &ms, latent, ikey);
+                        mla::finish_row(a, ms.kva, ms.ik, latent, ikey);
                     }
                     lap(&mut p.mla_proj);
                     let n = mla::select_at(l, a, cache, pools, pos, &mut ms, tr);
@@ -1269,18 +1284,47 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             }
             lap(&mut p.slot);
             if let (Attn::Mla(a), LayerState::Mla { cache, pools }) = (&lw.attn, &mut s.layers[l]) {
+                const IQ: usize = INDEX_N_HEADS * INDEX_HEAD_DIM;
+                let npools = s.max_ctx.div_ceil(INDEX_KPOOL);
+                // every token's projections off the card into its cache row, its indexer query and head
+                // weights kept; the pools completed along the way gain their keys
                 for i in 0..n {
-                    let mut ms = mla::Scratch { qr: &mut s.m_qr, qa: &mut s.m_qa, q: &mut s.m_q, kva: &mut s.m_kva, ik: &mut s.m_ik, iq: &mut s.m_iq, iw: &mut s.m_iw, pscore: &mut s.m_pscore, sel: &mut s.m_sel, heads: &mut s.m_heads, hs: &mut s.m_hs };
-                    {
-                        let (latent, ikey, igate) = mla::row(cache, pos + i);
-                        pl.mla_wait(l, i, ms.kva, ms.ik, igate, ms.iq, ms.iw);
-                        mla::finish_row(a, &ms, latent, ikey);
-                    }
-                    lap(&mut p.mla_proj);
-                    let sel_n = mla::select_at(l, a, cache, pools, pos + i, &mut ms, tr);
-                    lap(&mut p.mla_attn);
-                    pl.mla_attend(l, i, pos + i, &cache[(pos + i) * MLA_ROW..(pos + i) * MLA_ROW + KV_LORA_RANK], &ms.sel[..sel_n]);
-                    lap(&mut p.mla_out);
+                    let (latent, ikey, igate) = mla::row(cache, pos + i);
+                    let (iq, iw) = (&mut s.b_iq[i * IQ..(i + 1) * IQ], &mut s.b_iw[i * INDEX_N_HEADS..(i + 1) * INDEX_N_HEADS]);
+                    pl.mla_wait(l, i, &mut s.m_kva, &mut s.m_ik, igate, iq, iw);
+                    mla::finish_row(a, &s.m_kva, &s.m_ik, latent, ikey);
+                    mla::head_scale(iw);
+                    mla::pool_done(a, cache, pools, pos + i);
+                }
+                lap(&mut p.mla_proj);
+                // every token's selection: the pools scored in blocks over the thread pool (a token's pools
+                // are independent, as are the tokens'), then each token's picks — the one-token path had
+                // scored and picked on one thread, 150 ms a token at 17k positions (2026-10-17)
+                let blocks = ((pos + n) / INDEX_KPOOL).div_ceil(mla::SCORE_BLOCK);
+                {
+                    let (iq, iw, pools_r) = (&s.b_iq, &s.b_iw, &*pools);
+                    let ps_p = s.b_pscore.as_mut_ptr() as usize;
+                    s.pool.run(n * blocks, &move |it| {
+                        let (i, b) = (it / blocks, it % blocks);
+                        let (j0, visible) = (b * mla::SCORE_BLOCK, (pos + i + 1) / INDEX_KPOOL);
+                        if mla::selects(pos + i) && j0 < visible {
+                            let pscore = unsafe { std::slice::from_raw_parts_mut((ps_p as *mut f32).add(i * npools), npools) };
+                            mla::score_pools(&iq[i * IQ..(i + 1) * IQ], &iw[i * INDEX_N_HEADS..(i + 1) * INDEX_N_HEADS], pools_r, j0, (j0 + mla::SCORE_BLOCK).min(visible), pscore);
+                        }
+                    });
+                    let (pscore, pidx_p, sel_p, seln_p) = (&s.b_pscore, s.b_pidx.as_mut_ptr() as usize, s.b_sel.as_mut_ptr() as usize, s.b_seln.as_mut_ptr() as usize);
+                    s.pool.run(n, &move |i| unsafe {
+                        let pidx = std::slice::from_raw_parts_mut((pidx_p as *mut u32).add(i * npools), npools);
+                        let sel = std::slice::from_raw_parts_mut((sel_p as *mut usize).add(i * DENSE_BELOW), DENSE_BELOW);
+                        *(seln_p as *mut usize).add(i) = mla::pick(pos + i, &pscore[i * npools..(i + 1) * npools], pidx, sel);
+                    });
+                }
+                if n == 1 {
+                    tr.edge(l, "self_attn.indexer.count", &[s.b_seln[0] as f32]);
+                }
+                lap(&mut p.mla_attn);
+                for i in 0..n {
+                    pl.mla_attend(l, i, pos + i, &cache[(pos + i) * MLA_ROW..(pos + i) * MLA_ROW + KV_LORA_RANK], &s.b_sel[i * DENSE_BELOW..i * DENSE_BELOW + s.b_seln[i]]);
                 }
                 pl.mla_out(l, n);
                 lap(&mut p.mla_out);
