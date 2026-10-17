@@ -146,7 +146,6 @@ impl Glm {
     /// later than the others by more than the grain of an item — the placement trained on traffic.
     fn retrain(&mut self) {
         self.take_training();
-        self.train_seen = self.model.profile.tokens;
         let (items, ends, tokens) = self.train;
         if tokens < 32 || self.experts.nodes() < 2 {
             return;
@@ -220,6 +219,7 @@ impl Engine for Glm {
             println!("experts  : since start, a layer's 8 / 16 / 32 / 64 most-picked experts took {:.0} / {:.0} / {:.0} / {:.0} % of its picks", 100.0 * c[0], 100.0 * c[1], 100.0 * c[2], 100.0 * c[3]);
             self.take_training();
             self.model.profile = Default::default();
+            self.train_seen = 0;
         }
     }
     fn rows(&self, i: usize, out: &mut [f32]) {
