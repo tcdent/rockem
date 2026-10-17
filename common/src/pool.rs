@@ -82,6 +82,11 @@ pub trait Pool: Sync {
     fn last_ends(&self) -> f64 {
         0.0
     }
+    /// Since the last call, over the runs' posts: seconds sorting items into slots, draining the
+    /// previous job's workers, allocating the job and freeing the retired one.
+    fn post_stats(&self) -> (f64, f64, f64) {
+        (0.0, 0.0, 0.0)
+    }
 }
 
 pub struct Serial;

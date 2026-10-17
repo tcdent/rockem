@@ -55,6 +55,9 @@ pub struct Threads {
     overheads: std::sync::Mutex<(f64, f64, f64, usize)>,
     /// Since the last `overheads`: the sum over the placed runs of the last node's end (s).
     last_ends: std::sync::Mutex<f64>,
+    /// Since the last `post_stats`, over the runs' posts: seconds sorting the items into slots, draining
+    /// the previous job's workers, and allocating the job and freeing the retired one.
+    post_stats: std::sync::Mutex<(f64, f64, f64)>,
 }
 /// The grain of placement: a region's node is known per 2 MiB page.
 pub use crate::layout::PAGE;
@@ -235,7 +238,7 @@ impl Threads {
         }
         let node = node_of_core(cores[0]);
         let order = slot_order(node, ccd_of(cores[0]), &node_ccds);
-        Threads { shared, retired: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()), order, node_ccds, placed: std::sync::Mutex::new(Vec::new()), locality: std::sync::Mutex::new((0, 0)), prefetched: std::sync::Mutex::new((0, 0)), node, node_stats: std::sync::Mutex::new(([0; MAX_NODES], [0.0; MAX_NODES])), overheads: std::sync::Mutex::new((0.0, 0.0, 0.0, 0)), last_ends: std::sync::Mutex::new(0.0) }
+        Threads { shared, retired: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()), order, node_ccds, placed: std::sync::Mutex::new(Vec::new()), locality: std::sync::Mutex::new((0, 0)), prefetched: std::sync::Mutex::new((0, 0)), node, node_stats: std::sync::Mutex::new(([0; MAX_NODES], [0.0; MAX_NODES])), overheads: std::sync::Mutex::new((0.0, 0.0, 0.0, 0)), last_ends: std::sync::Mutex::new(0.0), post_stats: std::sync::Mutex::new((0.0, 0.0, 0.0)) }
     }
     /// Tell the pool where a region's memory lives: `nodes[p]` is the node of its `p`th `PAGE`.
     pub fn place(&self, base: usize, len: usize, nodes: Vec<u8>) {
@@ -288,6 +291,7 @@ impl Threads {
     /// The job slotted and published: the workers take it up; the job before it is stopped
     /// (a prefetch still running gives up its unclaimed items) and freed a generation late.
     fn post(&self, n: usize, at: Option<&(dyn Fn(usize) -> *const u8 + Sync)>, node: Option<&(dyn Fn(usize) -> usize + Sync)>, ccd: Option<&(dyn Fn(usize) -> usize + Sync)>, f: &(dyn Fn(usize) + Sync), owned: Option<Box<dyn Fn(usize) + Send + Sync>>) -> *mut Job {
+        let entered = std::time::Instant::now();
         let mut start = [0usize; SLOTS + 1];
         let mut order = vec![0u32; n];
         let mut item_slot = Vec::new();
@@ -324,6 +328,7 @@ impl Threads {
         }
         let sh = &*self.shared;
         sh.busy.store(true, Ordering::Relaxed);
+        let sorted = std::time::Instant::now();
         // the job before this one stops handing out items (it finished, or it was a prefetch), then no worker is inside it
         let current = sh.job.load(Ordering::Acquire);
         if !current.is_null() {
@@ -332,6 +337,7 @@ impl Threads {
         while sh.active.load(Ordering::Acquire) != 0 {
             std::hint::spin_loop();
         }
+        let drained = std::time::Instant::now();
         if !current.is_null() && unsafe { (*current)._owned.is_some() } {
             // a prefetch it overtook: what it managed
             *self.prefetched.lock().unwrap() = unsafe { ((*current).done.0.load(Ordering::Relaxed), (*current).n) };
@@ -344,6 +350,12 @@ impl Threads {
         let older = self.retired.swap(old, Ordering::AcqRel);
         if !older.is_null() {
             drop(unsafe { Box::from_raw(older) });
+        }
+        if !light {
+            let mut ps = self.post_stats.lock().unwrap();
+            ps.0 += (sorted - entered).as_secs_f64();
+            ps.1 += (drained - sorted).as_secs_f64();
+            ps.2 += drained.elapsed().as_secs_f64();
         }
         job
     }
@@ -391,6 +403,9 @@ impl Pool for Threads {
     }
     fn last_ends(&self) -> f64 {
         std::mem::replace(&mut *self.last_ends.lock().unwrap(), 0.0)
+    }
+    fn post_stats(&self) -> (f64, f64, f64) {
+        std::mem::replace(&mut *self.post_stats.lock().unwrap(), (0.0, 0.0, 0.0))
     }
     fn prefetched(&self) -> (usize, usize) {
         *self.prefetched.lock().unwrap()
@@ -726,6 +741,10 @@ pub struct Profile {
     pub runs: usize,
     /// The sum over the runs of the last node's end: what the phase waits for.
     pub run_last: f64,
+    /// The posts' parts: sorting into slots, draining the previous job, allocating and freeing.
+    pub post_sort: f64,
+    pub post_drain: f64,
+    pub post_free: f64,
 }
 impl Profile {
     /// The expert runs by node: each node's share of the items, when its last item finished (ms a
@@ -741,7 +760,7 @@ impl Profile {
         let share: Vec<String> = used.iter().map(|&d| format!("{:.1}", 100.0 * self.node_items[d] as f64 / total as f64)).collect();
         let end: Vec<String> = used.iter().map(|&d| format!("{:.2}", 1e3 * self.node_end[d] / n)).collect();
         let rate: Vec<String> = used.iter().map(|&d| format!("{:.1}", self.node_items[d] as f64 / (1e3 * self.node_end[d]).max(1e-9))).collect();
-        format!("\nprofile  : nodes — items {} %, run ends {} ms a token, {} items/ms; a token's {} runs end at {:.2} ms (the last node each run) and spend {:.2} ms slotting, {:.2} waking, {:.2} in the tail", share.join(" / "), end.join(" / "), rate.join(" / "), self.runs / self.tokens.max(1), 1e3 * self.run_last / n, 1e3 * self.run_slot / n, 1e3 * self.run_wake / n, 1e3 * self.run_tail / n)
+        format!("\nprofile  : nodes — items {} %, run ends {} ms a token, {} items/ms; a token's {} runs end at {:.2} ms (the last node each run) and spend {:.2} ms slotting (sort {:.2}, drain {:.2}, alloc+free {:.2}), {:.2} waking, {:.2} in the tail", share.join(" / "), end.join(" / "), rate.join(" / "), self.runs / self.tokens.max(1), 1e3 * self.run_last / n, 1e3 * self.run_slot / n, 1e3 * self.post_sort / n, 1e3 * self.post_drain / n, 1e3 * self.post_free / n, 1e3 * self.run_wake / n, 1e3 * self.run_tail / n)
     }
     /// One line of milliseconds a token, the phases in order and their sum.
     pub fn line(&self) -> String {
@@ -1155,4 +1174,8 @@ fn account(p: &mut Profile, last_picks: &mut [[usize; TOP_K]], freq: &mut [u32],
     p.run_tail += tail;
     p.runs += runs;
     p.run_last += pool.last_ends();
+    let (sort, drain, free) = pool.post_stats();
+    p.post_sort += sort;
+    p.post_drain += drain;
+    p.post_free += free;
 }
