@@ -351,6 +351,10 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
         let mut q_cpu = vec![0f32; VOCAB_SIZE];
         let mut have_q = false;
         let (mut agree, mut hit, mut n_acc, mut sum_acc, mut sum_acc_greedy_hit) = (0usize, 0usize, 0usize, 0f64, 0usize);
+        // depth 2: the draft at t+1 from the draft's own hidden state at t and the text's token there (an
+        // accepted first draft), its guess of ids[t+3] against the main model's logits at t+2
+        let mut q2: std::collections::HashMap<usize, Vec<f32>> = std::collections::HashMap::new();
+        let (mut agree2, mut n_acc2, mut sum_acc2) = (0usize, 0usize, 0f64);
         let (mut n_draft, mut card_agree, mut card_dmax) = (0usize, 0usize, 0f32);
         let s = &glm_5_3_flash::SAMPLING;
         let t0 = std::time::Instant::now();
@@ -393,6 +397,13 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
             } else {
                 h.copy_from_slice(&h1);
             }
+            if let Some(q) = q2.remove(&t) {
+                // the depth-2 draft made at t-1 (from the draft at t-2) and the main model's logits at t both predict ids[t+1]
+                let p = &model.logits[..VOCAB_SIZE];
+                agree2 += (argmax(p) == argmax(&q)) as usize;
+                sum_acc2 += overlap(p, &q, s);
+                n_acc2 += 1;
+            }
             if have_q {
                 // q_prev (drafted at t-1) and the main model's logits at t both predict ids[t+1]
                 let p = &model.logits[..VOCAB_SIZE];
@@ -409,11 +420,18 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
             }
             draft_both(&mut model, &h, ids[t + 1] as u32, t, &mut q_prev, &mut q_cpu, &mut h_out);
             have_q = t >= FIRST_POS;
+            if t >= FIRST_POS && t + 2 < n {
+                // the served path: the cards' draft at t+1 from the cards' draft output at t
+                let mut q = vec![0f32; VOCAB_SIZE];
+                model.draft_next(&w, ids[t + 2] as u32, t + 1, &mut q, &mut common::trace::NoTrace);
+                q2.insert(t + 2, q);
+            }
             if t % 100 == 0 {
                 println!("  mtp: {t} positions, {:.1} s", t0.elapsed().as_secs_f32());
             }
         }
         println!("mtp draft: cards vs host over {n_draft} positions — top-1 agree {:.3}, max |Δ logit| {card_dmax:.3e}", card_agree as f64 / n_draft as f64);
+        println!("mtp accept, depth 2: {n_acc2} positions — draft top-1 = main top-1 {:.3}; expected acceptance under the sampler {:.3}", agree2 as f64 / n_acc2.max(1) as f64, sum_acc2 / n_acc2.max(1) as f64);
         println!("mtp accept: {n_acc} positions — draft top-1 = main top-1 {:.3}; draft top-1 = text {:.3} (main top-1 = text {:.3}); expected acceptance under the sampler (T {} top-k {} top-p {}) {:.3}; {:.1} s", agree as f64 / n_acc as f64, hit as f64 / n_acc as f64, sum_acc_greedy_hit as f64 / n_acc as f64, s.temperature, s.top_k, s.top_p, sum_acc / n_acc as f64, t0.elapsed().as_secs_f32());
     }
     // --routing-trace: the --step-ids text a token at a time; every MoE layer's picks a position to the

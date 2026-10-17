@@ -955,6 +955,8 @@ pub struct CpuModel<'p, R: Routed> {
     prefix_hidden: Vec<f32>,
     d_cat: Vec<f32>,
     d_cats: Vec<f32>,
+    /// The draft layer's output at the last position it drafted, `[H]`: the next depth's hidden input.
+    d_hid: Vec<f32>,
     d_x: Vec<f32>,
     d_xn: Vec<f32>,
     d_y: Vec<f32>,
@@ -1025,6 +1027,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             prefix_hidden: vec![0.0; FIRST_POS * H],
             d_cat: vec![0.0; 2 * H],
             d_cats: vec![0.0; STEP * 2 * H],
+            d_hid: vec![0.0; H],
             d_x: vec![0.0; H],
             d_xn: vec![0.0; H],
             d_y: vec![0.0; H],
@@ -1279,10 +1282,18 @@ impl<'p, R: Routed> CpuModel<'p, R> {
         tr.edge(l, "routed", &s.b_y[(n - 1) * H..n * H]);
         pl.mtp_ffn(&s.b_y[..n * H], &mut s.b_x[..n * H], n);
         tr.edge(l, "mtp.ffn", &s.b_x[(n - 1) * H..n * H]);
+        s.d_hid.copy_from_slice(&s.b_x[(n - 1) * H..n * H]);
         pl.mtp_head(n - 1, logits);
         // the draft's expert time is the draft's (the step's `experts` lap takes what `elapsed` holds)
         s.routed.elapsed();
         s.profile.draft += t0.elapsed().as_secs_f64();
+    }
+    /// The next depth of drafting: the draft layer at `pos` (the position after the last drafted) from its
+    /// own output there and `next` (the token the last draft proposed, standing for an accepted draft);
+    /// `logits` is the draft of the token after `next`.
+    pub fn draft_next(&mut self, w: &Weights, next: u32, pos: usize, logits: &mut [f32], tr: &mut impl Trace) {
+        let hid = self.d_hid.clone(); // `draft_batch` writes `d_hid` for the depth after this one
+        self.draft_batch(w, &hid, &[next], pos, 1, logits, tr);
     }
     /// The KDA layers' state now, `[SNAPSHOT]`.
     pub fn snapshot(&self, out: &mut [f32]) {

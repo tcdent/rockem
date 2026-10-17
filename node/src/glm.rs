@@ -252,6 +252,12 @@ impl Engine for Glm {
         self.model.draft_batch(&self.w, &hiddens[..n * H], &nexts, pos, n, logits, &mut common::trace::NoTrace);
         self.hiddens = hiddens;
     }
+    fn draft_depth(&self) -> usize {
+        if self.drafts() { glm_5_3_flash::DRAFT_DEPTH } else { 0 }
+    }
+    fn draft_next(&mut self, next: u32, pos: usize, logits: &mut [f32]) {
+        self.model.draft_next(&self.w, next, pos, logits, &mut common::trace::NoTrace);
+    }
     fn rewind(&mut self, slot: usize) {
         self.model.rewind(slot)
     }

@@ -71,6 +71,15 @@ pub const STEP: usize = 512;
 /// KDA layers keep a state a token of such a step (`kda_step`'s ring) so the state after the
 /// last accepted token is a copy away.
 pub const SPEC_TOKENS: usize = 4;
+/// Drafts a verify step carries: the first from the main model's hidden state, each further one
+/// from the draft layer's own output at the position before (the checkpoint's single draft
+/// layer applied again). Measured on the 654-token gate text (2026-10-17): the first draft's
+/// top-1 is the main model's at 0.86 of positions, the second's at 0.50. Served at depth 2 the
+/// step of three tokens cost 75–78 ms for ~2.45 tokens (the union of three tokens' experts, the
+/// three-token pass, the second draft) against 58 ms for 1.92 at depth 1: no gain at 0.92
+/// acceptance, a loss at 0.84, so one draft.
+pub const DRAFT_DEPTH: usize = 1;
+const _: () = assert!(DRAFT_DEPTH + 1 <= SPEC_TOKENS, "a verify step holds the token and its drafts");
 
 pub mod expert;
 pub mod ffn;

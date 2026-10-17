@@ -64,6 +64,15 @@ pub trait Engine {
     fn draft(&mut self, _toks: &[u32], _next: u32, _pos: usize, _logits: &mut [f32]) {
         unreachable!("no draft layer")
     }
+    /// Drafts a verify step carries (0 without a draft layer); `draft` makes the first, `draft_next` each further one.
+    fn draft_depth(&self) -> usize {
+        0
+    }
+    /// The next depth: the draft layer at `pos` from its own last output and `next`, the token the last
+    /// draft proposed; `logits` receives the draft of the token after it.
+    fn draft_next(&mut self, _next: u32, _pos: usize, _logits: &mut [f32]) {
+        unreachable!("no draft layer")
+    }
     /// The sequence state back to after token `slot` of the last verify-sized step (its later tokens rejected).
     fn rewind(&mut self, _slot: usize) {
         unreachable!("no verify")

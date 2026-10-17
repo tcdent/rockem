@@ -232,8 +232,8 @@ struct Session {
     hits: usize,
     /// Speculative decoding: the model carries a draft layer (the cards run it after every step).
     spec: bool,
-    /// The draft of the token after `next`, `[vocab]`, from the last step.
-    draft: Vec<f32>,
+    /// The drafts made after the last step, `[vocab]` each: the token after `next`, then the token after that one.
+    drafts: Vec<Vec<f32>>,
     /// Verify steps run and drafts accepted, over the connection.
     verified: usize,
     accepted: usize,
@@ -445,7 +445,7 @@ impl Session {
         s.last_row = n - 1;
         s.commit(toks, 0, pos);
         if s.spec {
-            s.e.draft(toks, s.next, pos, &mut s.draft);
+            s.redraft(toks, pos);
         }
         if s.debug.is_some() {
             for i in 0..n {
@@ -460,6 +460,20 @@ impl Session {
                 eprintln!("  pos {p}: argmax {} margin {:.4e} (top2 {})", ix[0], lg[ix[0]] - lg[ix[1]], ix[1]);
                 std::fs::write(d.join(format!("pos{p}.f32")), raw(lg)).unwrap();
             }
+        }
+    }
+    /// After a step of `toks` at `pos..`: the drafts for the next step — the first over the step's positions
+    /// from the main model's hidden states, each further one from the draft layer's own output and the
+    /// token the draft before it proposed (sampled with the same uniform the verify will draw).
+    fn redraft(&mut self, toks: &[u32], pos: usize) {
+        let s = self;
+        let seed = s.e.seed_value();
+        let sam = s.e.sampling();
+        s.e.draft(toks, s.next, pos, &mut s.drafts[0]);
+        let end = pos + toks.len(); // the position of `next`
+        for d in 1..s.drafts.len() {
+            let x = common::sample::draw(&s.drafts[d - 1], sam, common::sample::uniform_at(seed ^ DRAFT_SALT, (end + d) as u64)) as u32;
+            s.e.draft_next(x, end + d - 1, &mut s.drafts[d]);
         }
     }
     /// Tokens `toks` computed at `pos..` (their rows at `row0..` of the last step) into the active
@@ -517,23 +531,44 @@ impl Session {
                 }
                 continue;
             }
-            // speculative: the draft of the token after `id` (made after the last step) is verified in
-            // one step with `id`: the model's own distribution at that position decides it, and the
-            // token after both comes from the same step when the draft holds
+            // speculative: the drafts made after the last step — the token after `id`, then the one after
+            // that — are verified in one step with `id`: the model's own distribution at each position
+            // decides, in order, and the draw after the accepted ones comes from the same step
             let s = self.e.sampling();
             let seed = self.e.seed_value();
             let pos = self.pos;
-            let x = common::sample::draw(&self.draft, s, common::sample::uniform_at(seed ^ DRAFT_SALT, (pos + 1) as u64)) as u32;
-            self.e.run(&[id, x], pos, false, true);
-            let (accepted, tok) = common::sample::verify(self.e.logits_row(0), &self.draft, s, x, common::sample::uniform_at(seed, (pos + 1) as u64), common::sample::uniform_at(seed ^ RESIDUAL_SALT, (pos + 1) as u64));
+            let k = self.drafts.len().min(limit - emitted).min(self.max_ctx - self.pos - 1);
+            let mut toks = vec![id];
+            for d in 0..k {
+                toks.push(common::sample::draw(&self.drafts[d], s, common::sample::uniform_at(seed ^ DRAFT_SALT, (pos + 1 + d) as u64)) as u32);
+            }
+            self.e.run(&toks, pos, false, true);
             self.verified += 1;
-            self.accepted += accepted as usize;
-            if accepted {
-                // both computed tokens stand; the draw after them is the step's second row's
-                self.next = self.e.draw(1, common::sample::uniform_at(seed, (pos + 2) as u64));
-                self.last_row = 1;
-                self.commit(&[id, x], 0, pos);
-                self.e.draft(&[id, x], self.next, pos, &mut self.draft);
+            // `kept`: the computed tokens that stand (`id` and the accepted drafts); `tok`: the token after them
+            let mut kept = 1;
+            let mut tok = None;
+            for d in 0..k {
+                let p = pos + 1 + d;
+                let (accepted, t) = common::sample::verify(self.e.logits_row(d), &self.drafts[d], s, toks[d + 1], common::sample::uniform_at(seed, p as u64), common::sample::uniform_at(seed ^ RESIDUAL_SALT, p as u64));
+                if !accepted {
+                    tok = Some(t);
+                    break;
+                }
+                self.accepted += 1;
+                kept += 1;
+            }
+            self.next = match tok {
+                Some(t) => t,
+                None => self.e.draw(k, common::sample::uniform_at(seed, (pos + 1 + k) as u64)),
+            };
+            if kept < toks.len() {
+                // the state after the last kept token is restored; the rejected tokens' rows are overwritten later
+                self.e.rewind(kept - 1);
+            }
+            self.last_row = kept - 1;
+            self.commit(&toks[..kept], 0, pos);
+            self.redraft(&toks[..kept], pos);
+            for &x in &toks[1..kept] {
                 let eos = self.e.is_eos(x);
                 if eos {
                     self.mark();
@@ -545,13 +580,6 @@ impl Session {
                 if eos {
                     return true;
                 }
-            } else {
-                // the first token stands with the residual draw after it; the state after the second is dropped
-                self.e.rewind(0);
-                self.next = tok;
-                self.last_row = 0;
-                self.commit(&[id], 0, pos);
-                self.e.draft(&[id], self.next, pos, &mut self.draft);
             }
         }
         self.mark();
@@ -622,7 +650,7 @@ fn serve(listen: &str, session: &mut Session, identity: u64) {
                     };
                     let ok = flush(session, &mut ids, &mut s) && session.started && session.generate(limit, |id| s.write_all(&id.to_le_bytes()).is_ok());
                     if session.verified > 0 {
-                        println!("spec     : {} verify steps, {} drafts accepted ({:.2})", session.verified, session.accepted, session.accepted as f32 / session.verified as f32);
+                        println!("spec     : {} verify steps, {} drafts accepted ({:.2} a step)", session.verified, session.accepted, session.accepted as f32 / session.verified as f32);
                         session.verified = 0;
                         session.accepted = 0;
                     }
@@ -723,10 +751,11 @@ fn main() {
     println!("cache    : {} cached positions ({:.1} GB of host memory), {} KB each{}, for {}", store.budget, budget_bytes as f64 / 1e9, position * 4 / 1024, if e.snapshot_len() > 0 { format!(", {} MB of state a transcript", e.snapshot_len() * 4 >> 20) } else { String::new() }, e.name());
     let (bos, first) = (e.bos(), e.first_pos());
     let spec = e.drafts() && debug.is_none();
+    let e_depth = if spec { e.draft_depth() } else { 0 };
     let vocab_n = e.vocab_size();
-    let mut session = Session { e, scoring: false, last_row: 0, next: 0, pos: first, max_ctx, started: false, prefix_left: 0, debug, store, active: 0, pending: None, hits: 0, spec, draft: vec![0.0; vocab_n], verified: 0, accepted: 0 };
+    let mut session = Session { e, scoring: false, last_row: 0, next: 0, pos: first, max_ctx, started: false, prefix_left: 0, debug, store, active: 0, pending: None, hits: 0, spec, drafts: vec![vec![0.0; vocab_n]; e_depth], verified: 0, accepted: 0 };
     if spec {
-        println!("spec     : the draft layer drafts a token after every step; verified in the next");
+        println!("spec     : the draft layer drafts {e_depth} tokens after every step; verified in the next");
     }
 
     // --- execution ---
