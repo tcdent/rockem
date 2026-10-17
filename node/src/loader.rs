@@ -69,7 +69,7 @@ pub fn placement(buf: &[u8]) -> Vec<u8> {
 pub fn load_placed(path: &std::path::Path, mem: Mem, node_of_item: &[u8]) -> glm_5_3_flash::expert::Stream<'static> {
     use glm_5_3_flash::expert::{item_index, ITEMS};
     use glm_5_3_flash::layout::{self, PAGE};
-    use glm_5_3_flash::{E, FIRST_K_DENSE_REPLACE, NUM_HIDDEN_LAYERS};
+    use glm_5_3_flash::{E, FIRST_K_DENSE_REPLACE};
     let src = fs::File::open(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let len = src.metadata().unwrap().len() as usize;
     assert_eq!(len, layout::STREAM, "{}: not the expert stream", path.display());
@@ -78,7 +78,7 @@ pub fn load_placed(path: &std::path::Path, mem: Mem, node_of_item: &[u8]) -> glm
     // each node's region: its items' bytes, the region starting on a page of its own
     let mut bytes = vec![0usize; nodes];
     let mut addr = vec![0u64; node_of_item.len()];
-    for l in FIRST_K_DENSE_REPLACE..NUM_HIDDEN_LAYERS {
+    for l in FIRST_K_DENSE_REPLACE..layout::LAYERS_IN_FILE {
         for e in 0..E {
             for (j, r) in layout::file_items(l, e) {
                 let n = node_of_item[item_index(l, e, j)] as usize;
@@ -97,7 +97,7 @@ pub fn load_placed(path: &std::path::Path, mem: Mem, node_of_item: &[u8]) -> glm
         cap[n] = (bytes[n] + bytes[n] / SLACK).div_ceil(PAGE) * PAGE;
         total += cap[n];
     }
-    for l in FIRST_K_DENSE_REPLACE..NUM_HIDDEN_LAYERS {
+    for l in FIRST_K_DENSE_REPLACE..layout::LAYERS_IN_FILE {
         for e in 0..E {
             for j in 0..ITEMS {
                 addr[item_index(l, e, j)] += base[node_of_item[item_index(l, e, j)] as usize] as u64;

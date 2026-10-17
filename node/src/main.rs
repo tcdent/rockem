@@ -234,6 +234,9 @@ struct Session {
     spec: bool,
     /// The draft of the token after `next`, `[vocab]`, from the last step.
     draft: Vec<f32>,
+    /// Verify steps run and drafts accepted, over the connection.
+    verified: usize,
+    accepted: usize,
 }
 /// The uniforms the speculative path draws with, apart from the positions' own.
 const DRAFT_SALT: u64 = 0x5eed_d4af_7000_0001;
@@ -523,6 +526,8 @@ impl Session {
             let x = common::sample::draw(&self.draft, s, common::sample::uniform_at(seed ^ DRAFT_SALT, (pos + 1) as u64)) as u32;
             self.e.run(&[id, x], pos, false, true);
             let (accepted, tok) = common::sample::verify(self.e.logits_row(0), &self.draft, s, x, common::sample::uniform_at(seed, (pos + 1) as u64), common::sample::uniform_at(seed ^ RESIDUAL_SALT, (pos + 1) as u64));
+            self.verified += 1;
+            self.accepted += accepted as usize;
             if accepted {
                 // both computed tokens stand; the draw after them is the step's second row's
                 self.next = self.e.draw(1, common::sample::uniform_at(seed, (pos + 2) as u64));
@@ -615,7 +620,13 @@ fn serve(listen: &str, session: &mut Session, identity: u64) {
                         0 => session.max_ctx,
                         n => n,
                     };
-                    flush(session, &mut ids, &mut s) && session.started && session.generate(limit, |id| s.write_all(&id.to_le_bytes()).is_ok())
+                    let ok = flush(session, &mut ids, &mut s) && session.started && session.generate(limit, |id| s.write_all(&id.to_le_bytes()).is_ok());
+                    if session.verified > 0 {
+                        println!("spec     : {} verify steps, {} drafts accepted ({:.2})", session.verified, session.accepted, session.accepted as f32 / session.verified as f32);
+                        session.verified = 0;
+                        session.accepted = 0;
+                    }
+                    ok
                 }
                 wire::SCORE => {
                     let ok = flush(session, &mut ids, &mut s);
@@ -713,7 +724,7 @@ fn main() {
     let (bos, first) = (e.bos(), e.first_pos());
     let spec = e.drafts() && debug.is_none();
     let vocab_n = e.vocab_size();
-    let mut session = Session { e, scoring: false, last_row: 0, next: 0, pos: first, max_ctx, started: false, prefix_left: 0, debug, store, active: 0, pending: None, hits: 0, spec, draft: vec![0.0; vocab_n] };
+    let mut session = Session { e, scoring: false, last_row: 0, next: 0, pos: first, max_ctx, started: false, prefix_left: 0, debug, store, active: 0, pending: None, hits: 0, spec, draft: vec![0.0; vocab_n], verified: 0, accepted: 0 };
     if spec {
         println!("spec     : the draft layer drafts a token after every step; verified in the next");
     }

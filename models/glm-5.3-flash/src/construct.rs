@@ -551,7 +551,7 @@ impl<'a> CpuExperts<'a> {
         let (stream, pool) = (self.stream, self.pool);
         let mut slice_node = Vec::with_capacity(layout::MOE_LAYERS * E * (GU_ITEMS + DOWN_ITEMS));
         let mut slice_slot = Vec::with_capacity(layout::MOE_LAYERS * E * (GU_ITEMS + DOWN_ITEMS));
-        for l in FIRST_K_DENSE_REPLACE..NUM_HIDDEN_LAYERS {
+        for l in FIRST_K_DENSE_REPLACE..layout::LAYERS_IN_FILE {
             for e in 0..E {
                 let w = expert::Weights::at(stream, l, e);
                 // a slice's core complex within its node: a function of the expert and the slice, never of the
@@ -614,7 +614,7 @@ impl Routed for CpuExperts<'_> {
     fn elapsed(&mut self) -> f64 {
         std::mem::take(&mut self.elapsed)
     }
-    fn prefetch(&self, l: usize, idx: [usize; TOP_K]) {
+    fn prefetch(&self, l: usize, idx: &[usize]) {
         // the stream lives as long as the process (the node leaks it; the gate's outlives every token):
         // the job that owns these closures is gone within the token
         let stream: &'static expert::Stream<'static> = unsafe { std::mem::transmute::<&expert::Stream, &'static expert::Stream<'static>>(self.stream) };
@@ -622,11 +622,12 @@ impl Routed for CpuExperts<'_> {
         // an item an (expert, node, CCD): the slices of that expert the compute will slot there, in the
         // compute's order — a slice's node from its rows' page, its CCD from the expert's id and the slice
         let (n_gu, n_down) = (GU_ITEMS, DOWN_ITEMS);
+        let idx: Vec<usize> = idx.to_vec();
         let mut items: Vec<(usize, usize, Vec<u32>)> = Vec::new(); // expert position, the pool's queue, slice ids (gate/up first, then down + n_gu)
-        let mut group = [usize::MAX; TOP_K * SLOTS]; // (k, queue) → its item
-        for k in 0..TOP_K {
+        let mut group = vec![usize::MAX; idx.len() * SLOTS]; // (k, queue) → its item
+        for (k, &e) in idx.iter().enumerate() {
             for j in 0..n_gu + n_down {
-                let q = self.slice_slot[((l - FIRST_K_DENSE_REPLACE) * E + idx[k]) * (n_gu + n_down) + j] as usize;
+                let q = self.slice_slot[((l - FIRST_K_DENSE_REPLACE) * E + e) * (n_gu + n_down) + j] as usize;
                 let g = &mut group[k * SLOTS + q];
                 if *g == usize::MAX {
                     *g = items.len();
@@ -880,6 +881,8 @@ pub struct Profile {
     pub dense_ffn: f64,
     pub experts: f64,
     pub head: f64,
+    /// The draft layer after a step (`draft_batch`), cards and host.
+    pub draft: f64,
     /// Over the MoE layers: how many of a layer's eight experts were also the previous token's at that layer
     /// (the ceiling of a same-layer prefetch), and the layers counted.
     pub reuse: usize,
@@ -928,8 +931,8 @@ impl Profile {
         let n = self.tokens.max(1) as f64 / 1e3;
         let mla = self.mla_proj + self.mla_attn + self.mla_out;
         let rs = self.route + self.shared;
-        let sum = self.hc + self.early + self.slot + self.kda_card + self.kda_cpu + mla + self.dense_ffn + rs + self.experts + self.head;
-        format!("{} tokens: hc {:.1}  early {:.1}  slot {:.1}  kda card {:.1}  kda cpu {:.1}  mla {:.1} (proj {:.1} attn {:.1} out {:.1})  dense ffn {:.1}  router+shared {:.1} (route {:.1} shared {:.1})  experts {:.1} (reused {:.2} of {} from the previous token, {:.2} named on the attention input; {:.0}% of the predicted slices pulled; {:.0}% of items on their CCD)  head {:.1}  = {:.1} ms a token{}", self.tokens, self.hc / n, self.early / n, self.slot / n, self.kda_card / n, self.kda_cpu / n, mla / n, self.mla_proj / n, self.mla_attn / n, self.mla_out / n, self.dense_ffn / n, rs / n, self.route / n, self.shared / n, self.experts / n, self.reuse as f64 / self.moe_layers.max(1) as f64, TOP_K, self.pre_agree as f64 / self.moe_layers.max(1) as f64, 100.0 * self.prefetched as f64 / self.prefetch_items.max(1) as f64, 100.0 * self.local_items as f64 / self.items.max(1) as f64, self.head / n, sum / n, self.nodes())
+        let sum = self.hc + self.early + self.slot + self.kda_card + self.kda_cpu + mla + self.dense_ffn + rs + self.experts + self.head + self.draft;
+        format!("{} tokens: hc {:.1}  early {:.1}  slot {:.1}  kda card {:.1}  kda cpu {:.1}  mla {:.1} (proj {:.1} attn {:.1} out {:.1})  dense ffn {:.1}  router+shared {:.1} (route {:.1} shared {:.1})  experts {:.1} (reused {:.2} of {} from the previous token, {:.2} named on the attention input; {:.0}% of the predicted slices pulled; {:.0}% of items on their CCD)  head {:.1}  draft {:.1}  = {:.1} ms a token{}", self.tokens, self.hc / n, self.early / n, self.slot / n, self.kda_card / n, self.kda_cpu / n, mla / n, self.mla_proj / n, self.mla_attn / n, self.mla_out / n, self.dense_ffn / n, rs / n, self.route / n, self.shared / n, self.experts / n, self.reuse as f64 / self.moe_layers.max(1) as f64, TOP_K, self.pre_agree as f64 / self.moe_layers.max(1) as f64, 100.0 * self.prefetched as f64 / self.prefetch_items.max(1) as f64, 100.0 * self.local_items as f64 / self.items.max(1) as f64, self.head / n, self.draft / n, sum / n, self.nodes())
     }
 }
 
@@ -1176,8 +1179,8 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             rmsnorm::<H>(&s.d_y, m.enorm, RMS_NORM_EPS, e);
             rmsnorm::<H>(hidden, m.hnorm, RMS_NORM_EPS, h);
         }
-        assert!(s.placed.is_none(), "draft: with cards use draft_batch");
         gemv::bf16_par::<H, { 2 * H }>(m.eh_proj, &s.d_cat, &mut s.d_x, s.pool);
+        tr.edge(l, "mtp.eh", &s.d_x);
         // the attention block
         rmsnorm::<H>(&s.d_x, m.input_ln, RMS_NORM_EPS, &mut s.d_xn);
         {
@@ -1194,16 +1197,19 @@ impl<'p, R: Routed> CpuModel<'p, R> {
         for d in 0..H {
             s.d_x[d] += s.d_y[d];
         }
+        tr.edge(l, "mtp.attn", &s.d_x);
         // the MoE block
         rmsnorm::<H>(&s.d_x, m.post_ln, RMS_NORM_EPS, &mut s.d_xn);
         {
             let mut fs = ffn::Scratch { gu: &mut s.f_gu, h: &mut s.f_h, expert_out: &mut s.f_expert_out, shared: &mut s.f_shared, score: &mut s.f_score };
             ffn::moe_routed(l, &m.ffn, &s.d_xn, &mut fs, s.pool, &mut s.routed, None, tr, &mut s.d_y);
             ffn::moe_shared(&m.ffn, &s.d_xn, &mut fs, s.pool);
+            tr.edge(l, "mtp.shared", fs.shared);
             for d in 0..H {
                 s.d_x[d] += s.d_y[d] + fs.shared[d];
             }
         }
+        tr.edge(l, "mtp.ffn", &s.d_x);
         hidden_out.copy_from_slice(&s.d_x);
         // the shared head
         rmsnorm::<H>(&s.d_x, m.head_norm, RMS_NORM_EPS, &mut s.d_xn);
@@ -1216,8 +1222,9 @@ impl<'p, R: Routed> CpuModel<'p, R> {
     /// layer `MTP_LAYER`, the shared expert there), and for the last position the shared head:
     /// `logits` is the draft of the token after `nexts[n - 1]`. Run after every step so the draft's
     /// cache has every position.
-    pub fn draft_batch(&mut self, w: &Weights, hiddens: &[f32], nexts: &[u32], pos: usize, n: usize, logits: &mut [f32]) {
+    pub fn draft_batch(&mut self, w: &Weights, hiddens: &[f32], nexts: &[u32], pos: usize, n: usize, logits: &mut [f32], tr: &mut impl Trace) {
         let s = self;
+        let t0 = std::time::Instant::now();
         let m = w.mtp.as_ref().expect("the weights carry no draft layer");
         let LayerState::Mla { cache, pools } = s.mtp.as_mut().expect("no draft state") else { unreachable!() };
         let pl = s.placed.as_mut().expect("draft_batch: the cards'");
@@ -1247,6 +1254,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
         }
         pl.mla_attend(l, n, pos, &s.b_lat[..n * KV_LORA_RANK]);
         pl.mtp_attn_out(&mut s.b_x[..n * H], n);
+        tr.edge(l, "mtp.attn", &s.b_x[(n - 1) * H..n * H]);
         // the routing and the routed experts here, every token's
         let mut picks = [[0usize; TOP_K]; STEP];
         let mut wts = [[0f32; TOP_K]; STEP];
@@ -1268,8 +1276,11 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 }
             }
         }
+        tr.edge(l, "routed", &s.b_y[(n - 1) * H..n * H]);
         pl.mtp_ffn(&s.b_y[..n * H], &mut s.b_x[..n * H], n);
+        tr.edge(l, "mtp.ffn", &s.b_x[(n - 1) * H..n * H]);
         pl.mtp_head(n - 1, logits);
+        s.profile.draft += t0.elapsed().as_secs_f64();
     }
     /// The KDA layers' state now, `[SNAPSHOT]`.
     pub fn snapshot(&self, out: &mut [f32]) {
@@ -1447,13 +1458,24 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             }
             lap(&mut p.hc);
             // the prefetch's predictor: the FFN router over the attention block's input, read as soon as it
-            // is there; a step of many tokens names most experts and runs none
-            let mut pre_picks = [E; TOP_K];
-            if let (Some(m), 1) = (moe, n) {
-                pl.early_logits(l, &mut s.f_score);
+            // is there, for a step of a few tokens (a token's, or a verify step's: the union of their picks);
+            // a step of many tokens names most experts and runs none
+            let mut pre_picks = [[E; TOP_K]; SPEC_TOKENS];
+            if let (Some(m), true) = (moe, n <= SPEC_TOKENS) {
+                pl.early_logits(l, &mut s.b_score[..n * E]);
                 lap(&mut p.early);
-                pre_picks = ffn::picks(m, &mut s.f_score);
-                s.routed.prefetch(l, pre_picks);
+                let mut union = [E; SPEC_TOKENS * TOP_K];
+                let mut nu = 0;
+                for i in 0..n {
+                    pre_picks[i] = ffn::picks(m, &mut s.b_score[i * E..(i + 1) * E]);
+                    for &e in &pre_picks[i] {
+                        if !union[..nu].contains(&e) {
+                            union[nu] = e;
+                            nu += 1;
+                        }
+                    }
+                }
+                s.routed.prefetch(l, &union[..nu]);
             }
             lap(&mut p.slot);
             if let (Attn::Mla(a), LayerState::Mla { cache, pools }) = (&lw.attn, &mut s.layers[l]) {
@@ -1532,7 +1554,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 }
                 pl.ffn_routed(l, n, &s.b_y[..n * H]);
                 for i in 0..n {
-                    account(p, &mut s.last_picks, &mut s.freq, s.pool, l, picks[i], if i == 0 { pre_picks } else { [E; TOP_K] });
+                    account(p, &mut s.last_picks, &mut s.freq, s.pool, l, picks[i], if n <= SPEC_TOKENS { pre_picks[i] } else { [E; TOP_K] });
                 }
                 let e = s.routed.elapsed();
                 p.experts += e;

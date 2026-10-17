@@ -114,7 +114,7 @@ struct MtpOn {
     gu_s: Mem,
     down_w: Mem,
     down_s: Mem,
-    dx: Mem, // [2·H] f32: enorm(embed(next)) | hnorm(hidden)
+    dx: Mem, // [STEP][2·H] f32: enorm(embed(next)) | hnorm(hidden), a step's positions
 }
 /// Host memory every card and the host see (`Kfd::host_shared`): what one produces and
 /// another consumes within a token. A layer's buffers alternate by its parity, so a
@@ -126,7 +126,7 @@ struct Shared {
     my: [Mem; 2],  // [STEP][H] f32: the MLA card's output projection
     yexp: [Mem; 2], // [STEP][H] f32: the host's routed experts
     xh: Mem,       // [STEP][H] f32: a MoE layer's FFN input for the host
-    scores: Mem,   // [E] f32: the early router's logits for the host (a one-token step's)
+    scores: Mem,   // [SPEC_TOKENS][E] f32: the early router's logits for the host (a step of a few tokens)
     scores_ffn: Mem, // [STEP][E] f32: the FFN half's router over its input, for the host's picks
     words: Mem,    // the handoff words, a cache line each: `word()`
 }
@@ -326,7 +326,7 @@ impl Cards {
                 my: [buf(), buf()],
                 yexp: [buf(), buf()],
                 xh: buf(),
-                scores: k0.host_shared(glm_5_3_flash::E * 4, &others),
+                scores: k0.host_shared(SPEC_TOKENS * glm_5_3_flash::E * 4, &others),
                 scores_ffn: k0.host_shared(STEP * glm_5_3_flash::E * 4, &others),
                 words: {
                     let m = k0.host_shared(word(W_KINDS, 0), &others);
@@ -538,19 +538,19 @@ impl Cards {
             };
             mlas.push(Some(MlaOn { card, input_ln: up(raw(&bf16_of(mt.input_ln))), qa_ln: up(raw(&bf16_of(mw.q_a_ln))), q_a: one(mw.q_a), kv_a: one(mw.kv_a), ix, q_b: one(mw.q_b), ix_wq_b: up(raw(mw.ix_wq_b)), kv_b: up(raw(mw.kv_b)), lat: k.vram_visible(max_ctx * KV_LORA_RANK * 4), pools: k.vram_visible(max_ctx.div_ceil(INDEX_KPOOL) * INDEX_HEAD_DIM * 4), o: one(mw.o) }));
             let (gu_w, gu_s) = {
-                let (g, u) = (one(mt.ffn.shared_gate), one(mt.ffn.shared_up));
-                let wm = k.vram_visible(g.0.size + u.0.size);
-                let sm = k.vram_visible(g.1.size + u.1.size);
-                // gate rows then up rows, as the main layers' shared expert is laid out
-                k.upload(&wm, 0, mt.ffn.shared_gate.w);
-                k.upload(&wm, g.0.size, mt.ffn.shared_up.w);
-                k.upload(&sm, 0, raw(mt.ffn.shared_gate.s));
-                k.upload(&sm, g.1.size, raw(mt.ffn.shared_up.s));
+                let (g, u) = (mt.ffn.shared_gate, mt.ffn.shared_up);
+                let wm = k.vram_visible(g.w.len() + u.w.len());
+                let sm = k.vram_visible((g.s.len() + u.s.len()) * 4);
+                // gate rows then up rows, their scales likewise, as the main layers' shared expert is laid out
+                k.upload(&wm, 0, g.w);
+                k.upload(&wm, g.w.len(), u.w);
+                k.upload(&sm, 0, raw(g.s));
+                k.upload(&sm, g.s.len() * 4, raw(u.s));
                 (wm, sm)
             };
             let (down_w, down_s) = one(mt.ffn.shared_down);
             println!("gpu      : the draft layer on card {card}: its attention, shared expert and eh_proj ({:.2} GB)", (mt.eh_proj.len() * 2 + gu_w.size + down_w.size) as f64 / 1e9);
-            MtpOn { card, eh: up(raw(mt.eh_proj)), post_ln: up(raw(&bf16_of(mt.post_ln))), head_norm: up(raw(&bf16_of(mt.head_norm))), gu_w, gu_s, down_w, down_s, dx: k.vram_visible(2 * H * 4) }
+            MtpOn { card, eh: up(raw(mt.eh_proj)), post_ln: up(raw(&bf16_of(mt.post_ln))), head_norm: up(raw(&bf16_of(mt.head_norm))), gu_w, gu_s, down_w, down_s, dx: k.vram_visible(STEP * 2 * H * 4) }
         });
         Cards { cards, shared, layers, ffns, mlas, head, mtp, seq: 0, half_seq: vec![[0; 2]; NUM_HIDDEN_LAYERS], token_from: vec![0; n], last_n: 1, npools: max_ctx.div_ceil(INDEX_KPOOL), tokens: 0 }
     }
@@ -763,7 +763,7 @@ impl Placed for Cards {
         self.half_seq[l][0] = value;
         let f = self.ffns[l].as_ref().unwrap();
         for c in &self.cards {
-            let router = self.early_router(l, c, self.shared.scores.va, W_ROUTE).filter(|_| n == 1);
+            let router = self.early_router(l, c, self.shared.scores.va, W_ROUTE).filter(|_| n <= SPEC_TOKENS);
             self.hc_pre(c, &f.hc[c.k.index][0], None, value, router, n);
         }
         let lay = self.layers[l].as_ref().unwrap();
@@ -800,14 +800,14 @@ impl Placed for Cards {
     fn early_logits(&mut self, l: usize, logits: &mut [f32]) {
         let f = self.ffns[l].as_ref().unwrap();
         crate::kfd::wait_word(self.word_ptr(W_ROUTE, f.card), self.half_seq[l][0]);
-        read(&self.shared.scores, 0, &mut logits[..glm_5_3_flash::E]);
+        read(&self.shared.scores, 0, logits);
     }
     fn mla_post(&mut self, l: usize, n: usize) {
         let value = self.next_seq();
         self.half_seq[l][0] = value;
         let f = self.ffns[l].as_ref().unwrap();
         for c in &self.cards {
-            let router = self.early_router(l, c, self.shared.scores.va, W_ROUTE).filter(|_| n == 1);
+            let router = self.early_router(l, c, self.shared.scores.va, W_ROUTE).filter(|_| n <= SPEC_TOKENS);
             self.hc_pre(c, &f.hc[c.k.index][0], None, value, router, n);
         }
         let m = self.mlas[l].as_ref().unwrap();
@@ -821,7 +821,7 @@ impl Placed for Cards {
     }
     fn hidden_all(&mut self, n: usize, out: &mut [f32]) {
         // the streams' means a pass of TOKENS at a time, through the head card's logits buffer (host memory)
-        let c = &self.cards[0];
+        let c = &self.cards[self.head.0];
         let mut p0 = 0;
         while p0 < n {
             let np = (n - p0).min(TOKENS);
@@ -976,7 +976,7 @@ impl Placed for Cards {
         unsafe { &*self.word_ptr(W_EXPERTS, 0) }.store(self.half_seq[l][1], std::sync::atomic::Ordering::Release);
     }
     fn layer_out(&mut self, _l: usize, i: usize, mean: &mut [f32]) {
-        let c = &self.cards[0];
+        let c = &self.cards[self.head.0];
         let mut a = Args::new();
         a.ptr(c.streams.at(i * HC * H * 4)).ptr(c.mean.va).u32(1);
         c.k.launch(&c.hc_mean, CHANNEL_GRID, g::WG, 0, &a);

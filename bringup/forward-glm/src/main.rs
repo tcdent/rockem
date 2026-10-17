@@ -11,6 +11,8 @@
 //!               [--positions N]       stop after N computed positions
 //!               [--step N]            with --gpu: the positions again in steps of N tokens, bit for bit the single tokens'
 //!               [--step-ids <file>]   the step gate over these ids (the model's prefix first, then any text's: longer than the goldens)
+//!               [--elf <path>]        with --gpu: this code object instead of the bundle's (a kernel under test)
+//!               [--timeline]          with --gpu: the cards' kernel laps a step (every multi-token step, every 16th token)
 //!               [--mtp-accept]        with --gpu: the draft layer's acceptance over the --step-ids text (greedy, and under the model's sampler)
 //!               [--gpu]               with --cpu: the blocks on the gfx1100 cards (node/src/glm_kfd.rs), the bundle's code object
 //!               [--force-picks]   every MoE layer takes the oracle's expert picks (weights still its own): separates tie flips from the rest
@@ -215,8 +217,10 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
     };
     let mut model = CpuModel::new(routed, &pool, ctx);
     if harness::flag("--gpu") {
-        let elf = std::fs::read(bundle.join(layout::KERNELS_FILE)).unwrap_or_else(|e| panic!("{}: {e}", bundle.join(layout::KERNELS_FILE).display()));
-        model.placed = Some(Box::new(glm_kfd::Cards::new(&elf, &w, ctx, false)));
+        // the bundle's code object, or one under test (`--elf`); `--timeline` prints the cards' kernel laps a step
+        let elf_path = arg("--elf").unwrap_or_else(|| bundle.join(layout::KERNELS_FILE));
+        let elf = std::fs::read(&elf_path).unwrap_or_else(|e| panic!("{}: {e}", elf_path.display()));
+        model.placed = Some(Box::new(glm_kfd::Cards::new(&elf, &w, ctx, harness::flag("--timeline"))));
     }
     model.seed_prefix(&w, &prefix);
     for (t, &id) in ids.iter().enumerate().take(FIRST_POS) {
@@ -341,14 +345,45 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
         model.seed_prefix(&w, &prefix);
         let mut h = vec![0f32; H];
         let mut h_out = vec![0f32; H];
-        let mut q_prev = vec![0f32; VOCAB_SIZE]; // the draft made at t-1: its guess of ids[t+1]
+        let mut q_prev = vec![0f32; VOCAB_SIZE]; // the draft made at t-1 (the cards'): its guess of ids[t+1]
+        let mut q_cpu = vec![0f32; VOCAB_SIZE];
         let mut have_q = false;
         let (mut agree, mut hit, mut n_acc, mut sum_acc, mut sum_acc_greedy_hit) = (0usize, 0usize, 0usize, 0f64, 0usize);
+        let (mut n_draft, mut card_agree, mut card_dmax) = (0usize, 0usize, 0f32);
         let s = &glm_5_3_flash::SAMPLING;
         let t0 = std::time::Instant::now();
+        // the draft at `pos` from hidden `h` and the next token `nt`: on the host and on the cards (the
+        // served path); `q` receives the cards', the two compared
+        let mut draft_both = |model: &mut CpuModel<_>, h: &[f32], nt: u32, pos: usize, q: &mut [f32], q_cpu: &mut [f32], h_out: &mut [f32]| {
+            let (mut th, mut tc) = (Collect::default(), Collect::default());
+            model.draft(&w, h, nt, pos, q_cpu, h_out, &mut th);
+            model.draft_batch(&w, h, &[nt], pos, 1, q, &mut tc);
+            let d = q.iter().zip(q_cpu.iter()).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            card_dmax = card_dmax.max(d);
+            card_agree += (argmax(q) == argmax(q_cpu)) as usize;
+            n_draft += 1;
+            if pos < FIRST_POS + 4 || (d > 1.0 && pos < 64) {
+                // the stages the cards report, each against the host's
+                let stages: Vec<String> = tc.edges.iter().filter_map(|(_, name, c)| th.edges.iter().find(|(_, n2, _)| n2 == name).map(|(_, _, hv)| {
+                    let dm = c.iter().zip(hv.iter()).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+                    let hm = hv.iter().fold(0f32, |a, &x| a.max(x.abs()));
+                    format!("{name} {dm:.2e} (host max {hm:.2e})")
+                })).collect();
+                // the cards' shared expert, derived: the FFN residual less the attention state and the routed sum
+                let get = |t: &Collect, name: &str| t.edges.iter().find(|(_, n2, _)| n2 == name).map(|(_, _, v)| v.clone());
+                let shared = match (get(&tc, "mtp.ffn"), get(&tc, "mtp.attn"), get(&tc, "routed"), get(&th, "mtp.shared")) {
+                    (Some(f), Some(a), Some(r), Some(hs)) => {
+                        let dm = (0..H).map(|i| (f[i] - a[i] - r[i] - hs[i]).abs()).fold(0f32, f32::max);
+                        format!(", shared (derived) {dm:.2e}")
+                    }
+                    _ => String::new(),
+                };
+                println!("  draft at {pos}: cards' top-1 {} host's top-1 {} max |Δ logit| {d:.3e}; {}{shared}", argmax(q), argmax(q_cpu), stages.join(", "));
+            }
+        };
         // the prefix's draft rows: position 0 from the prefix's hidden state and the prefix's second id
         let (h0, h1) = (model.prefix_hidden(0).to_vec(), model.prefix_hidden(1).to_vec());
-        model.draft(&w, &h0, ids[1] as u32, 0, &mut q_prev, &mut h_out, &mut common::trace::NoTrace);
+        draft_both(&mut model, &h0, ids[1] as u32, 0, &mut q_prev, &mut q_cpu, &mut h_out);
         for t in 1..n - 1 {
             if t >= FIRST_POS {
                 model.step(&w, ids[t] as u32, t, None, &mut common::trace::NoTrace, true);
@@ -366,18 +401,17 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
                 sum_acc += acc;
                 sum_acc_greedy_hit += (ap == ids[t + 1]) as usize;
                 n_acc += 1;
+                if t < FIRST_POS + 4 {
+                    println!("  at {t}: text {} main top-1 {ap} draft top-1 {aq} acceptance {acc:.3}", ids[t + 1]);
+                }
             }
-            if t >= FIRST_POS {
-                model.draft(&w, &h, ids[t + 1] as u32, t, &mut q_prev, &mut h_out, &mut common::trace::NoTrace);
-                have_q = true;
-            } else {
-                model.draft(&w, &h, ids[t + 1] as u32, t, &mut q_prev, &mut h_out, &mut common::trace::NoTrace);
-                have_q = true;
-            }
+            draft_both(&mut model, &h, ids[t + 1] as u32, t, &mut q_prev, &mut q_cpu, &mut h_out);
+            have_q = t >= FIRST_POS;
             if t % 100 == 0 {
                 println!("  mtp: {t} positions, {:.1} s", t0.elapsed().as_secs_f32());
             }
         }
+        println!("mtp draft: cards vs host over {n_draft} positions — top-1 agree {:.3}, max |Δ logit| {card_dmax:.3e}", card_agree as f64 / n_draft as f64);
         println!("mtp accept: {n_acc} positions — draft top-1 = main top-1 {:.3}; draft top-1 = text {:.3} (main top-1 = text {:.3}); expected acceptance under the sampler (T {} top-k {} top-p {}) {:.3}; {:.1} s", agree as f64 / n_acc as f64, hit as f64 / n_acc as f64, sum_acc_greedy_hit as f64 / n_acc as f64, s.temperature, s.top_k, s.top_p, sum_acc / n_acc as f64, t0.elapsed().as_secs_f32());
     }
     std::process::exit(if report.failures() > 0 || !step_gate { 1 } else { 0 });

@@ -249,7 +249,7 @@ impl Engine for Glm {
         nexts.push(next);
         self.model.placed.as_mut().unwrap().hidden_all(n, &mut self.hiddens[..n * H]);
         let hiddens = std::mem::take(&mut self.hiddens);
-        self.model.draft_batch(&self.w, &hiddens[..n * H], &nexts, pos, n, logits);
+        self.model.draft_batch(&self.w, &hiddens[..n * H], &nexts, pos, n, logits, &mut common::trace::NoTrace);
         self.hiddens = hiddens;
     }
     fn rewind(&mut self, slot: usize) {

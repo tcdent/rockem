@@ -47,7 +47,7 @@ impl<'a> Stream<'a> {
     pub fn file(bytes: &'a [u8]) -> Self {
         assert_eq!(bytes.len(), layout::STREAM);
         let mut addr = std::vec::Vec::with_capacity(layout::MOE_LAYERS * crate::E * ITEMS);
-        for l in crate::FIRST_K_DENSE_REPLACE..crate::NUM_HIDDEN_LAYERS {
+        for l in crate::FIRST_K_DENSE_REPLACE..crate::layout::LAYERS_IN_FILE {
             for e in 0..crate::E {
                 for c in 0..GU_ITEMS {
                     addr.push(layout::gu_item(l, e, c).start as u64);
@@ -378,7 +378,7 @@ mod tests {
         let stream: &[u8] = stream;
         // the stream's table over the block: the file's own offsets (only this expert's are reached)
         let mut addr = Vec::with_capacity(layout::MOE_LAYERS * crate::E * ITEMS);
-        for ll in crate::FIRST_K_DENSE_REPLACE..crate::NUM_HIDDEN_LAYERS {
+        for ll in crate::FIRST_K_DENSE_REPLACE..crate::layout::LAYERS_IN_FILE {
             for ee in 0..crate::E {
                 for c in 0..GU_ITEMS {
                     addr.push(layout::gu_item(ll, ee, c).start as u64);

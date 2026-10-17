@@ -35,9 +35,9 @@ pub trait Routed {
             self.run(l, picks, &x[i * H..(i + 1) * H], &mut out[i * TOP_K * H..(i + 1) * TOP_K * H]);
         }
     }
-    /// A hint, before `run`: these experts are likely layer `l`'s next; a realization may start
-    /// pulling them toward the cores that will stream them.
-    fn prefetch(&self, l: usize, idx: [usize; TOP_K]) {
+    /// A hint, before `run`: these experts (distinct) are likely layer `l`'s next; a realization may
+    /// start pulling them toward the cores that will stream them.
+    fn prefetch(&self, l: usize, idx: &[usize]) {
         let _ = (l, idx);
     }
     /// Seconds spent in `run` since the last call of this (bring-up: the token's profile); 0 if unmeasured.
@@ -56,7 +56,7 @@ impl<R: Routed + ?Sized> Routed for Box<R> {
     fn elapsed(&mut self) -> f64 {
         (**self).elapsed()
     }
-    fn prefetch(&self, l: usize, idx: [usize; TOP_K]) {
+    fn prefetch(&self, l: usize, idx: &[usize]) {
         (**self).prefetch(l, idx)
     }
 }
