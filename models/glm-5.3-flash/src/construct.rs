@@ -577,14 +577,14 @@ impl Routed for CpuExperts<'_> {
         let (i1, i2, i3) = (items.clone(), items.clone(), items);
         let node = move |i: usize| i1[i].1;
         let ccd = move |i: usize| i2[i].2;
-        // the touching yields between 64 KB chunks once the job is overtaken: the run that overtakes it
-        // waits for the items in flight, and a megabyte of touching would be a quarter millisecond of stall
+        // the touching yields between 16 KB chunks once the job is overtaken: the run that overtakes it
+        // waits for the items in flight (the run's slotting time was 13 µs with 64 KB chunks, 2026-10-16)
         let pool_s: &'static dyn Pool = unsafe { std::mem::transmute::<&dyn Pool, &'static dyn Pool>(pool) };
         let f = move |i: usize| {
             let it = &i3[i];
             let w = expert::Weights::at(stream, l, idx[it.0]);
             let touch_yielding = |b: &[u8]| -> bool {
-                for chunk in b.chunks(64 << 10) {
+                for chunk in b.chunks(16 << 10) {
                     if pool_s.abandoned() {
                         return false;
                     }

@@ -162,6 +162,15 @@ impl QAct<'_> {
 impl QAct<'_> {
     #[inline(always)]
     pub fn quantize(&mut self, x: &[f32]) {
+        #[cfg(target_arch = "x86_64")]
+        if GROUP == 128 {
+            unsafe { quantize_avx2(x, self.q, self.scale, self.gsum) };
+            return;
+        }
+        self.quantize_scalar(x)
+    }
+    /// The definition: per group, the absmax scale, round half away from zero, the group's sum.
+    pub fn quantize_scalar(&mut self, x: &[f32]) {
         for (g, chunk) in x.chunks_exact(GROUP).enumerate() {
             let mut amax = 0f32;
             for &v in chunk {
@@ -182,6 +191,96 @@ impl QAct<'_> {
             }
             self.scale[g] = s;
             self.gsum[g] = sum;
+        }
+    }
+}
+
+/// `QAct::quantize_scalar` on AVX2, the same arithmetic in the same order per element (absmax,
+/// `amax / 127`, `x · (1 / s)`, `(r ± 0.5) as i32` truncated, clamped to ±127) — bit for bit.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn quantize_avx2(x: &[f32], q: &mut [i8], scale: &mut [f32], gsum: &mut [i32]) {
+    use core::arch::x86_64::*;
+    debug_assert!(GROUP == 128);
+    let sign = _mm256_set1_ps(-0.0);
+    let half = _mm256_set1_ps(0.5);
+    let hi = _mm256_set1_epi32(127);
+    let lo = _mm256_set1_epi32(-127);
+    for (g, chunk) in x.chunks_exact(GROUP).enumerate() {
+        let p = chunk.as_ptr();
+        let mut m = _mm256_setzero_ps();
+        for i in (0..GROUP).step_by(8) {
+            m = _mm256_max_ps(m, _mm256_andnot_ps(sign, _mm256_loadu_ps(p.add(i))));
+        }
+        // the lanes' max, then the scalar's exact `amax / 127` and `1 / s`
+        let m128 = _mm_max_ps(_mm256_castps256_ps128(m), _mm256_extractf128_ps(m, 1));
+        let m64 = _mm_max_ps(m128, _mm_movehl_ps(m128, m128));
+        let m32 = _mm_max_ss(m64, _mm_shuffle_ps(m64, m64, 1));
+        let amax = _mm_cvtss_f32(m32);
+        let s = amax / 127.0;
+        let inv = if s > 0.0 { 1.0 / s } else { 0.0 };
+        let vinv = _mm256_set1_ps(inv);
+        let mut sum = _mm256_setzero_si256();
+        for i in (0..GROUP).step_by(8) {
+            let v = _mm256_mul_ps(_mm256_loadu_ps(p.add(i)), vinv);
+            // (v ± 0.5) as i32: the half with v's sign, then truncation
+            let r = _mm256_add_ps(v, _mm256_or_ps(half, _mm256_and_ps(v, sign)));
+            let t = _mm256_cvttps_epi32(r);
+            let c = _mm256_min_epi32(hi, _mm256_max_epi32(lo, t));
+            sum = _mm256_add_epi32(sum, c);
+            // eight i32 → eight i8
+            let packed = _mm256_packs_epi16(_mm256_packs_epi32(c, c), _mm256_setzero_si256());
+            let lo64 = _mm256_castsi256_si128(packed);
+            let hi64 = _mm256_extracti128_si256(packed, 1);
+            let b0 = _mm_cvtsi128_si32(lo64) as u32;
+            let b1 = _mm_cvtsi128_si32(hi64) as u32;
+            let bytes = (b0 as u64) | ((b1 as u64) << 32);
+            core::ptr::copy_nonoverlapping(&bytes as *const u64 as *const i8, q.as_mut_ptr().add(g * GROUP + i), 8);
+        }
+        let s128 = _mm_add_epi32(_mm256_castsi256_si128(sum), _mm256_extracti128_si256(sum, 1));
+        let s64 = _mm_add_epi32(s128, _mm_shuffle_epi32(s128, 0b01_00_11_10));
+        let s32 = _mm_add_epi32(s64, _mm_shuffle_epi32(s64, 0b00_00_00_01));
+        scale[g] = s;
+        gsum[g] = _mm_cvtsi128_si32(s32);
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod quantize_tests {
+    use super::*;
+    #[test]
+    fn avx2_matches_scalar_bit_for_bit() {
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for trial in 0..2000 {
+            let k = 4096;
+            let mut x = std::vec![0f32; k];
+            for v in x.iter_mut() {
+                let r = (next() % 2_000_001) as f32 / 1000.0 - 1000.0;
+                *v = match trial % 4 {
+                    0 => r,
+                    1 => r * 1e-3,
+                    2 => (r as i32 as f32) * 0.5, // many exact halves after scaling
+                    _ => if next() % 7 == 0 { 0.0 } else { r * 1e4 },
+                };
+            }
+            if trial % 11 == 0 {
+                for v in x[..GROUP].iter_mut() {
+                    *v = 0.0;
+                }
+            }
+            let (mut q1, mut s1, mut g1) = (std::vec![0i8; k], std::vec![0f32; k / GROUP], std::vec![0i32; k / GROUP]);
+            let (mut q2, mut s2, mut g2) = (std::vec![0i8; k], std::vec![0f32; k / GROUP], std::vec![0i32; k / GROUP]);
+            QAct { q: &mut q1, scale: &mut s1, gsum: &mut g1 }.quantize_scalar(&x);
+            unsafe { quantize_avx2(&x, &mut q2, &mut s2, &mut g2) };
+            assert_eq!(q1, q2, "trial {trial}");
+            assert_eq!(s1.iter().map(|v| v.to_bits()).collect::<std::vec::Vec<_>>(), s2.iter().map(|v| v.to_bits()).collect::<std::vec::Vec<_>>(), "trial {trial}");
+            assert_eq!(g1, g2, "trial {trial}");
         }
     }
 }
