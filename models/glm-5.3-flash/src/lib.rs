@@ -62,9 +62,11 @@ pub const SEED: u64 = 0x726f_636b_656d_0002;
 /// The most tokens one step carries (`common::gemv::TOKENS`): the card's launch width.
 pub const TOKENS: usize = common::gemv::TOKENS;
 /// Tokens a prefill step takes at most: the card's buffers are this deep, the rows kernels run it in
-/// passes of `TOKENS`, the KDA step loops it in the kernel, the host's experts group it by expert
-/// (tcdent 2026-10-16: 128 first, the sweet spot to be found).
-pub const STEP: usize = 256;
+/// passes of `TOKENS`, `hc_pre` in rounds of `PRE_TOKENS`, the KDA step loops it in the kernel, the
+/// host's experts group it by expert. Swept 2026-10-17 on metatron, a full step's prompt token:
+/// 128 → 9.1 ms, 256 → 8.1, 512 → 7.8 (experts 4.0 / 2.9 / 2.4: no longer falling as 1/n, so the
+/// card's 5.0 and the experts' compute are what is left). The kernels do not depend on it.
+pub const STEP: usize = 512;
 
 pub mod expert;
 pub mod ffn;
