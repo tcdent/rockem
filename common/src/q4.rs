@@ -33,6 +33,9 @@ use super::math::round;
 pub const GROUP: usize = 128;
 pub const TILE: usize = 4;
 pub const WBIAS: i32 = 8;
+/// Tokens `gemm` takes at once: its i32 partials and f32 sums a token (32 B) stay in L1; a caller
+/// with more tokens loops blocks of this many.
+pub const GEMM_TOKENS: usize = 64;
 
 /// Byte offset of (row, k)'s byte within the packed tensor, and whether k is
 /// in the high nibble.
@@ -311,6 +314,24 @@ pub fn gemv_scalar(k: usize, m: usize, w: &[u8], ws: &[f32], act: &Act, out: &mu
     }
 }
 
+/// `gemv` for `n` activations at once: `out(t)[0..m) = W · act(t)`. The weights are read once a
+/// tile and group and every token's dot runs on them, so the weight stream stays sequential while
+/// the dots run (a token at a time, the first token streams a part from DRAM and the rest re-read
+/// it from L2, and the two times add). The same integer sum a group (exact in any order), the same
+/// flush, the groups in order: `gemv`'s bits for every token.
+#[inline(always)]
+pub fn gemm<'a, const K: usize>(m: usize, w: &[u8], ws: &[f32], n: usize, act: impl Fn(usize) -> Act<'a>, out: impl Fn(usize) -> *mut f32) {
+    debug_assert!(w.len() >= m * K / 2);
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        avx2::gemm::<K>(m, w.as_ptr(), ws.as_ptr(), n, act, out)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    for t in 0..n {
+        gemv_scalar(K, m, w, ws, &act(t), unsafe { core::slice::from_raw_parts_mut(out(t), m) });
+    }
+}
+
 /// The realization this target ships.
 #[inline(always)]
 pub fn gemv<const K: usize>(m: usize, w: &[u8], ws: &[f32], act: &Act, out: &mut [f32]) {
@@ -402,6 +423,137 @@ pub mod avx2 {
             _mm_storeu_ps(out.add(t * TILE), y);
         }
     }
+
+    use super::GEMM_TOKENS as TOKENS;
+
+    /// `gemv` over `n ≤ TOKENS` activations with the weights read, unpacked and rearranged once a
+    /// pair of tiles and group, every token's dots run on the rearranged bytes. The rearrangement
+    /// (ik_llama.cpp's `q4_0_r8` shape) puts the eight rows in the lanes: a 32-byte block holds
+    /// one quad of k for each row, so `maddubs` against the token's quad broadcast to every lane
+    /// gives per-row partials and the group's eight row sums arrive in one i32 vector — no
+    /// horizontal sums. Per group a pair of tiles is four sub-blocks of 32 k (a chunk's low or
+    /// high nibbles), each an 8×8 dword transpose of the unpacked rows (24 shuffles, amortized
+    /// over the tokens), kept in a 1 KB scratch. Tokens go four at a time through a sub-block so
+    /// its eight weight vectors are loaded once for four tokens (8 weights + 4 sums in registers).
+    /// i16 sums over a sub-block stay exact (8 pair-products of at most 3810), widened to i32 a
+    /// sub-block; the flush is `gemv`'s expression lane-wise, groups in order: `gemv`'s bits.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn gemm<'a, const K: usize>(m: usize, w: *const u8, ws: *const f32, n: usize, act: impl Fn(usize) -> Act<'a>, out: impl Fn(usize) -> *mut f32) {
+        const { assert!(K % GROUP == 0) };
+        assert!(n <= TOKENS && m % (2 * TILE) == 0, "gemm: {n} tokens, {m} rows (pairs of tiles)");
+        if n == 1 {
+            // the rearrangement pays from a few tokens on (one core, 7551P: 0.73× at one token, 1.2× at 16)
+            return gemv::<K>(m, w, ws, &act(0), out(0));
+        }
+        let ngroups = K / GROUP;
+        let mask = _mm256_set1_epi8(0x0F);
+        // the rearranged group: sub-block (c, h) of 32 k, quad j of it, eight rows in the lanes
+        let mut blk = [_mm256_setzero_si256(); 32];
+        let mut y = [_mm256_setzero_ps(); TOKENS];
+        let mut tp = 0;
+        while tp < m / TILE {
+            for i in 0..n {
+                y[i] = _mm256_setzero_ps();
+            }
+            let (w0, w1) = (w.add(tp * K * 2), w.add((tp + 1) * K * 2));
+            let (s0, s1) = (ws.add(tp * ngroups * TILE), ws.add((tp + 1) * ngroups * TILE));
+            for g in 0..ngroups {
+                let (g0, g1) = (w0.add(g * (GROUP / 2) * TILE), w1.add(g * (GROUP / 2) * TILE));
+                for c in 0..2 {
+                    // the eight rows' packed chunk c: low nibbles are k c·64.., high k c·64+32..
+                    let mut lo = [_mm256_setzero_si256(); 8];
+                    let mut hi = [_mm256_setzero_si256(); 8];
+                    for r in 0..8 {
+                        let base = if r < 4 { g0 } else { g1 };
+                        let p = _mm256_loadu_si256(base.add((r % 4) * (GROUP / 2) + c * 32) as *const __m256i);
+                        lo[r] = _mm256_and_si256(p, mask);
+                        hi[r] = _mm256_and_si256(_mm256_srli_epi16::<4>(p), mask);
+                    }
+                    transpose8(&lo, &mut blk[(c * 2) * 8..(c * 2 + 1) * 8]);
+                    transpose8(&hi, &mut blk[(c * 2 + 1) * 8..(c * 2 + 2) * 8]);
+                }
+                // the eight rows' scales for the group
+                let sc_w = _mm256_set_m128(_mm_loadu_ps(s1.add(g * TILE)), _mm_loadu_ps(s0.add(g * TILE)));
+                let mut i = 0;
+                while i < n {
+                    let nt = (n - i).min(4);
+                    let acc = match nt {
+                        4 => dots::<4>(&blk, g, &act, i),
+                        3 => dots::<3>(&blk, g, &act, i),
+                        2 => dots::<2>(&blk, g, &act, i),
+                        _ => dots::<1>(&blk, g, &act, i),
+                    };
+                    for t in 0..nt {
+                        let a = act(i + t);
+                        let bias = _mm256_set1_epi32(WBIAS * *a.gsum.get_unchecked(g));
+                        let sum = _mm256_cvtepi32_ps(_mm256_sub_epi32(acc[t], bias));
+                        let sc = _mm256_mul_ps(sc_w, _mm256_set1_ps(*a.scale.get_unchecked(g)));
+                        y[i + t] = _mm256_add_ps(y[i + t], _mm256_mul_ps(sum, sc));
+                    }
+                    i += nt;
+                }
+            }
+            for i in 0..n {
+                _mm256_storeu_ps(out(i).add(tp * TILE), y[i]);
+            }
+            tp += 2;
+        }
+    }
+
+    /// `NT ≤ 4` tokens' integer dots over a rearranged group: for each sub-block its eight weight
+    /// vectors once, each token's quads broadcast against them, i16 sums widened a sub-block.
+    #[inline(always)]
+    unsafe fn dots<'a, const NT: usize>(blk: &[__m256i; 32], g: usize, act: &impl Fn(usize) -> Act<'a>, i0: usize) -> [__m256i; 4] {
+        let ones = _mm256_set1_epi16(1);
+        let mut acc = [_mm256_setzero_si256(); 4];
+        let mut aq = [core::ptr::null::<i32>(); NT];
+        for t in 0..NT {
+            aq[t] = act(i0 + t).q.as_ptr().add(g * GROUP) as *const i32;
+        }
+        for sb in 0..4 {
+            let wv = &blk[sb * 8..(sb + 1) * 8];
+            let mut s16 = [_mm256_setzero_si256(); NT];
+            for j in 0..8 {
+                for t in 0..NT {
+                    let a4 = _mm256_set1_epi32(*aq[t].add(sb * 8 + j));
+                    s16[t] = _mm256_add_epi16(s16[t], _mm256_maddubs_epi16(wv[j], a4));
+                }
+            }
+            for t in 0..NT {
+                acc[t] = _mm256_add_epi32(acc[t], _mm256_madd_epi16(s16[t], ones));
+            }
+        }
+        acc
+    }
+
+    /// Eight rows of eight dwords into eight dwords of eight rows.
+    #[inline(always)]
+    unsafe fn transpose8(r: &[__m256i; 8], o: &mut [__m256i]) {
+        let t0 = _mm256_unpacklo_epi32(r[0], r[1]);
+        let t1 = _mm256_unpackhi_epi32(r[0], r[1]);
+        let t2 = _mm256_unpacklo_epi32(r[2], r[3]);
+        let t3 = _mm256_unpackhi_epi32(r[2], r[3]);
+        let t4 = _mm256_unpacklo_epi32(r[4], r[5]);
+        let t5 = _mm256_unpackhi_epi32(r[4], r[5]);
+        let t6 = _mm256_unpacklo_epi32(r[6], r[7]);
+        let t7 = _mm256_unpackhi_epi32(r[6], r[7]);
+        let u0 = _mm256_unpacklo_epi64(t0, t2);
+        let u1 = _mm256_unpackhi_epi64(t0, t2);
+        let u2 = _mm256_unpacklo_epi64(t1, t3);
+        let u3 = _mm256_unpackhi_epi64(t1, t3);
+        let u4 = _mm256_unpacklo_epi64(t4, t6);
+        let u5 = _mm256_unpackhi_epi64(t4, t6);
+        let u6 = _mm256_unpacklo_epi64(t5, t7);
+        let u7 = _mm256_unpackhi_epi64(t5, t7);
+        o[0] = _mm256_permute2x128_si256::<0x20>(u0, u4);
+        o[1] = _mm256_permute2x128_si256::<0x20>(u1, u5);
+        o[2] = _mm256_permute2x128_si256::<0x20>(u2, u6);
+        o[3] = _mm256_permute2x128_si256::<0x20>(u3, u7);
+        o[4] = _mm256_permute2x128_si256::<0x31>(u0, u4);
+        o[5] = _mm256_permute2x128_si256::<0x31>(u1, u5);
+        o[6] = _mm256_permute2x128_si256::<0x31>(u2, u6);
+        o[7] = _mm256_permute2x128_si256::<0x31>(u3, u7);
+    }
 }
 
 #[cfg(test)]
@@ -471,6 +623,68 @@ mod tests {
         gemv_scalar(K, M, &pw, &ps, &act.act(), &mut a);
         gemv::<K>(M, &pw, &ps, &act.act(), &mut b);
         assert_eq!(a, b, "the AVX2 realization must be bit-identical to the scalar one");
+    }
+
+    #[test]
+    fn gemm_is_gemv_for_every_token() {
+        const K: usize = 1024;
+        const M: usize = 64;
+        const N: usize = 37;
+        let mut rng = Rng::new(0x1234_5678_9ABC_DEF1);
+        let w: Vec<i8> = (0..M * K).map(|_| rng.i4()).collect();
+        let sc: Vec<f32> = (0..M * (K / GROUP)).map(|_| 0.01 + (rng.next() % 100) as f32 * 1e-4).collect();
+        let (pw, ps) = pack(M, K, &w, &sc);
+        let xs: Vec<Vec<f32>> = (0..N).map(|_| (0..K).map(|_| rng.unit()).collect()).collect();
+        let (mut q, mut s, mut g) = (vec![0i8; N * K], vec![0f32; N * K / GROUP], vec![0i32; N * K / GROUP]);
+        for i in 0..N {
+            QAct { q: &mut q[i * K..(i + 1) * K], scale: &mut s[i * (K / GROUP)..(i + 1) * (K / GROUP)], gsum: &mut g[i * (K / GROUP)..(i + 1) * (K / GROUP)] }.quantize(&xs[i]);
+        }
+        let act = |i: usize| Act { q: &q[i * K..(i + 1) * K], scale: &s[i * (K / GROUP)..(i + 1) * (K / GROUP)], gsum: &g[i * (K / GROUP)..(i + 1) * (K / GROUP)] };
+        let mut a = vec![0f32; N * M];
+        let mut b = vec![0f32; N * M];
+        for i in 0..N {
+            gemv::<K>(M, &pw, &ps, &act(i), &mut a[i * M..(i + 1) * M]);
+        }
+        let bp = b.as_mut_ptr() as usize;
+        gemm::<K>(M, &pw, &ps, N, act, |i| unsafe { (bp as *mut f32).add(i * M) });
+        assert_eq!(a, b, "gemm must give gemv's bits for every token");
+    }
+
+    /// `cargo test --release -p common gemm_rate -- --ignored --nocapture`: one core, the expert
+    /// shapes, gemv a token at a time against gemm over the tokens.
+    #[test]
+    #[ignore]
+    fn gemm_rate() {
+        const K: usize = 4096;
+        const M: usize = 32;
+        let mut rng = Rng::new(3);
+        let w: Vec<i8> = (0..M * K).map(|_| rng.i4()).collect();
+        let sc: Vec<f32> = (0..M * (K / GROUP)).map(|_| 0.01).collect();
+        let (pw, ps) = pack(M, K, &w, &sc);
+        for &n in &[1usize, 4, 16, 64] {
+            let (mut q, mut s, mut g) = (vec![0i8; n * K], vec![0f32; n * K / GROUP], vec![0i32; n * K / GROUP]);
+            for i in 0..n {
+                let x: Vec<f32> = (0..K).map(|_| rng.unit()).collect();
+                QAct { q: &mut q[i * K..(i + 1) * K], scale: &mut s[i * (K / GROUP)..(i + 1) * (K / GROUP)], gsum: &mut g[i * (K / GROUP)..(i + 1) * (K / GROUP)] }.quantize(&x);
+            }
+            let act = |i: usize| Act { q: &q[i * K..(i + 1) * K], scale: &s[i * (K / GROUP)..(i + 1) * (K / GROUP)], gsum: &g[i * (K / GROUP)..(i + 1) * (K / GROUP)] };
+            let mut out = vec![0f32; n * M];
+            let reps = 2000 / n;
+            let t0 = std::time::Instant::now();
+            for _ in 0..reps {
+                for i in 0..n {
+                    gemv::<K>(M, &pw, &ps, &act(i), &mut out[i * M..(i + 1) * M]);
+                }
+            }
+            let a = t0.elapsed().as_secs_f64() / (reps * n) as f64;
+            let op = out.as_mut_ptr() as usize;
+            let t0 = std::time::Instant::now();
+            for _ in 0..reps {
+                gemm::<K>(M, &pw, &ps, n, act, |i| unsafe { (op as *mut f32).add(i * M) });
+            }
+            let b = t0.elapsed().as_secs_f64() / (reps * n) as f64;
+            std::println!("n {n:>2}: gemv {:.2} µs a token ({:.1} GMAC/s), gemm {:.2} µs ({:.1} GMAC/s), {:.2}×", a * 1e6, (M * K) as f64 / a / 1e9, b * 1e6, (M * K) as f64 / b / 1e9, a / b);
+        }
     }
 }
 

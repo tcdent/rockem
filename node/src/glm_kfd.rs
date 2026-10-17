@@ -83,9 +83,9 @@ struct Card {
     normeds: Vec<Mem>, // [PARTS][STEP][PART_QKV]
     snap: Mem,   // [KDA_WINDOW + KDA_MEMORY] f32, host memory: a layer's state on its way out
     // the FFN's and the head's
-    fx: Mem,     // [H] f32: the streams' mean, the head's input
+    fx: Mem,     // [TOKENS][H] f32: the streams' mean, the head's input, a pass of tokens
     gu: Mem,     // [STEP][DENSE_GU_ROWS] f32: gate | up
-    lg: Mem,     // [VOCAB_SIZE] f32, host memory: the logits
+    lg: Mem,     // [TOKENS][VOCAB_SIZE] f32, host memory: a pass of tokens' logits
     // the MLA's
     mqa: Mem,    // [STEP][Q_LORA_RANK] f32: q_a's output, the input of q_b and the indexer's query
     mq: Mem,     // [STEP][MLA_HEADS·Q_HEAD] f32: the query, the attention's input
@@ -258,9 +258,9 @@ impl Cards {
                     fgs: (0..g::PARTS).map(|_| alloc(STEP * 2 * g::PART_QKV)).collect(),
                     normeds: (0..g::PARTS).map(|_| alloc(STEP * g::PART_QKV)).collect(),
                     snap: k.host((KDA_WINDOW + KDA_MEMORY) * 4),
-                    fx: k.vram(H * 4),
+                    fx: k.vram(TOKENS * H * 4),
                     gu: alloc(STEP * DENSE_GU_ROWS),
-                    lg: k.host(VOCAB_SIZE * 4),
+                    lg: k.host(TOKENS * VOCAB_SIZE * 4),
                     mqa: alloc(STEP * Q_LORA_RANK),
                     mq: alloc(STEP * MLA_HEADS * Q_HEAD),
                     mproj: k.host(MPROJ * 4),
@@ -794,23 +794,30 @@ impl Placed for Cards {
     fn layer_out(&mut self, _l: usize, i: usize, mean: &mut [f32]) {
         let c = &self.cards[0];
         let mut a = Args::new();
-        a.ptr(c.streams.at(i * HC * H * 4)).ptr(c.mean.va);
+        a.ptr(c.streams.at(i * HC * H * 4)).ptr(c.mean.va).u32(1);
         c.k.launch(&c.hc_mean, CHANNEL_GRID, g::WG, 0, &a);
         c.k.sync();
         read(&c.mean, 0, &mut mean[..H]);
     }
-    fn logits(&mut self, i: usize, logits: &mut [f32]) {
+    fn logits(&mut self, from: usize, n: usize, logits: &mut [f32]) {
         let (card, norm, lm) = &self.head;
         let c = &self.cards[*card];
-        let mut a = Args::new();
-        a.ptr(c.streams.at(i * HC * H * 4)).ptr(c.fx.va);
-        c.k.launch(&c.hc_mean, CHANNEL_GRID, g::WG, 0, &a);
-        self.rows(c, &c.rows_h, c.fx.va, Some(norm.va), lm.va, c.lg.va, VOCAB_SIZE, H, 1);
+        // a pass of TOKENS at a time: the streams' means, the norm and lm_head over them, the pass read back
+        let mut p0 = 0;
+        while p0 < n {
+            let np = (n - p0).min(TOKENS);
+            let mut a = Args::new();
+            a.ptr(c.streams.at((from + p0) * HC * H * 4)).ptr(c.fx.va).u32(np as u32);
+            c.k.launch(&c.hc_mean, CHANNEL_GRID, g::WG, 0, &a);
+            self.rows(c, &c.rows_h, c.fx.va, Some(norm.va), lm.va, c.lg.va, VOCAB_SIZE, H, np);
+            c.k.sync();
+            read(&c.lg, 0, &mut logits[p0 * VOCAB_SIZE..(p0 + np) * VOCAB_SIZE]);
+            p0 += np;
+        }
         // the step ends when every card is done with its streams: the next begins by overwriting them
         for c in &self.cards {
             c.k.sync();
         }
-        read(&c.lg, 0, &mut logits[..VOCAB_SIZE]);
         self.timeline_report();
     }
     fn finish(&mut self) {

@@ -671,7 +671,11 @@ impl Routed for CpuExperts<'_> {
     /// pool: the gate/up parts (each token's input quantized once before), the hidden states
     /// quantized once each, the down parts. One token is a step of one.
     fn run_batch(&mut self, l: usize, idx: &[[usize; TOP_K]], x: &[f32], out: &mut [f32]) {
-        use common::q4::{self, Act, QAct, GROUP};
+        /// Pair `i`'s (token, slot) as the index of its hidden state and output row.
+        fn blk_slot(pairs: &[(u16, u8)], i: usize) -> usize {
+            pairs[i].0 as usize * TOP_K + pairs[i].1 as usize
+        }
+        use common::q4::{self, Act, QAct, GEMM_TOKENS, GROUP};
         use common::swiglu::swiglu_clamped;
         use expert::{DOWN_PARTS, DOWN_ROWS, GU_PARTS, GU_ROWS, SUB};
         let t0 = std::time::Instant::now();
@@ -709,7 +713,9 @@ impl Routed for CpuExperts<'_> {
         let slot_of = |e: usize, j: usize| slice_slot[((l - FIRST_K_DENSE_REPLACE) * E + e) * (GU_ITEMS + DOWN_ITEMS) + j] as usize;
         let (xq, xs, xg) = (&self.xq, &self.xs, &self.xg);
         let h_p = self.h.as_mut_ptr() as usize;
-        // the gate/up rows: part (j, c) owns expert experts[j]'s hidden channels c·GU_ROWS.., for each of its tokens
+        // the gate/up rows: part (j, c) owns expert experts[j]'s hidden channels c·GU_ROWS.., for all of
+        // its tokens at once (`q4::gemm`: the part's bytes read once, every token's dot on them), in
+        // blocks of GEMM_TOKENS
         let uses_r = &uses;
         let experts_r = &experts;
         let gate_slot = move |i: usize| slot_of(experts_r[i / GU_PARTS], i % GU_PARTS / SUB);
@@ -717,15 +723,24 @@ impl Routed for CpuExperts<'_> {
             let (j, c) = (i / GU_PARTS, i % GU_PARTS);
             let e = experts_r[j];
             let w = expert::Weights::at(stream, l, e);
-            let (gw, uw, gs, us) = w.gu(c);
-            for &(t, k) in uses_r(e) {
-                let (t, k) = (t as usize, k as usize);
-                let xa = Act { q: &xq[t * H..(t + 1) * H], scale: &xs[t * HG..(t + 1) * HG], gsum: &xg[t * HG..(t + 1) * HG] };
-                let mut gu = [0f32; 2 * GU_ROWS];
-                q4::gemv::<H>(GU_ROWS, gw, gs, &xa, &mut gu[..GU_ROWS]);
-                q4::gemv::<H>(GU_ROWS, uw, us, &xa, &mut gu[GU_ROWS..]);
-                let h = unsafe { std::slice::from_raw_parts_mut((h_p as *mut f32).add((t * TOP_K + k) * D_FF + c * GU_ROWS), GU_ROWS) };
-                swiglu_clamped::<GU_ROWS>(&gu, SWIGLU_LIMIT, h);
+            let (gw, uw, gs, usc) = w.gu(c);
+            let pairs = uses_r(e);
+            let mut b0 = 0;
+            while b0 < pairs.len() {
+                let blk = &pairs[b0..(b0 + GEMM_TOKENS).min(pairs.len())];
+                let act = |i: usize| {
+                    let t = blk[i].0 as usize;
+                    Act { q: &xq[t * H..(t + 1) * H], scale: &xs[t * HG..(t + 1) * HG], gsum: &xg[t * HG..(t + 1) * HG] }
+                };
+                let mut gu = [[0f32; 2 * GU_ROWS]; GEMM_TOKENS];
+                let gp = gu.as_mut_ptr() as *mut f32;
+                q4::gemm::<H>(GU_ROWS, gw, gs, blk.len(), act, |i| unsafe { gp.add(i * 2 * GU_ROWS) });
+                q4::gemm::<H>(GU_ROWS, uw, usc, blk.len(), act, |i| unsafe { gp.add(i * 2 * GU_ROWS + GU_ROWS) });
+                for (i, &(t, k)) in blk.iter().enumerate() {
+                    let h = unsafe { std::slice::from_raw_parts_mut((h_p as *mut f32).add((t as usize * TOP_K + k as usize) * D_FF + c * GU_ROWS), GU_ROWS) };
+                    swiglu_clamped::<GU_ROWS>(&gu[i], SWIGLU_LIMIT, h);
+                }
+                b0 += GEMM_TOKENS;
             }
         });
         // every (token, slot)'s hidden state quantized once: here for a token (2 µs each, less than a
@@ -743,7 +758,7 @@ impl Routed for CpuExperts<'_> {
         } else {
             self.pool.run(n * TOP_K, &quantize_h);
         }
-        // the down rows: part (j, c) owns rows c·DOWN_ROWS.. of expert experts[j]'s output, for each of its tokens
+        // the down rows: part (j, c) owns rows c·DOWN_ROWS.. of expert experts[j]'s output, for all of its tokens, likewise
         let (hq, hs, hg) = (&self.hq, &self.hs, &self.hg);
         let out_p = out.as_mut_ptr() as usize;
         let down_slot = move |i: usize| slot_of(experts_r[i / DOWN_PARTS], GU_ITEMS + i % DOWN_PARTS / SUB);
@@ -753,12 +768,17 @@ impl Routed for CpuExperts<'_> {
             let w = expert::Weights::at(stream, l, e);
             let (dw, ds) = w.down(c);
             let r0 = c * DOWN_ROWS;
-            for &(t, k) in uses_r(e) {
-                let (t, k) = (t as usize, k as usize);
-                let s = t * TOP_K + k;
-                let ha = Act { q: &hq[s * D_FF..(s + 1) * D_FF], scale: &hs[s * DG..(s + 1) * DG], gsum: &hg[s * DG..(s + 1) * DG] };
-                let o = unsafe { std::slice::from_raw_parts_mut((out_p as *mut f32).add(s * H + r0), DOWN_ROWS) };
-                q4::gemv::<D_FF>(DOWN_ROWS, dw, ds, &ha, o);
+            let pairs = uses_r(e);
+            let slot = |i: usize| blk_slot(pairs, i);
+            let mut b0 = 0;
+            while b0 < pairs.len() {
+                let blk = &pairs[b0..(b0 + GEMM_TOKENS).min(pairs.len())];
+                let act = |i: usize| {
+                    let s = slot(b0 + i);
+                    Act { q: &hq[s * D_FF..(s + 1) * D_FF], scale: &hs[s * DG..(s + 1) * DG], gsum: &hg[s * DG..(s + 1) * DG] }
+                };
+                q4::gemm::<D_FF>(DOWN_ROWS, dw, ds, blk.len(), act, |i| unsafe { (out_p as *mut f32).add(slot(b0 + i) * H + r0) });
+                b0 += GEMM_TOKENS;
             }
         });
         self.elapsed += t0.elapsed().as_secs_f64();
@@ -800,8 +820,8 @@ pub trait Placed {
     fn ffn_routed(&mut self, l: usize, n: usize, y: &[f32]);
     /// Token `i`'s layer output off the streams (bring-up).
     fn layer_out(&mut self, l: usize, i: usize, mean: &mut [f32]);
-    /// The head over token `i`'s streams; the step ends.
-    fn logits(&mut self, i: usize, logits: &mut [f32]);
+    /// The head over tokens `from..from + n`'s streams, `[n][VOCAB_SIZE]`; the step ends.
+    fn logits(&mut self, from: usize, n: usize, logits: &mut [f32]);
     /// The step's end without logits: every card done with its streams.
     fn finish(&mut self);
     fn seed(&mut self, l: usize, window: &[f32], mem: &[f32]);
@@ -902,6 +922,7 @@ pub struct CpuModel<'p, R: Routed> {
     pub max_ctx: usize,
     pub layers: Vec<LayerState>,
     /// The last step's logits, `[VOCAB_SIZE]`.
+    /// `[STEP][VOCAB_SIZE]`: token `i` of the last step's logits at row `i` (`Logits`); a single token's at row 0.
     pub logits: Vec<f32>,
     streams: Vec<f32>,
     x: Vec<f32>,
@@ -961,7 +982,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             freq: vec![0; NUM_HIDDEN_LAYERS * E],
             max_ctx,
             layers,
-            logits: vec![0.0; VOCAB_SIZE],
+            logits: vec![0.0; STEP * VOCAB_SIZE],
             streams: vec![0.0; HC * H],
             x: vec![0.0; H],
             xn: vec![0.0; H],
@@ -1098,7 +1119,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
     pub fn step(&mut self, w: &Weights, tok: u32, pos: usize, forced: Option<&[[usize; TOP_K]]>, tr: &mut impl Trace, logits: bool) {
         assert!(pos < self.max_ctx);
         if self.placed.is_some() {
-            return self.step_batch(w, &[tok], pos, forced, tr, logits);
+            return self.step_batch(w, &[tok], pos, forced, tr, if logits { Logits::Last } else { Logits::None });
         }
         let s = self;
         let row = &w.embed[tok as usize * H..(tok as usize + 1) * H];
@@ -1188,8 +1209,8 @@ impl<'p, R: Routed> CpuModel<'p, R> {
         }
         if logits {
             rmsnorm::<H>(&s.mean, &w.norm, RMS_NORM_EPS, &mut s.xn);
-            gemv::bf16_par::<VOCAB_SIZE, H>(w.lm_head, &s.xn, &mut s.logits, s.pool);
-            tr.edge(NONE, "logits", &s.logits);
+            gemv::bf16_par::<VOCAB_SIZE, H>(w.lm_head, &s.xn, &mut s.logits[..VOCAB_SIZE], s.pool);
+            tr.edge(NONE, "logits", &s.logits[..VOCAB_SIZE]);
         }
         lap(&mut p.head);
     }
@@ -1201,7 +1222,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
     /// Profile: `hc` is the posting, `kda_card` the wait for the cards (the attention block and
     /// the hyper-connections), `route` the host's router and sum around the experts, the MLA laps
     /// the host's selection, `head` the wait for the logits.
-    pub fn step_batch(&mut self, w: &Weights, toks: &[u32], pos: usize, forced: Option<&[[usize; TOP_K]]>, tr: &mut impl Trace, logits: bool) {
+    pub fn step_batch(&mut self, w: &Weights, toks: &[u32], pos: usize, forced: Option<&[[usize; TOP_K]]>, tr: &mut impl Trace, logits: Logits) {
         let s = self;
         let n = toks.len();
         assert!(n >= 1 && n <= STEP && pos + n <= s.max_ctx);
@@ -1323,16 +1344,26 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 tr.edge(l, "out", &s.mean);
             }
         }
-        if logits {
-            pl.logits(n - 1, &mut s.logits);
-            if n == 1 {
-                tr.edge(NONE, "logits", &s.logits);
-            }
-        } else {
-            pl.finish();
+        match logits {
+            Logits::None => pl.finish(),
+            Logits::Last => pl.logits(n - 1, 1, &mut s.logits[(n - 1) * VOCAB_SIZE..n * VOCAB_SIZE]),
+            Logits::All => pl.logits(0, n, &mut s.logits[..n * VOCAB_SIZE]),
+        }
+        if n == 1 && !matches!(logits, Logits::None) {
+            tr.edge(NONE, "logits", &s.logits[..VOCAB_SIZE]);
         }
         lap(&mut p.head);
     }
+}
+
+/// Which of a step's logits `step_batch` computes into `CpuModel::logits` (`[STEP][VOCAB_SIZE]`,
+/// token `i`'s at row `i`): none (the step ends without the head), the last token's (a reply's
+/// draw), or every token's (scoring, tracing).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Logits {
+    None,
+    Last,
+    All,
 }
 
 /// A MoE layer's bookkeeping after its experts ran: the picks against the previous token's and the

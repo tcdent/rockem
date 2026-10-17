@@ -11,7 +11,7 @@
 use crate::engine::{Engine, Sampling};
 use crate::loader;
 use common::trace::{NoTrace, Trace, NONE};
-use glm_5_3_flash::construct::{physical_cores, CpuExperts, CpuModel, Threads};
+use glm_5_3_flash::construct::{Logits, physical_cores, CpuExperts, CpuModel, Threads};
 use glm_5_3_flash::layout::{self, POSITION, SNAPSHOT};
 use glm_5_3_flash::weights::Weights;
 use glm_5_3_flash::{EOS_TOKENS, FIRST_POS, H, NUM_HIDDEN_LAYERS, PREFIX_IDS, SAMPLING, SEED, STEP, TOP_K, VOCAB_SIZE};
@@ -53,7 +53,6 @@ pub struct Glm {
     prefix: &'static [f32],
     prefix_logits: Vec<f32>,
     /// The last step's logits, a row per token, and the position of its first token.
-    logits: Vec<f32>,
     last_pos: usize,
     dtr: DebugTrace,
 }
@@ -102,7 +101,7 @@ impl Glm {
         for (pos, &id) in PREFIX_IDS.iter().enumerate() {
             model.step(&w, id, pos, None, &mut NoTrace, true);
         }
-        let prefix_logits = model.logits.clone();
+        let prefix_logits = model.logits[..VOCAB_SIZE].to_vec();
         let mut snap = vec![0f32; SNAPSHOT];
         model.snapshot(&mut snap);
         let mut rows = vec![0f32; FIRST_POS * POSITION];
@@ -128,7 +127,6 @@ impl Glm {
             model,
             prefix,
             prefix_logits,
-            logits: vec![0.0; STEP * VOCAB_SIZE],
             last_pos: 0,
             dtr: DebugTrace { tok: 0, layers: vec![0.0; STEP * NUM_HIDDEN_LAYERS * H], topk: vec![0; STEP * NUM_HIDDEN_LAYERS * TOP_K] },
         })
@@ -206,7 +204,7 @@ impl Engine for Glm {
     fn run(&mut self, toks: &[u32], pos: usize, trace: bool, all_logits: bool) {
         assert!(!toks.is_empty() && toks.len() <= STEP);
         self.last_pos = pos;
-        if (trace || all_logits || self.model.placed.is_none()) || toks.len() == 1 {
+        if trace || self.model.placed.is_none() || toks.len() == 1 {
             // a token at a time: every token's logits (scoring, tracing), or the CPU realization
             for (i, &tok) in toks.iter().enumerate() {
                 let logits = all_logits || i == toks.len() - 1;
@@ -216,15 +214,14 @@ impl Engine for Glm {
                 } else {
                     self.model.step(&self.w, tok, pos + i, None, &mut NoTrace, logits);
                 }
-                if logits {
-                    self.logits[i * VOCAB_SIZE..(i + 1) * VOCAB_SIZE].copy_from_slice(&self.model.logits);
+                if logits && i > 0 {
+                    // a single token's logits land at row 0: to the token's row of the step
+                    self.model.logits.copy_within(..VOCAB_SIZE, i * VOCAB_SIZE);
                 }
             }
         } else {
-            // the step at once on the cards: the last token's logits
-            self.model.step_batch(&self.w, toks, pos, None, &mut NoTrace, true);
-            let i = toks.len() - 1;
-            self.logits[i * VOCAB_SIZE..(i + 1) * VOCAB_SIZE].copy_from_slice(&self.model.logits);
+            // the step at once on the cards: every token's logits (scoring) or the last token's
+            self.model.step_batch(&self.w, toks, pos, None, &mut NoTrace, if all_logits { Logits::All } else { Logits::Last });
         }
         if self.profile_every > 0 && self.model.profile.tokens >= self.profile_every {
             for l in self.model.profile.line().split('\n') {
@@ -241,16 +238,16 @@ impl Engine for Glm {
         self.model.rows(self.last_pos + i, out)
     }
     fn logits_row(&self, i: usize) -> &[f32] {
-        &self.logits[i * VOCAB_SIZE..(i + 1) * VOCAB_SIZE]
+        &self.model.logits[i * VOCAB_SIZE..(i + 1) * VOCAB_SIZE]
     }
     fn set_logits(&mut self, i: usize, logits: &[f32]) {
-        self.logits[i * VOCAB_SIZE..(i + 1) * VOCAB_SIZE].copy_from_slice(&logits[..VOCAB_SIZE]);
+        self.model.logits[i * VOCAB_SIZE..(i + 1) * VOCAB_SIZE].copy_from_slice(&logits[..VOCAB_SIZE]);
     }
     fn draw(&mut self, i: usize, u: f64) -> u32 {
-        common::sample::draw(&self.logits[i * VOCAB_SIZE..(i + 1) * VOCAB_SIZE], &SAMPLING, u) as u32
+        common::sample::draw(&self.model.logits[i * VOCAB_SIZE..(i + 1) * VOCAB_SIZE], &SAMPLING, u) as u32
     }
     fn score(&mut self, i: usize, id: u32) -> f32 {
-        common::softmax::log_prob(&self.logits[i * VOCAB_SIZE..(i + 1) * VOCAB_SIZE], id as usize)
+        common::softmax::log_prob(&self.model.logits[i * VOCAB_SIZE..(i + 1) * VOCAB_SIZE], id as usize)
     }
     fn draw_prefix(&mut self, u: f64) -> u32 {
         common::sample::draw(&self.prefix_logits, &SAMPLING, u) as u32
@@ -264,7 +261,7 @@ impl Engine for Glm {
     }
     fn trace(&mut self, i: usize) -> (&[f32], &[u32], &[f32]) {
         let a = i * NUM_HIDDEN_LAYERS;
-        (&self.dtr.layers[a * H..(a + NUM_HIDDEN_LAYERS) * H], &self.dtr.topk[a * TOP_K..(a + NUM_HIDDEN_LAYERS) * TOP_K], &self.logits[i * VOCAB_SIZE..(i + 1) * VOCAB_SIZE])
+        (&self.dtr.layers[a * H..(a + NUM_HIDDEN_LAYERS) * H], &self.dtr.topk[a * TOP_K..(a + NUM_HIDDEN_LAYERS) * TOP_K], &self.model.logits[i * VOCAB_SIZE..(i + 1) * VOCAB_SIZE])
     }
 }
 

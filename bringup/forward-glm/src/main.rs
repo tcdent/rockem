@@ -251,7 +251,7 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
             }
             flips += miss;
         }
-        let lg = &model.logits;
+        let lg = &model.logits[..VOCAB_SIZE];
         let am = |r: &[f32]| r.iter().enumerate().fold((0, f32::NEG_INFINITY), |a, (i, &v)| if v > a.1 { (i, v) } else { a }).0;
         if let Some(g) = gold.row("logits", t) {
             agree_oracle += (am(lg) == am(g)) as usize;
@@ -283,8 +283,10 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
         };
         let position = glm_5_3_flash::layout::POSITION;
         let snap_len = glm_5_3_flash::layout::SNAPSHOT;
+        // every position's logits (what SCORE reads), every position's rows, the recurrent state
         let run = |model: &mut CpuModel<_>, step: usize| -> (Vec<f32>, Vec<f32>, Vec<f32>) {
             model.seed_prefix(&w, &prefix);
+            let mut lg = vec![0f32; n * VOCAB_SIZE];
             let mut t = FIRST_POS;
             while t < n {
                 let m = (n - t).min(step);
@@ -292,8 +294,9 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
                     model.step(&w, ids[t] as u32, t, None, &mut common::trace::NoTrace, true);
                 } else {
                     let toks: Vec<u32> = ids[t..t + m].iter().map(|&i| i as u32).collect();
-                    model.step_batch(&w, &toks, t, None, &mut common::trace::NoTrace, true);
+                    model.step_batch(&w, &toks, t, None, &mut common::trace::NoTrace, glm_5_3_flash::construct::Logits::All);
                 }
+                lg[t * VOCAB_SIZE..(t + m) * VOCAB_SIZE].copy_from_slice(&model.logits[..m * VOCAB_SIZE]);
                 t += m;
             }
             let mut rows = vec![0f32; n * position];
@@ -302,7 +305,7 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
             }
             let mut snap = vec![0f32; snap_len];
             model.snapshot(&mut snap);
-            (model.logits.clone(), rows, snap)
+            (lg, rows, snap)
         };
         let t0 = std::time::Instant::now();
         let (lg1, rows1, snap1) = run(&mut model, 1);
@@ -313,7 +316,7 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
         let diff = |a: &[f32], b: &[f32]| a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
         let (dl, dr, ds) = (diff(&lg1, &lg2), diff(&rows1, &rows2), diff(&snap1, &snap2));
         let maxd = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
-        println!("step gate: {} positions a token at a time in {t1:.1} s, in steps of {st} in {t2:.1} s ({:.1}×); differing f32s — logits {dl} (max {:.2e}), rows {dr} (max {:.2e}), state {ds} (max {:.2e})", n - FIRST_POS, t1 / t2, maxd(&lg1, &lg2), maxd(&rows1, &rows2), maxd(&snap1, &snap2));
+        println!("step gate: {} positions a token at a time in {t1:.1} s, in steps of {st} in {t2:.1} s ({:.1}×); differing f32s — logits {dl} of every position's (max {:.2e}), rows {dr} (max {:.2e}), state {ds} (max {:.2e})", n - FIRST_POS, t1 / t2, maxd(&lg1, &lg2), maxd(&rows1, &rows2), maxd(&snap1, &snap2));
         if dr > 0 {
             // where it starts: the first position with a differing row, and how many of its floats differ
             let first = rows1.iter().zip(&rows2).position(|(x, y)| x.to_bits() != y.to_bits()).unwrap();

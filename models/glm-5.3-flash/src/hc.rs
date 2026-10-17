@@ -690,18 +690,24 @@ pub mod gfx11 {
         }
     }
 
-    /// `mean[d] = Σ_j stream_j[d] / HC`, a thread a channel. Grid: CHANNEL_GRID.
+    /// `mean[i][d] = Σ_j stream_i,j[d] / HC` for `n` tokens (`streams: [n][HC][H]`), a thread a
+    /// channel looping the tokens. Grid: CHANNEL_GRID.
     #[no_mangle]
-    pub extern "gpu-kernel" fn hc_mean(streams: *const f32, mean: *mut f32) {
+    pub extern "gpu-kernel" fn hc_mean(streams: *const f32, mean: *mut f32, n: u32) {
         unsafe {
             let d = workgroup_id_x() as usize * 256 + workitem_id_x() as usize;
-            let mut acc = 0f32;
-            let mut j = 0;
-            while j < HC {
-                acc += *streams.add(j * H + d);
-                j += 1;
+            let mut i = 0;
+            while i < n as usize {
+                let st = streams.add(i * HC * H);
+                let mut acc = 0f32;
+                let mut j = 0;
+                while j < HC {
+                    acc += *st.add(j * H + d);
+                    j += 1;
+                }
+                *mean.add(i * H + d) = acc / HC as f32;
+                i += 1;
             }
-            *mean.add(d) = acc / HC as f32;
         }
     }
     const _: () = assert!(H % 256 == 0 && (HC * H) % 256 == 0 && HC * HC <= 256);
