@@ -221,11 +221,9 @@ pub mod gfx11_consts {
     /// `hc_pre`'s LDS: per token of the step, 8 wave partials of the dots and 8 of the squares, the
     /// coefficients; then a transpose scratch per wave.
     pub const PRE_LDS: u32 = (4 * (STEP * (16 + COEF_ROWS) + 8 * HC * HC)) as u32;
-    /// `hc_pre`'s partials in VRAM, per token: the coefficient dots `[COEF_ROWS][SLICES]`, every
-    /// workgroup's sum of squares of its stream channels, then every workgroup's sum of squares of
-    /// its channels of the collapse (the router's norm). The host allocates `STEP · PRE_STRIDE`.
-    pub const PRE_XSS: usize = COEF_ROWS * SLICES;
-    pub const PRE_STRIDE: usize = PRE_PARTS + PRE_XSS;
+    /// `hc_pre`'s partials in VRAM, per token: the coefficient dots `[COEF_ROWS][SLICES]`, then every
+    /// workgroup's sum of squares of its stream channels. The host allocates `STEP · PRE_STRIDE`.
+    pub const PRE_STRIDE: usize = PRE_PARTS;
     /// `hc_pre`'s VRAM words: for each of its three device barriers, an arrival count a row (0 between
     /// launches) and a done word a row; then the mix's ready word and the collapse's.
     pub const PRE_BARRIERS: usize = 3;
@@ -312,8 +310,7 @@ pub mod gfx11 {
     /// publishes `value` in `count`'s ready word; every workgroup waits for it (all resident: the
     /// grid is a fraction of the card) and collapses its `COLLAPSE` channels of every token,
     /// `x[i][d] = Σ_j pre_ij · stream_ij[d]`, into `x` and, when `x_host` is not null, there too
-    /// (the routed experts' input), with the sum of squares of those channels into `part` for the
-    /// router's norm. Then, when `router` is not null (the FFN card: the early router over the
+    /// (the routed experts' input). Then, when `router` is not null (the FFN card: the early router over the
     /// attention block's input, or the FFN router over its own), the workgroups arrive again, each
     /// takes its `ROUTER_ROWS_PER_WG` rows of the `[E][H]` bf16 router over every token's `x`
     /// normed with `ln` (a wave a token, no reduction through LDS) straight into `scores` (host
@@ -456,12 +453,10 @@ pub mod gfx11 {
             workgroup_sync();
             let d0 = wg * COLLAPSE;
             let d = d0 + t;
-            let mut i = 0;
-            while i < n {
-                let mt = mix.add(i * MIX);
-                let mut sq = 0f32;
-                if t < COLLAPSE && d < H {
-                    let st = streams.add(i * HC * H);
+            if t < COLLAPSE && d < H {
+                let mut i = 0;
+                while i < n {
+                    let (mt, st) = (mix.add(i * MIX), streams.add(i * HC * H));
                     let mut acc = 0f32;
                     let mut j = 0;
                     while j < HC {
@@ -472,28 +467,13 @@ pub mod gfx11 {
                     if !x_host.is_null() {
                         *x_host.add(i * H + d) = acc;
                     }
-                    sq = acc * acc;
+                    i += 1;
                 }
-                sq = wave_sum(lane, sq);
-                if lane == 0 {
-                    *red.add(i * 8 + wave) = sq;
-                }
-                i += 1;
             }
             if router.is_null() {
                 return;
             }
-            workgroup_sync();
-            if t < n {
-                let mut q = 0f32;
-                let mut k = 0;
-                while k < 8 {
-                    q += *red.add(t * 8 + k);
-                    k += 1;
-                }
-                AtomicU32::from_ptr(part.add(t * PRE_STRIDE + PRE_PARTS + wg) as *mut u32).store(q.to_bits(), Ordering::Release);
-            }
-            // the collapse's arrival: this workgroup's channels and squares to L2; workgroup 0 publishes; every workgroup waits
+            // the collapse's arrival: this workgroup's channels to L2; workgroup 0 publishes; every workgroup waits
             let ready2 = ready.add(1);
             fence(Ordering::Release);
             if arrive(b1, row, t, wave, lane, value) && t == 0 {
@@ -504,30 +484,47 @@ pub mod gfx11 {
             }
             workgroup_sync();
             fence(Ordering::Acquire);
-            // the router over every token's normed block input: a wave a token, this workgroup's rows
+            // the router over every token's normed block input: a wave a token, this workgroup's rows; the
+            // norm and every dot in the 256-thread reduction's order (thread lane + 32·w over elements
+            // 256 apart, each wave's lanes summed, the eight waves in order), so a score's bits are the
+            // one-token kernel's
             let mut i = wave;
             while i < n {
-                let pt = part.add(i * PRE_STRIDE + PRE_PARTS);
-                let mut tot = 0f32;
-                let mut k = lane as usize;
-                while k < COEF_ROWS * SLICES {
-                    tot += f32::from_bits(AtomicU32::from_ptr(pt.add(k) as *mut u32).load(Ordering::Acquire));
-                    k += 32;
-                }
-                let rr = 1.0 / sqrt(wave_sum(lane, tot) / H as f32 + RMS_NORM_EPS);
                 let xt = x.add(i * H);
+                let mut tot = 0f32;
+                let mut w = 0;
+                while w < 8 {
+                    let mut part_ss = 0f32;
+                    let mut k = lane as usize + 32 * w;
+                    while k < H {
+                        let v = *xt.add(k);
+                        part_ss += v * v;
+                        k += 256;
+                    }
+                    tot += wave_sum(lane, part_ss);
+                    w += 1;
+                }
+                let rr = 1.0 / sqrt(tot / H as f32 + RMS_NORM_EPS);
                 let mut r = 0;
                 while r < ROUTER_ROWS_PER_WG {
                     let rrow = wg + r * COEF_ROWS * SLICES;
                     if rrow < E {
                         let wr = router.add(rrow * H);
+                        // the workgroup's order on one wave, so a score's bits are what the 256-thread
+                        // reduction gave: thread (lane + 32·w) summed elements lane + 32·w + 256·j in
+                        // order, each wave's lanes summed, the eight waves summed in order
                         let mut acc = 0f32;
-                        let mut k = lane as usize;
-                        while k < H {
-                            acc += *xt.add(k) * widen(*ln.add(k)) * widen(*wr.add(k));
-                            k += 32;
+                        let mut w = 0;
+                        while w < 8 {
+                            let mut part = 0f32;
+                            let mut k = lane as usize + 32 * w;
+                            while k < H {
+                                part += *xt.add(k) * widen(*ln.add(k)) * widen(*wr.add(k));
+                                k += 256;
+                            }
+                            acc += wave_sum(lane, part);
+                            w += 1;
                         }
-                        acc = wave_sum(lane, acc);
                         if lane == 0 {
                             *scores.add(i * E + rrow) = acc * rr;
                         }
