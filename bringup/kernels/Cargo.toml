@@ -1,0 +1,16 @@
+[package]
+name = "bringup_kernels"
+version = "0.0.0"
+edition = "2021"
+description = "Bring-up kernels for gfx1100 that are not the model's: rate probes (WMMA iu8/bf16, f32 FMA) the benches launch. Built with the pinned nightly like the model's code object; see .cargo/config.toml."
+
+[lib]
+crate-type = ["cdylib"]
+
+[workspace]
+
+[profile.release]
+opt-level = 3
+lto = true
+panic = "abort"
+codegen-units = 1

@@ -337,8 +337,10 @@ pub const TOKENS: usize = 32;
 /// accumulators measured 30 % slower on one token, 2026-09-19).
 pub const PASS: usize = 8;
 /// The width a pass of a few tokens (two to FEW: a speculative verify step's) runs at, with
-/// four-step rounds: at PASS with two-step rounds a two-token step's rows kernels ran ~2× one
-/// token's (rows_h 199 µs a launch against ~90, timeline 2026-10-17).
+/// four-step rounds and the kernel's R rows a wave: at PASS with two-step rounds a two-token
+/// step's rows kernels ran ~2× one token's (rows_h 199 µs a launch against ~90, timeline
+/// 2026-10-17); one or two rows a wave for this width measured worse for the FP8 kernels
+/// (ffn_down_shared 1277 / 1208 µs a step against 994 at four), the same for bf16.
 pub const FEW: usize = 4;
 /// Steps per round at most: a round is unrolled with every load hoisted, so
 /// its depth is the registers it takes — forty-three steps of a 10,944-wide

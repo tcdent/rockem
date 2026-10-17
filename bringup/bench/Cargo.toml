@@ -73,3 +73,7 @@ path = "src/churn.rs"
 [[bin]]
 name = "bench-hc"
 path = "src/hc.rs"
+
+[[bin]]
+name = "bench-wmma"
+path = "src/wmma.rs"
