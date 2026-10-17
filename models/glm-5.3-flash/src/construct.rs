@@ -53,6 +53,8 @@ pub struct Threads {
     /// Since the last `overheads`, over the placed runs: seconds slotting (entry to post), to the
     /// first claim (wake), and after the last node's end (tail); and the runs.
     overheads: std::sync::Mutex<(f64, f64, f64, usize)>,
+    /// Since the last `overheads`: the sum over the placed runs of the last node's end (s).
+    last_ends: std::sync::Mutex<f64>,
 }
 /// The grain of placement: a region's node is known per 2 MiB page.
 pub use crate::layout::PAGE;
@@ -233,7 +235,7 @@ impl Threads {
         }
         let node = node_of_core(cores[0]);
         let order = slot_order(node, ccd_of(cores[0]), &node_ccds);
-        Threads { shared, retired: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()), order, node_ccds, placed: std::sync::Mutex::new(Vec::new()), locality: std::sync::Mutex::new((0, 0)), prefetched: std::sync::Mutex::new((0, 0)), node, node_stats: std::sync::Mutex::new(([0; MAX_NODES], [0.0; MAX_NODES])), overheads: std::sync::Mutex::new((0.0, 0.0, 0.0, 0)) }
+        Threads { shared, retired: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()), order, node_ccds, placed: std::sync::Mutex::new(Vec::new()), locality: std::sync::Mutex::new((0, 0)), prefetched: std::sync::Mutex::new((0, 0)), node, node_stats: std::sync::Mutex::new(([0; MAX_NODES], [0.0; MAX_NODES])), overheads: std::sync::Mutex::new((0.0, 0.0, 0.0, 0)), last_ends: std::sync::Mutex::new(0.0) }
     }
     /// Tell the pool where a region's memory lives: `nodes[p]` is the node of its `p`th `PAGE`.
     pub fn place(&self, base: usize, len: usize, nodes: Vec<u8>) {
@@ -280,6 +282,7 @@ impl Threads {
             o.1 += j.first.load(Ordering::Relaxed).min(total) as f64 * 1e-9;
             o.2 += total.saturating_sub(end_max) as f64 * 1e-9;
             o.3 += 1;
+            *self.last_ends.lock().unwrap() += end_max as f64 * 1e-9;
         }
     }
     /// The job slotted and published: the workers take it up; the job before it is stopped
@@ -385,6 +388,9 @@ impl Pool for Threads {
     }
     fn overheads(&self) -> (f64, f64, f64, usize) {
         std::mem::replace(&mut *self.overheads.lock().unwrap(), (0.0, 0.0, 0.0, 0))
+    }
+    fn last_ends(&self) -> f64 {
+        std::mem::replace(&mut *self.last_ends.lock().unwrap(), 0.0)
     }
     fn prefetched(&self) -> (usize, usize) {
         *self.prefetched.lock().unwrap()
@@ -718,6 +724,8 @@ pub struct Profile {
     pub run_wake: f64,
     pub run_tail: f64,
     pub runs: usize,
+    /// The sum over the runs of the last node's end: what the phase waits for.
+    pub run_last: f64,
 }
 impl Profile {
     /// The expert runs by node: each node's share of the items, when its last item finished (ms a
@@ -733,7 +741,7 @@ impl Profile {
         let share: Vec<String> = used.iter().map(|&d| format!("{:.1}", 100.0 * self.node_items[d] as f64 / total as f64)).collect();
         let end: Vec<String> = used.iter().map(|&d| format!("{:.2}", 1e3 * self.node_end[d] / n)).collect();
         let rate: Vec<String> = used.iter().map(|&d| format!("{:.1}", self.node_items[d] as f64 / (1e3 * self.node_end[d]).max(1e-9))).collect();
-        format!("\nprofile  : nodes — items {} %, run ends {} ms a token, {} items/ms; a token's {} runs spend {:.2} ms slotting, {:.2} waking, {:.2} in the tail", share.join(" / "), end.join(" / "), rate.join(" / "), self.runs / self.tokens.max(1), 1e3 * self.run_slot / n, 1e3 * self.run_wake / n, 1e3 * self.run_tail / n)
+        format!("\nprofile  : nodes — items {} %, run ends {} ms a token, {} items/ms; a token's {} runs end at {:.2} ms (the last node each run) and spend {:.2} ms slotting, {:.2} waking, {:.2} in the tail", share.join(" / "), end.join(" / "), rate.join(" / "), self.runs / self.tokens.max(1), 1e3 * self.run_last / n, 1e3 * self.run_slot / n, 1e3 * self.run_wake / n, 1e3 * self.run_tail / n)
     }
     /// One line of milliseconds a token, the phases in order and their sum.
     pub fn line(&self) -> String {
@@ -1146,4 +1154,5 @@ fn account(p: &mut Profile, last_picks: &mut [[usize; TOP_K]], freq: &mut [u32],
     p.run_wake += wake;
     p.run_tail += tail;
     p.runs += runs;
+    p.run_last += pool.last_ends();
 }

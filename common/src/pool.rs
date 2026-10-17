@@ -78,6 +78,10 @@ pub trait Pool: Sync {
     fn overheads(&self) -> (f64, f64, f64, usize) {
         (0.0, 0.0, 0.0, 0)
     }
+    /// Since the last call: the sum over the placed runs of the last node's end (s).
+    fn last_ends(&self) -> f64 {
+        0.0
+    }
 }
 
 pub struct Serial;
