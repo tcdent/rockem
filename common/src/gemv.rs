@@ -336,6 +336,10 @@ pub const TOKENS: usize = 32;
 /// the registers few enough for the memory-bound kernels' occupancy (32
 /// accumulators measured 30 % slower on one token, 2026-09-19).
 pub const PASS: usize = 8;
+/// The width a pass of a few tokens (two to FEW: a speculative verify step's) runs at, with
+/// four-step rounds: at PASS with two-step rounds a two-token step's rows kernels ran ~2× one
+/// token's (rows_h 199 µs a launch against ~90, timeline 2026-10-17).
+pub const FEW: usize = 4;
 /// Steps per round at most: a round is unrolled with every load hoisted, so
 /// its depth is the registers it takes — forty-three steps of a 10,944-wide
 /// row put 190 registers and scratch in a kernel that needs 23 (2026-09-19).
@@ -402,8 +406,9 @@ pub mod gfx11 {
     #[inline(always)]
     pub const fn round(np: usize, steps: usize) -> usize {
         // a pass of PASS tokens: two steps a round — a round's LDS reads unroll and hoist
-        // per token per step, and four steps of eight tokens spilled (2026-09-19)
-        let r = if np == 1 { FLIGHT } else { 2 };
+        // per token per step, and four steps of eight tokens spilled (2026-09-19); a pass of
+        // FEW tokens (a verify step's) takes four, the slab the same 16 token-steps
+        let r = if np == 1 { FLIGHT } else if np <= FEW { 4 } else { 2 };
         if r < steps { r } else { steps }
     }
 
@@ -634,6 +639,7 @@ pub mod gfx11 {
             // the pass runs at a constant width so its token loop has nothing predicated
             match width(np) {
                 1 => rows_pass::<K, 1, NORM, F, 1>(tid, w, ln, m, p0, np, eps, &stage, &ready, &emit),
+                FEW => rows_pass::<K, FEW, NORM, F, R>(tid, w, ln, m, p0, np, eps, &stage, &ready, &emit),
                 _ => rows_pass::<K, PASS, NORM, F, R>(tid, w, ln, m, p0, np, eps, &stage, &ready, &emit),
             }
             p0 += PASS;
@@ -774,17 +780,19 @@ pub mod gfx11 {
         }
     }
 
-    pub use super::{FLIGHT, PASS, TOKENS};
+    pub use super::{FEW, FLIGHT, PASS, TOKENS};
 
     /// The pass width a pass of `np` tokens runs at: one token runs at 1
-    /// (the decode path, its registers and code its own), any more at PASS,
-    /// the tokens past `np` computed on stale slab entries and never
+    /// (the decode path, its registers and code its own), a few (a verify step's) at FEW,
+    /// any more at PASS, the tokens past `np` computed on stale slab entries and never
     /// written. Four widths measured as one kernel carrying four copies:
     /// 192 registers and scratch (2026-09-19).
     #[inline(always)]
     pub const fn width(np: usize) -> usize {
         if np <= 1 {
             1
+        } else if np <= FEW {
+            FEW
         } else {
             PASS
         }

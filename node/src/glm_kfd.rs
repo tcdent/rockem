@@ -42,7 +42,7 @@ use glm_5_3_flash::kda::gfx11_consts as g;
 use common::gemv::ROWS;
 use glm_5_3_flash::ffn::gfx11_consts::ROWS_GU;
 use glm_5_3_flash::layout::{KDA_MEMORY, KDA_WINDOW};
-use glm_5_3_flash::mla::gfx11_consts::{ATTEND_GRID, ATTEND_LDS, IX_ROWS, O_IN, SELECT_LDS};
+use glm_5_3_flash::mla::gfx11_consts::{ATTEND_GRID, ATTEND_LDS, IX_ROWS, O_IN, ROWS_QB, SELECT_LDS};
 use glm_5_3_flash::DENSE_BELOW;
 use glm_5_3_flash::{INDEX_HEAD_DIM, INDEX_N_HEADS, KV_LORA_RANK, Q_LORA_RANK};
 use glm_5_3_flash::weights::{Attn, Ffn, Fp8, Weights};
@@ -692,7 +692,7 @@ impl Cards {
         self.rows_free(c, &c.rows_h, c.x.va, ln, m.ix.va, c.mproj.at(MIX * 4), IX_ROWS, H, n, ROWS);
         // over q_a's output normed with q_a's norm: the query and, alongside it, the indexer's query (VRAM: the card scores the pools)
         let qln = Some(m.qa_ln.va);
-        self.rows8(c, &c.mla_qb, c.mqa.va, qln, m.q_b.0.va, m.q_b.1.va, c.mq.va, MLA_HEADS * Q_HEAD, Q_LORA_RANK, n, ROWS);
+        self.rows8(c, &c.mla_qb, c.mqa.va, qln, m.q_b.0.va, m.q_b.1.va, c.mq.va, MLA_HEADS * Q_HEAD, Q_LORA_RANK, n, ROWS_QB);
         self.rows_free(c, &c.mla_iq, c.mqa.va, qln, m.ix_wq_b.va, c.miq.va, INDEX_N_HEADS * INDEX_HEAD_DIM, Q_LORA_RANK, n, ROWS);
         c.k.fence();
     }

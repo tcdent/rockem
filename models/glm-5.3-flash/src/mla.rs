@@ -375,6 +375,8 @@ pub mod gfx11_consts {
     /// (a head a workgroup re-read the token's 4 MB of latents 128 times a layer at 2048 selected
     /// positions, 512 MB a launch from L2: 240 µs, 2026-10-17).
     pub const ATTEND_H: usize = 1;
+    /// Rows a wave of `mla_qb` takes past one token: FP8 at four spilled (192 registers, 2026-10-17).
+    pub const ROWS_QB: usize = 2;
     pub const ATTEND_GRID: u32 = (MLA_HEADS / ATTEND_H) as u32;
     pub const ATT_SLOTS: usize = DENSE_BELOW.div_ceil(256) * 256;
     pub const AT_Q: usize = 0;
@@ -412,7 +414,7 @@ pub mod gfx11 {
             let tid = workitem_id_x();
             let (m, n) = (m as usize, n as usize);
             let t = tid as usize;
-            rows_fmt::<Q_LORA_RANK, true, Fp8, ROWS>(tid, Fp8 { w, s }, ln, m, n, RMS_NORM_EPS, |i, s| *qa.add(i * Q_LORA_RANK + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
+            rows_fmt::<Q_LORA_RANK, true, Fp8, ROWS_QB>(tid, Fp8 { w, s }, ln, m, n, RMS_NORM_EPS, |i, s| *qa.add(i * Q_LORA_RANK + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
         }
     }
 

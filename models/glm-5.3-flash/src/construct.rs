@@ -1280,6 +1280,8 @@ impl<'p, R: Routed> CpuModel<'p, R> {
         pl.mtp_ffn(&s.b_y[..n * H], &mut s.b_x[..n * H], n);
         tr.edge(l, "mtp.ffn", &s.b_x[(n - 1) * H..n * H]);
         pl.mtp_head(n - 1, logits);
+        // the draft's expert time is the draft's (the step's `experts` lap takes what `elapsed` holds)
+        s.routed.elapsed();
         s.profile.draft += t0.elapsed().as_secs_f64();
     }
     /// The KDA layers' state now, `[SNAPSHOT]`.
