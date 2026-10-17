@@ -73,6 +73,11 @@ pub trait Pool: Sync {
     fn node_ends(&self) -> ([usize; 8], [f64; 8]) {
         ([0; 8], [0.0; 8])
     }
+    /// Since the last call, over the placed runs: seconds spent slotting (entry to post), waiting for
+    /// the first claim (the workers' wake) and after the last node's end (the tail); and the runs.
+    fn overheads(&self) -> (f64, f64, f64, usize) {
+        (0.0, 0.0, 0.0, 0)
+    }
 }
 
 pub struct Serial;

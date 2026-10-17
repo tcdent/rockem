@@ -50,6 +50,9 @@ pub struct Threads {
     node: usize,
     /// Since the last `node_ends`: each node's items and the sum of its run-end times (s), over the placed runs.
     node_stats: std::sync::Mutex<([usize; MAX_NODES], [f64; MAX_NODES])>,
+    /// Since the last `overheads`, over the placed runs: seconds slotting (entry to post), to the
+    /// first claim (wake), and after the last node's end (tail); and the runs.
+    overheads: std::sync::Mutex<(f64, f64, f64, usize)>,
 }
 /// The grain of placement: a region's node is known per 2 MiB page.
 pub use crate::layout::PAGE;
@@ -77,6 +80,8 @@ struct Job {
     /// job was posted) — the run's end on each node, the measurement the placement is tuned by.
     node_done: [Counter; MAX_NODES],
     node_end: [std::sync::atomic::AtomicU64; MAX_NODES],
+    /// When the first item was claimed (ns after the job was posted): the workers' wake.
+    first: std::sync::atomic::AtomicU64,
     t0: std::time::Instant,
     /// A prefetch's closure, owned by its job (the runs' closures are the caller's, alive through the run).
     _owned: Option<Box<dyn Fn(usize) + Send + Sync>>,
@@ -155,6 +160,9 @@ unsafe fn work(job: *const Job, order: &[usize], node: usize) {
             if i >= j.start[s + 1] {
                 break;
             }
+            if mine == 0 {
+                j.first.fetch_min(j.t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
             f(j.order[i] as usize);
             mine += 1;
             local += (k == 0) as usize;
@@ -225,7 +233,7 @@ impl Threads {
         }
         let node = node_of_core(cores[0]);
         let order = slot_order(node, ccd_of(cores[0]), &node_ccds);
-        Threads { shared, retired: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()), order, node_ccds, placed: std::sync::Mutex::new(Vec::new()), locality: std::sync::Mutex::new((0, 0)), prefetched: std::sync::Mutex::new((0, 0)), node, node_stats: std::sync::Mutex::new(([0; MAX_NODES], [0.0; MAX_NODES])) }
+        Threads { shared, retired: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()), order, node_ccds, placed: std::sync::Mutex::new(Vec::new()), locality: std::sync::Mutex::new((0, 0)), prefetched: std::sync::Mutex::new((0, 0)), node, node_stats: std::sync::Mutex::new(([0; MAX_NODES], [0.0; MAX_NODES])), overheads: std::sync::Mutex::new((0.0, 0.0, 0.0, 0)) }
     }
     /// Tell the pool where a region's memory lives: `nodes[p]` is the node of its `p`th `PAGE`.
     pub fn place(&self, base: usize, len: usize, nodes: Vec<u8>) {
@@ -246,6 +254,7 @@ impl Threads {
             }
             return;
         }
+        let entered = std::time::Instant::now();
         let job = self.post(n, at, node, ccd, f, None);
         unsafe { work(job, &self.order, self.node) };
         while unsafe { (*job).done.0.load(Ordering::Acquire) } != n {
@@ -255,13 +264,22 @@ impl Threads {
             *self.locality.lock().unwrap() = (unsafe { (*job).local.0.load(Ordering::Relaxed) }, n);
             let j = unsafe { &*job };
             let mut st = self.node_stats.lock().unwrap();
+            let mut end_max = 0u64;
             for d in 0..MAX_NODES {
                 let done = j.node_done[d].0.load(Ordering::Relaxed);
                 if done > 0 {
                     st.0[d] += done;
-                    st.1[d] += j.node_end[d].load(Ordering::Relaxed) as f64 * 1e-9;
+                    let e = j.node_end[d].load(Ordering::Relaxed);
+                    st.1[d] += e as f64 * 1e-9;
+                    end_max = end_max.max(e);
                 }
             }
+            let total = j.t0.elapsed().as_nanos() as u64;
+            let mut o = self.overheads.lock().unwrap();
+            o.0 += (j.t0 - entered).as_secs_f64();
+            o.1 += j.first.load(Ordering::Relaxed).min(total) as f64 * 1e-9;
+            o.2 += total.saturating_sub(end_max) as f64 * 1e-9;
+            o.3 += 1;
         }
     }
     /// The job slotted and published: the workers take it up; the job before it is stopped
@@ -318,7 +336,7 @@ impl Threads {
         // no worker is inside any job: the one retired at the last publish can go
         let fp: *const (dyn Fn(usize) + Sync) = unsafe { std::mem::transmute(f) };
         let light = owned.is_some();
-        let job = Box::into_raw(Box::new(Job { f: fp, order, next: std::array::from_fn(|s| Counter(AtomicUsize::new(start[s]))), start, done: Counter(AtomicUsize::new(0)), local: Counter(AtomicUsize::new(0)), stop: std::sync::atomic::AtomicBool::new(false), n, node_done: std::array::from_fn(|_| Counter(AtomicUsize::new(0))), node_end: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)), t0: std::time::Instant::now(), _owned: owned, light }));
+        let job = Box::into_raw(Box::new(Job { f: fp, order, next: std::array::from_fn(|s| Counter(AtomicUsize::new(start[s]))), start, done: Counter(AtomicUsize::new(0)), local: Counter(AtomicUsize::new(0)), stop: std::sync::atomic::AtomicBool::new(false), n, node_done: std::array::from_fn(|_| Counter(AtomicUsize::new(0))), node_end: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)), first: std::sync::atomic::AtomicU64::new(u64::MAX), t0: std::time::Instant::now(), _owned: owned, light }));
         let old = sh.job.swap(job, Ordering::AcqRel);
         let older = self.retired.swap(old, Ordering::AcqRel);
         if !older.is_null() {
@@ -364,6 +382,9 @@ impl Pool for Threads {
     }
     fn node_ends(&self) -> ([usize; MAX_NODES], [f64; MAX_NODES]) {
         std::mem::replace(&mut *self.node_stats.lock().unwrap(), ([0; MAX_NODES], [0.0; MAX_NODES]))
+    }
+    fn overheads(&self) -> (f64, f64, f64, usize) {
+        std::mem::replace(&mut *self.overheads.lock().unwrap(), (0.0, 0.0, 0.0, 0))
     }
     fn prefetched(&self) -> (usize, usize) {
         *self.prefetched.lock().unwrap()
@@ -692,6 +713,11 @@ pub struct Profile {
     /// Per node over the expert runs: items, and the sum of its run ends (s) — the nodes' measured rates.
     pub node_items: [usize; MAX_NODES],
     pub node_end: [f64; MAX_NODES],
+    /// Over the expert runs: seconds slotting, waking, and after the last node's end; the runs.
+    pub run_slot: f64,
+    pub run_wake: f64,
+    pub run_tail: f64,
+    pub runs: usize,
 }
 impl Profile {
     /// The expert runs by node: each node's share of the items, when its last item finished (ms a
@@ -707,7 +733,7 @@ impl Profile {
         let share: Vec<String> = used.iter().map(|&d| format!("{:.1}", 100.0 * self.node_items[d] as f64 / total as f64)).collect();
         let end: Vec<String> = used.iter().map(|&d| format!("{:.2}", 1e3 * self.node_end[d] / n)).collect();
         let rate: Vec<String> = used.iter().map(|&d| format!("{:.1}", self.node_items[d] as f64 / (1e3 * self.node_end[d]).max(1e-9))).collect();
-        format!("\nprofile  : nodes — items {} %, run ends {} ms a token, {} items/ms", share.join(" / "), end.join(" / "), rate.join(" / "))
+        format!("\nprofile  : nodes — items {} %, run ends {} ms a token, {} items/ms; a token's {} runs spend {:.2} ms slotting, {:.2} waking, {:.2} in the tail", share.join(" / "), end.join(" / "), rate.join(" / "), self.runs / self.tokens.max(1), 1e3 * self.run_slot / n, 1e3 * self.run_wake / n, 1e3 * self.run_tail / n)
     }
     /// One line of milliseconds a token, the phases in order and their sum.
     pub fn line(&self) -> String {
@@ -1115,4 +1141,9 @@ fn account(p: &mut Profile, last_picks: &mut [[usize; TOP_K]], freq: &mut [u32],
         p.node_items[d] += items[d];
         p.node_end[d] += ends[d];
     }
+    let (slot, wake, tail, runs) = pool.overheads();
+    p.run_slot += slot;
+    p.run_wake += wake;
+    p.run_tail += tail;
+    p.runs += runs;
 }
