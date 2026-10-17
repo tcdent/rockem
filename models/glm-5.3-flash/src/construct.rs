@@ -682,15 +682,28 @@ impl Routed for CpuExperts<'_> {
         for i in 0..n {
             QAct { q: &mut self.xq[i * H..(i + 1) * H], scale: &mut self.xs[i * HG..(i + 1) * HG], gsum: &mut self.xg[i * HG..(i + 1) * HG] }.quantize(&x[i * H..(i + 1) * H]);
         }
-        // the experts picked, each with the (token, slot) pairs that picked it
-        let mut uses: Vec<Vec<(u16, u8)>> = vec![Vec::new(); E];
-        for (i, picks) in idx.iter().enumerate() {
-            for (k, &e) in picks.iter().enumerate() {
-                uses[e].push((i as u16, k as u8));
+        // the experts picked, each with the (token, slot) pairs that picked it: a counting sort into one
+        // list, `first[e]..first[e + 1]` an expert's pairs (no allocation an expert)
+        let mut first = [0usize; E + 1];
+        for picks in idx {
+            for &e in picks {
+                first[e + 1] += 1;
             }
         }
-        let experts: Vec<usize> = (0..E).filter(|&e| !uses[e].is_empty()).collect();
+        for e in 0..E {
+            first[e + 1] += first[e];
+        }
+        let mut fill = first;
+        let mut pairs = vec![(0u16, 0u8); n * TOP_K];
+        for (i, picks) in idx.iter().enumerate() {
+            for (k, &e) in picks.iter().enumerate() {
+                pairs[fill[e]] = (i as u16, k as u8);
+                fill[e] += 1;
+            }
+        }
+        let experts: Vec<usize> = (0..E).filter(|&e| first[e + 1] > first[e]).collect();
         let ne = experts.len();
+        let uses = |e: usize| &pairs[first[e]..first[e + 1]];
         let stream = self.stream;
         let slice_slot = &self.slice_slot;
         let slot_of = |e: usize, j: usize| slice_slot[((l - FIRST_K_DENSE_REPLACE) * E + e) * (GU_ITEMS + DOWN_ITEMS) + j] as usize;
@@ -705,7 +718,7 @@ impl Routed for CpuExperts<'_> {
             let e = experts_r[j];
             let w = expert::Weights::at(stream, l, e);
             let (gw, uw, gs, us) = w.gu(c);
-            for &(t, k) in &uses_r[e] {
+            for &(t, k) in uses_r(e) {
                 let (t, k) = (t as usize, k as usize);
                 let xa = Act { q: &xq[t * H..(t + 1) * H], scale: &xs[t * HG..(t + 1) * HG], gsum: &xg[t * HG..(t + 1) * HG] };
                 let mut gu = [0f32; 2 * GU_ROWS];
@@ -715,13 +728,21 @@ impl Routed for CpuExperts<'_> {
                 swiglu_clamped::<GU_ROWS>(&gu, SWIGLU_LIMIT, h);
             }
         });
-        // every (token, slot)'s hidden state quantized once, in parallel
+        // every (token, slot)'s hidden state quantized once: here for a token (2 µs each, less than a
+        // pool run's posting), over the pool for a step
         let (hq_p, hs_p, hg_p) = (self.hq.as_mut_ptr() as usize, self.hs.as_mut_ptr() as usize, self.hg.as_mut_ptr() as usize);
         let h = &self.h;
-        self.pool.run(n * TOP_K, &move |i| {
+        let quantize_h = move |i: usize| {
             let (q, sc, g) = unsafe { (std::slice::from_raw_parts_mut((hq_p as *mut i8).add(i * D_FF), D_FF), std::slice::from_raw_parts_mut((hs_p as *mut f32).add(i * DG), DG), std::slice::from_raw_parts_mut((hg_p as *mut i32).add(i * DG), DG)) };
             QAct { q, scale: sc, gsum: g }.quantize(&h[i * D_FF..(i + 1) * D_FF]);
-        });
+        };
+        if n * TOP_K <= 16 {
+            for i in 0..n * TOP_K {
+                quantize_h(i);
+            }
+        } else {
+            self.pool.run(n * TOP_K, &quantize_h);
+        }
         // the down rows: part (j, c) owns rows c·DOWN_ROWS.. of expert experts[j]'s output, for each of its tokens
         let (hq, hs, hg) = (&self.hq, &self.hs, &self.hg);
         let out_p = out.as_mut_ptr() as usize;
@@ -732,7 +753,7 @@ impl Routed for CpuExperts<'_> {
             let w = expert::Weights::at(stream, l, e);
             let (dw, ds) = w.down(c);
             let r0 = c * DOWN_ROWS;
-            for &(t, k) in &uses_r[e] {
+            for &(t, k) in uses_r(e) {
                 let (t, k) = (t as usize, k as usize);
                 let s = t * TOP_K + k;
                 let ha = Act { q: &hq[s * D_FF..(s + 1) * D_FF], scale: &hs[s * DG..(s + 1) * DG], gsum: &hg[s * DG..(s + 1) * DG] };
