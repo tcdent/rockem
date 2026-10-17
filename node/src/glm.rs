@@ -55,13 +55,10 @@ impl Glm {
     pub fn open(bundle: &std::path::Path, mem: loader::Mem, max_ctx: usize, gpu: bool, profile_every: usize, timeline: bool) -> Box<dyn Engine> {
         let t0 = std::time::Instant::now();
         let dense = loader::load(&bundle.join(layout::DENSE_FILE), mem);
-        // the experts placed by the box's own measurement: each node's share of every expert in
-        // proportion to its stream rate, so a layer's expert run ends on every node at once
-        let rates = crate::probe::node_rates();
-        let total: f64 = rates.iter().sum();
-        println!("placement: node streams {} GB/s → item shares {} %", rates.iter().map(|r| format!("{r:.0}")).collect::<Vec<_>>().join(" / "), rates.iter().map(|r| format!("{:.1}", 100.0 * r / total)).collect::<Vec<_>>().join(" / "));
-        let experts: &'static glm_5_3_flash::expert::Stream<'static> = Box::leak(Box::new(loader::load_placed(&bundle.join(layout::EXPERTS_FILE), mem, &layout::placement(&vec![1.0; rates.len()])))); // A/B: equal shares through the item loader
-        println!("bundle   : {} loaded in {:.1}s ({:.1} GB)", bundle.display(), t0.elapsed().as_secs_f32(), (dense.len() + experts.bytes.len()) as f64 / 1e9);
+        // the experts, placed equally first; the pool then measures where each node ends its runs
+        // and the items move so every node ends at once (below, once the pool is up)
+        let mut stream = loader::load_placed(&bundle.join(layout::EXPERTS_FILE), mem, &layout::placement(&vec![1.0; glm_5_3_flash::construct::node_count() as usize]));
+        println!("bundle   : {} loaded in {:.1}s ({:.1} GB)", bundle.display(), t0.elapsed().as_secs_f32(), (dense.len() + stream.bytes.len()) as f64 / 1e9);
         let w = Weights::from_dense(dense);
         let prefix_b = loader::load(&bundle.join(layout::PREFIX_FILE), loader::Mem::Anon);
         let (p, prefix, q) = unsafe { prefix_b.align_to::<f32>() };
@@ -70,7 +67,7 @@ impl Glm {
         let cores = physical_cores();
         let pool: &'static Threads = Box::leak(Box::new(Threads::new(&cores)));
         let mut by_node = [0usize; 8];
-        for buf in [dense, experts.bytes] {
+        for buf in [dense, stream.bytes] {
             let nodes = loader::placement(buf);
             for &d in &nodes {
                 by_node[d as usize] += 1;
@@ -79,6 +76,17 @@ impl Glm {
         }
         let used: Vec<String> = by_node.iter().filter(|&&n| n > 0).map(|&n| format!("{:.1}", n as f64 * 2.0 / 1024.0)).collect();
         println!("threads  : {} pinned, one per physical core; the weights' 2 MiB pages by node: {} GB", cores.len(), used.join(" / "));
+        // the placement trained on the pool itself: the rates its nodes show on real expert runs
+        if stream.regions.len() > 1 {
+            let t2 = std::time::Instant::now();
+            let rates = calibrate(&stream, pool, 24);
+            let total: f64 = rates.iter().sum();
+            let (moved, bytes) = stream.migrate(&layout::placement(&rates));
+            let after = calibrate(&stream, pool, 24);
+            let fmt = |v: &[f64]| v.iter().map(|r| format!("{r:.0}")).collect::<Vec<_>>().join(" / ");
+            println!("placement: the pool's node rates {} items/ms → shares {} %; {moved} items ({:.1} GB) moved in {:.1} s; after: {} items/ms", fmt(&rates), rates.iter().map(|r| format!("{:.1}", 100.0 * r / total)).collect::<Vec<_>>().join(" / "), bytes as f64 / 1e9, t2.elapsed().as_secs_f64(), fmt(&after));
+        }
+        let experts: &'static glm_5_3_flash::expert::Stream<'static> = Box::leak(Box::new(stream));
         let mut model = CpuModel::new(CpuExperts::new(experts, pool), pool, max_ctx);
         if gpu {
             // the KDA layers on the cards, split by layer order between them; everything else here
@@ -203,3 +211,38 @@ impl Engine for Glm {
 }
 
 const _: () = assert!(Sampling::GREEDY.top_k == 1);
+
+/// Each node's rate on real expert runs (items a ms): `tokens` tokens' worth of MoE layers with
+/// random picks and a random input through the pool, the ends read from it.
+fn calibrate(stream: &glm_5_3_flash::expert::Stream, pool: &'static Threads, tokens: usize) -> Vec<f64> {
+    use common::pool::Pool;
+    use glm_5_3_flash::ffn::Routed;
+    use glm_5_3_flash::{E, FIRST_K_DENSE_REPLACE};
+    let mut cpu = CpuExperts::new(stream, pool);
+    let mut seed = 0x9E3779B97F4A7C15u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let x: Vec<f32> = (0..H).map(|_| (next() % 2001) as f32 / 1000.0 - 1.0).collect();
+    let mut out = vec![0f32; TOP_K * H];
+    let _ = pool.node_ends();
+    for _ in 0..tokens {
+        for l in FIRST_K_DENSE_REPLACE..NUM_HIDDEN_LAYERS {
+            let mut picks = [0usize; TOP_K];
+            let mut k = 0;
+            while k < TOP_K {
+                let e = (next() % E as u64) as usize;
+                if !picks[..k].contains(&e) {
+                    picks[k] = e;
+                    k += 1;
+                }
+            }
+            cpu.run(l, &picks, &x, &mut out);
+        }
+    }
+    let (items, ends) = pool.node_ends();
+    (0..stream.regions.len()).map(|d| items[d] as f64 / (1e3 * ends[d]).max(1e-9f64)).collect()
+}

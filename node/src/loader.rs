@@ -23,6 +23,7 @@ pub enum Mem {
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn mlock(addr: *const u8, len: usize) -> i32;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn syscall(nr: i64, ...) -> i64;
 }
 const SYS_SET_MEMPOLICY: i64 = 238;
@@ -86,11 +87,15 @@ pub fn load_placed(path: &std::path::Path, mem: Mem, node_of_item: &[u8]) -> glm
             }
         }
     }
+    // each region with room for the items a re-placement moves in (`Stream::migrate`)
+    const SLACK: usize = 10;
     let mut base = vec![0usize; nodes];
+    let mut cap = vec![0usize; nodes];
     let mut total = 0;
     for n in 0..nodes {
         base[n] = total;
-        total += bytes[n].div_ceil(PAGE) * PAGE;
+        cap[n] = (bytes[n] + bytes[n] / SLACK).div_ceil(PAGE) * PAGE;
+        total += cap[n];
     }
     for l in FIRST_K_DENSE_REPLACE..NUM_HIDDEN_LAYERS {
         for e in 0..E {
@@ -104,9 +109,24 @@ pub fn load_placed(path: &std::path::Path, mem: Mem, node_of_item: &[u8]) -> glm
     if mem == Mem::Hugetlb {
         for n in 0..nodes {
             let mask: u64 = 1 << n;
-            let r = unsafe { syscall(SYS_MBIND, dst as usize + base[n], bytes[n].div_ceil(PAGE) * PAGE, MPOL_BIND, &mask as *const u64, 64u64, 0u64) };
+            let r = unsafe { syscall(SYS_MBIND, dst as usize + base[n], cap[n], MPOL_BIND, &mask as *const u64, 64u64, 0u64) };
             assert_eq!(r, 0, "mbind node {n}: {}", std::io::Error::last_os_error());
         }
+    }
+    // each region's pages faulted in order by a thread on its node, before the readers touch them in
+    // whatever order they reach them: the region's pages come off the node's free list in sequence
+    if mem == Mem::Hugetlb {
+        std::thread::scope(|sc| {
+            for n in 0..nodes {
+                let (b, l) = (dst as usize + base[n], cap[n]);
+                sc.spawn(move || {
+                    glm_5_3_flash::construct::pin(glm_5_3_flash::construct::first_core_of(n));
+                    const MADV_POPULATE_WRITE: i32 = 23;
+                    let r = unsafe { madvise(b as *mut u8, l, MADV_POPULATE_WRITE) };
+                    assert_eq!(r, 0, "madvise populate node {n}: {}", std::io::Error::last_os_error());
+                });
+            }
+        });
     }
     let t0 = std::time::Instant::now();
     let name = path.file_name().unwrap().to_string_lossy().into_owned();
@@ -146,11 +166,12 @@ pub fn load_placed(path: &std::path::Path, mem: Mem, node_of_item: &[u8]) -> glm
         }
     });
     assert_eq!(done.load(std::sync::atomic::Ordering::Relaxed), len, "placed load: bytes copied");
-    println!("loading  : {name} {:.1} GB in {:.0} s ({:.0} MB/s, placed by item; regions {} GB)", len as f64 / 1e9, t0.elapsed().as_secs_f64(), len as f64 / 1e6 / t0.elapsed().as_secs_f64(), bytes.iter().map(|b| format!("{:.1}", *b as f64 / 1e9)).collect::<Vec<_>>().join(" / "));
+    println!("loading  : {name} {:.1} GB in {:.0} s ({:.0} MB/s, placed by item; regions {} GB of {} mapped)", len as f64 / 1e9, t0.elapsed().as_secs_f64(), len as f64 / 1e6 / t0.elapsed().as_secs_f64(), bytes.iter().map(|b| format!("{:.1}", *b as f64 / 1e9)).collect::<Vec<_>>().join(" / "), total as f64 / 1e9);
     if mem == Mem::Hugetlb {
         assert_eq!(unsafe { mlock(dst, total) }, 0, "mlock: {}", std::io::Error::last_os_error());
     }
-    glm_5_3_flash::expert::Stream::placed(unsafe { std::slice::from_raw_parts(dst, total) }, addr)
+    let regions = (0..nodes).map(|n| glm_5_3_flash::expert::Region { base: base[n], cap: cap[n], used: bytes[n] }).collect();
+    glm_5_3_flash::expert::Stream::placed(unsafe { std::slice::from_raw_parts(dst, total) }, addr, node_of_item.to_vec(), regions)
 }
 /// A mapping of `len` bytes for the file: hugetlbfs (a file of the same name under the mount) or anonymous.
 fn map_memory(path: &std::path::Path, len: usize, mem: Mem) -> *mut u8 {

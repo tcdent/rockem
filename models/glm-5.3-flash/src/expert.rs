@@ -20,6 +20,17 @@ pub struct Stream<'a> {
     pub bytes: &'a [u8],
     /// Byte offset in `bytes` of every item, `[MOE_LAYERS][E][ITEMS]` (gate/up items, then down).
     pub addr: std::vec::Vec<u64>,
+    /// The node of every item, as placed.
+    pub node: std::vec::Vec<u8>,
+    /// A placed stream's regions, one a node: where it starts in `bytes`, its capacity, and the
+    /// bytes used — items moved to a node by `migrate` go at the end of its region.
+    pub regions: std::vec::Vec<Region>,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct Region {
+    pub base: usize,
+    pub cap: usize,
+    pub used: usize,
 }
 pub const ITEMS: usize = GU_ITEMS + DOWN_ITEMS;
 #[inline(always)]
@@ -41,12 +52,63 @@ impl<'a> Stream<'a> {
                 }
             }
         }
-        Stream { bytes, addr }
+        Stream { bytes, addr, node: std::vec![0; layout::MOE_LAYERS * crate::E * ITEMS], regions: std::vec::Vec::new() }
     }
     /// A placed copy: the loader's regions, with the table it filled.
-    pub fn placed(bytes: &'a [u8], addr: std::vec::Vec<u64>) -> Self {
+    pub fn placed(bytes: &'a [u8], addr: std::vec::Vec<u64>, node: std::vec::Vec<u8>, regions: std::vec::Vec<Region>) -> Self {
         assert_eq!(addr.len(), layout::MOE_LAYERS * crate::E * ITEMS);
-        Stream { bytes, addr }
+        assert_eq!(node.len(), addr.len());
+        Stream { bytes, addr, node, regions }
+    }
+    #[inline(always)]
+    pub const fn item_len(j: usize) -> usize {
+        if j < GU_ITEMS { layout::GU_ITEM } else { layout::DOWN_ITEM }
+    }
+    /// Re-place the items: every item whose node differs in `node` is copied to the end of its new
+    /// node's region and the table points there (the old copy stays, dead). Returns (items moved,
+    /// bytes). The caller owns the mapping behind `bytes` and nothing reads it meanwhile.
+    pub fn migrate(&mut self, node: &[u8]) -> (usize, usize) {
+        assert_eq!(node.len(), self.node.len());
+        let base = self.bytes.as_ptr() as usize;
+        let nodes = self.regions.len();
+        // the moves by destination node, then one thread a destination copies them in order
+        let mut moves: std::vec::Vec<std::vec::Vec<usize>> = std::vec![std::vec::Vec::new(); nodes];
+        for i in 0..node.len() {
+            if node[i] != self.node[i] {
+                moves[node[i] as usize].push(i);
+            }
+        }
+        let (mut n_moved, mut b_moved) = (0, 0);
+        let mut dst_of = std::vec![0u64; node.len()];
+        for (d, list) in moves.iter().enumerate() {
+            let r = &mut self.regions[d];
+            for &i in list {
+                let len = Self::item_len(i % ITEMS);
+                assert!(r.used + len <= r.cap, "node {d}'s region is full: {} moves of {} bytes into {} spare", list.len(), len, r.cap - r.used);
+                dst_of[i] = (r.base + r.used) as u64;
+                r.used += len;
+                n_moved += 1;
+                b_moved += len;
+            }
+        }
+        std::thread::scope(|sc| {
+            for list in &moves {
+                let (addr, dst_of) = (&self.addr, &dst_of);
+                sc.spawn(move || {
+                    for &i in list {
+                        let len = Self::item_len(i % ITEMS);
+                        unsafe { core::ptr::copy_nonoverlapping((base + addr[i] as usize) as *const u8, (base + dst_of[i] as usize) as *mut u8, len) };
+                    }
+                });
+            }
+        });
+        for list in &moves {
+            for &i in list {
+                self.addr[i] = dst_of[i];
+            }
+        }
+        self.node.copy_from_slice(node);
+        (n_moved, b_moved)
     }
 }
 
