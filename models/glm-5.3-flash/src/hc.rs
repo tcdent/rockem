@@ -484,12 +484,69 @@ pub mod gfx11 {
             }
             workgroup_sync();
             fence(Ordering::Acquire);
-            // the router over every token's normed block input: a wave a token, this workgroup's rows; the
-            // norm and every dot in the 256-thread reduction's order (thread lane + 32·w over elements
-            // 256 apart, each wave's lanes summed, the eight waves in order), so a score's bits are the
-            // one-token kernel's
+            // the router over every token's normed block input, this workgroup's rows. A few tokens: the
+            // 256-thread reduction a (token, row) at a time (two barriers each) — a token at a time
+            // keeps every wave busy. Many: a wave a token, the norm and every dot in that same order
+            // (thread lane + 32·w over elements 256 apart, each wave's lanes summed, the eight waves in
+            // order), so a score's bits are the same either way.
+            if n < 8 {
+                let mut i = 0;
+                while i < n {
+                    let xt = x.add(i * H);
+                    let mut ss = 0f32;
+                    let mut k = t;
+                    while k < H {
+                        let v = *xt.add(k);
+                        ss += v * v;
+                        k += 256;
+                    }
+                    ss = wave_sum(lane, ss);
+                    if lane == 0 {
+                        *red.add(wave) = ss;
+                    }
+                    workgroup_sync();
+                    let mut tot = 0f32;
+                    let mut k = 0;
+                    while k < 8 {
+                        tot += *red.add(k);
+                        k += 1;
+                    }
+                    let rr = 1.0 / sqrt(tot / H as f32 + RMS_NORM_EPS);
+                    workgroup_sync(); // red is reused below
+                    let mut r = 0;
+                    while r < ROUTER_ROWS_PER_WG {
+                        let rrow = wg + r * COEF_ROWS * SLICES;
+                        if rrow < E {
+                            let wr = router.add(rrow * H);
+                            let mut acc = 0f32;
+                            let mut k = t;
+                            while k < H {
+                                acc += *xt.add(k) * widen(*ln.add(k)) * widen(*wr.add(k));
+                                k += 256;
+                            }
+                            acc = wave_sum(lane, acc);
+                            if lane == 0 {
+                                *red.add(wave) = acc;
+                            }
+                            workgroup_sync();
+                            if t == 0 {
+                                let mut sum = 0f32;
+                                let mut k = 0;
+                                while k < 8 {
+                                    sum += *red.add(k);
+                                    k += 1;
+                                }
+                                *scores.add(i * E + rrow) = sum * rr;
+                            }
+                            workgroup_sync();
+                        }
+                        r += 1;
+                    }
+                    i += 1;
+                }
+            }
             let mut i = wave;
-            while i < n {
+            while i < n && n >= 8 {
                 let xt = x.add(i * H);
                 let mut tot = 0f32;
                 let mut w = 0;

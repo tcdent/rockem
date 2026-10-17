@@ -118,6 +118,12 @@ impl Engine for V2Lite {
     fn rows(&self, i: usize, out: &mut [f32]) {
         self.model.rows(i, out)
     }
+    fn logits_row(&self, i: usize) -> &[f32] {
+        &self.st.logits[i * VOCAB_SIZE..(i + 1) * VOCAB_SIZE]
+    }
+    fn set_logits(&mut self, i: usize, logits: &[f32]) {
+        self.st.logits[i * VOCAB_SIZE..(i + 1) * VOCAB_SIZE].copy_from_slice(&logits[..VOCAB_SIZE]);
+    }
     fn draw(&mut self, i: usize, u: f64) -> u32 {
         self.model.draw(i, &SAMPLING, u, &self.st.logits[i * VOCAB_SIZE..(i + 1) * VOCAB_SIZE]) as u32
     }

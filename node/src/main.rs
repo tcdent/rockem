@@ -120,13 +120,15 @@ struct Context {
     ids: Vec<u32>,
     keys: Vec<u64>, // keys[n] names ids[..=n]
     rows: Box<dyn Segment>,
-    /// The sequence state at the context's end, `snapshot_len` f32s (empty while the context is active).
+    /// The sequence state at the context's end, `snapshot_len` f32s (empty while the context is active),
+    /// and the logits there.
     snap: Vec<f32>,
-    /// The sequence state at other positions: at the end of every prompt generation started from
-    /// (`(positions, state)`), so the next turn of a chat — the same prompt, the reply as the
-    /// template re-renders it, the new message — resumes where its prompt matched instead of
-    /// recomputing the transcript (2026-10-16).
-    marks: Vec<(usize, Vec<f32>)>,
+    snap_logits: Vec<f32>,
+    /// The sequence state at other positions — at the end of every prompt generation started from,
+    /// and at a reply's end — `(positions, state, the logits there)`, so the next turn of a chat (the
+    /// same prompt, the reply as the API re-renders it, the new message) resumes where its prompt
+    /// matched, and the same prompt again draws at once (2026-10-16).
+    marks: Vec<(usize, Vec<f32>, Vec<f32>)>,
     used: u64,
 }
 struct Store {
@@ -144,10 +146,11 @@ impl Store {
         id.to_le_bytes().iter().fold(prev, |h, &b| (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3))
     }
     /// The context being written becomes a segment with `snap` as its end state; its rows are no longer the active region.
-    fn close(&mut self, ctx: usize, snap: Vec<f32>) {
+    fn close(&mut self, ctx: usize, snap: Vec<f32>, logits: Vec<f32>) {
         if let Some(c) = self.contexts[ctx].as_mut() {
             c.rows = Box::new(Dram(std::mem::take(&mut self.active)));
             c.snap = snap;
+            c.snap_logits = logits;
         }
     }
     /// A new context, the active one, holding `n` positions read from `from`, or the prefix (its ids and rows) when `from` is none.
@@ -155,7 +158,7 @@ impl Store {
         if self.active.is_empty() {
             self.active = vec![0f32; self.max_ctx * self.position];
         }
-        let mut c = Context { ids: Vec::new(), keys: Vec::new(), rows: Box::new(Dram(Vec::new())), snap: Vec::new(), marks: Vec::new(), used: 0 };
+        let mut c = Context { ids: Vec::new(), keys: Vec::new(), rows: Box::new(Dram(Vec::new())), snap: Vec::new(), snap_logits: Vec::new(), marks: Vec::new(), used: 0 };
         match from {
             Some((src, n)) => {
                 let p = self.contexts[src].as_ref().unwrap();
@@ -240,7 +243,8 @@ impl Session {
         if !self.store.active.is_empty() {
             let mut snap = vec![0f32; self.e.snapshot_len()];
             self.e.snapshot(&mut snap);
-            self.store.close(self.active, snap);
+            let logits = if self.pos > self.first_pos() { self.e.logits_row(self.last_row).to_vec() } else { Vec::new() };
+            self.store.close(self.active, snap, logits);
         }
         let (rows, _) = self.e.prefix();
         self.active = self.store.open(None, self.e.prefix_ids(), rows);
@@ -270,9 +274,10 @@ impl Session {
                 self.pending = None;
                 true
             }
-            Some((ctx, n)) => {
-                let last = self.store.contexts[ctx].as_ref().unwrap().ids[n - 1];
-                self.materialize(n - 1) && self.feed(last)
+            Some((_, n)) => {
+                // the whole prompt is cached: resume at its end where the state and logits were kept,
+                // else at the latest state before it and feed the rest (the last id's step gives the draw)
+                self.materialize(n)
             }
             None => true,
         }
@@ -306,7 +311,7 @@ impl Session {
                 if n == c.ids.len() && !c.snap.is_empty() {
                     best = n;
                 }
-                for (p, _) in &c.marks {
+                for (p, _, _) in &c.marks {
                     if *p <= n && *p > best {
                         best = *p;
                     }
@@ -319,16 +324,31 @@ impl Session {
         let (rows, _) = self.e.prefix();
         self.active = self.store.open(Some((src, at)), self.e.prefix_ids(), rows);
         self.store.held -= self.store.contexts[old].take().unwrap().ids.len();
+        let mut drawn = false;
         if at == first {
             self.e.seed_prefix();
         } else {
             let c = self.store.contexts[src].as_ref().unwrap();
-            let snap: &[f32] = if self.e.snapshot_len() == 0 { &[] } else if at == c.ids.len() && !c.snap.is_empty() { &c.snap } else { &c.marks.iter().find(|(p, _)| *p == at).unwrap().1 };
+            let (snap, logits): (&[f32], &[f32]) = if self.e.snapshot_len() == 0 {
+                (&[], &[])
+            } else if at == c.ids.len() && !c.snap.is_empty() {
+                (&c.snap, &c.snap_logits)
+            } else {
+                let m = c.marks.iter().find(|(p, _, _)| *p == at).unwrap();
+                (&m.1, &m.2)
+            };
             self.e.seed(&self.store.active[..at * self.store.position], snap);
+            // the logits kept with the state: the draw at this position needs no step
+            if !logits.is_empty() {
+                self.e.set_logits(0, logits);
+                self.last_row = 0;
+                self.next = self.e.draw(0, common::sample::uniform_at(self.e.seed_value(), (at - 1) as u64));
+                drawn = true;
+            }
         }
         self.pos = at;
         self.hits = at - first;
-        println!("context  : {} of a cached transcript's {} positions matched; resumed at {at}, {} replayed", n, self.store.contexts[src].as_ref().unwrap().ids.len(), replay.len());
+        println!("context  : {} of a cached transcript's {} positions matched; resumed at {at}{}, {} replayed", n, self.store.contexts[src].as_ref().unwrap().ids.len(), if drawn { " with its logits" } else { "" }, replay.len());
         replay.is_empty() || self.feed_many(&replay, &mut |_| {})
     }
     /// The sequence state now, kept with the active context at this position (the end of a
@@ -339,14 +359,15 @@ impl Session {
             return;
         }
         let c = self.store.contexts[self.active].as_mut().unwrap();
-        if c.marks.last().is_some_and(|(p, _)| *p == self.pos) {
+        if c.marks.last().is_some_and(|(p, _, _)| *p == self.pos) {
             return;
         }
         let t0 = std::time::Instant::now();
         let mut snap = vec![0f32; len];
         self.e.snapshot(&mut snap);
+        let logits = self.e.logits_row(self.last_row).to_vec();
         println!("context  : state at {} positions kept ({:.0} MB in {:.0} ms)", self.pos, 4.0 * len as f64 / 1e6, t0.elapsed().as_secs_f64() * 1e3);
-        c.marks.push((self.pos, snap));
+        c.marks.push((self.pos, snap, logits));
     }
     /// `ids` through the model at the next positions, as few steps as they
     /// allow (`tokens()` per step): the prefix's remaining ids are checked and

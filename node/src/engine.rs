@@ -57,6 +57,10 @@ pub trait Engine {
     fn draw(&mut self, i: usize, u: f64) -> u32;
     /// ln p(id) at the position after token `i`.
     fn score(&mut self, i: usize, id: u32) -> f32;
+    /// Token `i`'s logits of the last step, and their replacement: a context's kept state
+    /// carries the logits at its end, so a sequence resumed there draws without a step.
+    fn logits_row(&self, i: usize) -> &[f32];
+    fn set_logits(&mut self, i: usize, logits: &[f32]);
     /// The same two from the prefix's logits: what the first computed position is drawn or scored from.
     fn draw_prefix(&mut self, u: f64) -> u32;
     fn score_prefix(&mut self, id: u32) -> f32;

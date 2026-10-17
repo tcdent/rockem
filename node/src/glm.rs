@@ -240,6 +240,12 @@ impl Engine for Glm {
     fn rows(&self, i: usize, out: &mut [f32]) {
         self.model.rows(self.last_pos + i, out)
     }
+    fn logits_row(&self, i: usize) -> &[f32] {
+        &self.logits[i * VOCAB_SIZE..(i + 1) * VOCAB_SIZE]
+    }
+    fn set_logits(&mut self, i: usize, logits: &[f32]) {
+        self.logits[i * VOCAB_SIZE..(i + 1) * VOCAB_SIZE].copy_from_slice(&logits[..VOCAB_SIZE]);
+    }
     fn draw(&mut self, i: usize, u: f64) -> u32 {
         common::sample::draw(&self.logits[i * VOCAB_SIZE..(i + 1) * VOCAB_SIZE], &SAMPLING, u) as u32
     }

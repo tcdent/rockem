@@ -855,7 +855,7 @@ impl Profile {
         let share: Vec<String> = used.iter().map(|&d| format!("{:.1}", 100.0 * self.node_items[d] as f64 / total as f64)).collect();
         let end: Vec<String> = used.iter().map(|&d| format!("{:.2}", 1e3 * self.node_end[d] / n)).collect();
         let rate: Vec<String> = used.iter().map(|&d| format!("{:.1}", self.node_items[d] as f64 / (1e3 * self.node_end[d]).max(1e-9))).collect();
-        format!("\nprofile  : nodes — items {} %, run ends {} ms a token, {} items/ms; a token's {} runs end at {:.2} ms (the last node each run) and spend {:.2} ms slotting (sort {:.2}, drain {:.2}, alloc+free {:.2}), {:.2} waking, {:.2} in the tail", share.join(" / "), end.join(" / "), rate.join(" / "), self.runs / self.tokens.max(1), 1e3 * self.run_last / n, 1e3 * self.run_slot / n, 1e3 * self.post_sort / n, 1e3 * self.post_drain / n, 1e3 * self.post_free / n, 1e3 * self.run_wake / n, 1e3 * self.run_tail / n)
+        format!("\nprofile  : nodes — items {} %, run ends {} ms a token, {} items/ms; a token's {:.1} runs end at {:.2} ms (the last node each run) and spend {:.2} ms slotting (sort {:.2}, drain {:.2}, alloc+free {:.2}), {:.2} waking, {:.2} in the tail", share.join(" / "), end.join(" / "), rate.join(" / "), self.runs as f64 / n, 1e3 * self.run_last / n, 1e3 * self.run_slot / n, 1e3 * self.post_sort / n, 1e3 * self.post_drain / n, 1e3 * self.post_free / n, 1e3 * self.run_wake / n, 1e3 * self.run_tail / n)
     }
     /// One line of milliseconds a token, the phases in order and their sum.
     pub fn line(&self) -> String {
