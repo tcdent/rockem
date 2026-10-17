@@ -103,7 +103,7 @@ pub fn report() {
             }
         }
         if !dimms.is_empty() {
-            println!("hsmp     : socket {s} dimms: {}", dimms.join(" · "));
+            crate::platform::say(&format!("hsmp     : socket {s} dimms: "), &dimms.join(" · "));
         }
     }
 }

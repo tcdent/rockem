@@ -8,6 +8,31 @@ fn read(p: &str) -> String {
 fn exists(p: &str) -> &'static str {
     if fs::metadata(p).is_ok() { "present" } else { "absent" }
 }
+/// A banner line to stdout — which is /dev/kmsg on the box, where one write is one record of at
+/// most 1 KB and a longer one is refused (EINVAL, and println panics): long lines go out in parts.
+pub fn say(prefix: &str, text: &str) {
+    const LIMIT: usize = 900;
+    if text.len() <= LIMIT {
+        println!("{prefix}{text}");
+        return;
+    }
+    let mut rest = text;
+    let mut first = true;
+    while !rest.is_empty() {
+        let mut cut = rest.len().min(LIMIT);
+        while !rest.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        if cut < rest.len() {
+            if let Some(sp) = rest[..cut].rfind(' ') {
+                cut = sp + 1;
+            }
+        }
+        println!("{}{}", if first { prefix } else { "         …" }, &rest[..cut]);
+        rest = &rest[cut..];
+        first = false;
+    }
+}
 
 pub fn report() {
     println!("rockem node {} — pid {}", env!("CARGO_PKG_VERSION"), std::process::id());
@@ -42,7 +67,7 @@ pub fn report() {
             }
         }
     }
-    println!("dimm temp: {}", if dimms.is_empty() { "no jc42 sensors".to_string() } else { dimms.join(" · ") });
+    say("dimm temp: ", &if dimms.is_empty() { "no jc42 sensors".to_string() } else { dimms.join(" · ") });
     let mut edac = Vec::new();
     if let Ok(d) = fs::read_dir("/sys/devices/system/edac/mc") {
         let mut mcs: Vec<_> = d.flatten().map(|e| e.path()).filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("mc")).collect();
@@ -54,6 +79,11 @@ pub fn report() {
             edac.push(format!("{} ({}): {}", mc.file_name().unwrap().to_string_lossy(), read(&format!("{}/mc_name", mc.display())), parts.join(", ")));
         }
     }
-    println!("edac     : {}", if edac.is_empty() { "no memory controllers registered".to_string() } else { edac.join(" | ") });
+    if edac.is_empty() {
+        println!("edac     : no memory controllers registered");
+    }
+    for e in &edac {
+        say("edac     : ", e);
+    }
     crate::hsmp::report();
 }
