@@ -367,7 +367,21 @@ mod tests {
         for (off, it) in pack_items(l, e, &guw, &gus, &dw, &ds) {
             stream[off..off + it.len()].copy_from_slice(&it);
         }
-        let w = Weights { stream, l, e };
+        let stream: &[u8] = stream;
+        // the stream's table over the block: the file's own offsets (only this expert's are reached)
+        let mut addr = Vec::with_capacity(layout::MOE_LAYERS * crate::E * ITEMS);
+        for ll in crate::FIRST_K_DENSE_REPLACE..crate::NUM_HIDDEN_LAYERS {
+            for ee in 0..crate::E {
+                for c in 0..GU_ITEMS {
+                    addr.push(layout::gu_item(ll, ee, c).start as u64);
+                }
+                for c in 0..DOWN_ITEMS {
+                    addr.push(layout::down_item(ll, ee, c).start as u64);
+                }
+            }
+        }
+        let st = Stream::placed(stream, addr, vec![0; layout::MOE_LAYERS * crate::E * ITEMS], Vec::new());
+        let w = Weights::at(&st, l, e);
         let x: Vec<f32> = (0..H).map(|_| ((rnd() % 2000) as f32 - 1000.0) * 1e-3).collect();
 
         let run = |f: &dyn Fn(&Weights, &[f32], &mut Scratch, &mut [f32])| {
