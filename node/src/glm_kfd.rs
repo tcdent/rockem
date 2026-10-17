@@ -196,6 +196,8 @@ pub struct Cards {
     half_seq: Vec<[u32; 2]>,
     /// With the launches stamped: each card's first packet of the token, and the tokens since the last report.
     token_from: Vec<u64>,
+    /// The step's token count (`begin`), for the report at `finish`.
+    last_n: usize,
     tokens: u32,
 }
 
@@ -471,18 +473,19 @@ impl Cards {
             (card, norm, lm)
         };
         println!("gpu      : {} KDA layers, {mla_n} MLA layers (their latents to {max_ctx} positions), {dense} dense FFNs, {shared_n} shared experts, the hyper-connections, the streams and the head on {} card{} ({:.1} GB with their state) in {:.1}s", kda_layers.len(), n, if n == 1 { "" } else { "s" }, bytes as f64 / 1e9, t0.elapsed().as_secs_f32());
-        Cards { cards, shared, layers, ffns, mlas, head, seq: 0, half_seq: vec![[0; 2]; NUM_HIDDEN_LAYERS], token_from: vec![0; n], tokens: 0 }
+        Cards { cards, shared, layers, ffns, mlas, head, seq: 0, half_seq: vec![[0; 2]; NUM_HIDDEN_LAYERS], token_from: vec![0; n], last_n: 1, tokens: 0 }
     }
 
     /// With the launches stamped, every 16 tokens: a line per card of the last token's time by
     /// kernel (busy µs and count, most first) and the gaps between launches — where a token's
     /// card time goes.
-    fn timeline_report(&mut self) {
+    /// With `rockem.timeline`: every step of more than one token, and every sixteenth single token.
+    fn timeline_report(&mut self, n: usize) {
         if !self.cards[0].k.instrumented() {
             return;
         }
         self.tokens += 1;
-        if self.tokens % 16 != 0 {
+        if n == 1 && self.tokens % 16 != 0 {
             return;
         }
         for (i, c) in self.cards.iter().enumerate() {
@@ -507,7 +510,7 @@ impl Cards {
             let mut v: Vec<_> = by.into_iter().collect();
             v.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
             let parts: Vec<String> = v.iter().map(|(n, (us, cnt))| format!("{n} {us:.0}/{cnt}")).collect();
-            println!("timeline : card {i}: {} launches over {span:.0} µs, {busy:.0} busy, {gaps:.0} between; by kernel (µs/count): {}", tl.len(), parts.join(", "));
+            println!("timeline : card {i}, {n} tokens: {} launches{} over {span:.0} µs, {busy:.0} busy, {gaps:.0} between; by kernel (µs/count): {}", tl.len(), if c.k.posted() - self.token_from[i] > tl.len() as u64 { " (the ring's last)" } else { "" }, parts.join(", "));
         }
     }
 
@@ -635,6 +638,7 @@ impl Cards {
 
 impl Placed for Cards {
     fn begin(&mut self, rows: &[f32], n: usize) {
+        self.last_n = n;
         // every card: the step's handoffs restart, each token's embedding into each of its streams
         let mut streams = Vec::with_capacity(n * HC * H);
         for i in 0..n {
@@ -818,13 +822,13 @@ impl Placed for Cards {
         for c in &self.cards {
             c.k.sync();
         }
-        self.timeline_report();
+        self.timeline_report(self.last_n);
     }
     fn finish(&mut self) {
         for c in &self.cards {
             c.k.sync();
         }
-        self.timeline_report();
+        self.timeline_report(self.last_n);
     }
     fn seed(&mut self, l: usize, window: &[f32], mem: &[f32]) {
         // every part holds the full state buffers; each touches only its heads' entries

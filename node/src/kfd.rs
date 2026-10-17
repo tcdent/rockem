@@ -816,11 +816,12 @@ impl Kfd {
             .collect()
     }
     /// The launches from packet `from` to the last posted, in order: name, start and end on the
-    /// card's 100 MHz clock (a barrier packet's name is ""). Valid after `sync`, while the ring holds them.
+    /// card's 100 MHz clock (a barrier packet's name is ""). Valid after `sync`; past the ring's
+    /// depth (a step of hundreds of tokens) the earliest are gone and the last `RING_PACKETS` come.
     pub fn timeline_from(&self, from: u64) -> Vec<(&'static str, u64, u64)> {
         assert!(self.instrument, "timeline: the launcher was opened without instrumentation");
         let to = self.write_index.get();
-        assert!(to - from <= RING_PACKETS as u64, "timeline: more launches than the ring holds");
+        let from = from.max(to.saturating_sub(RING_PACKETS as u64));
         let names = self.names.borrow();
         (from..to)
             .map(|i| {
