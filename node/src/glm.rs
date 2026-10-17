@@ -60,7 +60,7 @@ impl Glm {
         let rates = crate::probe::node_rates();
         let total: f64 = rates.iter().sum();
         println!("placement: node streams {} GB/s → item shares {} %", rates.iter().map(|r| format!("{r:.0}")).collect::<Vec<_>>().join(" / "), rates.iter().map(|r| format!("{:.1}", 100.0 * r / total)).collect::<Vec<_>>().join(" / "));
-        let experts: &'static glm_5_3_flash::expert::Stream<'static> = Box::leak(Box::new(loader::load_placed(&bundle.join(layout::EXPERTS_FILE), mem, &layout::placement(&rates))));
+        let experts: &'static glm_5_3_flash::expert::Stream<'static> = Box::leak(Box::new(loader::load_placed(&bundle.join(layout::EXPERTS_FILE), mem, &layout::placement(&vec![1.0; rates.len()])))); // A/B: equal shares through the item loader
         println!("bundle   : {} loaded in {:.1}s ({:.1} GB)", bundle.display(), t0.elapsed().as_secs_f32(), (dense.len() + experts.bytes.len()) as f64 / 1e9);
         let w = Weights::from_dense(dense);
         let prefix_b = loader::load(&bundle.join(layout::PREFIX_FILE), loader::Mem::Anon);
@@ -170,7 +170,9 @@ impl Engine for Glm {
             self.logits[i * VOCAB_SIZE..(i + 1) * VOCAB_SIZE].copy_from_slice(&self.model.logits);
         }
         if self.profile_every > 0 && self.model.profile.tokens >= self.profile_every {
-            println!("profile  : {}", self.model.profile.line());
+            for l in self.model.profile.line().split('\n') {
+                println!("profile  : {}", l.trim_start_matches("profile  : "));
+            }
             let c = self.model.coverage(&[8, 16, 32, 64]);
             println!("experts  : since start, a layer's 8 / 16 / 32 / 64 most-picked experts took {:.0} / {:.0} / {:.0} / {:.0} % of its picks", 100.0 * c[0], 100.0 * c[1], 100.0 * c[2], 100.0 * c[3]);
             self.model.profile = Default::default();

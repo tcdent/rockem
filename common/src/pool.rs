@@ -56,6 +56,12 @@ pub trait Pool: Sync {
     fn prefetched(&self) -> (usize, usize) {
         (0, 0)
     }
+    /// Since the last call, over the placed runs: each node's items, and the sum over the runs
+    /// of the time (s) its last item finished — a node's end of each run. What the placement
+    /// of the items across the nodes is tuned by. All zero for a pool without nodes.
+    fn node_ends(&self) -> ([usize; 8], [f64; 8]) {
+        ([0; 8], [0.0; 8])
+    }
 }
 
 pub struct Serial;

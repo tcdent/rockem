@@ -27,6 +27,8 @@ extern "C" {
 }
 const SYS_SET_MEMPOLICY: i64 = 238;
 const SYS_MOVE_PAGES: i64 = 279;
+const SYS_MBIND: i64 = 237;
+const MPOL_BIND: i32 = 2;
 const MPOL_DEFAULT: i32 = 0;
 const MPOL_INTERLEAVE: i32 = 3;
 /// Interleave this thread's new pages over every online node (all 64 bits set names more nodes than exist, which the kernel masks to the possible ones).
@@ -98,49 +100,48 @@ pub fn load_placed(path: &std::path::Path, mem: Mem, node_of_item: &[u8]) -> glm
         }
     }
     let dst = map_memory(path, total, mem);
+    // each region bound to its node by policy: whoever touches a page, it is allocated there
+    if mem == Mem::Hugetlb {
+        for n in 0..nodes {
+            let mask: u64 = 1 << n;
+            let r = unsafe { syscall(SYS_MBIND, dst as usize + base[n], bytes[n].div_ceil(PAGE) * PAGE, MPOL_BIND, &mask as *const u64, 64u64, 0u64) };
+            assert_eq!(r, 0, "mbind node {n}: {}", std::io::Error::last_os_error());
+        }
+    }
     let t0 = std::time::Instant::now();
     let name = path.file_name().unwrap().to_string_lossy().into_owned();
     let done = std::sync::atomic::AtomicUsize::new(0);
     let dst_addr = dst as usize;
+    // readers over the file's runs (a block's 32 experts' share `r`, RUN bytes contiguous): one read
+    // a run, its items scattered to their nodes from the staging buffer
+    const READERS: usize = 8;
+    let runs = layout::MOE_LAYERS * (E / layout::XBLOCK) * layout::RUNS;
     std::thread::scope(|sc| {
-        for node in 0..nodes {
-            let (src, done, name, addr, node_of_item) = (&src, &done, &name, &addr, node_of_item);
+        for t in 0..READERS {
+            let (src, done, name, addr) = (&src, &done, &name, &addr);
             sc.spawn(move || {
-                glm_5_3_flash::construct::pin(glm_5_3_flash::construct::first_core_of(node));
+                let mut staging = vec![0u8; layout::RUN];
                 let mut next_mark = GB;
-                // adjacent items of this node in the file are adjacent in its region: one read a run
-                let (mut run_src, mut run_dst, mut run_len) = (0usize, 0usize, 0usize);
-                let flush = |run_src: usize, run_dst: usize, run_len: usize| {
-                    if run_len == 0 {
-                        return;
-                    }
-                    let page = unsafe { std::slice::from_raw_parts_mut((dst_addr + run_dst) as *mut u8, run_len) };
-                    src.read_exact_at(page, run_src as u64).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-                };
-                for l in FIRST_K_DENSE_REPLACE..NUM_HIDDEN_LAYERS {
-                    for e in 0..E {
-                        for (j, r) in layout::file_items(l, e) {
-                            let i = item_index(l, e, j);
-                            if node_of_item[i] as usize != node {
+                for u in (t..runs).step_by(READERS) {
+                    let (l, b, r) = (FIRST_K_DENSE_REPLACE + u / (E / layout::XBLOCK * layout::RUNS), u / layout::RUNS % (E / layout::XBLOCK), u % layout::RUNS);
+                    let run_start = layout::share(l, b * layout::XBLOCK, r);
+                    src.read_exact_at(&mut staging, run_start as u64).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+                    for e in b * layout::XBLOCK..(b + 1) * layout::XBLOCK {
+                        for (j, rg) in layout::file_items(l, e) {
+                            if rg.start < run_start || rg.start >= run_start + layout::RUN {
                                 continue;
                             }
-                            let a = addr[i] as usize;
-                            if run_len > 0 && run_src + run_len == r.start && run_dst + run_len == a {
-                                run_len += r.len();
-                            } else {
-                                flush(run_src, run_dst, run_len);
-                                let d = done.fetch_add(run_len, std::sync::atomic::Ordering::Relaxed) + run_len;
-                                if node == 0 && d >= next_mark {
-                                    println!("loading  : {name} {:.1}/{:.1} GB ({:.0} MB/s, placed by item)", d as f64 / 1e9, len as f64 / 1e9, d as f64 / 1e6 / t0.elapsed().as_secs_f64());
-                                    next_mark += GB;
-                                }
-                                (run_src, run_dst, run_len) = (r.start, a, r.len());
-                            }
+                            let a = addr[item_index(l, e, j)] as usize;
+                            let dst_item = unsafe { std::slice::from_raw_parts_mut((dst_addr + a) as *mut u8, rg.len()) };
+                            dst_item.copy_from_slice(&staging[rg.start - run_start..rg.end - run_start]);
                         }
                     }
+                    let d = done.fetch_add(layout::RUN, std::sync::atomic::Ordering::Relaxed) + layout::RUN;
+                    if t == 0 && d >= next_mark {
+                        println!("loading  : {name} {:.1}/{:.1} GB ({:.0} MB/s, placed by item)", d as f64 / 1e9, len as f64 / 1e9, d as f64 / 1e6 / t0.elapsed().as_secs_f64());
+                        next_mark += GB;
+                    }
                 }
-                flush(run_src, run_dst, run_len);
-                done.fetch_add(run_len, std::sync::atomic::Ordering::Relaxed);
             });
         }
     });

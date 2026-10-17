@@ -46,6 +46,10 @@ pub struct Threads {
     /// The last run's (local items, items) and the last prefetch's (done, items), for the profile.
     locality: std::sync::Mutex<(usize, usize)>,
     prefetched: std::sync::Mutex<(usize, usize)>,
+    /// The calling thread's node.
+    node: usize,
+    /// Since the last `node_ends`: each node's items and the sum of its run-end times (s), over the placed runs.
+    node_stats: std::sync::Mutex<([usize; MAX_NODES], [f64; MAX_NODES])>,
 }
 /// The grain of placement: a region's node is known per 2 MiB page.
 pub use crate::layout::PAGE;
@@ -69,6 +73,11 @@ struct Job {
     /// Set when the job is abandoned (a prefetch the next run overtakes): no more items are claimed.
     stop: std::sync::atomic::AtomicBool,
     n: usize,
+    /// Per node: items its workers completed, and when the last of them finished (ns after the
+    /// job was posted) — the run's end on each node, the measurement the placement is tuned by.
+    node_done: [Counter; MAX_NODES],
+    node_end: [std::sync::atomic::AtomicU64; MAX_NODES],
+    t0: std::time::Instant,
     /// A prefetch's closure, owned by its job (the runs' closures are the caller's, alive through the run).
     _owned: Option<Box<dyn Fn(usize) + Send + Sync>>,
     /// A prefetch: only the first `PREFETCH_CORES` cores of each CCD take its items, so the pull
@@ -132,7 +141,7 @@ fn slot_order(node: usize, ccd: usize, node_ccds: &[Vec<usize>]) -> Vec<usize> {
 }
 /// Every item of `job` this thread can claim, slot by slot in its order; the completions
 /// counted once, at the end.
-unsafe fn work(job: *const Job, order: &[usize]) {
+unsafe fn work(job: *const Job, order: &[usize], node: usize) {
     let j = &*job;
     let f = &*j.f;
     INSIDE.with(|c| c.set(job));
@@ -152,6 +161,9 @@ unsafe fn work(job: *const Job, order: &[usize]) {
         }
     }
     if mine > 0 {
+        // this thread's last item ends its node's run as far as it is concerned (no cross-node stealing: its items were its node's)
+        j.node_end[node].fetch_max(j.t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        j.node_done[node].0.fetch_add(mine, Ordering::Relaxed);
         j.done.0.fetch_add(mine, Ordering::AcqRel);
         j.local.0.fetch_add(local, Ordering::Relaxed);
     }
@@ -179,7 +191,8 @@ impl Threads {
         seen_in_ccd[ccd_of(cores[0])] += 1;
         for &core in &cores[1..] {
             let sh = shared.clone();
-            let order = slot_order(node_of_core(core), ccd_of(core), &node_ccds);
+            let node = node_of_core(core);
+            let order = slot_order(node, ccd_of(core), &node_ccds);
             let rank = seen_in_ccd[ccd_of(core)];
             seen_in_ccd[ccd_of(core)] += 1;
             std::thread::spawn(move || {
@@ -204,14 +217,15 @@ impl Threads {
                     let job = sh.job.load(Ordering::Acquire);
                     seen = job;
                     if !job.is_null() && !(unsafe { (*job).light } && rank >= PREFETCH_CORES) {
-                        unsafe { work(job, &order) };
+                        unsafe { work(job, &order, node) };
                     }
                     sh.active.fetch_sub(1, Ordering::AcqRel);
                 }
             });
         }
-        let order = slot_order(node_of_core(cores[0]), ccd_of(cores[0]), &node_ccds);
-        Threads { shared, retired: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()), order, node_ccds, placed: std::sync::Mutex::new(Vec::new()), locality: std::sync::Mutex::new((0, 0)), prefetched: std::sync::Mutex::new((0, 0)) }
+        let node = node_of_core(cores[0]);
+        let order = slot_order(node, ccd_of(cores[0]), &node_ccds);
+        Threads { shared, retired: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()), order, node_ccds, placed: std::sync::Mutex::new(Vec::new()), locality: std::sync::Mutex::new((0, 0)), prefetched: std::sync::Mutex::new((0, 0)), node, node_stats: std::sync::Mutex::new(([0; MAX_NODES], [0.0; MAX_NODES])) }
     }
     /// Tell the pool where a region's memory lives: `nodes[p]` is the node of its `p`th `PAGE`.
     pub fn place(&self, base: usize, len: usize, nodes: Vec<u8>) {
@@ -233,12 +247,21 @@ impl Threads {
             return;
         }
         let job = self.post(n, at, ccd, f, None);
-        unsafe { work(job, &self.order) };
+        unsafe { work(job, &self.order, self.node) };
         while unsafe { (*job).done.0.load(Ordering::Acquire) } != n {
             std::hint::spin_loop();
         }
         if ccd.is_some() {
             *self.locality.lock().unwrap() = (unsafe { (*job).local.0.load(Ordering::Relaxed) }, n);
+            let j = unsafe { &*job };
+            let mut st = self.node_stats.lock().unwrap();
+            for d in 0..MAX_NODES {
+                let done = j.node_done[d].0.load(Ordering::Relaxed);
+                if done > 0 {
+                    st.0[d] += done;
+                    st.1[d] += j.node_end[d].load(Ordering::Relaxed) as f64 * 1e-9;
+                }
+            }
         }
     }
     /// The job slotted and published: the workers take it up; the job before it is stopped
@@ -292,7 +315,7 @@ impl Threads {
         // no worker is inside any job: the one retired at the last publish can go
         let fp: *const (dyn Fn(usize) + Sync) = unsafe { std::mem::transmute(f) };
         let light = owned.is_some();
-        let job = Box::into_raw(Box::new(Job { f: fp, order, next: std::array::from_fn(|s| Counter(AtomicUsize::new(start[s]))), start, done: Counter(AtomicUsize::new(0)), local: Counter(AtomicUsize::new(0)), stop: std::sync::atomic::AtomicBool::new(false), n, _owned: owned, light }));
+        let job = Box::into_raw(Box::new(Job { f: fp, order, next: std::array::from_fn(|s| Counter(AtomicUsize::new(start[s]))), start, done: Counter(AtomicUsize::new(0)), local: Counter(AtomicUsize::new(0)), stop: std::sync::atomic::AtomicBool::new(false), n, node_done: std::array::from_fn(|_| Counter(AtomicUsize::new(0))), node_end: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)), t0: std::time::Instant::now(), _owned: owned, light }));
         let old = sh.job.swap(job, Ordering::AcqRel);
         let older = self.retired.swap(old, Ordering::AcqRel);
         if !older.is_null() {
@@ -326,6 +349,9 @@ impl Pool for Threads {
     }
     fn locality(&self) -> (usize, usize) {
         *self.locality.lock().unwrap()
+    }
+    fn node_ends(&self) -> ([usize; MAX_NODES], [f64; MAX_NODES]) {
+        std::mem::replace(&mut *self.node_stats.lock().unwrap(), ([0; MAX_NODES], [0.0; MAX_NODES]))
     }
     fn prefetched(&self) -> (usize, usize) {
         *self.prefetched.lock().unwrap()
@@ -650,15 +676,33 @@ pub struct Profile {
     /// Prefetch slices done before the router's run overtook the prefetch, and the slices asked for.
     pub prefetched: usize,
     pub prefetch_items: usize,
+    /// Per node over the expert runs: items, and the sum of its run ends (s) — the nodes' measured rates.
+    pub node_items: [usize; MAX_NODES],
+    pub node_end: [f64; MAX_NODES],
 }
 impl Profile {
+    /// The expert runs by node: each node's share of the items, when its last item finished (ms a
+    /// token, over the gate/up and down runs of every MoE layer), and its rate in items a ms — the
+    /// shares a placement should give the nodes are in proportion to these rates.
+    fn nodes(&self) -> String {
+        let used: Vec<usize> = (0..MAX_NODES).filter(|&d| self.node_items[d] > 0).collect();
+        if used.len() < 2 {
+            return String::new();
+        }
+        let n = self.tokens.max(1) as f64;
+        let total: usize = used.iter().map(|&d| self.node_items[d]).sum();
+        let share: Vec<String> = used.iter().map(|&d| format!("{:.1}", 100.0 * self.node_items[d] as f64 / total as f64)).collect();
+        let end: Vec<String> = used.iter().map(|&d| format!("{:.2}", 1e3 * self.node_end[d] / n)).collect();
+        let rate: Vec<String> = used.iter().map(|&d| format!("{:.1}", self.node_items[d] as f64 / (1e3 * self.node_end[d]).max(1e-9))).collect();
+        format!("\nprofile  : nodes — items {} %, run ends {} ms a token, {} items/ms", share.join(" / "), end.join(" / "), rate.join(" / "))
+    }
     /// One line of milliseconds a token, the phases in order and their sum.
     pub fn line(&self) -> String {
         let n = self.tokens.max(1) as f64 / 1e3;
         let mla = self.mla_proj + self.mla_attn + self.mla_out;
         let rs = self.route + self.shared;
         let sum = self.hc + self.early + self.slot + self.kda_card + self.kda_cpu + mla + self.dense_ffn + rs + self.experts + self.head;
-        format!("{} tokens: hc {:.1}  early {:.1}  slot {:.1}  kda card {:.1}  kda cpu {:.1}  mla {:.1} (proj {:.1} attn {:.1} out {:.1})  dense ffn {:.1}  router+shared {:.1} (route {:.1} shared {:.1})  experts {:.1} (reused {:.2} of {} from the previous token, {:.2} named on the attention input; {:.0}% of the predicted slices pulled; {:.0}% of items on their CCD)  head {:.1}  = {:.1} ms a token", self.tokens, self.hc / n, self.early / n, self.slot / n, self.kda_card / n, self.kda_cpu / n, mla / n, self.mla_proj / n, self.mla_attn / n, self.mla_out / n, self.dense_ffn / n, rs / n, self.route / n, self.shared / n, self.experts / n, self.reuse as f64 / self.moe_layers.max(1) as f64, TOP_K, self.pre_agree as f64 / self.moe_layers.max(1) as f64, 100.0 * self.prefetched as f64 / self.prefetch_items.max(1) as f64, 100.0 * self.local_items as f64 / self.items.max(1) as f64, self.head / n, sum / n)
+        format!("{} tokens: hc {:.1}  early {:.1}  slot {:.1}  kda card {:.1}  kda cpu {:.1}  mla {:.1} (proj {:.1} attn {:.1} out {:.1})  dense ffn {:.1}  router+shared {:.1} (route {:.1} shared {:.1})  experts {:.1} (reused {:.2} of {} from the previous token, {:.2} named on the attention input; {:.0}% of the predicted slices pulled; {:.0}% of items on their CCD)  head {:.1}  = {:.1} ms a token{}", self.tokens, self.hc / n, self.early / n, self.slot / n, self.kda_card / n, self.kda_cpu / n, mla / n, self.mla_proj / n, self.mla_attn / n, self.mla_out / n, self.dense_ffn / n, rs / n, self.route / n, self.shared / n, self.experts / n, self.reuse as f64 / self.moe_layers.max(1) as f64, TOP_K, self.pre_agree as f64 / self.moe_layers.max(1) as f64, 100.0 * self.prefetched as f64 / self.prefetch_items.max(1) as f64, 100.0 * self.local_items as f64 / self.items.max(1) as f64, self.head / n, sum / n, self.nodes())
     }
 }
 
@@ -1053,4 +1097,9 @@ fn account(p: &mut Profile, last_picks: &mut [[usize; TOP_K]], freq: &mut [u32],
     let (done, of) = pool.prefetched();
     p.prefetched += done;
     p.prefetch_items += of;
+    let (items, ends) = pool.node_ends();
+    for d in 0..MAX_NODES {
+        p.node_items[d] += items[d];
+        p.node_end[d] += ends[d];
+    }
 }
