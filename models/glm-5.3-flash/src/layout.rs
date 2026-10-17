@@ -103,42 +103,59 @@ pub fn file_items(l: usize, e: usize) -> std::vec::Vec<(usize, core::ops::Range<
 /// items and its down items are split in proportion to the rates — smooth weighted
 /// round-robin, the credit carried across experts, so a node's share of any run of items is
 /// within one item of its rate's share — and a layer's expert run ends on every node at once.
-/// `placement(rates)`, reached from an existing placement with the fewest moves: every expert's
-/// gate/up items and down items keep the nodes they have except the excess of a node over its
-/// new count, which goes to the nodes under theirs — so a re-placement copies the share delta,
-/// not a reshuffle (the weighted sequence alone would move a fifth of the items for a 2 % shift).
+/// The placement `rates` ask for, reached from `old` by moving only the difference: each node's
+/// count of gate/up items and of down items goes to its share of the total, one item at a time
+/// from a node over its count to a node under it, taken from the experts where the giver holds
+/// the most of that kind relative to the taker — so every expert's split stays near its share
+/// and a 1 % shift moves 1 % of the items (a re-dithered sequence would move a tenth of them).
 #[cfg(feature = "std")]
 pub fn placement_from(old: &[u8], rates: &[f64]) -> std::vec::Vec<u8> {
-    let target = placement(rates);
-    assert_eq!(old.len(), target.len());
     let nodes = rates.len();
-    let mut out = old.to_vec();
+    let total: f64 = rates.iter().sum();
     let items = GU_ITEMS + DOWN_ITEMS;
-    for x in 0..MOE_LAYERS * E {
-        for (lo, hi) in [(0, GU_ITEMS), (GU_ITEMS, items)] {
-            let base = x * items;
-            let mut want = std::vec![0i64; nodes];
-            for i in base + lo..base + hi {
-                want[target[i] as usize] += 1;
-                want[old[i] as usize] -= 1;
+    let experts = MOE_LAYERS * E;
+    assert_eq!(old.len(), experts * items);
+    let mut out = old.to_vec();
+    for (lo, hi) in [(0, GU_ITEMS), (GU_ITEMS, items)] {
+        let kind = hi - lo;
+        // the nodes' counts now, and wanted (the shares of the kind's total, the rounding to the largest remainders)
+        let mut cur = std::vec![0i64; nodes];
+        for x in 0..experts {
+            for i in x * items + lo..x * items + hi {
+                cur[old[i] as usize] += 1;
             }
-            // want[n] > 0: node n takes that many more; < 0: it gives up that many, from the end
-            let mut spare: std::vec::Vec<usize> = std::vec::Vec::new();
-            for i in (base + lo..base + hi).rev() {
-                let n = old[i] as usize;
-                if want[n] < 0 {
-                    want[n] += 1;
-                    spare.push(i);
-                }
+        }
+        let all = (experts * kind) as f64;
+        let exact: std::vec::Vec<f64> = rates.iter().map(|r| r / total * all).collect();
+        let mut want: std::vec::Vec<i64> = exact.iter().map(|w| w.floor() as i64).collect();
+        let mut short = (experts * kind) as i64 - want.iter().sum::<i64>();
+        let mut by_rem: std::vec::Vec<usize> = (0..nodes).collect();
+        by_rem.sort_by(|&a, &b| (exact[b] - exact[b].floor()).partial_cmp(&(exact[a] - exact[a].floor())).unwrap());
+        for &n in &by_rem {
+            if short == 0 {
+                break;
             }
-            for n in 0..nodes {
-                while want[n] > 0 {
-                    let i = spare.pop().expect("a giving node for every taking one");
-                    out[i] = n as u8;
-                    want[n] -= 1;
-                }
+            want[n] += 1;
+            short -= 1;
+        }
+        // per expert, each node's count of this kind
+        let mut per: std::vec::Vec<i32> = std::vec![0; experts * nodes];
+        for x in 0..experts {
+            for i in x * items + lo..x * items + hi {
+                per[x * nodes + old[i] as usize] += 1;
             }
-            debug_assert!(spare.is_empty());
+        }
+        loop {
+            let Some(giver) = (0..nodes).filter(|&n| cur[n] > want[n]).max_by_key(|&n| cur[n] - want[n]) else { break };
+            let Some(taker) = (0..nodes).filter(|&n| cur[n] < want[n]).max_by_key(|&n| want[n] - cur[n]) else { break };
+            // the expert where the giver holds the most of the kind against the taker
+            let x = (0..experts).filter(|&x| per[x * nodes + giver] > 0).max_by_key(|&x| per[x * nodes + giver] - per[x * nodes + taker]).unwrap();
+            let i = (x * items + lo..x * items + hi).rev().find(|&i| out[i] == giver as u8).unwrap();
+            out[i] = taker as u8;
+            per[x * nodes + giver] -= 1;
+            per[x * nodes + taker] += 1;
+            cur[giver] -= 1;
+            cur[taker] += 1;
         }
     }
     out

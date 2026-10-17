@@ -44,6 +44,8 @@ pub struct Glm {
     train: ([usize; 8], [f64; 8], usize),
     /// The profile's token count already folded into `train`.
     train_seen: usize,
+    /// A region ran out of room: no more rounds.
+    train_stopped: bool,
     /// `rockem.profile=N`: a line of the token's time by phase every N tokens (0: never).
     profile_every: usize,
     w: Weights<'static>,
@@ -120,6 +122,7 @@ impl Glm {
             experts,
             train: ([0; 8], [0.0; 8], 0),
             train_seen: 0,
+            train_stopped: false,
             profile_every,
             w,
             model,
@@ -147,7 +150,7 @@ impl Glm {
     fn retrain(&mut self) {
         self.take_training();
         let (items, ends, tokens) = self.train;
-        if tokens < 32 || self.experts.nodes() < 2 {
+        if tokens < 32 || self.experts.nodes() < 2 || self.train_stopped {
             return;
         }
         let nodes = self.experts.nodes();
@@ -156,6 +159,7 @@ impl Glm {
         if hi > lo * 1.02 {
             let r = place(self.experts, &rates, Some(&mut self.model.routed));
             println!("placement: after {tokens} tokens, {r}");
+            self.train_stopped = r.contains("no room");
         }
         self.train = ([0; 8], [0.0; 8], 0);
     }

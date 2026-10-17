@@ -88,7 +88,7 @@ pub fn load_placed(path: &std::path::Path, mem: Mem, node_of_item: &[u8]) -> glm
         }
     }
     // each region with room for the items a re-placement moves in (`Stream::migrate`)
-    const SLACK: usize = 10;
+    const SLACK: usize = 6; // a sixth: room for the rounds of re-placement (hugepages sized for it)
     let mut base = vec![0usize; nodes];
     let mut cap = vec![0usize; nodes];
     let mut total = 0;
