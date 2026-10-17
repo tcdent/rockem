@@ -225,7 +225,7 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
     for t in FIRST_POS..n {
         let forced: Vec<[usize; TOP_K]> = (FIRST_K_DENSE_REPLACE..NUM_HIDDEN_LAYERS).map(|l| routing.irow(&format!("l{l}.topk"), t).unwrap().iter().map(|&e| e as usize).collect::<Vec<_>>().try_into().unwrap()).collect();
         let mut c = Collect::default();
-        model.step(&w, ids[t] as u32, t, if force { Some(&forced) } else { None }, &mut c);
+        model.step(&w, ids[t] as u32, t, if force { Some(&forced) } else { None }, &mut c, true);
         for (l, name, data) in &c.edges {
             let key = if *l == common::trace::NONE { name.clone() } else { format!("l{l}.{name}") };
             if *l != common::trace::NONE && !names.contains(&name.as_str()) {

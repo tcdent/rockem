@@ -100,7 +100,7 @@ impl Glm {
         // the prefix from nothing: its logits, and the realization against the bundle's state
         let t1 = std::time::Instant::now();
         for (pos, &id) in PREFIX_IDS.iter().enumerate() {
-            model.step(&w, id, pos, None, &mut NoTrace);
+            model.step(&w, id, pos, None, &mut NoTrace, true);
         }
         let prefix_logits = model.logits.clone();
         let mut snap = vec![0f32; SNAPSHOT];
@@ -203,17 +203,20 @@ impl Engine for Glm {
         self.model.snapshot(out)
     }
     /// One token after another: `n` tokens are `n` steps.
-    fn run(&mut self, toks: &[u32], pos: usize, trace: bool) {
+    fn run(&mut self, toks: &[u32], pos: usize, trace: bool, all_logits: bool) {
         assert!(!toks.is_empty() && toks.len() <= TOKENS);
         self.last_pos = pos;
         for (i, &tok) in toks.iter().enumerate() {
+            let logits = all_logits || i == toks.len() - 1;
             if trace {
                 self.dtr.tok = i;
-                self.model.step(&self.w, tok, pos + i, None, &mut self.dtr);
+                self.model.step(&self.w, tok, pos + i, None, &mut self.dtr, logits);
             } else {
-                self.model.step(&self.w, tok, pos + i, None, &mut NoTrace);
+                self.model.step(&self.w, tok, pos + i, None, &mut NoTrace, logits);
             }
-            self.logits[i * VOCAB_SIZE..(i + 1) * VOCAB_SIZE].copy_from_slice(&self.model.logits);
+            if logits {
+                self.logits[i * VOCAB_SIZE..(i + 1) * VOCAB_SIZE].copy_from_slice(&self.model.logits);
+            }
         }
         if self.profile_every > 0 && self.model.profile.tokens >= self.profile_every {
             for l in self.model.profile.line().split('\n') {

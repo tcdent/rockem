@@ -725,6 +725,8 @@ pub trait Placed {
     fn ffn_routed(&mut self, l: usize, y: &[f32]);
     fn layer_out(&mut self, l: usize, mean: &mut [f32]);
     fn logits(&mut self, logits: &mut [f32]);
+    /// The token's end without its logits (a prompt token's): every card done with its streams.
+    fn finish(&mut self);
     fn seed(&mut self, l: usize, window: &[f32], mem: &[f32]);
     fn snapshot(&self, l: usize, window: &mut [f32], mem: &mut [f32]);
 }
@@ -1004,10 +1006,10 @@ impl<'p, R: Routed> CpuModel<'p, R> {
     /// logits in `self.logits`. `forced`: the MoE layers' picks to take instead
     /// of the router's, `[MoE layer][TOP_K]` (bring-up only). With cards, the
     /// token runs there (`step_cards`); here is the CPU realization.
-    pub fn step(&mut self, w: &Weights, tok: u32, pos: usize, forced: Option<&[[usize; TOP_K]]>, tr: &mut impl Trace) {
+    pub fn step(&mut self, w: &Weights, tok: u32, pos: usize, forced: Option<&[[usize; TOP_K]]>, tr: &mut impl Trace, logits: bool) {
         assert!(pos < self.max_ctx);
         if self.placed.is_some() {
-            return self.step_cards(w, tok, pos, forced, tr);
+            return self.step_cards(w, tok, pos, forced, tr, logits);
         }
         let s = self;
         let row = &w.embed[tok as usize * H..(tok as usize + 1) * H];
@@ -1095,9 +1097,11 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             tr.edge(l, "out", &s.mean);
             lap(&mut p.hc);
         }
-        rmsnorm::<H>(&s.mean, &w.norm, RMS_NORM_EPS, &mut s.xn);
-        gemv::bf16_par::<VOCAB_SIZE, H>(w.lm_head, &s.xn, &mut s.logits, s.pool);
-        tr.edge(NONE, "logits", &s.logits);
+        if logits {
+            rmsnorm::<H>(&s.mean, &w.norm, RMS_NORM_EPS, &mut s.xn);
+            gemv::bf16_par::<VOCAB_SIZE, H>(w.lm_head, &s.xn, &mut s.logits, s.pool);
+            tr.edge(NONE, "logits", &s.logits);
+        }
         lap(&mut p.head);
     }
 
@@ -1107,7 +1111,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
     /// `kda_card` the wait for the cards (the attention block and the hyper-connections),
     /// `route` the host's router and sum around the experts, the MLA laps the host's
     /// selection, `head` the wait for the logits.
-    fn step_cards(&mut self, w: &Weights, tok: u32, pos: usize, forced: Option<&[[usize; TOP_K]]>, tr: &mut impl Trace) {
+    fn step_cards(&mut self, w: &Weights, tok: u32, pos: usize, forced: Option<&[[usize; TOP_K]]>, tr: &mut impl Trace, logits: bool) {
         let s = self;
         let row = &w.embed[tok as usize * H..(tok as usize + 1) * H];
         for d in 0..H {
@@ -1179,8 +1183,12 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 tr.edge(l, "out", &s.mean);
             }
         }
-        pl.logits(&mut s.logits);
-        tr.edge(NONE, "logits", &s.logits);
+        if logits {
+            pl.logits(&mut s.logits);
+            tr.edge(NONE, "logits", &s.logits);
+        } else {
+            pl.finish();
+        }
         lap(&mut p.head);
     }
 }

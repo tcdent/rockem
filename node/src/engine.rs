@@ -47,8 +47,10 @@ pub trait Engine {
     /// The sequence state now, `snapshot_len()` f32s.
     fn snapshot(&self, out: &mut [f32]);
     /// `toks` at positions `pos..pos + n` through the model (`n <= tokens()`);
-    /// afterwards each token's draw, score, rows and trace are by its index.
-    fn run(&mut self, toks: &[u32], pos: usize, trace: bool);
+    /// afterwards each token's draw, score, rows and trace are by its index. With
+    /// `all_logits` every token's logits are computed (scoring, tracing); otherwise only the
+    /// last token's — a prompt token's head is 1.27 GB of lm_head it never uses (2026-10-16).
+    fn run(&mut self, toks: &[u32], pos: usize, trace: bool, all_logits: bool);
     /// Token `i`'s rows of the last step, `position()` f32s.
     fn rows(&self, i: usize, out: &mut [f32]);
     /// The token drawn under the model's sampling from token `i`'s logits with the uniform `u`.

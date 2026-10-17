@@ -768,6 +768,12 @@ impl Placed for Cards {
         read(&c.lg, 0, &mut logits[..VOCAB_SIZE]);
         self.timeline_report();
     }
+    fn finish(&mut self) {
+        for c in &self.cards {
+            c.k.sync();
+        }
+        self.timeline_report();
+    }
     fn seed(&mut self, l: usize, window: &[f32], mem: &[f32]) {
         // every part holds the full state buffers; each touches only its heads' entries
         for p in &self.layers[l].as_ref().unwrap().parts {

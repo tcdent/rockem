@@ -108,7 +108,7 @@ impl Engine for V2Lite {
         self.model.seed(rows)
     }
     fn snapshot(&self, _out: &mut [f32]) {}
-    fn run(&mut self, toks: &[u32], pos: usize, trace: bool) {
+    fn run(&mut self, toks: &[u32], pos: usize, trace: bool, _all_logits: bool) {
         if trace {
             self.st.run(&self.w, toks, pos, &mut self.model, &mut self.dtr)
         } else {

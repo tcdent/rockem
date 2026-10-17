@@ -122,6 +122,11 @@ struct Context {
     rows: Box<dyn Segment>,
     /// The sequence state at the context's end, `snapshot_len` f32s (empty while the context is active).
     snap: Vec<f32>,
+    /// The sequence state at other positions: at the end of every prompt generation started from
+    /// (`(positions, state)`), so the next turn of a chat — the same prompt, the reply as the
+    /// template re-renders it, the new message — resumes where its prompt matched instead of
+    /// recomputing the transcript (2026-10-16).
+    marks: Vec<(usize, Vec<f32>)>,
     used: u64,
 }
 struct Store {
@@ -150,7 +155,7 @@ impl Store {
         if self.active.is_empty() {
             self.active = vec![0f32; self.max_ctx * self.position];
         }
-        let mut c = Context { ids: Vec::new(), keys: Vec::new(), rows: Box::new(Dram(Vec::new())), snap: Vec::new(), used: 0 };
+        let mut c = Context { ids: Vec::new(), keys: Vec::new(), rows: Box::new(Dram(Vec::new())), snap: Vec::new(), marks: Vec::new(), used: 0 };
         match from {
             Some((src, n)) => {
                 let p = self.contexts[src].as_ref().unwrap();
@@ -283,18 +288,33 @@ impl Session {
     }
     /// Leave the matching state: the active context becomes a copy of the
     /// matched transcript's first `n` positions, the model is seeded from it,
-    /// and computing resumes at `n` — or, when the model's snapshot is not
-    /// there (a partial match of a transcript with sequence state), from the
-    /// prefix, the matched ids recomputed. False when the context is full.
+    /// and computing resumes at `n` — or, for a model with sequence state, at
+    /// the latest snapshot at or before `n` (the transcript's end, a mark at a
+    /// prompt's end, else the prefix), the matched ids after it recomputed.
+    /// False when the context is full.
     fn materialize(&mut self, n: usize) -> bool {
         let (src, matched) = self.pending.take().unwrap();
         let n = n.min(matched);
         self.store.touch(src);
         let first = self.first_pos();
-        let src_len = self.store.contexts[src].as_ref().unwrap().ids.len();
-        let resumable = n == first || self.e.snapshot_len() == 0 || n == src_len;
-        let at = if resumable { n } else { first };
-        let replay: Vec<u32> = if resumable { Vec::new() } else { self.store.contexts[src].as_ref().unwrap().ids[first..n].to_vec() };
+        let (at, replay): (usize, Vec<u32>) = {
+            let c = self.store.contexts[src].as_ref().unwrap();
+            let at = if self.e.snapshot_len() == 0 || n == first {
+                n
+            } else {
+                let mut best = first;
+                if n == c.ids.len() && !c.snap.is_empty() {
+                    best = n;
+                }
+                for (p, _) in &c.marks {
+                    if *p <= n && *p > best {
+                        best = *p;
+                    }
+                }
+                best
+            };
+            (at, c.ids[at..n].to_vec())
+        };
         let old = self.active;
         let (rows, _) = self.e.prefix();
         self.active = self.store.open(Some((src, at)), self.e.prefix_ids(), rows);
@@ -302,12 +322,30 @@ impl Session {
         if at == first {
             self.e.seed_prefix();
         } else {
-            let snap = &self.store.contexts[src].as_ref().unwrap().snap;
+            let c = self.store.contexts[src].as_ref().unwrap();
+            let snap: &[f32] = if self.e.snapshot_len() == 0 { &[] } else if at == c.ids.len() && !c.snap.is_empty() { &c.snap } else { &c.marks.iter().find(|(p, _)| *p == at).unwrap().1 };
             self.e.seed(&self.store.active[..at * self.store.position], snap);
         }
         self.pos = at;
         self.hits = at - first;
         replay.is_empty() || self.feed_many(&replay, &mut |_| {})
+    }
+    /// The sequence state now, kept with the active context at this position (the end of a
+    /// prompt): what a later turn resumes from. Nothing for a model whose state is all rows.
+    fn mark(&mut self) {
+        let len = self.e.snapshot_len();
+        if len == 0 || self.pos == self.first_pos() {
+            return;
+        }
+        let c = self.store.contexts[self.active].as_mut().unwrap();
+        if c.marks.last().is_some_and(|(p, _)| *p == self.pos) {
+            return;
+        }
+        let t0 = std::time::Instant::now();
+        let mut snap = vec![0f32; len];
+        self.e.snapshot(&mut snap);
+        println!("context  : state at {} positions kept ({:.0} MB in {:.0} ms)", self.pos, 4.0 * len as f64 / 1e6, t0.elapsed().as_secs_f64() * 1e3);
+        c.marks.push((self.pos, snap));
     }
     /// `ids` through the model at the next positions, as few steps as they
     /// allow (`tokens()` per step): the prefix's remaining ids are checked and
@@ -367,7 +405,7 @@ impl Session {
         let s = self;
         let n = toks.len();
         let pos = s.pos;
-        s.e.run(toks, pos, s.debug.is_some());
+        s.e.run(toks, pos, s.debug.is_some(), s.scoring || s.debug.is_some());
         // the draw at a position is a function of the seed and the position alone, so a
         // sequence draws the same whether its prefix was computed or served from the store
         let u = common::sample::uniform_at(s.e.seed_value(), (pos + n - 1) as u64);
@@ -406,6 +444,7 @@ impl Session {
         if !self.settle() {
             return false;
         }
+        self.mark();
         let first = self.first_pos();
         if self.pos == first {
             // nothing fed after the prefix: the first draw is from the prefix's logits
