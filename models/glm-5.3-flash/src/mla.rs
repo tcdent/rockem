@@ -388,7 +388,7 @@ pub mod gfx11 {
     pub use super::gfx11_consts::*;
     use crate::*;
     use common::gemv::gfx11::{rows_fmt, Bf16, Fp8};
-    use common::gemv::widen;
+    use common::gemv::{widen, ROWS};
     use common::math::exp;
     use core::arch::amdgpu::workitem_id_x;
 
@@ -399,7 +399,7 @@ pub mod gfx11 {
             let tid = workitem_id_x();
             let (m, n) = (m as usize, n as usize);
             let t = tid as usize;
-            rows_fmt::<Q_LORA_RANK, true, Fp8>(tid, Fp8 { w, s }, ln, m, n, RMS_NORM_EPS, |i, s| *qa.add(i * Q_LORA_RANK + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
+            rows_fmt::<Q_LORA_RANK, true, Fp8, ROWS>(tid, Fp8 { w, s }, ln, m, n, RMS_NORM_EPS, |i, s| *qa.add(i * Q_LORA_RANK + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
         }
     }
 
@@ -410,7 +410,7 @@ pub mod gfx11 {
             let tid = workitem_id_x();
             let (m, n) = (m as usize, n as usize);
             let t = tid as usize;
-            rows_fmt::<Q_LORA_RANK, true, Bf16>(tid, Bf16(w), ln, m, n, RMS_NORM_EPS, |i, s| *qa.add(i * Q_LORA_RANK + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
+            rows_fmt::<Q_LORA_RANK, true, Bf16, ROWS>(tid, Bf16(w), ln, m, n, RMS_NORM_EPS, |i, s| *qa.add(i * Q_LORA_RANK + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
         }
     }
 
@@ -421,7 +421,7 @@ pub mod gfx11 {
             let tid = workitem_id_x();
             let (m, n) = (m as usize, n as usize);
             let t = tid as usize;
-            rows_fmt::<O_IN, false, Fp8>(tid, Fp8 { w, s }, core::ptr::null(), m, n, 0.0, |i, s| *heads.add(i * O_IN + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
+            rows_fmt::<O_IN, false, Fp8, ROWS>(tid, Fp8 { w, s }, core::ptr::null(), m, n, 0.0, |i, s| *heads.add(i * O_IN + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
         }
     }
     const _: () = assert!(Q_LORA_RANK % 256 == 0 && O_IN % 256 == 0);

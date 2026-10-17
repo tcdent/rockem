@@ -344,6 +344,16 @@ pub const PASS: usize = 8;
 pub const FLIGHT: usize = 8;
 /// Floats per staged token-step (`gfx11::STEP`): 32 lanes at a stride of 10.
 pub const STEP: usize = 320;
+/// Rows a wave takes in a pass of many tokens: each staged activation read from LDS feeds this
+/// many FMAs (a row a wave read one per FMA: the rows kernels ran LDS-bound at ~0.5 TFLOPS over
+/// 32 tokens, 830 µs a launch against 125 for one token, timeline 2026-10-17). One token keeps a
+/// row a wave: its kernels stream weights and want the waves.
+pub const ROWS: usize = 4;
+/// Rows a workgroup takes for a launch over `n` tokens: eight waves, `r` rows each past one token
+/// (`ROWS`, or a kernel's own fewer where four spill: the FP8 gate/up at 192 registers).
+pub const fn rows_per_wg(n: usize, r: usize) -> usize {
+    8 * if n <= 1 { 1 } else { r }
+}
 
 /// What the host needs of the card's rows kernels: the FP8 decode table's size (floats of LDS).
 pub mod gfx11_lds {
@@ -437,29 +447,39 @@ pub mod gfx11 {
     /// nothing predicated: a runtime count measured as every block executed
     /// under masks, twice the time on one token (2026-09-19). `w` is the row.
     #[inline(always)]
-    pub unsafe fn bf16_row_step<const K: usize, const NP: usize>(lane: u32, w: *const u16, s: usize, slab: *const f32, acc: &mut [f32; PASS]) {
+    pub unsafe fn bf16_row_step<const K: usize, const NP: usize, const R: usize>(lane: u32, w: &[*const u16; R], s: usize, slab: *const f32, acc: &mut [[f32; PASS]; R]) {
         const { assert!(K % 8 == 0 && NP <= PASS) };
         let l = lane as usize;
         let base = s * 256 + l * 8;
         if base < K {
-            let p = w.add(base) as *const u64;
-            let (a, b) = (core::ptr::read_unaligned(p), core::ptr::read_unaligned(p.add(1)));
-            // the eight weights widened once, not once per token
-            let mut wa = [0f32; 4];
-            let mut wb = [0f32; 4];
-            let mut j = 0;
-            while j < 4 {
-                wa[j] = super::widen((a >> (16 * j)) as u16);
-                wb[j] = super::widen((b >> (16 * j)) as u16);
-                j += 1;
+            // each row's eight weights widened once, not once per token
+            let mut wa = [[0f32; 4]; R];
+            let mut wb = [[0f32; 4]; R];
+            let mut r = 0;
+            while r < R {
+                let p = w[r].add(base) as *const u64;
+                let (a, b) = (core::ptr::read_unaligned(p), core::ptr::read_unaligned(p.add(1)));
+                let mut j = 0;
+                while j < 4 {
+                    wa[r][j] = super::widen((a >> (16 * j)) as u16);
+                    wb[r][j] = super::widen((b >> (16 * j)) as u16);
+                    j += 1;
+                }
+                r += 1;
             }
+            // a staged element read once for the R rows; each (row, token)'s products in the one-row order
             let mut i = 0;
             while i < NP {
                 let x = slab.add(i * STEP + l * STRIDE);
                 let mut j = 0;
                 while j < 4 {
-                    acc[i] += wa[j] * *x.add(j);
-                    acc[i] += wb[j] * *x.add(4 + j);
+                    let (xa, xb) = (*x.add(j), *x.add(4 + j));
+                    let mut r = 0;
+                    while r < R {
+                        acc[r][i] += wa[r][j] * xa;
+                        acc[r][i] += wb[r][j] * xb;
+                        r += 1;
+                    }
                     j += 1;
                 }
                 i += 1;
@@ -476,7 +496,8 @@ pub mod gfx11 {
         /// Once per workgroup, before the first round (the round's barrier publishes it).
         unsafe fn setup(tid: u32, lds: *mut f32);
         unsafe fn row(self, row: usize) -> Self::Row;
-        unsafe fn step<const NP: usize>(lane: u32, r: Self::Row, s: usize, slab: *const f32, lds: *const f32, acc: &mut [f32; PASS]);
+        /// The wave's `R` rows' step `s` against the pass's `NP` staged tokens.
+        unsafe fn step<const NP: usize, const R: usize>(lane: u32, r: &[Self::Row; R], s: usize, slab: *const f32, lds: *const f32, acc: &mut [[f32; PASS]; R]);
     }
     /// bf16 rows: `bf16_row_step`.
     #[derive(Clone, Copy)]
@@ -491,8 +512,8 @@ pub mod gfx11 {
             self.0.add(row * K)
         }
         #[inline(always)]
-        unsafe fn step<const NP: usize>(lane: u32, r: *const u16, s: usize, slab: *const f32, _: *const f32, acc: &mut [f32; PASS]) {
-            bf16_row_step::<K, NP>(lane, r, s, slab, acc)
+        unsafe fn step<const NP: usize, const R: usize>(lane: u32, r: &[*const u16; R], s: usize, slab: *const f32, _: *const f32, acc: &mut [[f32; PASS]; R]) {
+            bf16_row_step::<K, NP, R>(lane, r, s, slab, acc)
         }
     }
     /// FP8 e4m3 rows with an f32 scale per `FP8_BLOCK`-square block (`super::fp8`'s
@@ -518,8 +539,8 @@ pub mod gfx11 {
             (self.w.add(row * K), self.s.add(row / super::FP8_BLOCK * (K / super::FP8_BLOCK)))
         }
         #[inline(always)]
-        unsafe fn step<const NP: usize>(lane: u32, r: (*const u8, *const f32), s: usize, slab: *const f32, lds: *const f32, acc: &mut [f32; PASS]) {
-            fp8_row_step::<K, NP>(lane, r.0, r.1, s, slab, lds, acc)
+        unsafe fn step<const NP: usize, const R: usize>(lane: u32, r: &[(*const u8, *const f32); R], s: usize, slab: *const f32, lds: *const f32, acc: &mut [[f32; PASS]; R]) {
+            fp8_row_step::<K, NP, R>(lane, r, s, slab, lds, acc)
         }
     }
 
@@ -530,28 +551,43 @@ pub mod gfx11 {
     /// folded into the weights here, where the CPU's `fp8` applies it to each
     /// block's sum: the two differ by rounding, not by value.
     #[inline(always)]
-    pub unsafe fn fp8_row_step<const K: usize, const NP: usize>(lane: u32, w: *const u8, sc: *const f32, s: usize, slab: *const f32, lut: *const f32, acc: &mut [f32; PASS]) {
+    pub unsafe fn fp8_row_step<const K: usize, const NP: usize, const R: usize>(lane: u32, w: &[(*const u8, *const f32); R], s: usize, slab: *const f32, lut: *const f32, acc: &mut [[f32; PASS]; R]) {
         const { assert!(K % 8 == 0 && NP <= PASS && super::FP8_BLOCK % 8 == 0) };
         let l = lane as usize;
         let base = s * 256 + l * 8;
         if base < K {
-            let q = core::ptr::read_unaligned(w.add(base) as *const u64);
-            let scale = *sc.add(base / super::FP8_BLOCK);
+            let mut q = [0u64; R];
+            let mut scale = [0f32; R];
+            let mut r = 0;
+            while r < R {
+                q[r] = core::ptr::read_unaligned(w[r].0.add(base) as *const u64);
+                scale[r] = *w[r].1.add(base / super::FP8_BLOCK);
+                r += 1;
+            }
             // four weights at a time: eight decoded at once spilled a register (2026-10-15)
             let mut h = 0;
             while h < 2 {
-                let mut wv = [0f32; 4];
-                let mut j = 0;
-                while j < 4 {
-                    wv[j] = *lut.add(((q >> (8 * (4 * h + j))) & 0xff) as usize) * scale;
-                    j += 1;
+                let mut wv = [[0f32; 4]; R];
+                let mut r = 0;
+                while r < R {
+                    let mut j = 0;
+                    while j < 4 {
+                        wv[r][j] = *lut.add(((q[r] >> (8 * (4 * h + j))) & 0xff) as usize) * scale[r];
+                        j += 1;
+                    }
+                    r += 1;
                 }
                 let mut i = 0;
                 while i < NP {
                     let x = slab.add(i * STEP + l * STRIDE + 4 * h);
                     let mut j = 0;
                     while j < 4 {
-                        acc[i] += wv[j] * *x.add(j);
+                        let xv = *x.add(j);
+                        let mut r = 0;
+                        while r < R {
+                            acc[r][i] += wv[r][j] * xv;
+                            r += 1;
+                        }
                         j += 1;
                     }
                     i += 1;
@@ -561,8 +597,8 @@ pub mod gfx11 {
         }
     }
 
-    /// The rows kernel skeleton: the workgroup's 8 rows (a wave each) of a
-    /// `[m][K]` bf16 matrix over `n` activations, a pass of PASS tokens at a
+    /// The rows kernel skeleton: the workgroup's rows (`rows_per_wg(n)`: a wave each for one
+    /// token, `ROWS` a wave past it) of a `[m][K]` matrix over `n` activations, a pass of PASS tokens at a
     /// time, each pass staged a round of steps at a time from `stage(token,
     /// s)` — each thread returns element `s · 256 + thread` of that token's
     /// activation (anything past `K`; the row primitive masks it) and the
@@ -585,19 +621,20 @@ pub mod gfx11 {
     /// re-read its activations and waited on the reads before its first
     /// weights: +12 µs a launch).
     #[inline(always)]
-    pub unsafe fn rows_over<const K: usize, const NORM: bool>(tid: u32, w: *const u16, ln: *const u16, m: usize, n: usize, eps: f32, stage: impl Fn(usize, usize) -> f32, ready: impl Fn(), emit: impl Fn(usize, usize, f32)) {
-        rows_fmt::<K, NORM, Bf16>(tid, Bf16(w), ln, m, n, eps, stage, ready, emit)
+    pub unsafe fn rows_over<const K: usize, const NORM: bool, const R: usize>(tid: u32, w: *const u16, ln: *const u16, m: usize, n: usize, eps: f32, stage: impl Fn(usize, usize) -> f32, ready: impl Fn(), emit: impl Fn(usize, usize, f32)) {
+        rows_fmt::<K, NORM, Bf16, R>(tid, Bf16(w), ln, m, n, eps, stage, ready, emit)
     }
-    /// `rows_over` for any weight format `F` (`Bf16`, `Fp8`).
+    /// `rows_over` for any weight format `F` (`Bf16`, `Fp8`); `R` rows a wave past one token (the
+    /// launch's grid is `rows_grid(m, n, R)`).
     #[inline(always)]
-    pub unsafe fn rows_fmt<const K: usize, const NORM: bool, F: Rows<K>>(tid: u32, w: F, ln: *const u16, m: usize, n: usize, eps: f32, stage: impl Fn(usize, usize) -> f32, ready: impl Fn(), emit: impl Fn(usize, usize, f32)) {
+    pub unsafe fn rows_fmt<const K: usize, const NORM: bool, F: Rows<K>, const R: usize>(tid: u32, w: F, ln: *const u16, m: usize, n: usize, eps: f32, stage: impl Fn(usize, usize) -> f32, ready: impl Fn(), emit: impl Fn(usize, usize, f32)) {
         let mut p0 = 0;
         while p0 < n {
             let np = if n - p0 < PASS { n - p0 } else { PASS };
             // the pass runs at a constant width so its token loop has nothing predicated
             match width(np) {
-                1 => rows_pass::<K, 1, NORM, F>(tid, w, ln, m, p0, np, eps, &stage, &ready, &emit),
-                _ => rows_pass::<K, PASS, NORM, F>(tid, w, ln, m, p0, np, eps, &stage, &ready, &emit),
+                1 => rows_pass::<K, 1, NORM, F, 1>(tid, w, ln, m, p0, np, eps, &stage, &ready, &emit),
+                _ => rows_pass::<K, PASS, NORM, F, R>(tid, w, ln, m, p0, np, eps, &stage, &ready, &emit),
             }
             p0 += PASS;
         }
@@ -637,23 +674,29 @@ pub mod gfx11 {
         }
     }
 
-    /// One pass of `np` tokens (from `p0`) at width `NP`: rounds of staged
-    /// steps, the row sums, the emits for the `np` real tokens.
+    /// One pass of `np` tokens (from `p0`) at width `NP`, a wave `R` rows (the workgroup's rows
+    /// `wg · 8R..`): rounds of staged steps, the row sums, the emits for the `np` real tokens.
     #[inline(always)]
-    unsafe fn rows_pass<const K: usize, const NP: usize, const NORM: bool, F: Rows<K>>(tid: u32, w: F, ln: *const u16, m: usize, p0: usize, np: usize, eps: f32, stage: &impl Fn(usize, usize) -> f32, ready: &impl Fn(), emit: &impl Fn(usize, usize, f32)) {
+    unsafe fn rows_pass<const K: usize, const NP: usize, const NORM: bool, F: Rows<K>, const R: usize>(tid: u32, w: F, ln: *const u16, m: usize, p0: usize, np: usize, eps: f32, stage: &impl Fn(usize, usize) -> f32, ready: &impl Fn(), emit: &impl Fn(usize, usize, f32)) {
         const { assert!((slab_floats(K, NP) + 8 * PASS + F::LDS) * 4 <= 60 * 1024) };
         let (lane, wave) = (tid % 32, (tid / 32) as usize);
         let slab: *mut f32 = crate::gfx11::lds();
         let red = slab.add(slab_floats(K, NP)); // 8 wave partials per token, the norm's
         let fmt = red.add(8 * PASS); // the format's own (a decode table)
         F::setup(tid, fmt);
-        let row = core::arch::amdgpu::workgroup_id_x() as usize * 8 + wave;
+        let row = (core::arch::amdgpu::workgroup_id_x() as usize * 8 + wave) * R;
         let steps = K.div_ceil(256);
         let r = round(NP, steps);
-        let mut acc = [0f32; PASS];
+        let mut acc = [[0f32; PASS]; R];
         let mut ss = [0f32; PASS];
         let live = row < m;
-        let wr = w.row(row);
+        // a row past the matrix computes the last row again and is never emitted
+        let mut wr = [w.row(if row < m { row } else { m - 1 }); R];
+        let mut k = 1;
+        while k < R {
+            wr[k] = w.row(if row + k < m { row + k } else { m - 1 });
+            k += 1;
+        }
         // full rounds carry no guards, so their loads hoist; one guarded round takes the tail
         let mut s0 = 0;
         while s0 + r <= steps {
@@ -666,7 +709,7 @@ pub mod gfx11 {
             if live {
                 let mut k = 0;
                 while k < r {
-                    F::step::<NP>(lane, wr, s0 + k, slab.add(k * NP * STEP), fmt, &mut acc);
+                    F::step::<NP, R>(lane, &wr, s0 + k, slab.add(k * NP * STEP), fmt, &mut acc);
                     k += 1;
                 }
             }
@@ -685,7 +728,7 @@ pub mod gfx11 {
             if live {
                 let mut k = 0;
                 while k < tail {
-                    F::step::<NP>(lane, wr, s0 + k, slab.add(k * NP * STEP), fmt, &mut acc);
+                    F::step::<NP, R>(lane, &wr, s0 + k, slab.add(k * NP * STEP), fmt, &mut acc);
                     k += 1;
                 }
             }
@@ -717,13 +760,17 @@ pub mod gfx11 {
             }
         }
         ready();
-        let mut i = 0;
-        while i < NP {
-            let y = crate::gfx11::wave_sum(lane, acc[i]);
-            if lane == 0 && row < m && i < np {
-                emit(row, p0 + i, if NORM { y * rr[i] } else { y });
+        let mut k = 0;
+        while k < R {
+            let mut i = 0;
+            while i < NP {
+                let y = crate::gfx11::wave_sum(lane, acc[k][i]);
+                if lane == 0 && row + k < m && i < np {
+                    emit(row + k, p0 + i, if NORM { y * rr[i] } else { y });
+                }
+                i += 1;
             }
-            i += 1;
+            k += 1;
         }
     }
 

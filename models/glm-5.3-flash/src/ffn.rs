@@ -188,6 +188,9 @@ pub mod gfx11_consts {
     /// Rows of the fused gate|up launch: the gate's rows, then the up's.
     pub const SHARED_GU_ROWS: usize = 2 * N_SHARED_EXPERTS * D_FF;
     pub const DENSE_GU_ROWS: usize = 2 * INTERMEDIATE_SIZE;
+    /// Rows a wave takes in `ffn_gu` (FP8, normed, width H) past one token: four put it at 192
+    /// registers with 20 of scratch (2026-10-17); every other rows kernel takes `common::gemv::ROWS`.
+    pub const ROWS_GU: usize = 2;
 }
 
 #[cfg(target_arch = "amdgpu")]
@@ -201,6 +204,8 @@ pub mod gfx11 {
     //! Scales: one f32 per 128×128 block, `[m/128][K/128]` (`common::gemv::fp8`).
     use crate::*;
     use common::gemv::gfx11::{rows_fmt, Fp8};
+    use common::gemv::ROWS;
+    use super::gfx11_consts::ROWS_GU;
     use common::swiglu::silu;
     use core::arch::amdgpu::workitem_id_x;
 
@@ -211,7 +216,7 @@ pub mod gfx11 {
             let tid = workitem_id_x();
             let (m, n) = (m as usize, n as usize);
             let t = tid as usize;
-            rows_fmt::<H, true, Fp8>(tid, Fp8 { w, s }, ln, m, n, RMS_NORM_EPS, |i, s| *x.add(i * H + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
+            rows_fmt::<H, true, Fp8, ROWS_GU>(tid, Fp8 { w, s }, ln, m, n, RMS_NORM_EPS, |i, s| *x.add(i * H + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
         }
     }
 
@@ -232,7 +237,7 @@ pub mod gfx11 {
             let tid = workitem_id_x();
             let (m, n) = (m as usize, n as usize);
             let t = tid as usize;
-            rows_fmt::<N, false, Fp8>(tid, Fp8 { w, s }, core::ptr::null(), m, n, 0.0, |i, s| if s * 256 + t < N { swiglu_at::<N>(gu, i, s * 256 + t) } else { 0.0 }, || {}, |row, i, y| *out.add(i * m + row) = y);
+            rows_fmt::<N, false, Fp8, ROWS>(tid, Fp8 { w, s }, core::ptr::null(), m, n, 0.0, |i, s| if s * 256 + t < N { swiglu_at::<N>(gu, i, s * 256 + t) } else { 0.0 }, || {}, |row, i, y| *out.add(i * m + row) = y);
         }
     }
 
@@ -244,7 +249,7 @@ pub mod gfx11 {
             let tid = workitem_id_x();
             let (m, n) = (m as usize, n as usize);
             let t = tid as usize;
-            rows_fmt::<N, false, Fp8>(tid, Fp8 { w, s }, core::ptr::null(), m, n, 0.0, |i, s| swiglu_at::<N>(gu, i, s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
+            rows_fmt::<N, false, Fp8, ROWS>(tid, Fp8 { w, s }, core::ptr::null(), m, n, 0.0, |i, s| swiglu_at::<N>(gu, i, s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
         }
     }
     const _: () = assert!(INTERMEDIATE_SIZE % 256 == 0 && (N_SHARED_EXPERTS * D_FF) % 256 == 0);

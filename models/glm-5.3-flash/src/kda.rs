@@ -146,8 +146,10 @@ pub mod gfx11_consts {
     use crate::*;
     pub const WG: u32 = 256;
     /// The rows kernels: 8 rows per workgroup.
-    pub const fn rows_grid(m: usize) -> u32 {
-        m.div_ceil(8) as u32
+    /// Workgroups of a rows launch over `m` rows for `n` tokens, the kernel's `r` rows a wave
+    /// (`common::gemv::rows_per_wg`).
+    pub const fn rows_grid(m: usize, n: usize, r: usize) -> u32 {
+        m.div_ceil(common::gemv::rows_per_wg(n, r)) as u32
     }
     /// LDS a rows kernel over `[m][k]` needs for a step of `n` tokens (`common::gemv::gfx11`).
     pub const fn rows_lds(k: usize, n: usize) -> usize {
@@ -200,12 +202,12 @@ pub mod gfx11 {
     pub use super::gfx11_consts::*;
     use crate::*;
     use common::gemv::gfx11::rows_over;
-    use common::gemv::widen;
+    use common::gemv::{widen, ROWS};
     use common::gfx11::{lds, wave_sum, workgroup_sync};
     use common::math::{exp, rsqrt};
     use common::swiglu::silu;
     use core::arch::amdgpu::{workgroup_id_x, workitem_id_x};
-    const _: () = assert!(TOKENS == common::gemv::gfx11::TOKENS);
+    const _: () = assert!(TOKENS == common::gemv::gfx11::TOKENS && PART_QKV % (8 * ROWS) == 0);
 
     /// `out[i][row] = W[row] · rmsnorm_ln(x[i])` for `m` rows of a `[m][H]`
     /// bf16 matrix and `n` activations `x` (`[n][H]`). Grid: rows_grid(m).
@@ -215,7 +217,7 @@ pub mod gfx11 {
             let tid = workitem_id_x();
             let (m, n) = (m as usize, n as usize);
             let t = tid as usize;
-            rows_over::<H, true>(tid, w, ln, m, n, RMS_NORM_EPS, |i, s| *x.add(i * H + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
+            rows_over::<H, true, ROWS>(tid, w, ln, m, n, RMS_NORM_EPS, |i, s| *x.add(i * H + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
         }
     }
 
@@ -227,13 +229,13 @@ pub mod gfx11 {
             let tid = workitem_id_x();
             let (m, n) = (m as usize, n as usize);
             let t = tid as usize;
-            rows_over::<KDA_QKV, false>(tid, w, core::ptr::null(), m, n, 0.0, |i, s| *x.add(i * KDA_QKV + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
+            rows_over::<KDA_QKV, false, ROWS>(tid, w, core::ptr::null(), m, n, 0.0, |i, s| *x.add(i * KDA_QKV + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
         }
     }
 
     /// `rows_d` over two inputs: rows below `split` read `x[0..KDA_DIM]`, rows from `split` read
     /// `x[KDA_DIM..2·KDA_DIM]` — f_b over f_a's output and g_b over g_a's as one launch (the
-    /// weights and the outputs back to back, `split` a multiple of a workgroup's 8 rows); token
+    /// weights and the outputs back to back, `split` a multiple of a workgroup's rows); token
     /// `i`'s input at `x[i · xs]` (the stride of the launch that made it).
     #[no_mangle]
     pub extern "gpu-kernel" fn rows_d2(x: *const f32, w: *const u16, out: *mut f32, m: u32, n: u32, split: u32, xs: u32) {
@@ -241,8 +243,8 @@ pub mod gfx11 {
             let tid = workitem_id_x();
             let (m, n, xs) = (m as usize, n as usize, xs as usize);
             let t = tid as usize;
-            let x = if core::arch::amdgpu::workgroup_id_x() * 8 >= split { x.add(KDA_DIM) } else { x };
-            rows_over::<KDA_DIM, false>(tid, w, core::ptr::null(), m, n, 0.0, |i, s| if s * 256 + t < KDA_DIM { *x.add(i * xs + s * 256 + t) } else { 0.0 }, || {}, |row, i, y| *out.add(i * m + row) = y);
+            let x = if core::arch::amdgpu::workgroup_id_x() as usize * common::gemv::rows_per_wg(n, ROWS) >= split as usize { x.add(KDA_DIM) } else { x };
+            rows_over::<KDA_DIM, false, ROWS>(tid, w, core::ptr::null(), m, n, 0.0, |i, s| if s * 256 + t < KDA_DIM { *x.add(i * xs + s * 256 + t) } else { 0.0 }, || {}, |row, i, y| *out.add(i * m + row) = y);
         }
     }
 
@@ -254,7 +256,7 @@ pub mod gfx11 {
             let tid = workitem_id_x();
             let (m, n) = (m as usize, n as usize);
             let t = tid as usize;
-            rows_over::<PART_QKV, false>(tid, w, core::ptr::null(), m, n, 0.0, |i, s| *x.add(i * PART_QKV + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
+            rows_over::<PART_QKV, false, ROWS>(tid, w, core::ptr::null(), m, n, 0.0, |i, s| *x.add(i * PART_QKV + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
         }
     }
 

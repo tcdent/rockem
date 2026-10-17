@@ -39,6 +39,8 @@ use glm_5_3_flash::construct::Placed;
 use glm_5_3_flash::ffn::gfx11_consts::{DENSE_GU_ROWS, SHARED_GU_ROWS};
 use glm_5_3_flash::hc::gfx11_consts::{CHANNEL_GRID, MIX as HC_MIX, PRE_COUNTS, PRE_GRID, PRE_LDS, PRE_STRIDE};
 use glm_5_3_flash::kda::gfx11_consts as g;
+use common::gemv::ROWS;
+use glm_5_3_flash::ffn::gfx11_consts::ROWS_GU;
 use glm_5_3_flash::layout::{KDA_MEMORY, KDA_WINDOW};
 use glm_5_3_flash::mla::gfx11_consts::{ATTEND_GRID, ATTEND_LDS, IX_ROWS, O_IN};
 use glm_5_3_flash::DENSE_BELOW;
@@ -573,19 +575,19 @@ impl Cards {
     /// when given) for `m` rows of width `k_width`, scales `s`; `x` is `[n][k_width]`, `out` `[n][m]`.
     /// A launch takes `TOKENS` tokens at most (the kernels' slab), so a step is passes of that many.
     #[allow(clippy::too_many_arguments)]
-    fn rows8(&self, c: &Card, kernel: &crate::kfd::Kernel, x: usize, ln: Option<usize>, w: usize, s: usize, out: usize, m: usize, k_width: usize, n: usize) {
-        self.rows8_at(c, kernel, x, k_width, ln, w, s, out, m, k_width, n, true)
+    fn rows8(&self, c: &Card, kernel: &crate::kfd::Kernel, x: usize, ln: Option<usize>, w: usize, s: usize, out: usize, m: usize, k_width: usize, n: usize, r: usize) {
+        self.rows8_at(c, kernel, x, k_width, ln, w, s, out, m, k_width, n, r, true)
     }
     #[allow(clippy::too_many_arguments)]
-    fn rows8_free(&self, c: &Card, kernel: &crate::kfd::Kernel, x: usize, ln: Option<usize>, w: usize, s: usize, out: usize, m: usize, k_width: usize, n: usize) {
-        self.rows8_at(c, kernel, x, k_width, ln, w, s, out, m, k_width, n, false)
+    fn rows8_free(&self, c: &Card, kernel: &crate::kfd::Kernel, x: usize, ln: Option<usize>, w: usize, s: usize, out: usize, m: usize, k_width: usize, n: usize, r: usize) {
+        self.rows8_at(c, kernel, x, k_width, ln, w, s, out, m, k_width, n, r, false)
     }
     /// `rows8` with the input's token stride `xs` given: the down kernels read token `i`'s gate|up row
     /// at `x[i · 2 · k_width]` (`swiglu_at`), so a pass past the first starts at the stride's multiple,
     /// not the width's (the second pass of a step's dense and shared-expert down read from the
     /// middle of token 16's row until 2026-10-16; a step of 32 or fewer tokens is one pass and never saw it).
     #[allow(clippy::too_many_arguments)]
-    fn rows8_at(&self, c: &Card, kernel: &crate::kfd::Kernel, x: usize, xs: usize, ln: Option<usize>, w: usize, s: usize, out: usize, m: usize, k_width: usize, n: usize, barrier: bool) {
+    fn rows8_at(&self, c: &Card, kernel: &crate::kfd::Kernel, x: usize, xs: usize, ln: Option<usize>, w: usize, s: usize, out: usize, m: usize, k_width: usize, n: usize, r: usize, barrier: bool) {
         let mut p0 = 0;
         while p0 < n {
             let np = (n - p0).min(TOKENS);
@@ -597,9 +599,9 @@ impl Cards {
             a.ptr(w).ptr(s).ptr(out + p0 * m * 4).u32(m as u32).u32(np as u32);
             let lds = g::fp8_rows_lds(k_width, np) as u32;
             if barrier || p0 > 0 {
-                c.k.launch(kernel, g::rows_grid(m), g::WG, lds, &a);
+                c.k.launch(kernel, g::rows_grid(m, np, r), g::WG, lds, &a);
             } else {
-                c.k.launch_free(kernel, g::rows_grid(m), g::WG, lds, &a);
+                c.k.launch_free(kernel, g::rows_grid(m, np, r), g::WG, lds, &a);
             }
             p0 += np;
         }
@@ -607,17 +609,17 @@ impl Cards {
 
     /// bf16 rows on card `c` over the step's `n` tokens (as `rows8`). Addresses are device VAs.
     #[allow(clippy::too_many_arguments)]
-    fn rows(&self, c: &Card, kernel: &crate::kfd::Kernel, x: usize, ln: Option<usize>, w: usize, out: usize, m: usize, k_width: usize, n: usize) {
-        self.rows_at(c, kernel, x, ln, w, out, m, k_width, n, true)
+    fn rows(&self, c: &Card, kernel: &crate::kfd::Kernel, x: usize, ln: Option<usize>, w: usize, out: usize, m: usize, k_width: usize, n: usize, r: usize) {
+        self.rows_at(c, kernel, x, ln, w, out, m, k_width, n, r, true)
     }
     /// `rows` launched free: as soon as the launch before it has launched, so the two run together —
     /// for a launch whose inputs were complete when the one before it launched.
     #[allow(clippy::too_many_arguments)]
-    fn rows_free(&self, c: &Card, kernel: &crate::kfd::Kernel, x: usize, ln: Option<usize>, w: usize, out: usize, m: usize, k_width: usize, n: usize) {
-        self.rows_at(c, kernel, x, ln, w, out, m, k_width, n, false)
+    fn rows_free(&self, c: &Card, kernel: &crate::kfd::Kernel, x: usize, ln: Option<usize>, w: usize, out: usize, m: usize, k_width: usize, n: usize, r: usize) {
+        self.rows_at(c, kernel, x, ln, w, out, m, k_width, n, r, false)
     }
     #[allow(clippy::too_many_arguments)]
-    fn rows_at(&self, c: &Card, kernel: &crate::kfd::Kernel, x: usize, ln: Option<usize>, w: usize, out: usize, m: usize, k_width: usize, n: usize, barrier: bool) {
+    fn rows_at(&self, c: &Card, kernel: &crate::kfd::Kernel, x: usize, ln: Option<usize>, w: usize, out: usize, m: usize, k_width: usize, n: usize, r: usize, barrier: bool) {
         let mut p0 = 0;
         while p0 < n {
             let np = (n - p0).min(TOKENS);
@@ -629,9 +631,9 @@ impl Cards {
             a.ptr(w).ptr(out + p0 * m * 4).u32(m as u32).u32(np as u32);
             let lds = if ln.is_some() { g::normed_rows_lds(k_width, np) } else { g::rows_lds(k_width, np) } as u32;
             if barrier || p0 > 0 {
-                c.k.launch(kernel, g::rows_grid(m), g::WG, lds, &a);
+                c.k.launch(kernel, g::rows_grid(m, np, r), g::WG, lds, &a);
             } else {
-                c.k.launch_free(kernel, g::rows_grid(m), g::WG, lds, &a);
+                c.k.launch_free(kernel, g::rows_grid(m, np, r), g::WG, lds, &a);
             }
             p0 += np;
         }
@@ -668,14 +670,14 @@ impl Placed for Cards {
             let c = &self.cards[p.card];
             let (smix, fg, normed) = (&c.smixs[i], &c.fgs[i], &c.normeds[i]);
             // the gates' first halves and beta, then q | k | v: one launch over the normed block input, [n][M_SMALL]
-            self.rows(c, &c.rows_h, c.x.va, Some(p.input_ln.va), p.sq.va, smix.va, M_SMALL, H, n);
+            self.rows(c, &c.rows_h, c.x.va, Some(p.input_ln.va), p.sq.va, smix.va, M_SMALL, H, n, ROWS);
             // the gates' second halves as one launch: f_b over f_a's output, g_b over g_a's — token i's input at smix[i · M_SMALL]
             let mut p0 = 0;
             while p0 < n {
                 let np = (n - p0).min(TOKENS);
                 let mut a = Args::new();
                 a.ptr(smix.at(p0 * M_SMALL * 4)).ptr(p.fg.va).ptr(fg.at(p0 * 2 * g::PART_QKV * 4)).u32(2 * g::PART_QKV as u32).u32(np as u32).u32(g::PART_QKV as u32).u32(M_SMALL as u32);
-                c.k.launch(&c.rows_d2, g::rows_grid(2 * g::PART_QKV), g::WG, g::rows_lds(KDA_DIM, np) as u32, &a);
+                c.k.launch(&c.rows_d2, g::rows_grid(2 * g::PART_QKV, np, ROWS), g::WG, g::rows_lds(KDA_DIM, np) as u32, &a);
                 p0 += np;
             }
             // the delta rule over the step's tokens in order, the heads' memory in registers across them
@@ -683,7 +685,7 @@ impl Placed for Cards {
             let mut a = Args::new();
             a.ptr(mixed).ptr(p.taps.va).ptr(p.window.va).ptr(fg.va).ptr(p.dt_bias.va).ptr(p.a_log.va).ptr(smix.at(2 * KDA_DIM * 4)).ptr(fg.at(g::PART_QKV * 4)).ptr(p.mem.va).ptr(p.o_norm.va).ptr(normed.va).u32(p.head0 as u32).u32(n as u32).u32(M_SMALL as u32).u32(2 * g::PART_QKV as u32).u32(M_SMALL as u32);
             c.k.launch(&c.step, g::STEP_GRID, g::WG, g::STEP_LDS as u32, &a);
-            self.rows(c, &c.rows_part, normed.va, None, p.o.va, c.yv.at(i * STEP * H * 4), H, g::PART_QKV, n);
+            self.rows(c, &c.rows_part, normed.va, None, p.o.va, c.yv.at(i * STEP * H * 4), H, g::PART_QKV, n, ROWS);
         }
         // each card's shares out and its word; every card folds the sum into its streams
         let mut parts: Vec<Vec<usize>> = vec![Vec::new(); self.cards.len()];
@@ -709,13 +711,13 @@ impl Placed for Cards {
         let c = &self.cards[m.card];
         let ln = Some(m.input_ln.va);
         // over the normed block input: q_a into VRAM for the next two, kv_a and the indexer's three out to the host
-        self.rows8(c, &c.ffn_gu, c.x.va, ln, m.q_a.0.va, m.q_a.1.va, c.mqa.va, Q_LORA_RANK, H, n);
-        self.rows8_free(c, &c.ffn_gu, c.x.va, ln, m.kv_a.0.va, m.kv_a.1.va, c.mproj.at(MKVA * 4), KV_LORA_RANK, H, n);
-        self.rows_free(c, &c.rows_h, c.x.va, ln, m.ix.va, c.mproj.at(MIX * 4), IX_ROWS, H, n);
+        self.rows8(c, &c.ffn_gu, c.x.va, ln, m.q_a.0.va, m.q_a.1.va, c.mqa.va, Q_LORA_RANK, H, n, ROWS_GU);
+        self.rows8_free(c, &c.ffn_gu, c.x.va, ln, m.kv_a.0.va, m.kv_a.1.va, c.mproj.at(MKVA * 4), KV_LORA_RANK, H, n, ROWS_GU);
+        self.rows_free(c, &c.rows_h, c.x.va, ln, m.ix.va, c.mproj.at(MIX * 4), IX_ROWS, H, n, ROWS);
         // over q_a's output normed with q_a's norm: the query and, alongside it, the indexer's query
         let qln = Some(m.qa_ln.va);
-        self.rows8(c, &c.mla_qb, c.mqa.va, qln, m.q_b.0.va, m.q_b.1.va, c.mq.va, MLA_HEADS * Q_HEAD, Q_LORA_RANK, n);
-        self.rows_free(c, &c.mla_iq, c.mqa.va, qln, m.ix_wq_b.va, c.mproj.at(MIQ * 4), INDEX_N_HEADS * INDEX_HEAD_DIM, Q_LORA_RANK, n);
+        self.rows8(c, &c.mla_qb, c.mqa.va, qln, m.q_b.0.va, m.q_b.1.va, c.mq.va, MLA_HEADS * Q_HEAD, Q_LORA_RANK, n, ROWS);
+        self.rows_free(c, &c.mla_iq, c.mqa.va, qln, m.ix_wq_b.va, c.mproj.at(MIQ * 4), INDEX_N_HEADS * INDEX_HEAD_DIM, Q_LORA_RANK, n, ROWS);
         c.k.fence();
         // the other cards fold the output in once it is there (posted now: they wait for the word)
         for (i, o) in self.cards.iter().enumerate() {
@@ -760,7 +762,7 @@ impl Placed for Cards {
         let c = &self.cards[m.card];
         let my = self.shared.my[l % 2].va;
         // the output projection over every token's heads, then the streams
-        self.rows8(c, &c.mla_o, c.mheads.va, None, m.o.0.va, m.o.1.va, c.myv.va, H, O_IN, n);
+        self.rows8(c, &c.mla_o, c.mheads.va, None, m.o.0.va, m.o.1.va, c.myv.va, H, O_IN, n, ROWS);
         self.hc_post(c, Some((c.myv.va, my, n * H)), Some((W_Y, m.card)), None, None, self.half_seq[l][0], my, None, n);
     }
     fn mla_seed(&mut self, l: usize, pos: usize, latent: &[f32]) {
@@ -781,8 +783,8 @@ impl Placed for Cards {
         let c = &self.cards[f.card];
         let (rows, down, k_width) = if f.dense { (DENSE_GU_ROWS, &c.ffn_down_dense, INTERMEDIATE_SIZE) } else { (SHARED_GU_ROWS, &c.ffn_down_shared, N_SHARED_EXPERTS * D_FF) };
         let fy = self.shared.fy[parity].va;
-        self.rows8(c, &c.ffn_gu, c.x.va, Some(f.ln.va), f.gu_w.va, f.gu_s.va, c.gu.va, rows, H, n);
-        self.rows8_at(c, down, c.gu.va, 2 * k_width, None, f.down_w.va, f.down_s.va, c.fyv.va, H, k_width, n, true);
+        self.rows8(c, &c.ffn_gu, c.x.va, Some(f.ln.va), f.gu_w.va, f.gu_s.va, c.gu.va, rows, H, n, ROWS_GU);
+        self.rows8_at(c, down, c.gu.va, 2 * k_width, None, f.down_w.va, f.down_s.va, c.fyv.va, H, k_width, n, ROWS, true);
         for o in &self.cards {
             let producer = o.k.index == f.card;
             let copy = producer.then_some((o.fyv.va, fy, n * H));
@@ -823,7 +825,7 @@ impl Placed for Cards {
             let mut a = Args::new();
             a.ptr(c.streams.at((from + p0) * HC * H * 4)).ptr(c.fx.va).u32(np as u32);
             c.k.launch(&c.hc_mean, CHANNEL_GRID, g::WG, 0, &a);
-            self.rows(c, &c.rows_h, c.fx.va, Some(norm.va), lm.va, c.lg.va, VOCAB_SIZE, H, np);
+            self.rows(c, &c.rows_h, c.fx.va, Some(norm.va), lm.va, c.lg.va, VOCAB_SIZE, H, np, ROWS);
             c.k.sync();
             read(&c.lg, 0, &mut logits[p0 * VOCAB_SIZE..(p0 + np) * VOCAB_SIZE]);
             p0 += np;

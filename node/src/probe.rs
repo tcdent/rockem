@@ -658,7 +658,7 @@ pub fn run(elf: Option<&[u8]>) {
             }
             a.ptr(w).ptr(out).u32(m as u32).u32(1);
             let lds = if ln.is_some() { g::normed_rows_lds(kw, 1) } else { g::rows_lds(kw, 1) } as u32;
-            k.launch(kernel, g::rows_grid(m), g::WG, lds, &a);
+            k.launch(kernel, g::rows_grid(m, 1, common::gemv::ROWS), g::WG, lds, &a);
         };
         let gbs = |bytes: usize, secs: f64| bytes as f64 / secs / 1e9;
         let mut back = vec![0f32; H];
@@ -716,7 +716,7 @@ pub fn run(elf: Option<&[u8]>) {
                 a.ptr(ln);
             }
             a.ptr(w8m.va).ptr(sc.va).ptr(out).u32(m as u32).u32(1);
-            k.launch(kernel, g::rows_grid(m), g::WG, g::fp8_rows_lds(kw, 1) as u32, &a);
+            k.launch(kernel, g::rows_grid(m, 1, common::gemv::ROWS), g::WG, g::fp8_rows_lds(kw, 1) as u32, &a);
         };
         let shared_gu = gbs(SHARED_GU_ROWS * H, best(iters, || {
             fp8(&gu_k, x.va, Some(ln.va), gu_out.va, SHARED_GU_ROWS, H);
