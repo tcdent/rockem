@@ -51,7 +51,14 @@ pub const XBLOCK_BYTES: usize = RUNS * RUN;
 /// An expert's bytes (the four shares), for sizing.
 pub const RECORD: usize = RUNS * SHARE;
 pub const LAYER: usize = E * RECORD;
-pub const MOE_LAYERS: usize = NUM_HIDDEN_LAYERS - FIRST_K_DENSE_REPLACE;
+/// MoE layers in the expert stream: the main stack's, then the draft layer's (`MTP_LAYER`).
+pub const MOE_LAYERS: usize = NUM_HIDDEN_LAYERS - FIRST_K_DENSE_REPLACE + NUM_NEXTN;
+/// The draft layer (multi-token prediction): the checkpoint's `layers.{NUM_HIDDEN_LAYERS}`, a
+/// DSA/MLA attention and a MoE MLP like the main stack's with `eh_proj` ahead and the shared
+/// head's norm after, no hyper-connections (a plain residual block). Its experts follow the main
+/// stack's in the stream, its dense tensors follow layer `NUM_HIDDEN_LAYERS - 1`'s in the file.
+pub const MTP_LAYER: usize = NUM_HIDDEN_LAYERS;
+const _: () = assert!(NUM_NEXTN <= 1, "one draft layer: the stream and the file lay out one");
 pub const STREAM: usize = MOE_LAYERS * LAYER;
 pub const RECIPE_RTN: &str = "experts:q4g128-a8-rtn dense:native";
 
@@ -311,12 +318,30 @@ pub const MOE: [Tensor; 5] = [
     Tensor::new("mlp.shared_experts.down_proj.weight", Fp8, H, N_SHARED_EXPERTS * D_FF),
 ];
 
+/// The draft layer's norms (no hyper-connections) and its own tensors around the block.
+pub const MTP_COMMON: [Tensor; 2] = [
+    Tensor::new("input_layernorm.weight", Bf16, 1, H),
+    Tensor::new("post_attention_layernorm.weight", Bf16, 1, H),
+];
+pub const MTP_OWN: [Tensor; 4] = [
+    Tensor::new("eh_proj.weight", Bf16, H, 2 * H),
+    Tensor::new("enorm.weight", Bf16, 1, H),
+    Tensor::new("hnorm.weight", Bf16, 1, H),
+    Tensor::new("shared_head.norm.weight", Bf16, 1, H),
+];
+
 pub const fn attn(l: usize) -> &'static [Tensor] {
-    if LINEAR_ATTENTION[l] { &KDA } else { &MLA }
+    if l == MTP_LAYER || !LINEAR_ATTENTION[l] { &MLA } else { &KDA }
 }
 pub const fn ffn(l: usize) -> &'static [Tensor] {
-    if DENSE_MLP[l] { &DENSE_FFN } else { &MOE }
+    if l != MTP_LAYER && DENSE_MLP[l] { &DENSE_FFN } else { &MOE }
 }
+/// Layer `l`'s sections in the file, in order.
+pub const fn sections(l: usize) -> [&'static [Tensor]; 3] {
+    if l == MTP_LAYER { [&MTP_OWN, &MTP_COMMON, &MLA] } else { [&COMMON, attn(l), ffn(l)] }
+}
+/// Whether the layer is in the file: the main stack, and the draft layer when the checkpoint has one.
+pub const LAYERS_IN_FILE: usize = NUM_HIDDEN_LAYERS + NUM_NEXTN;
 pub const fn section(ts: &[Tensor]) -> usize {
     let mut b = 0;
     let mut i = 0;
@@ -331,17 +356,22 @@ pub const fn within(ts: &[Tensor], i: usize) -> usize {
     section(ts.split_at(i).0)
 }
 pub const HEAD_BYTES: usize = section(&HEAD);
-/// Byte offset of layer `l`: its `COMMON`, then `attn(l)`, then `ffn(l)`.
+/// Byte offset of layer `l`: its sections (`sections(l)`) follow the layers before it; the draft
+/// layer's follow the main stack's (its MoE tensors after its MLA's: `ffn(MTP_LAYER)`).
 pub const fn layer(l: usize) -> usize {
     let mut off = HEAD_BYTES;
     let mut i = 0;
     while i < l {
-        off += section(&COMMON) + section(attn(i)) + section(ffn(i));
+        let ss = sections(i);
+        off += section(ss[0]) + section(ss[1]) + section(ss[2]);
+        if i == MTP_LAYER {
+            off += section(ffn(i));
+        }
         i += 1;
     }
     off
 }
-pub const DENSE_BYTES: usize = layer(NUM_HIDDEN_LAYERS);
+pub const DENSE_BYTES: usize = layer(LAYERS_IN_FILE);
 
 /// A tensor's place in the file: (byte offset, the tensor), by layer and checkpoint name
 /// (`None` for the head's). Construction only: a linear scan of the layer's tables.
@@ -350,9 +380,10 @@ pub fn locate(layer_: Option<usize>, name: &str) -> Option<(usize, Tensor)> {
         None => HEAD.iter().enumerate().find(|(_, t)| t.name == name).map(|(i, t)| (within(&HEAD, i), *t)),
         Some(l) => {
             let base = layer(l);
-            let sections: [&[Tensor]; 3] = [&COMMON, attn(l), ffn(l)];
+            let ss = sections(l);
+            let secs: [&[Tensor]; 4] = if l == MTP_LAYER { [ss[0], ss[1], ss[2], ffn(l)] } else { [ss[0], ss[1], ss[2], &[]] };
             let mut off = base;
-            for s in sections {
+            for s in secs {
                 if let Some((i, t)) = s.iter().enumerate().find(|(_, t)| t.name == name) {
                     return Some((off + within(s, i), *t));
                 }
@@ -371,9 +402,10 @@ pub const VOCAB_FILE: &str = "vocab.bin";
 pub const KERNELS_FILE: &str = "kernels.gfx1100.elf";
 pub const TOKENIZER_FILES: [&str; 2] = ["tokenizer.json", "tokenizer_config.json"];
 pub const CHAT_TEMPLATE_FILE: &str = "chat_template.jinja";
-/// The prefix's state, f32: `[FIRST_POS][POSITION]` rows, then `[SNAPSHOT]`.
-/// Computed once at bundle build at full precision (the f32 reference); every
-/// sequence is seeded from it and computed from `FIRST_POS`.
+/// The prefix's state, f32: `[FIRST_POS][POSITION]` rows, then `[SNAPSHOT]`, then the prefix
+/// positions' hidden states `[FIRST_POS][H]` (the streams' mean before the final norm: the draft
+/// layer's input at those positions). Computed once at bundle build at full precision (the f32
+/// reference); every sequence is seeded from it and computed from `FIRST_POS`.
 pub const PREFIX_FILE: &str = "prefix.f32";
 
 // --- sequence state ---
@@ -400,7 +432,7 @@ pub const KDA_MEMORY: usize = KDA_HEADS * KDA_DIM * KDA_DIM;
 pub const KDA_STATE: usize = KDA_WINDOW + KDA_MEMORY;
 /// The sequence state that is not per position: every KDA layer's, in layer order.
 pub const SNAPSHOT: usize = KDA_LAYERS * KDA_STATE;
-pub const PREFIX_LEN: usize = FIRST_POS * POSITION + SNAPSHOT;
+pub const PREFIX_LEN: usize = FIRST_POS * POSITION + SNAPSHOT + FIRST_POS * H;
 
 const _: () = assert!(KDA_LAYERS + MLA_LAYERS == NUM_HIDDEN_LAYERS);
 const _: () = assert!(count(&DENSE_MLP, true) == FIRST_K_DENSE_REPLACE);

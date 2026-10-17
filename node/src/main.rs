@@ -230,7 +230,14 @@ struct Session {
     /// While the prompt is a prefix the store holds: (context, positions matched); nothing computed yet.
     pending: Option<(usize, usize)>,
     hits: usize,
+    /// Speculative decoding: the model carries a draft layer (the cards run it after every step).
+    spec: bool,
+    /// The draft of the token after `next`, `[vocab]`, from the last step.
+    draft: Vec<f32>,
 }
+/// The uniforms the speculative path draws with, apart from the positions' own.
+const DRAFT_SALT: u64 = 0x5eed_d4af_7000_0001;
+const RESIDUAL_SALT: u64 = 0x5eed_d4af_7000_0002;
 impl Session {
     fn first_pos(&self) -> usize {
         self.e.first_pos()
@@ -433,16 +440,14 @@ impl Session {
         let u = common::sample::uniform_at(s.e.seed_value(), (pos + n - 1) as u64);
         s.next = s.e.draw(n - 1, u);
         s.last_row = n - 1;
-        let position = s.store.position;
-        for i in 0..n {
-            let p = pos + i;
-            s.e.rows(i, &mut s.store.active[p * position..(p + 1) * position]);
-            let c = s.store.contexts[s.active].as_mut().unwrap();
-            c.ids.push(toks[i]);
-            let key = Store::key(c.keys[p - 1], toks[i]);
-            c.keys.push(key);
-            s.store.grew(s.active, p);
-            if let Some(d) = &s.debug {
+        s.commit(toks, 0, pos);
+        if s.spec {
+            s.e.draft(toks, s.next, pos, &mut s.draft);
+        }
+        if s.debug.is_some() {
+            for i in 0..n {
+                let p = pos + i;
+                let d = s.debug.as_ref().unwrap();
                 let (layers, topk, lg) = s.e.trace(i);
                 let raw = |v: &[f32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, 4 * v.len()) }.to_vec();
                 std::fs::write(d.join(format!("pos{p}.layers.f32")), raw(layers)).unwrap();
@@ -453,7 +458,22 @@ impl Session {
                 std::fs::write(d.join(format!("pos{p}.f32")), raw(lg)).unwrap();
             }
         }
-        s.pos = pos + n;
+    }
+    /// Tokens `toks` computed at `pos..` (their rows at `row0..` of the last step) into the active
+    /// context: rows, ids, keys; the position advances past them.
+    fn commit(&mut self, toks: &[u32], row0: usize, pos: usize) {
+        let s = self;
+        let position = s.store.position;
+        for (i, &tok) in toks.iter().enumerate() {
+            let p = pos + i;
+            s.e.rows(row0 + i, &mut s.store.active[p * position..(p + 1) * position]);
+            let c = s.store.contexts[s.active].as_mut().unwrap();
+            c.ids.push(tok);
+            let key = Store::key(c.keys[p - 1], tok);
+            c.keys.push(key);
+            s.store.grew(s.active, p);
+        }
+        s.pos = pos + toks.len();
     }
     /// One token through the model at the next position. False when the context is full.
     fn feed(&mut self, id: u32) -> bool {
@@ -474,17 +494,59 @@ impl Session {
             // nothing fed after the prefix: the first draw is from the prefix's logits
             self.next = self.e.draw_prefix(common::sample::uniform_at(self.e.seed_value(), (first - 1) as u64));
         }
-        for _ in 0..limit {
+        let mut emitted = 0;
+        while emitted < limit {
             let id = self.next;
             let eos = self.e.is_eos(id);
             if eos {
                 self.mark();
             }
-            if !emit(id) || !self.feed(id) {
+            if !emit(id) {
                 return false;
             }
-            if eos {
-                return true;
+            emitted += 1;
+            if eos || !self.spec || emitted >= limit || self.pos + 2 > self.max_ctx {
+                if !self.feed(id) {
+                    return false;
+                }
+                if eos {
+                    return true;
+                }
+                continue;
+            }
+            // speculative: the draft of the token after `id` (made after the last step) is verified in
+            // one step with `id`: the model's own distribution at that position decides it, and the
+            // token after both comes from the same step when the draft holds
+            let s = self.e.sampling();
+            let seed = self.e.seed_value();
+            let pos = self.pos;
+            let x = common::sample::draw(&self.draft, s, common::sample::uniform_at(seed ^ DRAFT_SALT, (pos + 1) as u64)) as u32;
+            self.e.run(&[id, x], pos, false, true);
+            let (accepted, tok) = common::sample::verify(self.e.logits_row(0), &self.draft, s, x, common::sample::uniform_at(seed, (pos + 1) as u64), common::sample::uniform_at(seed ^ RESIDUAL_SALT, (pos + 1) as u64));
+            if accepted {
+                // both computed tokens stand; the draw after them is the step's second row's
+                self.next = self.e.draw(1, common::sample::uniform_at(seed, (pos + 2) as u64));
+                self.last_row = 1;
+                self.commit(&[id, x], 0, pos);
+                self.e.draft(&[id, x], self.next, pos, &mut self.draft);
+                let eos = self.e.is_eos(x);
+                if eos {
+                    self.mark();
+                }
+                if !emit(x) {
+                    return false;
+                }
+                emitted += 1;
+                if eos {
+                    return true;
+                }
+            } else {
+                // the first token stands with the residual draw after it; the state after the second is dropped
+                self.e.rewind(0);
+                self.next = tok;
+                self.last_row = 0;
+                self.commit(&[id], 0, pos);
+                self.e.draft(&[id], self.next, pos, &mut self.draft);
             }
         }
         self.mark();
@@ -649,7 +711,12 @@ fn main() {
     let store = Store { contexts: Vec::new(), index: std::collections::HashMap::new(), budget: (budget_bytes / (position * 4)).max(max_ctx), held: 0, clock: 0, max_ctx, position, active: Vec::new() };
     println!("cache    : {} cached positions ({:.1} GB of host memory), {} KB each{}, for {}", store.budget, budget_bytes as f64 / 1e9, position * 4 / 1024, if e.snapshot_len() > 0 { format!(", {} MB of state a transcript", e.snapshot_len() * 4 >> 20) } else { String::new() }, e.name());
     let (bos, first) = (e.bos(), e.first_pos());
-    let mut session = Session { e, scoring: false, last_row: 0, next: 0, pos: first, max_ctx, started: false, prefix_left: 0, debug, store, active: 0, pending: None, hits: 0 };
+    let spec = e.drafts() && debug.is_none();
+    let vocab_n = e.vocab_size();
+    let mut session = Session { e, scoring: false, last_row: 0, next: 0, pos: first, max_ctx, started: false, prefix_left: 0, debug, store, active: 0, pending: None, hits: 0, spec, draft: vec![0.0; vocab_n] };
+    if spec {
+        println!("spec     : the draft layer drafts a token after every step; verified in the next");
+    }
 
     // --- execution ---
     if let Some(listen) = config("rockem.listen") {

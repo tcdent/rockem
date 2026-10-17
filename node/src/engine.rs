@@ -53,6 +53,22 @@ pub trait Engine {
     fn run(&mut self, toks: &[u32], pos: usize, trace: bool, all_logits: bool);
     /// Token `i`'s rows of the last step, `position()` f32s.
     fn rows(&self, i: usize, out: &mut [f32]);
+    /// Whether the model carries a draft layer (multi-token prediction).
+    fn drafts(&self) -> bool {
+        false
+    }
+    /// After a step of `toks` at `pos`: the draft layer over those positions (each with the token
+    /// that follows it — the step's next token, `next` after the last), its cache kept; `logits`
+    /// receives the draft of the token after `next`. The sampler's constants (`sampling`) and
+    /// `common::sample::verify` decide acceptance.
+    fn draft(&mut self, _toks: &[u32], _next: u32, _pos: usize, _logits: &mut [f32]) {
+        unreachable!("no draft layer")
+    }
+    /// The sequence state back to after token `slot` of the last verify-sized step (its later tokens rejected).
+    fn rewind(&mut self, _slot: usize) {
+        unreachable!("no verify")
+    }
+    fn sampling(&self) -> &'static common::sample::Sampling;
     /// The token drawn under the model's sampling from token `i`'s logits with the uniform `u`.
     fn draw(&mut self, i: usize, u: f64) -> u32;
     /// ln p(id) at the position after token `i`.

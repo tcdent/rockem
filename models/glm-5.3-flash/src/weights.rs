@@ -99,6 +99,22 @@ pub struct Weights<'a> {
     pub norm: &'a [f32],
     pub lm_head: &'a [u16], // [VOCAB_SIZE][H]
     pub layers: Vec<Layer<'a>>,
+    /// The draft layer, when the checkpoint has one (`layout::MTP_LAYER`).
+    pub mtp: Option<Mtp<'a>>,
+}
+
+/// The draft layer: `eh_proj` over the concatenation of the next token's normed embedding and the
+/// normed hidden state, then an MLA attention and a MoE MLP as a plain residual block, then the
+/// shared head's norm into the shared `lm_head`.
+pub struct Mtp<'a> {
+    pub eh_proj: &'a [u16], // [H][2·H]: the embedding half first, then the hidden state's
+    pub enorm: &'a [f32],
+    pub hnorm: &'a [f32],
+    pub input_ln: &'a [f32],
+    pub post_ln: &'a [f32],
+    pub attn: Mla<'a>,
+    pub ffn: Moe<'a>,
+    pub head_norm: &'a [f32],
 }
 
 /// A tensor's bytes in the file, by layer and name.
@@ -148,6 +164,30 @@ impl<'a> Weights<'a> {
         assert_eq!(dense.len(), layout::DENSE_BYTES, "dense file size");
         assert_eq!(dense.as_ptr() as usize % ALIGN_MIN, 0, "dense file alignment");
         let at = At { dense };
+        // an MLA attention's and a MoE MLP's tensors, by layer: the main stack's and the draft layer's
+        let mla = |l_: Option<usize>| Mla {
+                    q_a: at.fp8(l_, "self_attn.q_a_proj.weight"),
+                    q_a_ln: at.widened(l_, "self_attn.q_a_layernorm.weight"),
+                    q_b: at.fp8(l_, "self_attn.q_b_proj.weight"),
+                    kv_a: at.fp8(l_, "self_attn.kv_a_proj_with_mqa.weight"),
+                    kv_a_ln: at.widened(l_, "self_attn.kv_a_layernorm.weight"),
+                    kv_b: at.bf16(l_, "self_attn.kv_b_proj.weight"),
+                    o: at.fp8(l_, "self_attn.o_proj.weight"),
+                    ix_wq_b: at.bf16(l_, "self_attn.indexer.wq_b.weight"),
+                    ix_wk: at.bf16(l_, "self_attn.indexer.wk.weight"),
+                    ix_k_norm_w: at.widened(l_, "self_attn.indexer.k_norm.weight"),
+                    ix_k_norm_b: at.widened(l_, "self_attn.indexer.k_norm.bias"),
+                    ix_weights: at.bf16(l_, "self_attn.indexer.weights_proj.weight"),
+                    ix_ape: at.widened(l_, "self_attn.indexer.index_kpool_compress_ape"),
+                    ix_gate: at.bf16(l_, "self_attn.indexer.index_kpool_compress_gate"),
+                };
+        let moe = |l_: Option<usize>| Moe {
+                    router: at.bf16(l_, "mlp.gate.weight"),
+                    bias: at.f32(l_, "mlp.gate.e_score_correction_bias"),
+                    shared_gate: at.fp8(l_, "mlp.shared_experts.gate_proj.weight"),
+                    shared_up: at.fp8(l_, "mlp.shared_experts.up_proj.weight"),
+                    shared_down: at.fp8(l_, "mlp.shared_experts.down_proj.weight"),
+                };
         let mut layers = Vec::with_capacity(NUM_HIDDEN_LAYERS);
         for l in 0..NUM_HIDDEN_LAYERS {
             let l_ = Some(l);
@@ -169,41 +209,25 @@ impl<'a> Weights<'a> {
                     o: at.bf16(l_, "self_attn.o_proj.weight"),
                 })
             } else {
-                Attn::Mla(Mla {
-                    q_a: at.fp8(l_, "self_attn.q_a_proj.weight"),
-                    q_a_ln: at.widened(l_, "self_attn.q_a_layernorm.weight"),
-                    q_b: at.fp8(l_, "self_attn.q_b_proj.weight"),
-                    kv_a: at.fp8(l_, "self_attn.kv_a_proj_with_mqa.weight"),
-                    kv_a_ln: at.widened(l_, "self_attn.kv_a_layernorm.weight"),
-                    kv_b: at.bf16(l_, "self_attn.kv_b_proj.weight"),
-                    o: at.fp8(l_, "self_attn.o_proj.weight"),
-                    ix_wq_b: at.bf16(l_, "self_attn.indexer.wq_b.weight"),
-                    ix_wk: at.bf16(l_, "self_attn.indexer.wk.weight"),
-                    ix_k_norm_w: at.widened(l_, "self_attn.indexer.k_norm.weight"),
-                    ix_k_norm_b: at.widened(l_, "self_attn.indexer.k_norm.bias"),
-                    ix_weights: at.bf16(l_, "self_attn.indexer.weights_proj.weight"),
-                    ix_ape: at.widened(l_, "self_attn.indexer.index_kpool_compress_ape"),
-                    ix_gate: at.bf16(l_, "self_attn.indexer.index_kpool_compress_gate"),
-                })
+                Attn::Mla(mla(l_))
             };
             let ffn = if DENSE_MLP[l] {
                 Ffn::Dense(DenseFfn { gate: at.fp8(l_, "mlp.gate_proj.weight"), up: at.fp8(l_, "mlp.up_proj.weight"), down: at.fp8(l_, "mlp.down_proj.weight") })
             } else {
-                Ffn::Moe(Moe {
-                    router: at.bf16(l_, "mlp.gate.weight"),
-                    bias: at.f32(l_, "mlp.gate.e_score_correction_bias"),
-                    shared_gate: at.fp8(l_, "mlp.shared_experts.gate_proj.weight"),
-                    shared_up: at.fp8(l_, "mlp.shared_experts.up_proj.weight"),
-                    shared_down: at.fp8(l_, "mlp.shared_experts.down_proj.weight"),
-                })
+                Ffn::Moe(moe(l_))
             };
             layers.push(Layer { input_ln: at.widened(l_, "input_layernorm.weight"), post_ln: at.widened(l_, "post_attention_layernorm.weight"), hc_attn: hc("attn"), hc_ffn: hc("ffn"), attn, ffn });
         }
+        let mtp = (NUM_NEXTN == 1).then(|| {
+            let l_ = Some(layout::MTP_LAYER);
+            Mtp { eh_proj: at.bf16(l_, "eh_proj.weight"), enorm: at.widened(l_, "enorm.weight"), hnorm: at.widened(l_, "hnorm.weight"), input_ln: at.widened(l_, "input_layernorm.weight"), post_ln: at.widened(l_, "post_attention_layernorm.weight"), attn: mla(l_), ffn: moe(l_), head_norm: at.widened(l_, "shared_head.norm.weight") }
+        });
         Weights {
             embed: at.bf16(None, "model.language_model.embed_tokens.weight"),
             norm: at.widened(None, "model.language_model.norm.weight"),
             lm_head: at.bf16(None, "lm_head.weight"),
             layers,
+            mtp,
         }
     }
 }

@@ -52,6 +52,8 @@ pub struct Glm {
     model: CpuModel<'static, CpuExperts<'static>>,
     prefix: &'static [f32],
     prefix_logits: Vec<f32>,
+    /// A step's hidden states for the draft, `[STEP][H]`.
+    hiddens: Vec<f32>,
     /// The last step's logits, a row per token, and the position of its first token.
     last_pos: usize,
     dtr: DebugTrace,
@@ -127,6 +129,7 @@ impl Glm {
             model,
             prefix,
             prefix_logits,
+            hiddens: vec![0.0; STEP * H],
             last_pos: 0,
             dtr: DebugTrace { tok: 0, layers: vec![0.0; STEP * NUM_HIDDEN_LAYERS * H], topk: vec![0; STEP * NUM_HIDDEN_LAYERS * TOP_K] },
         })
@@ -236,6 +239,24 @@ impl Engine for Glm {
     }
     fn rows(&self, i: usize, out: &mut [f32]) {
         self.model.rows(self.last_pos + i, out)
+    }
+    fn drafts(&self) -> bool {
+        self.model.mtp.is_some() && self.model.placed.is_some()
+    }
+    fn draft(&mut self, toks: &[u32], next: u32, pos: usize, logits: &mut [f32]) {
+        let n = toks.len();
+        let mut nexts: Vec<u32> = toks[1..].to_vec();
+        nexts.push(next);
+        self.model.placed.as_mut().unwrap().hidden_all(n, &mut self.hiddens[..n * H]);
+        let hiddens = std::mem::take(&mut self.hiddens);
+        self.model.draft_batch(&self.w, &hiddens[..n * H], &nexts, pos, n, logits);
+        self.hiddens = hiddens;
+    }
+    fn rewind(&mut self, slot: usize) {
+        self.model.rewind(slot)
+    }
+    fn sampling(&self) -> &'static common::sample::Sampling {
+        &SAMPLING
     }
     fn logits_row(&self, i: usize) -> &[f32] {
         &self.model.logits[i * VOCAB_SIZE..(i + 1) * VOCAB_SIZE]

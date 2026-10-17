@@ -42,11 +42,11 @@ use glm_5_3_flash::kda::gfx11_consts as g;
 use common::gemv::ROWS;
 use glm_5_3_flash::ffn::gfx11_consts::ROWS_GU;
 use glm_5_3_flash::layout::{KDA_MEMORY, KDA_WINDOW};
-use glm_5_3_flash::mla::gfx11_consts::{ATTEND_GRID, ATTEND_LDS, IX_ROWS, O_IN};
+use glm_5_3_flash::mla::gfx11_consts::{ATTEND_GRID, ATTEND_LDS, IX_ROWS, O_IN, SELECT_LDS};
 use glm_5_3_flash::DENSE_BELOW;
 use glm_5_3_flash::{INDEX_HEAD_DIM, INDEX_N_HEADS, KV_LORA_RANK, Q_LORA_RANK};
 use glm_5_3_flash::weights::{Attn, Ffn, Fp8, Weights};
-use glm_5_3_flash::{CONV_DIM, CONV_TAPS, D_FF, H, HC, INDEX_KPOOL, INTERMEDIATE_SIZE, KDA_DIM, KDA_HEADS, KDA_QKV, LINEAR_ATTENTION, MLA_HEADS, NUM_HIDDEN_LAYERS, N_SHARED_EXPERTS, Q_HEAD, STEP, TOKENS, VOCAB_SIZE};
+use glm_5_3_flash::{CONV_DIM, CONV_TAPS, D_FF, H, HC, INDEX_KPOOL, INTERMEDIATE_SIZE, SPEC_TOKENS, KDA_DIM, KDA_HEADS, KDA_QKV, LINEAR_ATTENTION, MLA_HEADS, NUM_HIDDEN_LAYERS, N_SHARED_EXPERTS, Q_HEAD, STEP, TOKENS, VOCAB_SIZE};
 use std::sync::atomic::AtomicU32;
 use std::rc::Rc;
 
@@ -64,6 +64,9 @@ struct Card {
     mla_iq: crate::kfd::Kernel,
     mla_attend: crate::kfd::Kernel,
     ix_score: crate::kfd::Kernel,
+    ix_select: crate::kfd::Kernel,
+    add2: crate::kfd::Kernel,
+    mtp_eh: crate::kfd::Kernel,
     mla_o: crate::kfd::Kernel,
     hc_pre: crate::kfd::Kernel,
     hc_post: crate::kfd::Kernel,
@@ -96,8 +99,22 @@ struct Card {
     msel: Mem,   // [STEP][DENSE_BELOW] u32, host-visible: the positions each token of the step attends
     mseln: Mem,  // [STEP] u32: how many each token attends
     miq: Mem,    // [STEP][INDEX_N_HEADS·INDEX_HEAD_DIM] f32: the indexer's query, the card's scorer's input
-    mscore: Mem, // [STEP][pools] f32, host memory: the indexer's scores for the host's picks
+    mscore: Mem, // [STEP][pools] f32: the indexer's scores, the card's selection's input
     mheads: Mem, // [STEP][O_IN] f32: the heads' outputs, the output projection's input
+}
+/// The draft layer's own pieces on the head's card (its MLA attention is `mlas[MTP_LAYER]`, its
+/// routed experts the host's as layer `MTP_LAYER`): `eh_proj`, the norms, the shared expert, and
+/// the `[2·H]` input staging.
+struct MtpOn {
+    card: usize,
+    eh: Mem,        // [H][2·H] bf16
+    post_ln: Mem,   // bf16
+    head_norm: Mem, // bf16
+    gu_w: Mem,
+    gu_s: Mem,
+    down_w: Mem,
+    down_s: Mem,
+    dx: Mem, // [2·H] f32: enorm(embed(next)) | hnorm(hidden)
 }
 /// Host memory every card and the host see (`Kfd::host_shared`): what one produces and
 /// another consumes within a token. A layer's buffers alternate by its parity, so a
@@ -150,6 +167,9 @@ struct Part {
     o_norm: Mem,
     window: Mem, // [CONV_TAPS-1][CONV_DIM] f32
     mem: Mem,    // [KDA_HEADS][KDA_DIM][KDA_DIM] f32
+    // a speculative verify step's states a token (this part's heads' entries), for `kda_rewind`
+    ring: Mem,   // [SPEC_TOKENS][KDA_HEADS][KDA_DIM][KDA_DIM] f32
+    ring_w: Mem, // [SPEC_TOKENS][CONV_TAPS-1][CONV_DIM] f32
 }
 struct Layer {
     parts: Vec<Part>,
@@ -197,6 +217,7 @@ pub struct Cards {
     mlas: Vec<Option<MlaOn>>,
     /// The head's card, the final norm (bf16) and lm_head.
     head: (usize, Mem, Mem),
+    mtp: Option<MtpOn>,
     /// The handoff sequence: a value a half of a layer's words carry, and each layer's (attention, FFN) values this token.
     seq: u32,
     half_seq: Vec<[u32; 2]>,
@@ -204,6 +225,8 @@ pub struct Cards {
     token_from: Vec<u64>,
     /// The step's token count (`begin`), for the report at `finish`.
     last_n: usize,
+    /// Pools the context can hold: the scores' row stride.
+    npools: usize,
     tokens: u32,
 }
 
@@ -241,6 +264,9 @@ impl Cards {
                     mla_iq: k.kernel("mla_iq"),
                     mla_attend: k.kernel("mla_attend"),
                     ix_score: k.kernel("ix_score"),
+                    ix_select: k.kernel("ix_select"),
+                    add2: k.kernel("add2"),
+                    mtp_eh: k.kernel("mtp_eh"),
                     mla_o: k.kernel("mla_o"),
                     hc_pre: k.kernel("hc_pre"),
                     hc_post: k.kernel("hc_post"),
@@ -276,7 +302,7 @@ impl Cards {
                     msel: alloc(STEP * DENSE_BELOW),
                     mseln: alloc(STEP),
                     miq: alloc(STEP * INDEX_N_HEADS * INDEX_HEAD_DIM),
-                    mscore: k.host(STEP * max_ctx.div_ceil(INDEX_KPOOL) * 4),
+                    mscore: alloc(STEP * max_ctx.div_ceil(INDEX_KPOOL)),
                     mheads: alloc(STEP * O_IN),
                     k,
                 }
@@ -374,6 +400,8 @@ impl Cards {
                     o_norm: up(raw(kw.o_norm)),
                     window: up(raw(&zero_w)),
                     mem: up(raw(&zero_m)),
+                    ring: k.vram(SPEC_TOKENS * KDA_MEMORY * 4),
+                    ring_w: k.vram(SPEC_TOKENS * KDA_WINDOW * 4),
                 };
                 bytes += 2 * ((SMALL_ROWS + 3 * g::PART_QKV) * H + H * g::PART_QKV + 2 * g::PART_QKV * KDA_DIM + taps.len()) + 4 * (KDA_WINDOW + KDA_MEMORY);
                 parts.push(p);
@@ -483,7 +511,48 @@ impl Cards {
             (card, norm, lm)
         };
         println!("gpu      : {} KDA layers, {mla_n} MLA layers (their latents to {max_ctx} positions), {dense} dense FFNs, {shared_n} shared experts, the hyper-connections, the streams and the head on {} card{} ({:.1} GB with their state) in {:.1}s", kda_layers.len(), n, if n == 1 { "" } else { "s" }, bytes as f64 / 1e9, t0.elapsed().as_secs_f32());
-        Cards { cards, shared, layers, ffns, mlas, head, seq: 0, half_seq: vec![[0; 2]; NUM_HIDDEN_LAYERS], token_from: vec![0; n], last_n: 1, tokens: 0 }
+        // the draft layer: its MLA attention as layer MTP_LAYER on the head's card (the shared lm_head is
+        // there), its own pieces beside it
+        let mtp = w.mtp.as_ref().map(|mt| {
+            let card = head.0;
+            let k = &cards[card].k;
+            let one = |a: Fp8| -> (Mem, Mem) {
+                let wm = k.vram_visible(a.w.len());
+                k.upload(&wm, 0, a.w);
+                let sm = k.vram_visible(a.s.len() * 4);
+                k.upload(&sm, 0, raw(a.s));
+                (wm, sm)
+            };
+            let up = |b: &[u8]| -> Mem {
+                let m = k.vram_visible(b.len());
+                k.upload(&m, 0, b);
+                m
+            };
+            let mw = &mt.attn;
+            let ix = {
+                let m = k.vram_visible(IX_ROWS * H * 2);
+                k.upload(&m, 0, raw(mw.ix_wk));
+                k.upload(&m, mw.ix_wk.len() * 2, raw(mw.ix_gate));
+                k.upload(&m, (mw.ix_wk.len() + mw.ix_gate.len()) * 2, raw(mw.ix_weights));
+                m
+            };
+            mlas.push(Some(MlaOn { card, input_ln: up(raw(&bf16_of(mt.input_ln))), qa_ln: up(raw(&bf16_of(mw.q_a_ln))), q_a: one(mw.q_a), kv_a: one(mw.kv_a), ix, q_b: one(mw.q_b), ix_wq_b: up(raw(mw.ix_wq_b)), kv_b: up(raw(mw.kv_b)), lat: k.vram_visible(max_ctx * KV_LORA_RANK * 4), pools: k.vram_visible(max_ctx.div_ceil(INDEX_KPOOL) * INDEX_HEAD_DIM * 4), o: one(mw.o) }));
+            let (gu_w, gu_s) = {
+                let (g, u) = (one(mt.ffn.shared_gate), one(mt.ffn.shared_up));
+                let wm = k.vram_visible(g.0.size + u.0.size);
+                let sm = k.vram_visible(g.1.size + u.1.size);
+                // gate rows then up rows, as the main layers' shared expert is laid out
+                k.upload(&wm, 0, mt.ffn.shared_gate.w);
+                k.upload(&wm, g.0.size, mt.ffn.shared_up.w);
+                k.upload(&sm, 0, raw(mt.ffn.shared_gate.s));
+                k.upload(&sm, g.1.size, raw(mt.ffn.shared_up.s));
+                (wm, sm)
+            };
+            let (down_w, down_s) = one(mt.ffn.shared_down);
+            println!("gpu      : the draft layer on card {card}: its attention, shared expert and eh_proj ({:.2} GB)", (mt.eh_proj.len() * 2 + gu_w.size + down_w.size) as f64 / 1e9);
+            MtpOn { card, eh: up(raw(mt.eh_proj)), post_ln: up(raw(&bf16_of(mt.post_ln))), head_norm: up(raw(&bf16_of(mt.head_norm))), gu_w, gu_s, down_w, down_s, dx: k.vram_visible(2 * H * 4) }
+        });
+        Cards { cards, shared, layers, ffns, mlas, head, mtp, seq: 0, half_seq: vec![[0; 2]; NUM_HIDDEN_LAYERS], token_from: vec![0; n], last_n: 1, npools: max_ctx.div_ceil(INDEX_KPOOL), tokens: 0 }
     }
 
     /// With the launches stamped, every 16 tokens: a line per card of the last token's time by
@@ -613,6 +682,32 @@ impl Cards {
         }
     }
 
+    /// An MLA layer's projections over the step's block input in `c.x`: q_a into VRAM for the next two,
+    /// kv_a and the indexer's three out to the host, the query and the indexer's query; then a fence.
+    fn mla_rows(&self, m: &MlaOn, n: usize) {
+        let c = &self.cards[m.card];
+        let ln = Some(m.input_ln.va);
+        self.rows8(c, &c.ffn_gu, c.x.va, ln, m.q_a.0.va, m.q_a.1.va, c.mqa.va, Q_LORA_RANK, H, n, ROWS_GU);
+        self.rows8_free(c, &c.ffn_gu, c.x.va, ln, m.kv_a.0.va, m.kv_a.1.va, c.mproj.at(MKVA * 4), KV_LORA_RANK, H, n, ROWS_GU);
+        self.rows_free(c, &c.rows_h, c.x.va, ln, m.ix.va, c.mproj.at(MIX * 4), IX_ROWS, H, n, ROWS);
+        // over q_a's output normed with q_a's norm: the query and, alongside it, the indexer's query (VRAM: the card scores the pools)
+        let qln = Some(m.qa_ln.va);
+        self.rows8(c, &c.mla_qb, c.mqa.va, qln, m.q_b.0.va, m.q_b.1.va, c.mq.va, MLA_HEADS * Q_HEAD, Q_LORA_RANK, n, ROWS);
+        self.rows_free(c, &c.mla_iq, c.mqa.va, qln, m.ix_wq_b.va, c.miq.va, INDEX_N_HEADS * INDEX_HEAD_DIM, Q_LORA_RANK, n, ROWS);
+        c.k.fence();
+    }
+    /// `x[..n·H] += a + b` on card `c` (`b` 0 for none): the draft layer's residual.
+    fn add2(&self, c: &Card, x: usize, a: usize, b: usize, n: usize) {
+        let mut args = Args::new();
+        args.ptr(x).ptr(a).ptr(b).u32((n * H) as u32);
+        c.k.launch(&c.add2, (n * H / 256) as u32, g::WG, 0, &args);
+    }
+    /// `n·H` floats from VRAM to host memory on card `c` (a copy launch).
+    fn copy_out(&self, c: &Card, src: usize, dst: usize, n: usize) {
+        let mut args = Args::new();
+        args.ptr(src).ptr(dst).u32((n * H) as u32);
+        c.k.launch(&c.copy, (n * H).div_ceil(g::COPY_WG_WORDS) as u32, g::WG, 0, &args);
+    }
     /// bf16 rows on card `c` over the step's `n` tokens (as `rows8`). Addresses are device VAs.
     #[allow(clippy::too_many_arguments)]
     fn rows(&self, c: &Card, kernel: &crate::kfd::Kernel, x: usize, ln: Option<usize>, w: usize, out: usize, m: usize, k_width: usize, n: usize, r: usize) {
@@ -663,6 +758,8 @@ impl Placed for Cards {
     }
     fn attention(&mut self, l: usize, n: usize) {
         let value = self.next_seq();
+        // a step of a verify's size keeps a state a token (`kda_rewind`); one token and a prompt's step do not
+        let ring = (2..=SPEC_TOKENS).contains(&n);
         self.half_seq[l][0] = value;
         let f = self.ffns[l].as_ref().unwrap();
         for c in &self.cards {
@@ -689,7 +786,7 @@ impl Placed for Cards {
             // the delta rule over the step's tokens in order, the heads' memory in registers across them
             let mixed = smix.at(SMALL_ROWS * 4);
             let mut a = Args::new();
-            a.ptr(mixed).ptr(p.taps.va).ptr(p.window.va).ptr(fg.va).ptr(p.dt_bias.va).ptr(p.a_log.va).ptr(smix.at(2 * KDA_DIM * 4)).ptr(fg.at(g::PART_QKV * 4)).ptr(p.mem.va).ptr(p.o_norm.va).ptr(normed.va).u32(p.head0 as u32).u32(n as u32).u32(M_SMALL as u32).u32(2 * g::PART_QKV as u32).u32(M_SMALL as u32);
+            a.ptr(mixed).ptr(p.taps.va).ptr(p.window.va).ptr(fg.va).ptr(p.dt_bias.va).ptr(p.a_log.va).ptr(smix.at(2 * KDA_DIM * 4)).ptr(fg.at(g::PART_QKV * 4)).ptr(p.mem.va).ptr(p.o_norm.va).ptr(normed.va).u32(p.head0 as u32).u32(n as u32).u32(M_SMALL as u32).u32(2 * g::PART_QKV as u32).u32(M_SMALL as u32).ptr(if ring { p.ring.va } else { 0 }).ptr(if ring { p.ring_w.va } else { 0 });
             c.k.launch(&c.step, g::STEP_GRID, g::WG, g::STEP_LDS as u32, &a);
             self.rows(c, &c.rows_part, normed.va, None, p.o.va, c.yv.at(i * STEP * H * 4), H, g::PART_QKV, n, ROWS);
         }
@@ -714,23 +811,71 @@ impl Placed for Cards {
             self.hc_pre(c, &f.hc[c.k.index][0], None, value, router, n);
         }
         let m = self.mlas[l].as_ref().unwrap();
-        let c = &self.cards[m.card];
-        let ln = Some(m.input_ln.va);
-        // over the normed block input: q_a into VRAM for the next two, kv_a and the indexer's three out to the host
-        self.rows8(c, &c.ffn_gu, c.x.va, ln, m.q_a.0.va, m.q_a.1.va, c.mqa.va, Q_LORA_RANK, H, n, ROWS_GU);
-        self.rows8_free(c, &c.ffn_gu, c.x.va, ln, m.kv_a.0.va, m.kv_a.1.va, c.mproj.at(MKVA * 4), KV_LORA_RANK, H, n, ROWS_GU);
-        self.rows_free(c, &c.rows_h, c.x.va, ln, m.ix.va, c.mproj.at(MIX * 4), IX_ROWS, H, n, ROWS);
-        // over q_a's output normed with q_a's norm: the query and, alongside it, the indexer's query (VRAM: the card scores the pools)
-        let qln = Some(m.qa_ln.va);
-        self.rows8(c, &c.mla_qb, c.mqa.va, qln, m.q_b.0.va, m.q_b.1.va, c.mq.va, MLA_HEADS * Q_HEAD, Q_LORA_RANK, n, ROWS);
-        self.rows_free(c, &c.mla_iq, c.mqa.va, qln, m.ix_wq_b.va, c.miq.va, INDEX_N_HEADS * INDEX_HEAD_DIM, Q_LORA_RANK, n, ROWS);
-        c.k.fence();
+        self.mla_rows(m, n);
         // the other cards fold the output in once it is there (posted now: they wait for the word)
         for (i, o) in self.cards.iter().enumerate() {
             if i != m.card {
                 self.hc_post(o, None, None, Some((W_Y, m.card)), None, value, self.shared.my[l % 2].va, None, n);
             }
         }
+    }
+    fn hidden_all(&mut self, n: usize, out: &mut [f32]) {
+        // the streams' means a pass of TOKENS at a time, through the head card's logits buffer (host memory)
+        let c = &self.cards[0];
+        let mut p0 = 0;
+        while p0 < n {
+            let np = (n - p0).min(TOKENS);
+            let mut a = Args::new();
+            a.ptr(c.streams.at(p0 * HC * H * 4)).ptr(c.fx.va).u32(np as u32);
+            c.k.launch(&c.hc_mean, CHANNEL_GRID, g::WG, 0, &a);
+            let mut b = Args::new();
+            b.ptr(c.fx.va).ptr(c.lg.va).u32((np * H) as u32);
+            c.k.launch(&c.copy, (np * H).div_ceil(g::COPY_WG_WORDS) as u32, g::WG, 0, &b);
+            c.k.sync();
+            read(&c.lg, 0, &mut out[p0 * H..(p0 + np) * H]);
+            p0 += np;
+        }
+    }
+    fn mtp_begin(&mut self, cat: &[f32], n: usize) {
+        let t = self.mtp.as_ref().expect("no draft layer on the cards");
+        let c = &self.cards[t.card];
+        // eh_proj over the staged inputs into the block input slots, then the attention's projections
+        c.k.upload(&t.dx, 0, raw(&cat[..n * 2 * H]));
+        self.rows(c, &c.mtp_eh, t.dx.va, None, t.eh.va, c.x.va, H, 2 * H, n, ROWS);
+        let m = self.mlas[glm_5_3_flash::layout::MTP_LAYER].as_ref().unwrap();
+        self.mla_rows(m, n);
+    }
+    fn mtp_attn_out(&mut self, hidden: &mut [f32], n: usize) {
+        let t = self.mtp.as_ref().unwrap();
+        let c = &self.cards[t.card];
+        let m = self.mlas[glm_5_3_flash::layout::MTP_LAYER].as_ref().unwrap();
+        // the output projection, the residual, the block's states out to the host for its routing
+        self.rows8(c, &c.mla_o, c.mheads.va, None, m.o.0.va, m.o.1.va, c.myv.va, H, O_IN, n, ROWS);
+        self.add2(c, c.x.va, c.myv.va, 0, n);
+        self.copy_out(c, c.x.va, self.shared.xh.va, n);
+        c.k.sync();
+        read(&self.shared.xh, 0, &mut hidden[..n * H]);
+    }
+    fn mtp_ffn(&mut self, routed: &[f32], hidden: &mut [f32], n: usize) {
+        let t = self.mtp.as_ref().unwrap();
+        let c = &self.cards[t.card];
+        // the shared expert over the post-normed states, the host's routed experts, the residual
+        let yexp = &self.shared.yexp[0];
+        unsafe { std::ptr::copy_nonoverlapping(routed.as_ptr(), yexp.ptr() as *mut f32, n * H) };
+        self.rows8(c, &c.ffn_gu, c.x.va, Some(t.post_ln.va), t.gu_w.va, t.gu_s.va, c.gu.va, SHARED_GU_ROWS, H, n, ROWS_GU);
+        self.rows8_at(c, &c.ffn_down_shared, c.gu.va, 2 * N_SHARED_EXPERTS * D_FF, None, t.down_w.va, t.down_s.va, c.fyv.va, H, N_SHARED_EXPERTS * D_FF, n, ROWS, true);
+        self.add2(c, c.x.va, c.fyv.va, yexp.va, n);
+        self.copy_out(c, c.x.va, self.shared.xh.va, n);
+        c.k.sync();
+        read(&self.shared.xh, 0, &mut hidden[..n * H]);
+    }
+    fn mtp_head(&mut self, i: usize, logits: &mut [f32]) {
+        let t = self.mtp.as_ref().unwrap();
+        let c = &self.cards[t.card];
+        let (_, _, lm) = &self.head;
+        self.rows(c, &c.rows_h, c.x.at(i * H * 4), Some(t.head_norm.va), lm.va, c.lg.va, VOCAB_SIZE, H, 1, ROWS);
+        c.k.sync();
+        read(&c.lg, 0, &mut logits[..VOCAB_SIZE]);
     }
     fn mla_wait(&mut self, l: usize, i: usize, kva: &mut [f32], ik: &mut [f32], igate: &mut [f32]) {
         let c = &self.cards[self.mlas[l].as_ref().unwrap().card];
@@ -748,36 +893,34 @@ impl Placed for Cards {
             self.cards[m.card].k.upload(&m.pools, from * INDEX_HEAD_DIM * 4, raw(&pools[from * INDEX_HEAD_DIM..to * INDEX_HEAD_DIM]));
         }
     }
-    fn ix_scores(&mut self, l: usize, pos: usize, n: usize, scores: &mut [f32], stride: usize) {
+    fn ix_select(&mut self, l: usize, pos: usize, n: usize, count: Option<&mut usize>) {
         let m = self.mlas[l].as_ref().unwrap();
         let c = &self.cards[m.card];
-        // the scores of every selecting token's pools, read back
-        let nb = ((pos + n) / INDEX_KPOOL).div_ceil(256);
-        let (scale, wscale) = glm_5_3_flash::mla::score_scales();
+        // the scores of every selecting token's pools, then each token's selection into the attend's lists;
+        // nothing comes back to the host but a count asked for (bring-up)
+        let stride = self.npools;
+        if glm_5_3_flash::mla::selects(pos + n - 1) {
+            let nb = ((pos + n) / INDEX_KPOOL).div_ceil(256);
+            let (scale, wscale) = glm_5_3_flash::mla::score_scales();
+            let mut a = Args::new();
+            a.ptr(c.miq.va).ptr(c.mproj.at(MIX * 4)).ptr(m.pools.va).ptr(c.mscore.va).u32(pos as u32).u32(nb as u32).u32(stride as u32).f32(scale).f32(wscale);
+            c.k.launch(&c.ix_score, (n * nb) as u32, g::WG, 0, &a);
+        }
         let mut a = Args::new();
-        a.ptr(c.miq.va).ptr(c.mproj.at(MIX * 4)).ptr(m.pools.va).ptr(c.mscore.va).u32(pos as u32).u32(nb as u32).u32(stride as u32).f32(scale).f32(wscale);
-        c.k.launch(&c.ix_score, (n * nb) as u32, g::WG, 0, &a);
-        c.k.sync();
-        for i in 0..n {
-            let visible = (pos + i + 1) / INDEX_KPOOL;
-            read(&c.mscore, i * stride * 4, &mut scores[i * stride..i * stride + visible]);
+        a.ptr(c.mscore.va).u32(stride as u32).u32(pos as u32).ptr(c.msel.va).ptr(c.mseln.va);
+        c.k.launch(&c.ix_select, n as u32, g::WG, SELECT_LDS as u32, &a);
+        if let Some(count) = count {
+            c.k.sync();
+            let mut w = [0u32; 1];
+            read(&c.mseln, 0, &mut w);
+            *count = w[0] as usize;
         }
     }
-    fn mla_attend(&mut self, l: usize, n: usize, pos: usize, latents: &[f32], sels: &[usize], counts: &[usize]) {
+    fn mla_attend(&mut self, l: usize, n: usize, pos: usize, latents: &[f32]) {
         let m = self.mlas[l].as_ref().unwrap();
         let c = &self.cards[m.card];
-        // the step's latents into the mirror, each token's selection and count, one launch over (token, head)
+        // the step's latents into the mirror; the selections are the card's (`ix_select`); one launch over (token, heads)
         c.k.upload(&m.lat, pos * KV_LORA_RANK * 4, raw(&latents[..n * KV_LORA_RANK]));
-        let mut sel32 = [0u32; DENSE_BELOW];
-        let mut n32 = [0u32; STEP];
-        for i in 0..n {
-            for (d, &p) in sel32.iter_mut().zip(&sels[i * DENSE_BELOW..i * DENSE_BELOW + counts[i]]) {
-                *d = p as u32;
-            }
-            c.k.upload(&c.msel, i * DENSE_BELOW * 4, raw(&sel32[..counts[i]]));
-            n32[i] = counts[i] as u32;
-        }
-        c.k.upload(&c.mseln, 0, raw(&n32[..n]));
         let mut a = Args::new();
         a.ptr(c.mq.va).ptr(m.kv_b.va).ptr(m.lat.va).ptr(c.msel.va).ptr(c.mseln.va).ptr(c.mheads.va);
         c.k.launch(&c.mla_attend, ATTEND_GRID * n as u32, g::WG, ATTEND_LDS as u32, &a);
@@ -866,6 +1009,20 @@ impl Placed for Cards {
             c.k.sync();
         }
         self.timeline_report(self.last_n);
+    }
+    fn kda_rewind(&mut self, l: usize, slot: usize) {
+        // every part: its state buffers from the ring's slot (a copy launch each; the ring holds every
+        // part's heads' entries where its own buffers do)
+        for p in &self.layers[l].as_ref().unwrap().parts {
+            let c = &self.cards[p.card];
+            let copy = |src: usize, dst: usize, n: usize| {
+                let mut a = Args::new();
+                a.ptr(src).ptr(dst).u32(n as u32);
+                c.k.launch(&c.copy, n.div_ceil(g::COPY_WG_WORDS) as u32, g::WG, 0, &a);
+            };
+            copy(p.ring.at(slot * KDA_MEMORY * 4), p.mem.va, KDA_MEMORY);
+            copy(p.ring_w.at(slot * KDA_WINDOW * 4), p.window.va, KDA_WINDOW);
+        }
     }
     fn seed(&mut self, l: usize, window: &[f32], mem: &[f32]) {
         // every part holds the full state buffers; each touches only its heads' entries

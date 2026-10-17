@@ -175,6 +175,71 @@ pub fn draw(logits: &[f32], s: &Sampling, u: f64) -> usize {
     c[keep - 1].1 as usize // u landed past the rounded-off tail
 }
 
+#[cfg(any(feature = "std", test))]
+/// The distribution `draw` samples from, as (id, probability) over its support: the top-k
+/// candidates and their ties at temperature, cut to the nucleus — `draw`'s arithmetic, so a draw
+/// with uniform `u` is the id where the running mass first exceeds `u`. Greedy (temperature 0):
+/// the argmax alone.
+pub fn dist(logits: &[f32], s: &Sampling) -> std::vec::Vec<(u32, f64)> {
+    if s.temperature <= 0.0 {
+        return std::vec![(argmax(logits) as u32, 1.0)];
+    }
+    let mut c = [(0f32, 0u32); CAP];
+    let n = candidates(logits, s.top_k, &mut c);
+    let k = s.top_k.clamp(1, CAP).min(n);
+    let theta = c[k - 1].0;
+    let mut n2 = k;
+    while n2 < n && c[n2].0 >= theta {
+        n2 += 1;
+    }
+    let inv_t = 1.0 / s.temperature;
+    let top = c[0].0;
+    let mut mass = [0f32; CAP];
+    let mut total = 0f64;
+    for i in 0..n2 {
+        mass[i] = exp((c[i].0 - top) * inv_t);
+        total += mass[i] as f64;
+    }
+    let lim = s.top_p as f64 * total;
+    let mut above = 0f64;
+    let mut keep = 0;
+    while keep < n2 && above < lim {
+        above += mass[keep] as f64;
+        keep += 1;
+    }
+    (0..keep).map(|i| (c[i].1, mass[i] as f64 / above)).collect()
+}
+#[cfg(any(feature = "std", test))]
+/// Speculative verification of a draft `x` drawn from `q` (the draft's logits) against the
+/// model's `p` at the same position: accepted with probability `min(1, p(x) / q(x))` by the
+/// uniform `r`; else a token from the residual `max(p − q, 0)` normalized, by the uniform `u`
+/// (the model's distribution exactly, Leviathan et al. / Chen et al.). Returns (accepted, token).
+pub fn verify(p_logits: &[f32], q_logits: &[f32], s: &Sampling, x: u32, r: f64, u: f64) -> (bool, u32) {
+    let (p, q) = (dist(p_logits, s), dist(q_logits, s));
+    let at = |d: &[(u32, f64)], id: u32| d.iter().find(|(i, _)| *i == id).map_or(0.0, |(_, v)| *v);
+    let (px, qx) = (at(&p, x), at(&q, x));
+    if qx > 0.0 && r * qx < px {
+        return (true, x);
+    }
+    // the residual over p's support
+    let mut res: std::vec::Vec<(u32, f64)> = p.iter().map(|&(id, pv)| (id, (pv - at(&q, id)).max(0.0))).filter(|(_, v)| *v > 0.0).collect();
+    let total: f64 = res.iter().map(|(_, v)| v).sum();
+    if res.is_empty() || total <= 0.0 {
+        // p within q: the draw from p itself
+        res = p;
+    }
+    let total: f64 = res.iter().map(|(_, v)| v).sum();
+    let target = u * total;
+    let mut acc = 0f64;
+    for &(id, v) in &res {
+        acc += v;
+        if target < acc {
+            return (false, id);
+        }
+    }
+    (false, res[res.len() - 1].0)
+}
+
 pub fn sample(logits: &[f32], s: &Sampling, rng: &mut Rng) -> usize {
     let u = rng.uniform();
     draw(logits, s, u)

@@ -371,14 +371,22 @@ pub mod gfx11_consts {
     pub const O_IN: usize = MLA_HEADS * V_HEAD_DIM;
     /// `mla_attend`: a workgroup per head; its LDS in floats: the head's query, `q_abs`, the
     /// latent mix, the scores over the selected positions (`ATT_SLOTS`), reduction scratch.
-    pub const ATTEND_GRID: u32 = MLA_HEADS as u32;
+    /// Heads a workgroup takes: a selected latent row is read once for their dots and their mixes
+    /// (a head a workgroup re-read the token's 4 MB of latents 128 times a layer at 2048 selected
+    /// positions, 512 MB a launch from L2: 240 µs, 2026-10-17).
+    pub const ATTEND_H: usize = 1;
+    pub const ATTEND_GRID: u32 = (MLA_HEADS / ATTEND_H) as u32;
     pub const ATT_SLOTS: usize = DENSE_BELOW.div_ceil(256) * 256;
     pub const AT_Q: usize = 0;
-    pub const AT_QABS: usize = AT_Q + Q_HEAD;
-    pub const AT_OLAT: usize = AT_QABS + KV_LORA_RANK;
-    pub const AT_ATT: usize = AT_OLAT + KV_LORA_RANK;
-    pub const AT_RED: usize = AT_ATT + ATT_SLOTS;
-    pub const ATTEND_LDS: usize = 4 * (AT_RED + 16);
+    pub const AT_QABS: usize = AT_Q + ATTEND_H * Q_HEAD;
+    /// The mixes take `q_abs`'s room: it is dead once the scores are in.
+    pub const AT_OLAT: usize = AT_QABS;
+    pub const AT_ATT: usize = AT_QABS + ATTEND_H * KV_LORA_RANK;
+    pub const AT_RED: usize = AT_ATT + ATTEND_H * ATT_SLOTS;
+    pub const ATTEND_LDS: usize = 4 * (AT_RED + ATTEND_H * 8);
+    const _: () = assert!(MLA_HEADS % ATTEND_H == 0 && ATTEND_LDS <= 60 * 1024);
+    /// `ix_select`'s LDS: a 256-bin histogram and the scan's eight wave totals, u32.
+    pub const SELECT_LDS: usize = 4 * (256 + 8);
 }
 
 #[cfg(target_arch = "amdgpu")]
@@ -431,15 +439,16 @@ pub mod gfx11 {
     }
     const _: () = assert!(Q_LORA_RANK % 256 == 0 && O_IN % 256 == 0);
 
-    /// Absorbed MLA for one (token, head) over the token's selected positions (`sel[i]`, `counts[i]`
-    /// of them), the latents resident (`lat: [ctx][KV_LORA_RANK]`): `q_abs = W_ukᵀ q` (each thread
-    /// two latent channels, the products summed over the query's channels in order, as the host
-    /// does), the scores (a thread a position), the softmax, the latent mix (a thread two channels,
-    /// the positions in order), and `W_uv` over it a wave-row at a time into `heads[i][h]`. Grid:
-    /// ATTEND_GRID × the step's tokens (a workgroup a head of a token: a token's launch alone was
-    /// 128 workgroups on 84 CUs, 2026-10-17); LDS: ATTEND_LDS. `q: [tokens][MLA_HEADS][Q_HEAD]`,
-    /// `kvb` the layer's `[MLA_HEADS][KVB_HEAD][KV_LORA_RANK]` bf16, `sel: [tokens][DENSE_BELOW]`,
-    /// `heads: [tokens][MLA_HEADS][V_HEAD_DIM]`.
+    /// Absorbed MLA for one token and `ATTEND_H` heads over the token's selected positions (`sel[i]`,
+    /// `counts[i]` of them), the latents resident (`lat: [ctx][KV_LORA_RANK]`): `q_abs = W_ukᵀ q` for
+    /// each head (a thread two latent channels, the products summed over the query's channels in
+    /// order, as the host does), the scores (a thread a position: the row read once, a dot a head),
+    /// each head's softmax (its own thread partition and wave order), the latent mixes (a thread two
+    /// channels, the positions in order, each latent value read once for the heads), and `W_uv` over
+    /// each mix a wave-row at a time into `heads[i][h]`. Every (head, position) product runs in the
+    /// one-head kernel's order: the same bits. Grid: ATTEND_GRID × the step's tokens; LDS: ATTEND_LDS.
+    /// `q: [tokens][MLA_HEADS][Q_HEAD]`, `kvb` the layer's `[MLA_HEADS][KVB_HEAD][KV_LORA_RANK]` bf16,
+    /// `sel: [tokens][DENSE_BELOW]`, `heads: [tokens][MLA_HEADS][V_HEAD_DIM]`.
     #[no_mangle]
     pub extern "gpu-kernel" fn mla_attend(q: *const f32, kvb: *const u16, lat: *const f32, sel: *const u32, counts: *const u32, heads: *mut f32) {
         unsafe {
@@ -447,8 +456,9 @@ pub mod gfx11 {
             use common::gfx11::{lds, wave_max, wave_sum, workgroup_sync};
             use core::arch::amdgpu::workgroup_id_x;
             const D: usize = KV_LORA_RANK;
+            const AH: usize = ATTEND_H;
             let wg = workgroup_id_x() as usize;
-            let (i, h) = (wg / MLA_HEADS, wg % MLA_HEADS);
+            let (i, h0) = (wg / (MLA_HEADS / AH), (wg % (MLA_HEADS / AH)) * AH);
             let (q, sel, heads) = (q.add(i * MLA_HEADS * Q_HEAD), sel.add(i * DENSE_BELOW), heads.add(i * MLA_HEADS * V_HEAD_DIM));
             let n = *counts.add(i) as usize;
             let tid = workitem_id_x();
@@ -456,108 +466,157 @@ pub mod gfx11 {
             let (lane, wave) = (tid % 32, (tid / 32) as usize);
             let l: *mut f32 = lds();
             let (qh, qabs, olat, att, red) = (l.add(AT_Q), l.add(AT_QABS), l.add(AT_OLAT), l.add(AT_ATT), l.add(AT_RED));
-            let w_uk = kvb.add(h * KVB_HEAD * D);
-            let w_uv = w_uk.add(QK_NOPE_HEAD_DIM * D);
+            let w_uk = |h: usize| kvb.add((h0 + h) * KVB_HEAD * D);
             let scale = 1.0 / common::math::sqrt(Q_HEAD as f32);
-            // the head's query
-            if t < Q_HEAD {
-                *qh.add(t) = *q.add(h * Q_HEAD + t);
-            }
-            workgroup_sync();
-            // q_abs: two latent channels a thread
-            let mut j = t;
-            while j < D {
-                let mut acc = 0f32;
-                let mut i = 0;
-                while i < QK_NOPE_HEAD_DIM {
-                    acc += widen(*w_uk.add(i * D + j)) * *qh.add(i);
-                    i += 1;
+            // the heads' queries
+            let mut h = 0;
+            while h < AH {
+                if t < Q_HEAD {
+                    *qh.add(h * Q_HEAD + t) = *q.add((h0 + h) * Q_HEAD + t);
                 }
-                *qabs.add(j) = acc;
-                j += 256;
+                h += 1;
             }
             workgroup_sync();
-            // the scores: a position a thread, and each thread's max
-            let mut mx = f32::NEG_INFINITY;
+            // q_abs: two latent channels a thread, a head at a time
+            let mut h = 0;
+            while h < AH {
+                let (wk, qk) = (w_uk(h), qh.add(h * Q_HEAD));
+                let mut j = t;
+                while j < D {
+                    let mut acc = 0f32;
+                    let mut c = 0;
+                    while c < QK_NOPE_HEAD_DIM {
+                        acc += widen(*wk.add(c * D + j)) * *qk.add(c);
+                        c += 1;
+                    }
+                    *qabs.add(h * D + j) = acc;
+                    j += 256;
+                }
+                h += 1;
+            }
+            workgroup_sync();
+            // the scores: a position a thread, its row read once for the heads' dots; each head's max
+            let mut mx = [f32::NEG_INFINITY; AH];
             let mut p = t;
             while p < n {
                 let row = lat.add(*sel.add(p) as usize * D);
-                let mut acc = 0f32;
-                let mut j = 0;
-                while j < D {
-                    acc += *qabs.add(j) * *row.add(j);
-                    j += 1;
-                }
-                let sc = acc * scale;
-                *att.add(p) = sc;
-                if sc > mx {
-                    mx = sc;
+                let mut h = 0;
+                while h < AH {
+                    let qa = qabs.add(h * D);
+                    let mut acc = 0f32;
+                    let mut j = 0;
+                    while j < D {
+                        acc += *qa.add(j) * *row.add(j);
+                        j += 1;
+                    }
+                    let sc = acc * scale;
+                    *att.add(h * ATT_SLOTS + p) = sc;
+                    if sc > mx[h] {
+                        mx[h] = sc;
+                    }
+                    h += 1;
                 }
                 p += 256;
             }
-            // the softmax: the workgroup's max, the exponentials, their sum
-            let m = wave_max(lane, mx);
-            if lane == 0 {
-                *red.add(wave) = m;
-            }
-            workgroup_sync();
-            let mut m = *red;
-            let mut w = 1;
-            while w < 8 {
-                if *red.add(w) > m {
-                    m = *red.add(w);
+            // each head's softmax: the workgroup's max, the exponentials, their sum (the one-head kernel's
+            // thread partition and wave order), then normalized
+            let mut h = 0;
+            while h < AH {
+                let m = wave_max(lane, mx[h]);
+                if lane == 0 {
+                    *red.add(h * 8 + wave) = m;
                 }
-                w += 1;
-            }
-            let mut sum = 0f32;
-            let mut p = t;
-            while p < n {
-                let e = exp(*att.add(p) - m);
-                *att.add(p) = e;
-                sum += e;
-                p += 256;
-            }
-            let s = wave_sum(lane, sum);
-            workgroup_sync(); // every wave has read the maxima before the sums land in the same scratch
-            if lane == 0 {
-                *red.add(wave) = s;
+                h += 1;
             }
             workgroup_sync();
-            let mut total = 0f32;
-            let mut w = 0;
-            while w < 8 {
-                total += *red.add(w);
-                w += 1;
-            }
-            let inv = 1.0 / total;
-            let mut p = t;
-            while p < n {
-                *att.add(p) *= inv;
-                p += 256;
+            let mut h = 0;
+            while h < AH {
+                let mut m = *red.add(h * 8);
+                let mut w = 1;
+                while w < 8 {
+                    if *red.add(h * 8 + w) > m {
+                        m = *red.add(h * 8 + w);
+                    }
+                    w += 1;
+                }
+                let ah = att.add(h * ATT_SLOTS);
+                let mut sum = 0f32;
+                let mut p = t;
+                while p < n {
+                    let e = exp(*ah.add(p) - m);
+                    *ah.add(p) = e;
+                    sum += e;
+                    p += 256;
+                }
+                let s = wave_sum(lane, sum);
+                workgroup_sync(); // every wave has read the maxima before the sums land in the same scratch
+                if lane == 0 {
+                    *red.add(h * 8 + wave) = s;
+                }
+                workgroup_sync();
+                let mut total = 0f32;
+                let mut w = 0;
+                while w < 8 {
+                    total += *red.add(h * 8 + w);
+                    w += 1;
+                }
+                let inv = 1.0 / total;
+                let mut p = t;
+                while p < n {
+                    *ah.add(p) *= inv;
+                    p += 256;
+                }
+                h += 1;
             }
             workgroup_sync();
-            // the latent mix: two channels a thread, the positions in order
+            // the latent mixes: two channels a thread, the positions in order, each value read once for the heads
             let mut j = t;
             while j < D {
-                let mut acc = 0f32;
+                let mut acc = [0f32; AH];
                 let mut p = 0;
                 while p < n {
-                    acc += *att.add(p) * *lat.add(*sel.add(p) as usize * D + j);
+                    let v = *lat.add(*sel.add(p) as usize * D + j);
+                    let mut h = 0;
+                    while h < AH {
+                        acc[h] += *att.add(h * ATT_SLOTS + p) * v;
+                        h += 1;
+                    }
                     p += 1;
                 }
-                *olat.add(j) = acc;
+                let mut h = 0;
+                while h < AH {
+                    *olat.add(h * D + j) = acc[h];
+                    h += 1;
+                }
                 j += 256;
             }
             workgroup_sync();
-            // W_uv over the mix: each wave its rows
-            let mut i = wave * (V_HEAD_DIM / 8);
-            while i < (wave + 1) * (V_HEAD_DIM / 8) {
-                let y = bf16_row::<D>(lane, w_uv.add(i * D), olat);
-                if lane == 0 {
-                    *heads.add(h * V_HEAD_DIM + i) = y;
+            // W_uv over each head's mix: each wave its rows
+            let mut h = 0;
+            while h < AH {
+                let w_uv = w_uk(h).add(QK_NOPE_HEAD_DIM * D);
+                let mut r = wave * (V_HEAD_DIM / 8);
+                while r < (wave + 1) * (V_HEAD_DIM / 8) {
+                    let y = bf16_row::<D>(lane, w_uv.add(r * D), olat.add(h * D));
+                    if lane == 0 {
+                        *heads.add((h0 + h) * V_HEAD_DIM + r) = y;
+                    }
+                    r += 1;
                 }
-                i += 1;
+                h += 1;
             }
+        }
+    }
+    /// `out[i][row] = W[row] · x[i]` for the draft layer's `eh_proj` (`[H][2·H]` bf16) over `x: [n][2·H]`
+    /// (the next token's normed embedding, then the normed hidden state). Grid: rows_grid(m, n, ROWS).
+    #[no_mangle]
+    pub extern "gpu-kernel" fn mtp_eh(x: *const f32, w: *const u16, out: *mut f32, m: u32, n: u32) {
+        unsafe {
+            use common::gemv::gfx11::rows_over;
+            let tid = workitem_id_x();
+            let (m, n) = (m as usize, n as usize);
+            let t = tid as usize;
+            rows_over::<{ 2 * H }, false, ROWS>(tid, w, core::ptr::null(), m, n, 0.0, |i, s| *x.add(i * 2 * H + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
         }
     }
     /// The indexer's scores on the card: a thread a (token, pool) of the step, the host's
@@ -598,6 +657,125 @@ pub mod gfx11 {
                 h += 1;
             }
             *score.add(i * stride as usize + j) = sc;
+        }
+    }
+    /// The indexer's selection on the card: a workgroup a token, `pick`'s result — below `KEEP`
+    /// complete pools every position; past it the `KEEP` best pools by score, lower index first on
+    /// a tie, in index order, then the incomplete tail — into `sel[i]` and `counts[i]`, what
+    /// `mla_attend` reads. The `KEEP`th largest score is found by a radix select over the scores'
+    /// order-preserving bits (four passes of 256 bins in LDS); then a pool is taken if its score is
+    /// greater, or equal and among the first of the equals by index (a scan over the pools in index
+    /// order, chunks of 256). The host's pick and this agree on the set exactly. Grid: tokens;
+    /// LDS: SELECT_LDS. `score: [tokens][stride]`.
+    #[no_mangle]
+    pub extern "gpu-kernel" fn ix_select(score: *const f32, stride: u32, pos0: u32, sel: *mut u32, counts: *mut u32) {
+        unsafe {
+            use common::gfx11::{lds, workgroup_scan_excl, workgroup_sync};
+            use core::arch::amdgpu::workgroup_id_x;
+            use core::sync::atomic::{AtomicU32, Ordering};
+            let i = workgroup_id_x() as usize;
+            let pos = pos0 as usize + i;
+            let visible = (pos + 1) / INDEX_KPOOL;
+            let tid = workitem_id_x();
+            let t = tid as usize;
+            let (sel, score) = (sel.add(i * DENSE_BELOW), score.add(i * stride as usize));
+            if visible <= super::KEEP {
+                // every position
+                let mut p = t;
+                while p <= pos {
+                    *sel.add(p) = p as u32;
+                    p += 256;
+                }
+                if t == 0 {
+                    *counts.add(i) = (pos + 1) as u32;
+                }
+                return;
+            }
+            let l: *mut u32 = lds();
+            let (hist, red) = (l, l.add(256));
+            // a score's bits in an order-preserving unsigned key
+            let key = |j: usize| -> u32 {
+                let b = (*score.add(j)).to_bits();
+                if b & 0x8000_0000 != 0 { !b } else { b | 0x8000_0000 }
+            };
+            // the KEEPth largest key: four radix passes from the top byte
+            let mut prefix = 0u32;
+            let mut mask = 0u32;
+            let mut want = super::KEEP as u32; // of the keys matching the prefix, how many the top KEEP still take
+            let mut above = 0u32; // keys strictly greater than the final threshold
+            let mut shift = 24;
+            loop {
+                *hist.add(t) = 0;
+                workgroup_sync();
+                let mut j = t;
+                while j < visible {
+                    let k = key(j);
+                    if k & mask == prefix {
+                        AtomicU32::from_ptr(hist.add(((k >> shift) & 255) as usize)).fetch_add(1, Ordering::Relaxed);
+                    }
+                    j += 256;
+                }
+                workgroup_sync();
+                // every thread walks the bins from the top to the same answer
+                let mut cum = 0u32;
+                let mut b = 256usize;
+                let mut digit = 0u32;
+                while b > 0 {
+                    b -= 1;
+                    let c = *hist.add(b);
+                    if cum + c >= want {
+                        digit = b as u32;
+                        break;
+                    }
+                    cum += c;
+                }
+                prefix |= digit << shift;
+                mask |= 255 << shift;
+                above += cum;
+                want -= cum;
+                workgroup_sync();
+                if shift == 0 {
+                    break;
+                }
+                shift -= 8;
+            }
+            let thr = prefix;
+            let need = super::KEEP as u32 - above; // of the keys equal to the threshold, the first by index
+            // the pools in index order, chunks of 256: taken if greater than the threshold, or equal and
+            // among the first `need` equals; each taken pool's four positions at its rank
+            let mut carry_eq = 0u32;
+            let mut carry_sel = 0u32;
+            let mut base = 0;
+            while base < visible {
+                let j = base + t;
+                let k = if j < visible { key(j) } else { 0 };
+                let gt = j < visible && k > thr;
+                let eq = j < visible && k == thr;
+                let (eq_before, eq_total) = workgroup_scan_excl(tid, eq as u32, red);
+                let take = gt || (eq && carry_eq + eq_before < need);
+                let (rank, taken) = workgroup_scan_excl(tid, take as u32, red);
+                if take {
+                    let r = (carry_sel + rank) as usize * INDEX_KPOOL;
+                    let mut q = 0;
+                    while q < INDEX_KPOOL {
+                        *sel.add(r + q) = (j * INDEX_KPOOL + q) as u32;
+                        q += 1;
+                    }
+                }
+                carry_eq += eq_total;
+                carry_sel += taken;
+                base += 256;
+            }
+            // the incomplete tail's positions
+            let tail0 = visible * INDEX_KPOOL;
+            let mut p = tail0 + t;
+            while p <= pos {
+                *sel.add(super::KEEP * INDEX_KPOOL + p - tail0) = p as u32;
+                p += 256;
+            }
+            if t == 0 {
+                *counts.add(i) = (super::KEEP * INDEX_KPOOL + pos + 1 - tail0) as u32;
+            }
         }
     }
     const _: () = assert!(V_HEAD_DIM % 8 == 0 && KV_LORA_RANK % 256 == 0 && Q_HEAD <= 256);

@@ -295,9 +295,13 @@ pub mod gfx11 {
     /// so a sweep's reduction over rows is 64 products in registers and one
     /// exchange of two partials per column. The sum order differs from the
     /// CPU's (two halves, then their sum), as the card's stream already does.
+    /// With `ring` and `ring_w` not null (a speculative verify step), the state after each token `i`
+    /// is also written to `ring[i]` (`[SPEC_TOKENS][KDA_HEADS][KDA_DIM][KDA_DIM]`, this part's heads'
+    /// entries) and `ring_w[i]` (`[SPEC_TOKENS][CONV_TAPS - 1][CONV_DIM]`), so the state after the
+    /// last accepted token is a copy away (`kda_rewind`).
     /// Grid: STEP_GRID, over heads `head0..`; LDS: STEP_LDS.
     #[no_mangle]
-    pub extern "gpu-kernel" fn kda_step(mixed: *const f32, taps: *const u16, window: *mut f32, f: *const f32, dt_bias: *const f32, a_log: *const f32, beta: *const f32, gate: *const f32, mem: *mut f32, o_norm: *const f32, normed: *mut f32, head0: u32, n: u32, ms: u32, fs: u32, bs: u32) {
+    pub extern "gpu-kernel" fn kda_step(mixed: *const f32, taps: *const u16, window: *mut f32, f: *const f32, dt_bias: *const f32, a_log: *const f32, beta: *const f32, gate: *const f32, mem: *mut f32, o_norm: *const f32, normed: *mut f32, head0: u32, n: u32, ms: u32, fs: u32, bs: u32, ring: *mut f32, ring_w: *mut f32) {
         unsafe {
             // token i's inputs: `mixed[i · ms]`, `f[i · fs]`, `gate[i · fs]`, `beta[i · bs]` — the strides of the launches that made them
             let (ms, fs, bs) = (ms as usize, fs as usize, bs as usize);
@@ -336,6 +340,12 @@ pub mod gfx11 {
                     *window.add(g) = w1;
                     *window.add(CONV_DIM + g) = w2;
                     *window.add(2 * CONV_DIM + g) = x;
+                    if !ring_w.is_null() {
+                        let rw = ring_w.add(i * (CONV_TAPS - 1) * CONV_DIM);
+                        *rw.add(g) = w1;
+                        *rw.add(CONV_DIM + g) = w2;
+                        *rw.add(2 * CONV_DIM + g) = x;
+                    }
                     c += 256;
                 }
                 // the forget factors: log-decay in (LOWER, 0) per key channel
@@ -401,6 +411,14 @@ pub mod gfx11 {
                     workgroup_sync_waves4(red);
                 }
                 workgroup_sync();
+                if !ring.is_null() {
+                    let rm = ring.add(i * KDA_HEADS * D * D);
+                    let mut r = 0;
+                    while r < HALF {
+                        *rm.add(h * D * D + (kk0 + r) * D + vv) = s[r];
+                        r += 1;
+                    }
+                }
                 i += 1;
             }
             let mut r = 0;

@@ -11,6 +11,7 @@
 //!               [--positions N]       stop after N computed positions
 //!               [--step N]            with --gpu: the positions again in steps of N tokens, bit for bit the single tokens'
 //!               [--step-ids <file>]   the step gate over these ids (the model's prefix first, then any text's: longer than the goldens)
+//!               [--mtp-accept]        with --gpu: the draft layer's acceptance over the --step-ids text (greedy, and under the model's sampler)
 //!               [--gpu]               with --cpu: the blocks on the gfx1100 cards (node/src/glm_kfd.rs), the bundle's code object
 //!               [--force-picks]   every MoE layer takes the oracle's expert picks (weights still its own): separates tie flips from the rest
 //!               [--detail 1e-3]   also print every row past this relative error, and every position whose picks differ
@@ -329,7 +330,72 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
     } else {
         true
     };
+    // --mtp-accept: the draft layer a token behind the main model over the --step-ids text: at every
+    // position its draft of the token after the next, against the main model's own distribution there —
+    // top-1 agreement (greedy acceptance), the draft's top-1 hitting the text, and the expected
+    // acceptance under the model's sampler (Σ min(p, q) over the two truncated distributions)
+    if harness::flag("--mtp-accept") {
+        let ids = step_ids.as_deref().expect("--mtp-accept needs --step-ids");
+        let n = ids.len();
+        assert!(model.mtp.is_some() && model.placed.is_some(), "--mtp-accept needs a bundle with the draft layer and --gpu");
+        model.seed_prefix(&w, &prefix);
+        let mut h = vec![0f32; H];
+        let mut h_out = vec![0f32; H];
+        let mut q_prev = vec![0f32; VOCAB_SIZE]; // the draft made at t-1: its guess of ids[t+1]
+        let mut have_q = false;
+        let (mut agree, mut hit, mut n_acc, mut sum_acc, mut sum_acc_greedy_hit) = (0usize, 0usize, 0usize, 0f64, 0usize);
+        let s = &glm_5_3_flash::SAMPLING;
+        let t0 = std::time::Instant::now();
+        // the prefix's draft rows: position 0 from the prefix's hidden state and the prefix's second id
+        let (h0, h1) = (model.prefix_hidden(0).to_vec(), model.prefix_hidden(1).to_vec());
+        model.draft(&w, &h0, ids[1] as u32, 0, &mut q_prev, &mut h_out, &mut common::trace::NoTrace);
+        for t in 1..n - 1 {
+            if t >= FIRST_POS {
+                model.step(&w, ids[t] as u32, t, None, &mut common::trace::NoTrace, true);
+                model.hidden(&mut h);
+            } else {
+                h.copy_from_slice(&h1);
+            }
+            if have_q {
+                // q_prev (drafted at t-1) and the main model's logits at t both predict ids[t+1]
+                let p = &model.logits[..VOCAB_SIZE];
+                let (ap, aq) = (argmax(p), argmax(&q_prev));
+                agree += (ap == aq) as usize;
+                hit += (aq == ids[t + 1]) as usize;
+                let acc = overlap(p, &q_prev, s);
+                sum_acc += acc;
+                sum_acc_greedy_hit += (ap == ids[t + 1]) as usize;
+                n_acc += 1;
+            }
+            if t >= FIRST_POS {
+                model.draft(&w, &h, ids[t + 1] as u32, t, &mut q_prev, &mut h_out, &mut common::trace::NoTrace);
+                have_q = true;
+            } else {
+                model.draft(&w, &h, ids[t + 1] as u32, t, &mut q_prev, &mut h_out, &mut common::trace::NoTrace);
+                have_q = true;
+            }
+            if t % 100 == 0 {
+                println!("  mtp: {t} positions, {:.1} s", t0.elapsed().as_secs_f32());
+            }
+        }
+        println!("mtp accept: {n_acc} positions — draft top-1 = main top-1 {:.3}; draft top-1 = text {:.3} (main top-1 = text {:.3}); expected acceptance under the sampler (T {} top-k {} top-p {}) {:.3}; {:.1} s", agree as f64 / n_acc as f64, hit as f64 / n_acc as f64, sum_acc_greedy_hit as f64 / n_acc as f64, s.temperature, s.top_k, s.top_p, sum_acc / n_acc as f64, t0.elapsed().as_secs_f32());
+    }
     std::process::exit(if report.failures() > 0 || !step_gate { 1 } else { 0 });
+}
+
+fn argmax(v: &[f32]) -> usize {
+    v.iter().enumerate().fold((0, f32::NEG_INFINITY), |a, (i, &x)| if x > a.1 { (i, x) } else { a }).0
+}
+/// Expected acceptance of a draft from `q` verified against `p`: Σ_x min(p(x), q(x)).
+fn overlap(p: &[f32], q: &[f32], s: &common::sample::Sampling) -> f64 {
+    let (dp, dq) = (common::sample::dist(p, s), common::sample::dist(q, s));
+    let mut acc = 0f64;
+    for (id, pq) in &dq {
+        if let Some((_, pp)) = dp.iter().find(|(i, _)| i == id) {
+            acc += pq.min(*pp);
+        }
+    }
+    acc
 }
 
 /// Routed experts in f32 arithmetic with f32 activations (the oracle's recipe), from whatever

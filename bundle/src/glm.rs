@@ -5,7 +5,7 @@
 //! the f32 reference, the console vocabulary, the checkpoint's tokenizer and
 //! chat template, and the manifest.
 //!
-//!   bundle --model glm-5.3-flash --snapshot <dir> --out <dir> [--experts-only | --dense-only] [--kernels <gfx1100 .elf>]
+//!   bundle --model glm-5.3-flash --snapshot <dir> --out <dir> [--experts-only [--only-layer L] | --dense-only] [--kernels <gfx1100 .elf>]
 //!
 //! `--dense-only` reuses the experts file already in <out>; `--experts-only` writes
 //! nothing else. The experts take the time: 12,096 records of 13.4 MB, each
@@ -208,9 +208,13 @@ pub fn relayout(path: &std::path::Path, from: &str) {
     eprintln!("relayout : {blocks} blocks in place in {:.1}s, {} bytes; update the manifest's sha256 of the file", t0.elapsed().as_secs_f32(), layout::STREAM);
 }
 
+/// Every MoE layer's experts (the main stack's, then the draft layer's), or with `--only-layer L`
+/// one layer's into the file as it stands (the file grown to the stream's length: how the draft
+/// layer joins a bundle built before it).
 fn write_experts(ck: &Checkpoint, path: &std::path::Path) {
-    let jobs: Vec<(usize, usize)> = (FIRST_K_DENSE_REPLACE..NUM_HIDDEN_LAYERS).flat_map(|l| (0..E).map(move |e| (l, e))).collect();
-    let file = fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(path).unwrap();
+    let only: Option<usize> = harness::arg("--only-layer").map(|v| v.to_string_lossy().parse().unwrap());
+    let jobs: Vec<(usize, usize)> = (FIRST_K_DENSE_REPLACE..layout::LAYERS_IN_FILE).filter(|&l| only.is_none_or(|o| o == l)).flat_map(|l| (0..E).map(move |e| (l, e))).collect();
+    let file = fs::OpenOptions::new().read(true).write(true).create(true).truncate(only.is_none()).open(path).unwrap();
     file.set_len(layout::STREAM as u64).unwrap();
     let t0 = std::time::Instant::now();
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
@@ -261,9 +265,11 @@ fn write_dense(ck: &Checkpoint, path: &std::path::Path) {
     for (i, t) in layout::HEAD.iter().enumerate() {
         put(layout::within(&layout::HEAD, i), t, t.name);
     }
-    for l in 0..NUM_HIDDEN_LAYERS {
+    for l in 0..layout::LAYERS_IN_FILE {
         let mut off = layout::layer(l);
-        for s in [&layout::COMMON[..], layout::attn(l), layout::ffn(l)] {
+        let ss = layout::sections(l);
+        let secs: Vec<&[layout::Tensor]> = if l == layout::MTP_LAYER { vec![ss[0], ss[1], ss[2], layout::ffn(l)] } else { ss.to_vec() };
+        for s in secs {
             for (i, t) in s.iter().enumerate() {
                 put(off + layout::within(s, i), t, &ckname(l, t.name));
             }
@@ -317,6 +323,16 @@ fn write_prefix(ck: &Checkpoint, path: &std::path::Path) {
     }
     assert_eq!(snap.len(), layout::SNAPSHOT);
     rows.extend_from_slice(&snap);
+    // the prefix positions' hidden states: the streams' mean before the final norm (the draft layer's input)
+    for t in 0..n {
+        for d in 0..H {
+            let mut acc = 0f32;
+            for j in 0..HC {
+                acc += streams[(t * HC + j) * H + d];
+            }
+            rows.push(acc / HC as f32);
+        }
+    }
     assert_eq!(rows.len(), layout::PREFIX_LEN);
     fs::write(path, unsafe { std::slice::from_raw_parts(rows.as_ptr() as *const u8, 4 * rows.len()) }).unwrap();
 }

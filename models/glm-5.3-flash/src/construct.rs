@@ -802,7 +802,11 @@ impl Routed for CpuExperts<'_> {
 pub trait Placed {
     /// The step's `n` tokens' embeddings (`[n][H]`) into every card's streams; the handoffs restart.
     fn begin(&mut self, rows: &[f32], n: usize);
+    /// A KDA layer's block over the step; a step of a verify's size (`2..=SPEC_TOKENS` tokens) keeps
+    /// the state after each token for `kda_rewind`.
     fn attention(&mut self, l: usize, n: usize);
+    /// A KDA layer's state back to what it was after token `slot` of the last verify-sized step.
+    fn kda_rewind(&mut self, l: usize, slot: usize);
     /// The early router's logits (`[E]`) of a one-token step.
     fn early_logits(&mut self, l: usize, logits: &mut [f32]);
     fn mla_post(&mut self, l: usize, n: usize);
@@ -812,14 +816,26 @@ pub trait Placed {
     /// The pool keys `from..to` into the card's mirror (every pool completed, by a step or a seed, goes
     /// there before any token scores among them).
     fn ix_pools(&mut self, l: usize, pools: &[f32], from: usize, to: usize);
-    /// The indexer's scores of every token's complete pools (`scores: [n][stride]`, `mla::score_pools`'s
-    /// values) on the card, from the mirrored pools.
-    fn ix_scores(&mut self, l: usize, pos: usize, n: usize, scores: &mut [f32], stride: usize);
-    /// The step's `n` tokens (at `pos..`) attend over their selections (`sels: [n][DENSE_BELOW]`,
-    /// `counts[i]` positions each), one launch; their latents (`[n][KV_LORA_RANK]`) into the mirror first.
-    fn mla_attend(&mut self, l: usize, n: usize, pos: usize, latents: &[f32], sels: &[usize], counts: &[usize]);
+    /// Every token's selection on the card (`mla::score_pools` and `mla::pick`'s results, from the
+    /// mirrored pools) into the attend's lists; the first token's count back when asked (bring-up).
+    fn ix_select(&mut self, l: usize, pos: usize, n: usize, count: Option<&mut usize>);
+    /// The step's `n` tokens (at `pos..`) attend over their selections (the card's, `ix_select`), one
+    /// launch; their latents (`[n][KV_LORA_RANK]`) into the mirror first.
+    fn mla_attend(&mut self, l: usize, n: usize, pos: usize, latents: &[f32]);
     /// The output projection over the step's heads, into the streams.
     fn mla_out(&mut self, l: usize, n: usize);
+    /// The draft layer (`layout::MTP_LAYER`): its input `[2·H]` (the next token's normed embedding, the
+    /// normed hidden state) through `eh_proj` and the attention's projections (then `mla_wait`,
+    /// `ix_pools`, `ix_select`, `mla_attend` as for any MLA layer);
+    fn mtp_begin(&mut self, cat: &[f32], n: usize);
+    /// its output projection and residual, the blocks' states out (`[n][H]`) for the host's routing;
+    fn mtp_attn_out(&mut self, hidden: &mut [f32], n: usize);
+    /// the shared expert, the host's routed experts' sums `routed` (`[n][H]`) and the residual, the states out;
+    fn mtp_ffn(&mut self, routed: &[f32], hidden: &mut [f32], n: usize);
+    /// the shared head over token `i`'s state: its draft's logits.
+    fn mtp_head(&mut self, i: usize, logits: &mut [f32]);
+    /// The last step's tokens' hidden states (the streams' means before the final norm), `[n][H]`.
+    fn hidden_all(&mut self, n: usize, out: &mut [f32]);
     fn mla_seed(&mut self, l: usize, pos: usize, latent: &[f32]);
     fn ffn(&mut self, l: usize, n: usize);
     /// A MoE layer's FFN input for every token (`[n][H]`) and the FFN router's logits (`[n][E]`).
@@ -929,6 +945,16 @@ pub struct CpuModel<'p, R: Routed> {
     pub freq: Vec<u32>,
     pub max_ctx: usize,
     pub layers: Vec<LayerState>,
+    /// The draft layer's sequence state (its MLA cache rows and pool keys, positions as the main
+    /// model's), when the weights carry one.
+    pub mtp: Option<LayerState>,
+    /// The prefix positions' hidden states (`[FIRST_POS][H]`, the prefix file's): the draft's input there.
+    prefix_hidden: Vec<f32>,
+    d_cat: Vec<f32>,
+    d_cats: Vec<f32>,
+    d_x: Vec<f32>,
+    d_xn: Vec<f32>,
+    d_y: Vec<f32>,
     /// The last step's logits, `[VOCAB_SIZE]`.
     /// `[STEP][VOCAB_SIZE]`: token `i` of the last step's logits at row `i` (`Logits`); a single token's at row 0.
     pub logits: Vec<f32>,
@@ -959,10 +985,6 @@ pub struct CpuModel<'p, R: Routed> {
     m_pidx: Vec<u32>,
     m_sel: Vec<usize>,
     // a step's MLA selection, a token a row: indexer queries, head weights, pool scores, the pick's scratch, the selections and their lengths
-    b_pscore: Vec<f32>,
-    b_pidx: Vec<u32>,
-    b_sel: Vec<usize>,
-    b_seln: Vec<usize>,
     b_lat: Vec<f32>,
     m_heads: Vec<f32>,
     m_hs: Vec<f32>,
@@ -996,6 +1018,13 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             last_picks: vec![[E; TOP_K]; NUM_HIDDEN_LAYERS],
             freq: vec![0; NUM_HIDDEN_LAYERS * E],
             max_ctx,
+            mtp: (NUM_NEXTN == 1).then(|| LayerState::Mla { cache: vec![0.0; max_ctx * MLA_ROW], pools: vec![0.0; max_ctx.div_ceil(INDEX_KPOOL) * INDEX_HEAD_DIM] }),
+            prefix_hidden: vec![0.0; FIRST_POS * H],
+            d_cat: vec![0.0; 2 * H],
+            d_cats: vec![0.0; STEP * 2 * H],
+            d_x: vec![0.0; H],
+            d_xn: vec![0.0; H],
+            d_y: vec![0.0; H],
             layers,
             logits: vec![0.0; STEP * VOCAB_SIZE],
             streams: vec![0.0; HC * H],
@@ -1024,10 +1053,6 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             m_pscore: vec![0.0; max_ctx.div_ceil(INDEX_KPOOL) + 1],
             m_pidx: vec![0; max_ctx.div_ceil(INDEX_KPOOL) + 1],
             m_sel: vec![0; DENSE_BELOW],
-            b_pscore: vec![0.0; STEP * max_ctx.div_ceil(INDEX_KPOOL)],
-            b_pidx: vec![0; STEP * max_ctx.div_ceil(INDEX_KPOOL)],
-            b_sel: vec![0; STEP * DENSE_BELOW],
-            b_seln: vec![0; STEP],
             b_lat: vec![0.0; STEP * KV_LORA_RANK],
             m_heads: vec![0.0; MLA_HEADS * V_HEAD_DIM],
             m_hs: vec![0.0; MLA_HEADS * mla::HEAD_SCRATCH],
@@ -1102,8 +1127,149 @@ impl<'p, R: Routed> CpuModel<'p, R> {
     /// The bundle's prefix file: its rows, then its snapshot.
     pub fn seed_prefix(&mut self, w: &Weights, prefix: &[f32]) {
         assert_eq!(prefix.len(), layout::PREFIX_LEN);
-        let (rows, snap) = prefix.split_at(FIRST_POS * POSITION);
+        let (rows, rest) = prefix.split_at(FIRST_POS * POSITION);
+        let (snap, hidden) = rest.split_at(layout::SNAPSHOT);
+        self.prefix_hidden.copy_from_slice(hidden);
         self.seed(w, rows, snap)
+    }
+    /// The KDA layers' states back to what they were after token `slot` of the last verify-sized step
+    /// (its drafts past `slot` rejected). The cards' only.
+    pub fn rewind(&mut self, slot: usize) {
+        let pl = self.placed.as_mut().expect("rewind: the KDA ring is the cards'");
+        for l in 0..NUM_HIDDEN_LAYERS {
+            if LINEAR_ATTENTION[l] {
+                pl.kda_rewind(l, slot);
+            }
+        }
+    }
+    /// Prefix position `pos`'s hidden state (the streams' mean before the final norm).
+    pub fn prefix_hidden(&self, pos: usize) -> &[f32] {
+        &self.prefix_hidden[pos * H..(pos + 1) * H]
+    }
+    /// The last computed token's hidden state (the streams' mean before the final norm, `[H]`): the
+    /// cards' when placed (token 0 of the last step), else this realization's.
+    pub fn hidden(&mut self, out: &mut [f32]) {
+        match self.placed.as_mut() {
+            Some(pl) => pl.layer_out(NUM_HIDDEN_LAYERS - 1, 0, out),
+            None => out.copy_from_slice(&self.mean),
+        }
+    }
+    /// The draft layer (multi-token prediction) at position `pos`: `eh_proj` over the next token's
+    /// normed embedding and the normed hidden state `hidden` (the main model's at `pos`, or the
+    /// draft's own `hidden_out` of the position before when drafting further), then its MLA attention
+    /// over its own cache (its row at `pos` written) and its MoE MLP as a plain residual block, the
+    /// shared head's norm and the shared head into `logits` — the draft of the token after the next.
+    /// `hidden_out` receives the block's output. The CPU realization; the experts through `routed`
+    /// as layer `MTP_LAYER`.
+    pub fn draft(&mut self, w: &Weights, hidden: &[f32], next_tok: u32, pos: usize, logits: &mut [f32], hidden_out: &mut [f32], tr: &mut impl Trace) {
+        let s = self;
+        let m = w.mtp.as_ref().expect("the weights carry no draft layer");
+        let LayerState::Mla { cache, pools } = s.mtp.as_mut().expect("no draft state") else { unreachable!() };
+        let l = layout::MTP_LAYER;
+        // eh_proj over [enorm(embed(next)) | hnorm(hidden)]
+        let row = &w.embed[next_tok as usize * H..(next_tok as usize + 1) * H];
+        for d in 0..H {
+            s.d_y[d] = widen(row[d]);
+        }
+        {
+            let (e, h) = s.d_cat.split_at_mut(H);
+            rmsnorm::<H>(&s.d_y, m.enorm, RMS_NORM_EPS, e);
+            rmsnorm::<H>(hidden, m.hnorm, RMS_NORM_EPS, h);
+        }
+        assert!(s.placed.is_none(), "draft: with cards use draft_batch");
+        gemv::bf16_par::<H, { 2 * H }>(m.eh_proj, &s.d_cat, &mut s.d_x, s.pool);
+        // the attention block
+        rmsnorm::<H>(&s.d_x, m.input_ln, RMS_NORM_EPS, &mut s.d_xn);
+        {
+            let mut ms = mla::Scratch { qr: &mut s.m_qr, qa: &mut s.m_qa, q: &mut s.m_q, kva: &mut s.m_kva, ik: &mut s.m_ik, iq: &mut s.m_iq, iw: &mut s.m_iw, pscore: &mut s.m_pscore, pidx: &mut s.m_pidx, sel: &mut s.m_sel, heads: &mut s.m_heads, hs: &mut s.m_hs };
+            {
+                let (latent, ikey, igate) = mla::row(cache, pos);
+                mla::project(&m.attn, &s.d_xn, &mut ms, igate, s.pool);
+                mla::finish_row(&m.attn, ms.kva, ms.ik, latent, ikey);
+            }
+            let n = mla::select_at(l, &m.attn, cache, pools, pos, &mut ms, tr);
+            mla::heads(l, &m.attn, cache, &mut ms, n, s.pool, tr);
+            mla::output(&m.attn, ms.heads, &mut s.d_y, s.pool);
+        }
+        for d in 0..H {
+            s.d_x[d] += s.d_y[d];
+        }
+        // the MoE block
+        rmsnorm::<H>(&s.d_x, m.post_ln, RMS_NORM_EPS, &mut s.d_xn);
+        {
+            let mut fs = ffn::Scratch { gu: &mut s.f_gu, h: &mut s.f_h, expert_out: &mut s.f_expert_out, shared: &mut s.f_shared, score: &mut s.f_score };
+            ffn::moe_routed(l, &m.ffn, &s.d_xn, &mut fs, s.pool, &mut s.routed, None, tr, &mut s.d_y);
+            ffn::moe_shared(&m.ffn, &s.d_xn, &mut fs, s.pool);
+            for d in 0..H {
+                s.d_x[d] += s.d_y[d] + fs.shared[d];
+            }
+        }
+        hidden_out.copy_from_slice(&s.d_x);
+        // the shared head
+        rmsnorm::<H>(&s.d_x, m.head_norm, RMS_NORM_EPS, &mut s.d_xn);
+        gemv::bf16_par::<VOCAB_SIZE, H>(w.lm_head, &s.d_xn, &mut logits[..VOCAB_SIZE], s.pool);
+    }
+    /// The draft layer on the cards over the last step's `n` positions (`pos..`): each position's
+    /// hidden state (`hiddens: [n][H]`, the main model's there) with the token that follows it
+    /// (`nexts[i]`, the step's next token or the draw after it) through `eh_proj`, the attention over
+    /// the draft's own cache (its rows at these positions written), the MoE (routed experts here as
+    /// layer `MTP_LAYER`, the shared expert there), and for the last position the shared head:
+    /// `logits` is the draft of the token after `nexts[n - 1]`. Run after every step so the draft's
+    /// cache has every position.
+    pub fn draft_batch(&mut self, w: &Weights, hiddens: &[f32], nexts: &[u32], pos: usize, n: usize, logits: &mut [f32]) {
+        let s = self;
+        let m = w.mtp.as_ref().expect("the weights carry no draft layer");
+        let LayerState::Mla { cache, pools } = s.mtp.as_mut().expect("no draft state") else { unreachable!() };
+        let pl = s.placed.as_mut().expect("draft_batch: the cards'");
+        let l = layout::MTP_LAYER;
+        assert!(n >= 1 && n <= STEP && nexts.len() >= n && hiddens.len() >= n * H);
+        // every position's [enorm(embed(next)) | hnorm(hidden)]
+        for i in 0..n {
+            let row = &w.embed[nexts[i] as usize * H..(nexts[i] as usize + 1) * H];
+            for d in 0..H {
+                s.d_y[d] = widen(row[d]);
+            }
+            let (e, h) = s.d_cats[i * 2 * H..(i + 1) * 2 * H].split_at_mut(H);
+            rmsnorm::<H>(&s.d_y, m.enorm, RMS_NORM_EPS, e);
+            rmsnorm::<H>(&hiddens[i * H..(i + 1) * H], m.hnorm, RMS_NORM_EPS, h);
+        }
+        pl.mtp_begin(&s.d_cats[..n * 2 * H], n);
+        for i in 0..n {
+            let (latent, ikey, igate) = mla::row(cache, pos + i);
+            pl.mla_wait(l, i, &mut s.m_kva, &mut s.m_ik, igate);
+            mla::finish_row(&m.attn, &s.m_kva, &s.m_ik, latent, ikey);
+            mla::pool_done(&m.attn, cache, pools, pos + i);
+        }
+        pl.ix_pools(l, pools, pos / INDEX_KPOOL, (pos + n) / INDEX_KPOOL);
+        pl.ix_select(l, pos, n, None);
+        for i in 0..n {
+            s.b_lat[i * KV_LORA_RANK..(i + 1) * KV_LORA_RANK].copy_from_slice(&cache[(pos + i) * MLA_ROW..(pos + i) * MLA_ROW + KV_LORA_RANK]);
+        }
+        pl.mla_attend(l, n, pos, &s.b_lat[..n * KV_LORA_RANK]);
+        pl.mtp_attn_out(&mut s.b_x[..n * H], n);
+        // the routing and the routed experts here, every token's
+        let mut picks = [[0usize; TOP_K]; STEP];
+        let mut wts = [[0f32; TOP_K]; STEP];
+        for i in 0..n {
+            rmsnorm::<H>(&s.b_x[i * H..(i + 1) * H], m.post_ln, RMS_NORM_EPS, &mut s.b_xn[i * H..(i + 1) * H]);
+            gemv::bf16_par::<E, H>(m.ffn.router, &s.b_xn[i * H..(i + 1) * H], &mut s.f_score, s.pool);
+            let (idx, wt) = ffn::route_scores(&m.ffn, &mut s.f_score, None);
+            picks[i] = idx;
+            wts[i] = wt;
+        }
+        s.routed.run_batch(l, &picks[..n], &s.b_xn[..n * H], &mut s.b_out[..n * TOP_K * H]);
+        for i in 0..n {
+            let y = &mut s.b_y[i * H..(i + 1) * H];
+            y.fill(0.0);
+            for k in 0..TOP_K {
+                let eo = &s.b_out[(i * TOP_K + k) * H..(i * TOP_K + k + 1) * H];
+                for d in 0..H {
+                    y[d] += wts[i][k] * eo[d];
+                }
+            }
+        }
+        pl.mtp_ffn(&s.b_y[..n * H], &mut s.b_x[..n * H], n);
+        pl.mtp_head(n - 1, logits);
     }
     /// The KDA layers' state now, `[SNAPSHOT]`.
     pub fn snapshot(&self, out: &mut [f32]) {
@@ -1291,7 +1457,6 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             }
             lap(&mut p.slot);
             if let (Attn::Mla(a), LayerState::Mla { cache, pools }) = (&lw.attn, &mut s.layers[l]) {
-                let npools = s.max_ctx.div_ceil(INDEX_KPOOL);
                 // every token's projections off the card into its cache row, its indexer query and head
                 // weights kept; the pools completed along the way gain their keys
                 for i in 0..n {
@@ -1301,30 +1466,22 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     mla::pool_done(a, cache, pools, pos + i);
                 }
                 lap(&mut p.mla_proj);
-                // every token's selection: the pools scored on the card (this step's completed pools mirrored
-                // first), each token's picks over the thread pool — the one-token path had scored and picked on
-                // one thread, 150 ms a token at 17k positions (2026-10-17)
+                // every token's selection on the card (this step's completed pools mirrored first): the
+                // scores, the picks, straight into the attend's lists — the one-token path had scored and
+                // picked on one thread, 150 ms a token at 17k positions (2026-10-17); then the host's round
+                // trip for the picks, 1.8 ms a token at 18k
                 pl.ix_pools(l, pools, pos / INDEX_KPOOL, (pos + n) / INDEX_KPOOL);
-                if mla::selects(pos + n - 1) {
-                    pl.ix_scores(l, pos, n, &mut s.b_pscore, npools);
-                }
-                {
-                    let (pscore, pidx_p, sel_p, seln_p) = (&s.b_pscore, s.b_pidx.as_mut_ptr() as usize, s.b_sel.as_mut_ptr() as usize, s.b_seln.as_mut_ptr() as usize);
-                    s.pool.run(n, &move |i| unsafe {
-                        let pidx = std::slice::from_raw_parts_mut((pidx_p as *mut u32).add(i * npools), npools);
-                        let sel = std::slice::from_raw_parts_mut((sel_p as *mut usize).add(i * DENSE_BELOW), DENSE_BELOW);
-                        *(seln_p as *mut usize).add(i) = mla::pick(pos + i, &pscore[i * npools..(i + 1) * npools], pidx, sel);
-                    });
-                }
-                if n == 1 {
-                    tr.edge(l, "self_attn.indexer.count", &[s.b_seln[0] as f32]);
+                let mut count = 0usize;
+                pl.ix_select(l, pos, n, (n == 1 && tr.wants_edges()).then_some(&mut count));
+                if n == 1 && tr.wants_edges() {
+                    tr.edge(l, "self_attn.indexer.count", &[count as f32]);
                 }
                 lap(&mut p.mla_attn);
                 // the step's latents gathered off the cache rows; every token's attention in one launch
                 for i in 0..n {
                     s.b_lat[i * KV_LORA_RANK..(i + 1) * KV_LORA_RANK].copy_from_slice(&cache[(pos + i) * MLA_ROW..(pos + i) * MLA_ROW + KV_LORA_RANK]);
                 }
-                pl.mla_attend(l, n, pos, &s.b_lat[..n * KV_LORA_RANK], &s.b_sel[..n * DENSE_BELOW], &s.b_seln[..n]);
+                pl.mla_attend(l, n, pos, &s.b_lat[..n * KV_LORA_RANK]);
                 pl.mla_out(l, n);
                 lap(&mut p.mla_out);
             }

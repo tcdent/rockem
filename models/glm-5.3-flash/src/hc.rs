@@ -690,6 +690,17 @@ pub mod gfx11 {
         }
     }
 
+    /// `x[i] += a[i] + b[i]` over `n` floats (`b` null for one addend): the draft layer's plain
+    /// residual. Grid: n.div_ceil(256).
+    #[no_mangle]
+    pub extern "gpu-kernel" fn add2(x: *mut f32, a: *const f32, b: *const f32, n: u32) {
+        unsafe {
+            let i = workgroup_id_x() as usize * 256 + workitem_id_x() as usize;
+            if i < n as usize {
+                *x.add(i) += *a.add(i) + if b.is_null() { 0.0 } else { *b.add(i) };
+            }
+        }
+    }
     /// `mean[i][d] = Σ_j stream_i,j[d] / HC` for `n` tokens (`streams: [n][HC][H]`), a thread a
     /// channel looping the tokens. Grid: CHANNEL_GRID.
     #[no_mangle]

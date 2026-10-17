@@ -99,6 +99,43 @@ pub unsafe fn wave_max(lane: u32, v: f32) -> f32 {
     v
 }
 
+/// Exclusive prefix sum of one u32 per thread across a 256-thread workgroup (thread order), and
+/// the workgroup's total to every thread: a wave scan over `ds_bpermute`, the eight wave totals
+/// through `red` (eight u32). Two barriers.
+#[inline(always)]
+pub unsafe fn workgroup_scan_excl(tid: u32, v: u32, red: *mut u32) -> (u32, u32) {
+    let (lane, wave) = (tid % 32, (tid / 32) as usize);
+    // the wave's inclusive scan: shifts of 1, 2, 4, 8, 16 lanes
+    let mut incl = v;
+    let mut d = 1;
+    while d < 32 {
+        let o = ds_bpermute((lane.wrapping_sub(d)) * 4, incl);
+        if lane >= d {
+            incl += o;
+        }
+        d <<= 1;
+    }
+    let wave_total = ds_bpermute(31 * 4, incl);
+    if lane == 31 {
+        *red.add(wave) = incl;
+    }
+    workgroup_sync();
+    let mut before = 0u32;
+    let mut total = 0u32;
+    let mut w = 0;
+    while w < 8 {
+        let t = *red.add(w);
+        if w < wave {
+            before += t;
+        }
+        total += t;
+        w += 1;
+    }
+    workgroup_sync();
+    let _ = wave_total;
+    (before + incl - v, total)
+}
+
 /// Sum of one f32 per thread across a 256-thread workgroup, through eight
 /// wave partials in `red`; every thread gets the result. Two barriers.
 #[inline(always)]
