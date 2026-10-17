@@ -31,6 +31,22 @@ pub trait Pool: Sync {
         let _ = (node, ccd);
         self.run(n, f)
     }
+    /// The queue an item on `node` with core-complex preference `ccd` is slotted into — what
+    /// `run_on` computes per item; a caller holds it in a map and runs `run_slotted`.
+    fn slot(&self, node: usize, ccd: usize) -> usize {
+        let _ = (node, ccd);
+        0
+    }
+    /// `run_on` with each item's queue given outright (`slot(i)`, from `Pool::slot`).
+    fn run_slotted(&self, n: usize, slot: &(dyn Fn(usize) -> usize + Sync), f: &(dyn Fn(usize) + Sync)) {
+        let _ = slot;
+        self.run(n, f)
+    }
+    /// `prefetch_on` with each item's queue given outright.
+    #[cfg(feature = "std")]
+    fn prefetch_slotted(&self, n: usize, slot: std::boxed::Box<dyn Fn(usize) -> usize + Send + Sync>, f: std::boxed::Box<dyn Fn(usize) + Send + Sync>) {
+        let _ = (n, slot, f);
+    }
     /// `prefetch` for a caller that knows each item's node (as `run_on`).
     #[cfg(feature = "std")]
     fn prefetch_on(&self, n: usize, node: std::boxed::Box<dyn Fn(usize) -> usize + Send + Sync>, ccd: std::boxed::Box<dyn Fn(usize) -> usize + Send + Sync>, f: std::boxed::Box<dyn Fn(usize) + Send + Sync>) {
