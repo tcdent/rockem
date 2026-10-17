@@ -81,7 +81,7 @@ impl Glm {
             let t2 = std::time::Instant::now();
             let rates = calibrate(&stream, pool, 24);
             let total: f64 = rates.iter().sum();
-            let (moved, bytes) = stream.migrate(&layout::placement(&rates));
+            let (moved, bytes) = stream.migrate(&layout::placement_from(&stream.node, &rates));
             let after = calibrate(&stream, pool, 24);
             let fmt = |v: &[f64]| v.iter().map(|r| format!("{r:.0}")).collect::<Vec<_>>().join(" / ");
             println!("placement: the pool's node rates {} items/ms → shares {} %; {moved} items ({:.1} GB) moved in {:.1} s; after: {} items/ms", fmt(&rates), rates.iter().map(|r| format!("{:.1}", 100.0 * r / total)).collect::<Vec<_>>().join(" / "), bytes as f64 / 1e9, t2.elapsed().as_secs_f64(), fmt(&after));

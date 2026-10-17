@@ -103,6 +103,46 @@ pub fn file_items(l: usize, e: usize) -> std::vec::Vec<(usize, core::ops::Range<
 /// items and its down items are split in proportion to the rates — smooth weighted
 /// round-robin, the credit carried across experts, so a node's share of any run of items is
 /// within one item of its rate's share — and a layer's expert run ends on every node at once.
+/// `placement(rates)`, reached from an existing placement with the fewest moves: every expert's
+/// gate/up items and down items keep the nodes they have except the excess of a node over its
+/// new count, which goes to the nodes under theirs — so a re-placement copies the share delta,
+/// not a reshuffle (the weighted sequence alone would move a fifth of the items for a 2 % shift).
+#[cfg(feature = "std")]
+pub fn placement_from(old: &[u8], rates: &[f64]) -> std::vec::Vec<u8> {
+    let target = placement(rates);
+    assert_eq!(old.len(), target.len());
+    let nodes = rates.len();
+    let mut out = old.to_vec();
+    let items = GU_ITEMS + DOWN_ITEMS;
+    for x in 0..MOE_LAYERS * E {
+        for (lo, hi) in [(0, GU_ITEMS), (GU_ITEMS, items)] {
+            let base = x * items;
+            let mut want = std::vec![0i64; nodes];
+            for i in base + lo..base + hi {
+                want[target[i] as usize] += 1;
+                want[old[i] as usize] -= 1;
+            }
+            // want[n] > 0: node n takes that many more; < 0: it gives up that many, from the end
+            let mut spare: std::vec::Vec<usize> = std::vec::Vec::new();
+            for i in (base + lo..base + hi).rev() {
+                let n = old[i] as usize;
+                if want[n] < 0 {
+                    want[n] += 1;
+                    spare.push(i);
+                }
+            }
+            for n in 0..nodes {
+                while want[n] > 0 {
+                    let i = spare.pop().expect("a giving node for every taking one");
+                    out[i] = n as u8;
+                    want[n] -= 1;
+                }
+            }
+            debug_assert!(spare.is_empty());
+        }
+    }
+    out
+}
 #[cfg(feature = "std")]
 pub fn placement(rates: &[f64]) -> std::vec::Vec<u8> {
     let total: f64 = rates.iter().sum();
