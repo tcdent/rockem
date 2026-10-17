@@ -1549,6 +1549,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     });
                 }
                 if n == 1 {
+                    tr.edge(l, "ffn_in", &s.b_xn[..H]);
                     for k in 0..TOP_K {
                         tr.routed(l, k, &s.b_out[k * H..(k + 1) * H]);
                     }

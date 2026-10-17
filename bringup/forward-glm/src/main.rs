@@ -13,6 +13,7 @@
 //!               [--step-ids <file>]   the step gate over these ids (the model's prefix first, then any text's: longer than the goldens)
 //!               [--elf <path>]        with --gpu: this code object instead of the bundle's (a kernel under test)
 //!               [--timeline]          with --gpu: the cards' kernel laps a step (every multi-token step, every 16th token)
+//!               [--routing-trace <file>] with --gpu: every MoE layer's picks a position over the --step-ids text, and the layer-ahead predictor scored
 //!               [--mtp-accept]        with --gpu: the draft layer's acceptance over the --step-ids text (greedy, and under the model's sampler)
 //!               [--gpu]               with --cpu: the blocks on the gfx1100 cards (node/src/glm_kfd.rs), the bundle's code object
 //!               [--force-picks]   every MoE layer takes the oracle's expert picks (weights still its own): separates tie flips from the rest
@@ -33,6 +34,7 @@ use glm_5_3_flash::construct::{CpuExperts, CpuModel};
 use glm_5_3_flash::reference::*;
 use glm_5_3_flash::*;
 use harness::{arg, arg_required, Checkpoint, Golden, Report};
+use std::io::Write;
 use std::path::PathBuf;
 
 fn main() {
@@ -413,6 +415,44 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
         }
         println!("mtp draft: cards vs host over {n_draft} positions — top-1 agree {:.3}, max |Δ logit| {card_dmax:.3e}", card_agree as f64 / n_draft as f64);
         println!("mtp accept: {n_acc} positions — draft top-1 = main top-1 {:.3}; draft top-1 = text {:.3} (main top-1 = text {:.3}); expected acceptance under the sampler (T {} top-k {} top-p {}) {:.3}; {:.1} s", agree as f64 / n_acc as f64, hit as f64 / n_acc as f64, sum_acc_greedy_hit as f64 / n_acc as f64, s.temperature, s.top_k, s.top_p, sum_acc / n_acc as f64, t0.elapsed().as_secs_f32());
+    }
+    // --routing-trace: the --step-ids text a token at a time; every MoE layer's picks a position to the
+    // file (`pos layer e0..e7`, for the cache replay), and the layer-ahead predictor scored here: layer
+    // l+1's router over layer l's FFN input, against l+1's picks (today's predictor, layer l's router over
+    // the attention block's input, from the profile)
+    if let Some(out) = arg("--routing-trace") {
+        use glm_5_3_flash::weights::Ffn;
+        let ids = step_ids.as_deref().expect("--routing-trace needs --step-ids");
+        assert!(model.placed.is_some(), "--routing-trace needs --gpu");
+        model.seed_prefix(&w, &prefix);
+        model.profile = Default::default();
+        let mut f = std::io::BufWriter::new(std::fs::File::create(&out).unwrap());
+        let mut logits = vec![0f32; E];
+        let (mut ahead, mut ahead_n) = (0usize, 0usize);
+        let t0 = std::time::Instant::now();
+        for t in FIRST_POS..ids.len() {
+            let mut tc = Collect::default();
+            model.step(&w, ids[t] as u32, t, None, &mut tc, true);
+            for (l, idx) in &tc.topk {
+                writeln!(f, "{t} {l} {}", idx.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(" ")).unwrap();
+            }
+            for (l, name, xn) in &tc.edges {
+                if name != "ffn_in" || l + 1 >= NUM_HIDDEN_LAYERS {
+                    continue;
+                }
+                if let (Ffn::Moe(next), Some((_, actual))) = (&w.layers[l + 1].ffn, tc.topk.iter().find(|(l2, _)| *l2 == l + 1)) {
+                    common::gemv::bf16_par::<E, H>(next.router, xn, &mut logits, &pool);
+                    let pred = glm_5_3_flash::ffn::picks(next, &mut logits);
+                    ahead += actual.iter().filter(|e| pred.contains(e)).count();
+                    ahead_n += 1;
+                }
+            }
+            if t % 200 == 0 {
+                println!("  routing trace: {t} positions, {:.1} s", t0.elapsed().as_secs_f32());
+            }
+        }
+        let p = &model.profile;
+        println!("routing trace: {} positions to {}; layer-ahead predictor names {:.2} of {TOP_K} picks (layer l+1's router over layer l's FFN input); today's names {:.2} (layer l's router over the attention input); {:.1} s", ids.len() - FIRST_POS, out.display(), ahead as f64 / ahead_n.max(1) as f64, p.pre_agree as f64 / p.moe_layers.max(1) as f64, t0.elapsed().as_secs_f32());
     }
     std::process::exit(if report.failures() > 0 || !step_gate { 1 } else { 0 });
 }
