@@ -61,6 +61,10 @@ pub const SAMPLING: common::sample::Sampling = common::sample::Sampling { temper
 pub const SEED: u64 = 0x726f_636b_656d_0002;
 /// The most tokens one step carries (`common::gemv::TOKENS`): the card's launch width.
 pub const TOKENS: usize = common::gemv::TOKENS;
+/// Tokens a prefill step takes at most: the card's buffers are this deep, the rows kernels run it in
+/// passes of `TOKENS`, the KDA step loops it in the kernel, the host's experts group it by expert
+/// (tcdent 2026-10-16: 128 first, the sweet spot to be found).
+pub const STEP: usize = 128;
 
 pub mod expert;
 pub mod ffn;

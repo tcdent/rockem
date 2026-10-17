@@ -218,7 +218,14 @@ pub mod gfx11_consts {
     pub const SLICES: usize = 8;
     pub const K_SLICE: usize = HC * H / SLICES;
     pub const PRE_GRID: u32 = (COEF_ROWS * SLICES) as u32;
-    pub const PRE_LDS: u32 = 512;
+    /// `hc_pre`'s LDS: per token of the step, 8 wave partials of the dots and 8 of the squares, the
+    /// coefficients; then a transpose scratch per wave.
+    pub const PRE_LDS: u32 = (4 * (STEP * (16 + COEF_ROWS) + 8 * HC * HC)) as u32;
+    /// `hc_pre`'s partials in VRAM, per token: the coefficient dots `[COEF_ROWS][SLICES]`, every
+    /// workgroup's sum of squares of its stream channels, then every workgroup's sum of squares of
+    /// its channels of the collapse (the router's norm). The host allocates `STEP · PRE_STRIDE`.
+    pub const PRE_XSS: usize = COEF_ROWS * SLICES;
+    pub const PRE_STRIDE: usize = PRE_PARTS + PRE_XSS;
     /// `hc_pre`'s VRAM words: for each of its three device barriers, an arrival count a row (0 between
     /// launches) and a done word a row; then the mix's ready word and the collapse's.
     pub const PRE_BARRIERS: usize = 3;
@@ -229,7 +236,7 @@ pub mod gfx11_consts {
     pub const PRE_PARTS: usize = COEF_ROWS * SLICES + COEF_ROWS * SLICES;
     /// Channels of the collapse a workgroup takes.
     pub const COLLAPSE: usize = H.div_ceil(COEF_ROWS * SLICES);
-    const _: () = assert!(HC * H % SLICES == 0 && K_SLICE % 256 == 0 && COEF_ROWS <= 256 && (16 + COEF_ROWS + HC * HC) * 4 <= PRE_LDS as usize && COEF_ROWS <= 32 && COLLAPSE <= 256 && H % 256 == 0 && HC * HC <= 32 && HC.is_power_of_two());
+    const _: () = assert!(HC * H % SLICES == 0 && K_SLICE % 256 == 0 && COEF_ROWS <= 256 && PRE_LDS <= 60 * 1024 && COEF_ROWS <= 32 && COLLAPSE <= 256 && H % 256 == 0 && HC * HC <= 32 && HC.is_power_of_two() && STEP <= 256 && K_SLICE / 256 == 8);
     /// The mix the card keeps between a block's two halves: pre `[HC]`, post `[HC]`, comb `[HC][HC]`.
     pub const MIX: usize = 2 * HC + HC * HC;
     /// `hc_post` and `hc_mean`: a thread a channel.
@@ -293,104 +300,125 @@ pub mod gfx11 {
         wg0
     }
 
-    /// The hyper-connection's input half as one launch over `COEF_ROWS · SLICES` workgroups.
-    /// Workgroup (row, slice) takes the dot of its `K_SLICE` of row `row` with the raw stream
-    /// channels into `part[row][slice]`, and the sum of squares of those channels alongside
-    /// (the norm is a scalar), then counts its arrival (`count[row]`; the last of a row counts
-    /// in `count[COEF_ROWS]`). The last workgroup of all sums the squares and each row's
-    /// partials in fixed order, makes the mix (`hc::pre`'s arithmetic) into `mix` and publishes
-    /// `value` in `count[COEF_ROWS + 1]`; every workgroup waits for that word (all resident:
-    /// the grid is a fraction of the card) and collapses its `COLLAPSE` channels,
-    /// `x[d] = Σ_i pre_i · stream_i[d]`, into `x` and, when `x_host` is not null, there too (the
-    /// routed experts' input). One workgroup doing the collapse alone was the 50 µs (timeline
-    /// 2026-10-16). Then, when `router` is not null (the FFN card: the early router over the
-    /// attention block's input, or the FFN router over its own), the workgroups arrive again,
-    /// each norms `x` with `ln` and takes its `ROUTER_ROWS_PER_WG` rows of the `[E][H]` bf16
-    /// router straight into `scores` (host memory), and the last of them writes `value` to
-    /// `word`: the two launches and two handoffs a layer the routers cost are inside this one.
-    /// Counts back at 0 when the launch leaves. LDS: 512 bytes.
+    /// The hyper-connection's input half as one launch over `COEF_ROWS · SLICES` workgroups, for
+    /// the `n` tokens of a step (`streams: [n][HC][H]`, `mix: [n][MIX]`, `x`, `x_host: [n][H]`,
+    /// `scores: [n][E]`, `part: [n][PRE_STRIDE]`). Workgroup (row, slice) takes, for every token,
+    /// the dot of its `K_SLICE` of row `row` with the raw stream channels and the sum of squares of
+    /// those channels (its eight weights a thread read once, the tokens looped), the wave partials
+    /// kept in LDS and summed after one barrier, then counts its arrival (`count[row]`). The last
+    /// workgroup of all makes every token's mix (`hc::pre`'s arithmetic: the norm from one row's
+    /// slices' squares, the coefficients from every row's partials in fixed order, the sigmoids,
+    /// softmax rows and Sinkhorn on a wave a token, eight tokens at a time) into `mix` and
+    /// publishes `value` in `count`'s ready word; every workgroup waits for it (all resident: the
+    /// grid is a fraction of the card) and collapses its `COLLAPSE` channels of every token,
+    /// `x[i][d] = Σ_j pre_ij · stream_ij[d]`, into `x` and, when `x_host` is not null, there too
+    /// (the routed experts' input), with the sum of squares of those channels into `part` for the
+    /// router's norm. Then, when `router` is not null (the FFN card: the early router over the
+    /// attention block's input, or the FFN router over its own), the workgroups arrive again, each
+    /// takes its `ROUTER_ROWS_PER_WG` rows of the `[E][H]` bf16 router over every token's `x`
+    /// normed with `ln` (a wave a token, no reduction through LDS) straight into `scores` (host
+    /// memory), and the last of them writes `value` to `word`. One token is n = 1 through the
+    /// same launch. Counts back at 0 when the launch leaves. LDS: PRE_LDS.
     #[no_mangle]
-    pub extern "gpu-kernel" fn hc_pre(streams: *const f32, w: *const u16, part: *mut f32, base: *const f32, scale: *const f32, mix: *mut f32, x: *mut f32, x_host: *mut f32, count: *mut u32, value: u32, ln: *const u16, router: *const u16, scores: *mut f32, word: *mut u32) {
+    pub extern "gpu-kernel" fn hc_pre(streams: *const f32, w: *const u16, part: *mut f32, base: *const f32, scale: *const f32, mix: *mut f32, x: *mut f32, x_host: *mut f32, count: *mut u32, value: u32, ln: *const u16, router: *const u16, scores: *mut f32, word: *mut u32, n: u32) {
         unsafe {
+            let n = n as usize;
             let t = workitem_id_x() as usize;
             let (wave, lane) = (t / 32, (t % 32) as u32);
             let wg = workgroup_id_x() as usize;
             let (row, slice) = (wg / SLICES, wg % SLICES);
-            let red = lds::<f32>(); // [8] dot partials | [8] square partials | [COEF_ROWS] coefficients | [HC·HC] transpose
-            let red2 = red.add(8);
-            let coefs = red.add(16);
+            let l = lds::<f32>();
+            let red = l; // [STEP][8] dot partials
+            let red2 = l.add(STEP * 8); // [STEP][8] square partials
+            let coefs = l.add(STEP * 16); // [STEP][COEF_ROWS]
+            let trs = l.add(STEP * (16 + COEF_ROWS)); // [8 waves][HC·HC] transpose scratch
             let (b0, b1, b2) = (count, count.add(2 * COEF_ROWS), count.add(4 * COEF_ROWS));
             let ready = count.add(PRE_BARRIERS * 2 * COEF_ROWS);
-            // this slice of the row against the raw channels, and the channels' squares
+            // this slice of the row: the thread's eight weights once, every token's channels against them
             let (w_row, c0) = (w.add(row * HC * H), slice * K_SLICE);
-            let (mut acc, mut ss) = (0f32, 0f32);
-            let mut i = t;
-            while i < K_SLICE {
-                let v = *streams.add(c0 + i);
-                acc += v * widen(*w_row.add(c0 + i));
-                ss += v * v;
-                i += 256;
+            let mut wv = [0f32; 8];
+            let mut k = 0;
+            while k < 8 {
+                wv[k] = widen(*w_row.add(c0 + k * 256 + t));
+                k += 1;
             }
-            acc = wave_sum(lane, acc);
-            ss = wave_sum(lane, ss);
-            if lane == 0 {
-                *red.add(wave) = acc;
-                *red2.add(wave) = ss;
+            let mut i = 0;
+            while i < n {
+                let s_tok = streams.add(i * HC * H + c0);
+                let (mut acc, mut ss) = (0f32, 0f32);
+                let mut k = 0;
+                while k < 8 {
+                    let v = *s_tok.add(k * 256 + t);
+                    acc += v * wv[k];
+                    ss += v * v;
+                    k += 1;
+                }
+                acc = wave_sum(lane, acc);
+                ss = wave_sum(lane, ss);
+                if lane == 0 {
+                    *red.add(i * 8 + wave) = acc;
+                    *red2.add(i * 8 + wave) = ss;
+                }
+                i += 1;
             }
             workgroup_sync();
-            if t == 0 {
+            // a thread a token: the eight partials summed in order, past this CU's caches
+            if t < n {
                 let (mut p, mut q) = (0f32, 0f32);
                 let mut k = 0;
                 while k < 8 {
-                    p += *red.add(k);
-                    q += *red2.add(k);
+                    p += *red.add(t * 8 + k);
+                    q += *red2.add(t * 8 + k);
                     k += 1;
                 }
-                // the partials past this CU's caches
-                AtomicU32::from_ptr(part.add(row * SLICES + slice) as *mut u32).store(p.to_bits(), Ordering::Release);
-                AtomicU32::from_ptr(part.add(COEF_ROWS * SLICES + wg) as *mut u32).store(q.to_bits(), Ordering::Release);
+                let pt = part.add(t * PRE_STRIDE);
+                AtomicU32::from_ptr(pt.add(row * SLICES + slice) as *mut u32).store(p.to_bits(), Ordering::Release);
+                AtomicU32::from_ptr(pt.add(COEF_ROWS * SLICES + wg) as *mut u32).store(q.to_bits(), Ordering::Release);
             }
             if arrive(b0, row, t, wave, lane, value) {
-                // the norm from one row's slices' squares (every row's slices read the same channels; one row
-                // covers them all), the coefficients from every row's partials: fixed order
-                let mut tot = 0f32;
-                let mut k = 0;
-                while k < SLICES {
-                    tot += f32::from_bits(AtomicU32::from_ptr(part.add(COEF_ROWS * SLICES + k) as *mut u32).load(Ordering::Acquire));
-                    k += 1;
-                }
-                let r = 1.0 / sqrt(tot / (HC * H) as f32 + RMS_NORM_EPS);
+                // every token's coefficients: the norm from one row's slices' squares (every row's slices
+                // read the same channels; one row covers them all), the rows' partials in fixed order
                 if t < COEF_ROWS {
-                    let mut sum = 0f32;
-                    let mut k = 0;
-                    while k < SLICES {
-                        sum += f32::from_bits(AtomicU32::from_ptr(part.add(t * SLICES + k) as *mut u32).load(Ordering::Acquire));
-                        k += 1;
+                    let mut i = 0;
+                    while i < n {
+                        let pt = part.add(i * PRE_STRIDE);
+                        let mut tot = 0f32;
+                        let mut k = 0;
+                        while k < SLICES {
+                            tot += f32::from_bits(AtomicU32::from_ptr(pt.add(COEF_ROWS * SLICES + k) as *mut u32).load(Ordering::Acquire));
+                            k += 1;
+                        }
+                        let rn = 1.0 / sqrt(tot / (HC * H) as f32 + RMS_NORM_EPS);
+                        let mut sum = 0f32;
+                        let mut k = 0;
+                        while k < SLICES {
+                            sum += f32::from_bits(AtomicU32::from_ptr(pt.add(t * SLICES + k) as *mut u32).load(Ordering::Acquire));
+                            k += 1;
+                        }
+                        *coefs.add(i * COEF_ROWS + t) = sum * rn;
+                        i += 1;
                     }
-                    *coefs.add(t) = sum * r;
                 }
                 workgroup_sync();
-                // the mix on wave 0, a lane an entry (lane = i·HC + j): the sigmoids on lanes 0..2·HC, the
-                // softmax rows and the Sinkhorn passes as group sums over the row's four lanes and the
-                // column's four (lanes j, j+HC, …: a transpose through LDS turns columns into rows). One
-                // thread computing the whole mix serially took 15 µs of the launch (bench-hc 2026-10-16).
-                if wave == 0 {
-                    let c = |i: usize| *coefs.add(i);
-                    let l = lane as usize;
-                    let (s0, s1, s2) = (*scale, *scale.add(1), *scale.add(2));
-                    let (li, lj) = (l / HC, l % HC);
-                    let inb = l < HC * HC;
-                    let small = if l < HC { l } else { 0 };
-                    let pre_v = sigmoid(c(small) * s0 + *base.add(small)) + HC_EPS; // lanes 0..HC: pre[lane]
+                // the mix on a wave a token, a lane an entry (lane = i·HC + j): the sigmoids on lanes 0..2·HC,
+                // the softmax rows and the Sinkhorn passes as group sums over the row's four lanes and the
+                // column's four (a transpose through LDS turns columns into rows), eight tokens at a time
+                let (s0, s1, s2) = (*scale, *scale.add(1), *scale.add(2));
+                let tr = trs.add(wave * HC * HC);
+                let mut i = wave;
+                while i < n {
+                    let c = |k: usize| *coefs.add(i * COEF_ROWS + k);
+                    let lu = lane as usize;
+                    let (li, lj) = (lu / HC, lu % HC);
+                    let inb = lu < HC * HC;
+                    let small = if lu < HC { lu } else { 0 };
+                    let pre_v = sigmoid(c(small) * s0 + *base.add(small)) + HC_EPS;
                     let post_v = 2.0 * sigmoid(c(HC + small) * s1 + *base.add(HC + small));
                     let mut e = if inb { c(2 * HC + li * HC + lj) * s2 + *base.add(2 * HC + li * HC + lj) } else { f32::NEG_INFINITY };
                     let mx = group_max(lane, e, HC as u32);
                     e = if inb { exp(e - mx) } else { 0.0 };
                     let sum = group_sum(lane, e, HC as u32);
                     let mut cbv = if inb { e / sum + HC_EPS } else { 0.0 };
-                    // Sinkhorn-Knopp: columns first, then rows and columns HC_SINKHORN_ITERS - 1 times; a column
-                    // sum is a row sum of the transpose, kept in LDS as the lane's mirror entry (j, i)
-                    let tr = coefs.add(COEF_ROWS); // [HC·HC] scratch past the coefficients
                     let mut it = 0;
                     while it < HC_SINKHORN_ITERS {
                         if it > 0 {
@@ -400,56 +428,72 @@ pub mod gfx11 {
                         if inb {
                             *tr.add(lj * HC + li) = cbv;
                         }
-                        // the column sum: the transpose's row sum, read back by each lane's (j, i)
-                        let mirror = if inb { *tr.add(lane as usize) } else { 0.0 }; // lane (li, lj) reads tr[li·HC+lj] = cb[lj][li]
-                        let cs_t = group_sum(lane, mirror, HC as u32) + HC_EPS; // the sum of column li, on lanes of row li
-                        // bring column j's sum to lane (i, j): it sits on lanes (j, *) — lane j·HC
+                        let mirror = if inb { *tr.add(lu) } else { 0.0 };
+                        let cs_t = group_sum(lane, mirror, HC as u32) + HC_EPS;
                         let cs = lane_read((lj * HC) as u32, cs_t);
                         cbv /= cs;
                         it += 1;
                     }
+                    let mt = mix.add(i * MIX);
                     if inb {
-                        AtomicU32::from_ptr(mix.add(2 * HC + lane as usize) as *mut u32).store(cbv.to_bits(), Ordering::Relaxed);
+                        AtomicU32::from_ptr(mt.add(2 * HC + lu) as *mut u32).store(cbv.to_bits(), Ordering::Relaxed);
                     }
-                    if (lane as usize) < HC {
-                        AtomicU32::from_ptr(mix.add(lane as usize) as *mut u32).store(pre_v.to_bits(), Ordering::Relaxed);
-                        AtomicU32::from_ptr(mix.add(HC + lane as usize) as *mut u32).store(post_v.to_bits(), Ordering::Relaxed);
+                    if lu < HC {
+                        AtomicU32::from_ptr(mt.add(lu) as *mut u32).store(pre_v.to_bits(), Ordering::Relaxed);
+                        AtomicU32::from_ptr(mt.add(HC + lu) as *mut u32).store(post_v.to_bits(), Ordering::Relaxed);
                     }
-                    if lane == 0 {
-                        AtomicU32::from_ptr(ready).store(value, Ordering::Release);
-                    }
+                    i += 8;
+                }
+                workgroup_sync();
+                if t == 0 {
+                    AtomicU32::from_ptr(ready).store(value, Ordering::Release);
                 }
             }
-            // every workgroup: the mix, then its channels of the collapse
+            // every workgroup: each token's mix, then its channels of the token's collapse, and their squares
             if t == 0 {
                 await_word(ready, value);
             }
             workgroup_sync();
-            let mut pre = [0f32; HC];
-            let mut i = 0;
-            while i < HC {
-                pre[i] = f32::from_bits(AtomicU32::from_ptr(mix.add(i) as *mut u32).load(Ordering::Relaxed));
-                i += 1;
-            }
             let d0 = wg * COLLAPSE;
-            let mut d = d0 + t;
-            while d < d0 + COLLAPSE && d < H {
-                let mut acc = 0f32;
-                let mut i = 0;
-                while i < HC {
-                    acc += pre[i] * *streams.add(i * H + d);
-                    i += 1;
+            let d = d0 + t;
+            let mut i = 0;
+            while i < n {
+                let mt = mix.add(i * MIX);
+                let mut sq = 0f32;
+                if t < COLLAPSE && d < H {
+                    let st = streams.add(i * HC * H);
+                    let mut acc = 0f32;
+                    let mut j = 0;
+                    while j < HC {
+                        acc += f32::from_bits(AtomicU32::from_ptr(mt.add(j) as *mut u32).load(Ordering::Relaxed)) * *st.add(j * H + d);
+                        j += 1;
+                    }
+                    *x.add(i * H + d) = acc;
+                    if !x_host.is_null() {
+                        *x_host.add(i * H + d) = acc;
+                    }
+                    sq = acc * acc;
                 }
-                *x.add(d) = acc;
-                if !x_host.is_null() {
-                    *x_host.add(d) = acc;
+                sq = wave_sum(lane, sq);
+                if lane == 0 {
+                    *red.add(i * 8 + wave) = sq;
                 }
-                d += 256;
+                i += 1;
             }
             if router.is_null() {
                 return;
             }
-            // the collapse's arrival: this workgroup's channels to L2; workgroup 0 publishes; every workgroup waits
+            workgroup_sync();
+            if t < n {
+                let mut q = 0f32;
+                let mut k = 0;
+                while k < 8 {
+                    q += *red.add(t * 8 + k);
+                    k += 1;
+                }
+                AtomicU32::from_ptr(part.add(t * PRE_STRIDE + PRE_PARTS + wg) as *mut u32).store(q.to_bits(), Ordering::Release);
+            }
+            // the collapse's arrival: this workgroup's channels and squares to L2; workgroup 0 publishes; every workgroup waits
             let ready2 = ready.add(1);
             fence(Ordering::Release);
             if arrive(b1, row, t, wave, lane, value) && t == 0 {
@@ -460,55 +504,37 @@ pub mod gfx11 {
             }
             workgroup_sync();
             fence(Ordering::Acquire);
-            // the router over the normed block input: the norm from every channel, this workgroup's rows
-            let mut ss = 0f32;
-            let mut k = t;
-            while k < H {
-                let v = *x.add(k);
-                ss += v * v;
-                k += 256;
-            }
-            ss = wave_sum(lane, ss);
-            if lane == 0 {
-                *red.add(wave) = ss;
-            }
-            workgroup_sync();
-            let mut tot = 0f32;
-            let mut k = 0;
-            while k < 8 {
-                tot += *red.add(k);
-                k += 1;
-            }
-            let rr = 1.0 / sqrt(tot / H as f32 + RMS_NORM_EPS);
-            workgroup_sync(); // red is reused below
-            let mut r = 0;
-            while r < ROUTER_ROWS_PER_WG {
-                let row = wg + r * COEF_ROWS * SLICES;
-                if row < E {
-                    let wr = router.add(row * H);
-                    let mut acc = 0f32;
-                    let mut k = t;
-                    while k < H {
-                        acc += *x.add(k) * widen(*ln.add(k)) * widen(*wr.add(k));
-                        k += 256;
-                    }
-                    acc = wave_sum(lane, acc);
-                    if lane == 0 {
-                        *red.add(wave) = acc;
-                    }
-                    workgroup_sync();
-                    if t == 0 {
-                        let mut sum = 0f32;
-                        let mut k = 0;
-                        while k < 8 {
-                            sum += *red.add(k);
-                            k += 1;
-                        }
-                        *scores.add(row) = sum * rr;
-                    }
-                    workgroup_sync();
+            // the router over every token's normed block input: a wave a token, this workgroup's rows
+            let mut i = wave;
+            while i < n {
+                let pt = part.add(i * PRE_STRIDE + PRE_PARTS);
+                let mut tot = 0f32;
+                let mut k = lane as usize;
+                while k < COEF_ROWS * SLICES {
+                    tot += f32::from_bits(AtomicU32::from_ptr(pt.add(k) as *mut u32).load(Ordering::Acquire));
+                    k += 32;
                 }
-                r += 1;
+                let rr = 1.0 / sqrt(wave_sum(lane, tot) / H as f32 + RMS_NORM_EPS);
+                let xt = x.add(i * H);
+                let mut r = 0;
+                while r < ROUTER_ROWS_PER_WG {
+                    let rrow = wg + r * COEF_ROWS * SLICES;
+                    if rrow < E {
+                        let wr = router.add(rrow * H);
+                        let mut acc = 0f32;
+                        let mut k = lane as usize;
+                        while k < H {
+                            acc += *xt.add(k) * widen(*ln.add(k)) * widen(*wr.add(k));
+                            k += 32;
+                        }
+                        acc = wave_sum(lane, acc);
+                        if lane == 0 {
+                            *scores.add(i * E + rrow) = acc * rr;
+                        }
+                    }
+                    r += 1;
+                }
+                i += 8;
             }
             // the router's arrival: this workgroup's scores out over the link; workgroup 0 says so
             fence(Ordering::Release);
@@ -518,16 +544,17 @@ pub mod gfx11 {
         }
     }
 
-    /// `stream_j[d] = post_j · y[d] + Σ_i comb_ij · stream_i[d]`, a thread a channel, the block
-    /// output `y` the sum of `ya` and `yb` (`yb` null for one source): the parts of a split
-    /// attention block, or the shared expert's rows and the host's routed experts. The handoff
-    /// first, so the update is one launch, not two: workgroup 0 copies this
-    /// card's `n` floats from `src` out to `dst`, writes `value` to `mine`, holds until `w0` and
-    /// `w1` (those not null) read `value`, then releases the other workgroups through `go`, a
+    /// `stream_ij[d] = post_ij · y_i[d] + Σ_k comb_ikj · stream_ik[d]` for the `tokens` tokens of a
+    /// step (`mix: [tokens][MIX]`, `streams: [tokens][HC][H]`, `ya`, `yb: [tokens][H]`), a thread a
+    /// channel looping the tokens, the block output `y` the sum of `ya` and `yb` (`yb` null for one
+    /// source): the parts of a split attention block, or the shared expert's rows and the host's
+    /// routed experts. The handoff first, so the update is one launch, not two: workgroup 0 copies
+    /// this card's `n` floats from `src` out to `dst`, writes `value` to `mine`, holds until `w0`
+    /// and `w1` (those not null) read `value`, then releases the other workgroups through `go`, a
     /// VRAM word (one poller over the link a card: sixteen slowed the host's experts by 0.5 ms a
     /// token, timeline 2026-10-16). Grid: CHANNEL_GRID.
     #[no_mangle]
-    pub extern "gpu-kernel" fn hc_post(mix: *const f32, ya: *const f32, yb: *const f32, streams: *mut f32, src: *const f32, dst: *mut f32, n: u32, mine: *mut u32, w0: *const u32, w1: *const u32, value: u32, go: *mut u32) {
+    pub extern "gpu-kernel" fn hc_post(mix: *const f32, ya: *const f32, yb: *const f32, streams: *mut f32, src: *const f32, dst: *mut f32, n: u32, mine: *mut u32, w0: *const u32, w1: *const u32, value: u32, go: *mut u32, tokens: u32) {
         unsafe {
             let t = workitem_id_x();
             if workgroup_id_x() == 0 {
@@ -560,23 +587,28 @@ pub mod gfx11 {
             }
             workgroup_sync();
             let d = workgroup_id_x() as usize * 256 + workitem_id_x() as usize;
-            let mut res = [0f32; HC];
             let mut i = 0;
-            while i < HC {
-                res[i] = *streams.add(i * H + d);
-                i += 1;
-            }
-            let yd = *ya.add(d) + if yb.is_null() { 0.0 } else { *yb.add(d) };
-            let mut j = 0;
-            while j < HC {
-                let mut acc = 0f32;
-                let mut i = 0;
-                while i < HC {
-                    acc += *mix.add(2 * HC + i * HC + j) * res[i];
-                    i += 1;
+            while i < tokens as usize {
+                let (mt, st) = (mix.add(i * MIX), streams.add(i * HC * H));
+                let mut res = [0f32; HC];
+                let mut k = 0;
+                while k < HC {
+                    res[k] = *st.add(k * H + d);
+                    k += 1;
                 }
-                *streams.add(j * H + d) = *mix.add(HC + j) * yd + acc;
-                j += 1;
+                let yd = *ya.add(i * H + d) + if yb.is_null() { 0.0 } else { *yb.add(i * H + d) };
+                let mut j = 0;
+                while j < HC {
+                    let mut acc = 0f32;
+                    let mut k = 0;
+                    while k < HC {
+                        acc += *mt.add(2 * HC + k * HC + j) * res[k];
+                        k += 1;
+                    }
+                    *st.add(j * H + d) = *mt.add(HC + j) * yd + acc;
+                    j += 1;
+                }
+                i += 1;
             }
         }
     }

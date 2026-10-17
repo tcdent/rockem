@@ -26,6 +26,15 @@ pub struct Scratch<'a> {
 /// `idx` on `x` (`[H]`), each one's raw output to `out[k·H..]` in the order of `idx`.
 pub trait Routed {
     fn run(&mut self, l: usize, idx: &[usize; TOP_K], x: &[f32], out: &mut [f32]);
+    /// A step's tokens at once: token `i`'s picks `idx[i]`, its input `x[i · H..]`, its experts'
+    /// outputs `out[(i · TOP_K + k) · H..]`. A realization that streams weights groups the step by
+    /// expert so each expert's bytes are read once for every token that picked it; the default is
+    /// `run` a token at a time.
+    fn run_batch(&mut self, l: usize, idx: &[[usize; TOP_K]], x: &[f32], out: &mut [f32]) {
+        for (i, picks) in idx.iter().enumerate() {
+            self.run(l, picks, &x[i * H..(i + 1) * H], &mut out[i * TOP_K * H..(i + 1) * TOP_K * H]);
+        }
+    }
     /// A hint, before `run`: these experts are likely layer `l`'s next; a realization may start
     /// pulling them toward the cores that will stream them.
     fn prefetch(&self, l: usize, idx: [usize; TOP_K]) {
@@ -40,6 +49,9 @@ pub trait Routed {
 impl<R: Routed + ?Sized> Routed for Box<R> {
     fn run(&mut self, l: usize, idx: &[usize; TOP_K], x: &[f32], out: &mut [f32]) {
         (**self).run(l, idx, x, out)
+    }
+    fn run_batch(&mut self, l: usize, idx: &[[usize; TOP_K]], x: &[f32], out: &mut [f32]) {
+        (**self).run_batch(l, idx, x, out)
     }
     fn elapsed(&mut self) -> f64 {
         (**self).elapsed()

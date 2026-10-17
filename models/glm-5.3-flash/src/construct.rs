@@ -524,19 +524,25 @@ pub struct CpuExperts<'a> {
     /// complex the slice's hash names — a map, so a run's slotting is a byte a part (tcdent
     /// 2026-10-16: "hold that as a map of offsets in memory for the lookup").
     slice_slot: Vec<u8>,
+    /// A step's activations quantized once each (`[STEP][H]` and their groups), the experts' hidden
+    /// states (`[STEP][TOP_K][D_FF]`) and those quantized once each for the down rows.
     xq: Vec<i8>,
     xs: Vec<f32>,
     xg: Vec<i32>,
-    h: Vec<f32>, // [TOP_K][D_FF]: the experts' hidden states
+    h: Vec<f32>,
+    hq: Vec<i8>,
+    hs: Vec<f32>,
+    hg: Vec<i32>,
     elapsed: f64,
 }
 /// An item is the record's (`layout::gu_item`, `layout::down_item`): 32 gate/up items and 20 down items an expert.
 use crate::layout::{DOWN_ITEMS, GU_ITEMS};
+use crate::STEP;
 
 impl<'a> CpuExperts<'a> {
     pub fn new(stream: &'a expert::Stream<'a>, pool: &'a dyn Pool) -> Self {
         use common::q4::GROUP;
-        let mut this = CpuExperts { stream, pool, slice_node: Vec::new(), slice_slot: Vec::new(), xq: vec![0; H], xs: vec![0.0; H / GROUP], xg: vec![0; H / GROUP], h: vec![0.0; TOP_K * D_FF], elapsed: 0.0 };
+        let mut this = CpuExperts { stream, pool, slice_node: Vec::new(), slice_slot: Vec::new(), xq: vec![0; STEP * H], xs: vec![0.0; STEP * H / GROUP], xg: vec![0; STEP * H / GROUP], h: vec![0.0; STEP * TOP_K * D_FF], hq: vec![0; STEP * TOP_K * D_FF], hs: vec![0.0; STEP * TOP_K * D_FF / GROUP], hg: vec![0; STEP * TOP_K * D_FF / GROUP], elapsed: 0.0 };
         this.relearn();
         this
     }
@@ -658,41 +664,81 @@ impl Routed for CpuExperts<'_> {
         self.pool.prefetch_slotted(n, Box::new(slot), Box::new(f));
     }
     fn run(&mut self, l: usize, idx: &[usize; TOP_K], x: &[f32], out: &mut [f32]) {
+        self.run_batch(l, std::slice::from_ref(idx), x, out)
+    }
+    /// The step grouped by expert: every expert any token picked is one group of parts, each part
+    /// streamed once and applied to every (token, slot) that picked the expert. Three runs over the
+    /// pool: the gate/up parts (each token's input quantized once before), the hidden states
+    /// quantized once each, the down parts. One token is a step of one.
+    fn run_batch(&mut self, l: usize, idx: &[[usize; TOP_K]], x: &[f32], out: &mut [f32]) {
         use common::q4::{self, Act, QAct, GROUP};
         use common::swiglu::swiglu_clamped;
-        let t0 = std::time::Instant::now();
-        QAct { q: &mut self.xq, scale: &mut self.xs, gsum: &mut self.xg }.quantize(&x[..H]);
-        let xa = Act { q: &self.xq, scale: &self.xs, gsum: &self.xg };
-        let stream = self.stream;
-        let (h_p, out_p) = (self.h.as_mut_ptr() as usize, out.as_mut_ptr() as usize);
         use expert::{DOWN_PARTS, DOWN_ROWS, GU_PARTS, GU_ROWS, SUB};
+        let t0 = std::time::Instant::now();
+        let n = idx.len();
+        assert!(n <= STEP);
+        const HG: usize = H / GROUP;
+        const DG: usize = D_FF / GROUP;
+        for i in 0..n {
+            QAct { q: &mut self.xq[i * H..(i + 1) * H], scale: &mut self.xs[i * HG..(i + 1) * HG], gsum: &mut self.xg[i * HG..(i + 1) * HG] }.quantize(&x[i * H..(i + 1) * H]);
+        }
+        // the experts picked, each with the (token, slot) pairs that picked it
+        let mut uses: Vec<Vec<(u16, u8)>> = vec![Vec::new(); E];
+        for (i, picks) in idx.iter().enumerate() {
+            for (k, &e) in picks.iter().enumerate() {
+                uses[e].push((i as u16, k as u8));
+            }
+        }
+        let experts: Vec<usize> = (0..E).filter(|&e| !uses[e].is_empty()).collect();
+        let ne = experts.len();
+        let stream = self.stream;
         let slice_slot = &self.slice_slot;
         let slot_of = |e: usize, j: usize| slice_slot[((l - FIRST_K_DENSE_REPLACE) * E + e) * (GU_ITEMS + DOWN_ITEMS) + j] as usize;
-        // the gate/up rows: part (k, c) owns expert k's hidden channels c·GU_ROWS..; its queue is its file item's, from the map
-        let gate_slot = move |i: usize| slot_of(idx[i / GU_PARTS], i % GU_PARTS / SUB);
-        self.pool.run_slotted(TOP_K * GU_PARTS, &gate_slot, &move |i| {
-            let (k, c) = (i / GU_PARTS, i % GU_PARTS);
-            let w = expert::Weights::at(stream, l, idx[k]);
+        let (xq, xs, xg) = (&self.xq, &self.xs, &self.xg);
+        let h_p = self.h.as_mut_ptr() as usize;
+        // the gate/up rows: part (j, c) owns expert experts[j]'s hidden channels c·GU_ROWS.., for each of its tokens
+        let uses_r = &uses;
+        let experts_r = &experts;
+        let gate_slot = move |i: usize| slot_of(experts_r[i / GU_PARTS], i % GU_PARTS / SUB);
+        self.pool.run_slotted(ne * GU_PARTS, &gate_slot, &move |i| {
+            let (j, c) = (i / GU_PARTS, i % GU_PARTS);
+            let e = experts_r[j];
+            let w = expert::Weights::at(stream, l, e);
             let (gw, uw, gs, us) = w.gu(c);
-            let mut gu = [0f32; 2 * GU_ROWS];
-            q4::gemv::<H>(GU_ROWS, gw, gs, &xa, &mut gu[..GU_ROWS]);
-            q4::gemv::<H>(GU_ROWS, uw, us, &xa, &mut gu[GU_ROWS..]);
-            let h = unsafe { std::slice::from_raw_parts_mut((h_p as *mut f32).add(k * D_FF + c * GU_ROWS), GU_ROWS) };
-            swiglu_clamped::<GU_ROWS>(&gu, SWIGLU_LIMIT, h);
+            for &(t, k) in &uses_r[e] {
+                let (t, k) = (t as usize, k as usize);
+                let xa = Act { q: &xq[t * H..(t + 1) * H], scale: &xs[t * HG..(t + 1) * HG], gsum: &xg[t * HG..(t + 1) * HG] };
+                let mut gu = [0f32; 2 * GU_ROWS];
+                q4::gemv::<H>(GU_ROWS, gw, gs, &xa, &mut gu[..GU_ROWS]);
+                q4::gemv::<H>(GU_ROWS, uw, us, &xa, &mut gu[GU_ROWS..]);
+                let h = unsafe { std::slice::from_raw_parts_mut((h_p as *mut f32).add((t * TOP_K + k) * D_FF + c * GU_ROWS), GU_ROWS) };
+                swiglu_clamped::<GU_ROWS>(&gu, SWIGLU_LIMIT, h);
+            }
         });
-        // the down rows: part (k, c) owns rows c·DOWN_ROWS.. of expert k's output over its whole hidden state, quantized here
+        // every (token, slot)'s hidden state quantized once, in parallel
+        let (hq_p, hs_p, hg_p) = (self.hq.as_mut_ptr() as usize, self.hs.as_mut_ptr() as usize, self.hg.as_mut_ptr() as usize);
         let h = &self.h;
-        let down_slot = move |i: usize| slot_of(idx[i / DOWN_PARTS], GU_ITEMS + i % DOWN_PARTS / SUB);
-        self.pool.run_slotted(TOP_K * DOWN_PARTS, &down_slot, &move |i| {
-            let (k, c) = (i / DOWN_PARTS, i % DOWN_PARTS);
-            let w = expert::Weights::at(stream, l, idx[k]);
-            let (mut hq, mut hs, mut hg) = ([0i8; D_FF], [0f32; D_FF / GROUP], [0i32; D_FF / GROUP]);
-            QAct { q: &mut hq, scale: &mut hs, gsum: &mut hg }.quantize(&h[k * D_FF..(k + 1) * D_FF]);
-            let ha = Act { q: &hq, scale: &hs, gsum: &hg };
-            let r0 = c * DOWN_ROWS;
+        self.pool.run(n * TOP_K, &move |i| {
+            let (q, sc, g) = unsafe { (std::slice::from_raw_parts_mut((hq_p as *mut i8).add(i * D_FF), D_FF), std::slice::from_raw_parts_mut((hs_p as *mut f32).add(i * DG), DG), std::slice::from_raw_parts_mut((hg_p as *mut i32).add(i * DG), DG)) };
+            QAct { q, scale: sc, gsum: g }.quantize(&h[i * D_FF..(i + 1) * D_FF]);
+        });
+        // the down rows: part (j, c) owns rows c·DOWN_ROWS.. of expert experts[j]'s output, for each of its tokens
+        let (hq, hs, hg) = (&self.hq, &self.hs, &self.hg);
+        let out_p = out.as_mut_ptr() as usize;
+        let down_slot = move |i: usize| slot_of(experts_r[i / DOWN_PARTS], GU_ITEMS + i % DOWN_PARTS / SUB);
+        self.pool.run_slotted(ne * DOWN_PARTS, &down_slot, &move |i| {
+            let (j, c) = (i / DOWN_PARTS, i % DOWN_PARTS);
+            let e = experts_r[j];
+            let w = expert::Weights::at(stream, l, e);
             let (dw, ds) = w.down(c);
-            let o = unsafe { std::slice::from_raw_parts_mut((out_p as *mut f32).add(k * H + r0), DOWN_ROWS) };
-            q4::gemv::<D_FF>(DOWN_ROWS, dw, ds, &ha, o);
+            let r0 = c * DOWN_ROWS;
+            for &(t, k) in &uses_r[e] {
+                let (t, k) = (t as usize, k as usize);
+                let s = t * TOP_K + k;
+                let ha = Act { q: &hq[s * D_FF..(s + 1) * D_FF], scale: &hs[s * DG..(s + 1) * DG], gsum: &hg[s * DG..(s + 1) * DG] };
+                let o = unsafe { std::slice::from_raw_parts_mut((out_p as *mut f32).add(s * H + r0), DOWN_ROWS) };
+                q4::gemv::<D_FF>(DOWN_ROWS, dw, ds, &ha, o);
+            }
         });
         self.elapsed += t0.elapsed().as_secs_f64();
     }
@@ -712,20 +758,29 @@ impl Routed for CpuExperts<'_> {
 /// a KDA layer's state; `mla_seed` installs a latent; `layer_out` fetches a
 /// layer's output off the streams for bring-up.
 pub trait Placed {
-    fn begin(&mut self, row: &[f32]);
-    fn attention(&mut self, l: usize);
-    fn early_logits(&mut self, l: usize, logits: &mut [f32]);
-    fn mla_post(&mut self, l: usize);
-    fn mla_wait(&mut self, l: usize, kva: &mut [f32], ik: &mut [f32], igate: &mut [f32], iq: &mut [f32], iw: &mut [f32]);
-    fn mla_attend(&mut self, l: usize, pos: usize, latent: &[f32], sel: &[usize]);
+    /// The step's `n` tokens' embeddings (`[n][H]`) into every card's streams; the handoffs restart.
+    fn begin(&mut self, rows: &[f32], n: usize);
+    fn attention(&mut self, l: usize, n: usize);
+    /// The early router's logits for every token of the step, `[n][E]`.
+    fn early_logits(&mut self, l: usize, n: usize, logits: &mut [f32]);
+    fn mla_post(&mut self, l: usize, n: usize);
+    /// Token `i`'s projections of the step (the launch waited for at `i == 0`).
+    fn mla_wait(&mut self, l: usize, i: usize, kva: &mut [f32], ik: &mut [f32], igate: &mut [f32], iq: &mut [f32], iw: &mut [f32]);
+    /// Token `i` (at `pos`) attends over its selection; its latent into the mirror first.
+    fn mla_attend(&mut self, l: usize, i: usize, pos: usize, latent: &[f32], sel: &[usize]);
+    /// The output projection over the step's heads, into the streams.
+    fn mla_out(&mut self, l: usize, n: usize);
     fn mla_seed(&mut self, l: usize, pos: usize, latent: &[f32]);
-    fn ffn(&mut self, l: usize);
-    /// A MoE layer's block input and its router's logits, waited for: the routed experts' input and picks.
-    fn ffn_input(&mut self, l: usize, x: &mut [f32], logits: &mut [f32]);
-    fn ffn_routed(&mut self, l: usize, y: &[f32]);
-    fn layer_out(&mut self, l: usize, mean: &mut [f32]);
-    fn logits(&mut self, logits: &mut [f32]);
-    /// The token's end without its logits (a prompt token's): every card done with its streams.
+    fn ffn(&mut self, l: usize, n: usize);
+    /// A MoE layer's FFN input for every token (`[n][H]`) and the FFN router's logits (`[n][E]`).
+    fn ffn_input(&mut self, l: usize, n: usize, x: &mut [f32], logits: &mut [f32]);
+    /// The routed experts' output for every token (`[n][H]`), into the streams.
+    fn ffn_routed(&mut self, l: usize, n: usize, y: &[f32]);
+    /// Token `i`'s layer output off the streams (bring-up).
+    fn layer_out(&mut self, l: usize, i: usize, mean: &mut [f32]);
+    /// The head over token `i`'s streams; the step ends.
+    fn logits(&mut self, i: usize, logits: &mut [f32]);
+    /// The step's end without logits: every card done with its streams.
     fn finish(&mut self);
     fn seed(&mut self, l: usize, window: &[f32], mem: &[f32]);
     fn snapshot(&self, l: usize, window: &mut [f32], mem: &mut [f32]);
@@ -858,6 +913,13 @@ pub struct CpuModel<'p, R: Routed> {
     f_expert_out: Vec<f32>,
     f_shared: Vec<f32>,
     f_score: Vec<f32>,
+    /// A step's per-token rows with the cards: the block inputs, their norms, the routed outputs,
+    /// the routers' logits, the experts' outputs (`[STEP][…]`).
+    b_x: Vec<f32>,
+    b_xn: Vec<f32>,
+    b_y: Vec<f32>,
+    b_score: Vec<f32>,
+    b_out: Vec<f32>,
 }
 
 impl<'p, R: Routed> CpuModel<'p, R> {
@@ -910,6 +972,11 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             f_expert_out: vec![0.0; TOP_K * H],
             f_shared: vec![0.0; H],
             f_score: vec![0.0; E],
+            b_x: vec![0.0; STEP * H],
+            b_xn: vec![0.0; STEP * H],
+            b_y: vec![0.0; STEP * H],
+            b_score: vec![0.0; STEP * E],
+            b_out: vec![0.0; STEP * TOP_K * H],
         }
     }
 
@@ -1009,7 +1076,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
     pub fn step(&mut self, w: &Weights, tok: u32, pos: usize, forced: Option<&[[usize; TOP_K]]>, tr: &mut impl Trace, logits: bool) {
         assert!(pos < self.max_ctx);
         if self.placed.is_some() {
-            return self.step_cards(w, tok, pos, forced, tr, logits);
+            return self.step_batch(w, &[tok], pos, forced, tr, logits);
         }
         let s = self;
         let row = &w.embed[tok as usize * H..(tok as usize + 1) * H];
@@ -1105,21 +1172,28 @@ impl<'p, R: Routed> CpuModel<'p, R> {
         lap(&mut p.head);
     }
 
-    /// The token on the cards: the host posts each layer's halves and works only where the
-    /// routed experts are its own — it waits for the FFN half's input, runs them, hands
-    /// their output back — and reads the logits at the end. Profile: `hc` is the posting,
-    /// `kda_card` the wait for the cards (the attention block and the hyper-connections),
-    /// `route` the host's router and sum around the experts, the MLA laps the host's
-    /// selection, `head` the wait for the logits.
-    fn step_cards(&mut self, w: &Weights, tok: u32, pos: usize, forced: Option<&[[usize; TOP_K]]>, tr: &mut impl Trace, logits: bool) {
+    /// A step of `toks` (at `pos..pos + n`, `n ≤ STEP`) on the cards: the host posts each layer's
+    /// halves over the step and works only where the routed experts are its own — it waits for
+    /// the FFN half's inputs, runs the step's experts grouped by expert, hands their outputs back —
+    /// and reads the last token's logits at the end when asked. One token is a step of one.
+    /// Profile: `hc` is the posting, `kda_card` the wait for the cards (the attention block and
+    /// the hyper-connections), `route` the host's router and sum around the experts, the MLA laps
+    /// the host's selection, `head` the wait for the logits.
+    pub fn step_batch(&mut self, w: &Weights, toks: &[u32], pos: usize, forced: Option<&[[usize; TOP_K]]>, tr: &mut impl Trace, logits: bool) {
         let s = self;
-        let row = &w.embed[tok as usize * H..(tok as usize + 1) * H];
-        for d in 0..H {
-            s.x[d] = widen(row[d]);
+        let n = toks.len();
+        assert!(n >= 1 && n <= STEP && pos + n <= s.max_ctx);
+        for (i, &tok) in toks.iter().enumerate() {
+            let row = &w.embed[tok as usize * H..(tok as usize + 1) * H];
+            for d in 0..H {
+                s.b_x[i * H + d] = widen(row[d]);
+            }
         }
-        tr.edge(NONE, "embed", &s.x);
+        if n == 1 {
+            tr.edge(NONE, "embed", &s.b_x[..H]);
+        }
         let pl = s.placed.as_mut().unwrap();
-        pl.begin(&s.x);
+        pl.begin(&s.b_x[..n * H], n);
         let mut t = std::time::Instant::now();
         let mut lap = |acc: &mut f64| {
             let now = std::time::Instant::now();
@@ -1127,7 +1201,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             t = now;
         };
         let p = &mut s.profile;
-        p.tokens += 1;
+        p.tokens += n;
         for l in 0..NUM_HIDDEN_LAYERS {
             let lw = &w.layers[l];
             let moe = match &lw.ffn {
@@ -1136,56 +1210,94 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             };
             let is_mla = matches!(lw.attn, Attn::Mla(_));
             if is_mla {
-                pl.mla_post(l);
+                pl.mla_post(l, n);
             } else {
-                pl.attention(l);
+                pl.attention(l, n);
             }
             lap(&mut p.hc);
-            // the prefetch's predictor: the FFN router over the attention block's input, read as soon as it is there
+            // the prefetch's predictor: the FFN router over the attention block's input, read as soon as it
+            // is there; a step of many tokens names most experts, so only a token's worth is prefetched
             let mut pre_picks = [E; TOP_K];
             if let Some(m) = moe {
-                pl.early_logits(l, &mut s.f_score);
+                pl.early_logits(l, n, &mut s.b_score);
                 lap(&mut p.early);
-                pre_picks = ffn::picks(m, &mut s.f_score);
-                s.routed.prefetch(l, pre_picks);
+                if n == 1 {
+                    s.f_score.copy_from_slice(&s.b_score[..E]);
+                    pre_picks = ffn::picks(m, &mut s.f_score);
+                    s.routed.prefetch(l, pre_picks);
+                }
             }
             lap(&mut p.slot);
             if let (Attn::Mla(a), LayerState::Mla { cache, pools }) = (&lw.attn, &mut s.layers[l]) {
-                let mut ms = mla::Scratch { qr: &mut s.m_qr, qa: &mut s.m_qa, q: &mut s.m_q, kva: &mut s.m_kva, ik: &mut s.m_ik, iq: &mut s.m_iq, iw: &mut s.m_iw, pscore: &mut s.m_pscore, sel: &mut s.m_sel, heads: &mut s.m_heads, hs: &mut s.m_hs };
-                {
-                    let (latent, ikey, igate) = mla::row(cache, pos);
-                    pl.mla_wait(l, ms.kva, ms.ik, igate, ms.iq, ms.iw);
-                    mla::finish_row(a, &ms, latent, ikey);
+                for i in 0..n {
+                    let mut ms = mla::Scratch { qr: &mut s.m_qr, qa: &mut s.m_qa, q: &mut s.m_q, kva: &mut s.m_kva, ik: &mut s.m_ik, iq: &mut s.m_iq, iw: &mut s.m_iw, pscore: &mut s.m_pscore, sel: &mut s.m_sel, heads: &mut s.m_heads, hs: &mut s.m_hs };
+                    {
+                        let (latent, ikey, igate) = mla::row(cache, pos + i);
+                        pl.mla_wait(l, i, ms.kva, ms.ik, igate, ms.iq, ms.iw);
+                        mla::finish_row(a, &ms, latent, ikey);
+                    }
+                    lap(&mut p.mla_proj);
+                    let sel_n = mla::select_at(l, a, cache, pools, pos + i, &mut ms, tr);
+                    lap(&mut p.mla_attn);
+                    pl.mla_attend(l, i, pos + i, &cache[(pos + i) * MLA_ROW..(pos + i) * MLA_ROW + KV_LORA_RANK], &ms.sel[..sel_n]);
+                    lap(&mut p.mla_out);
                 }
-                lap(&mut p.mla_proj);
-                let n = mla::select_at(l, a, cache, pools, pos, &mut ms, tr);
-                lap(&mut p.mla_attn);
-                pl.mla_attend(l, pos, &cache[pos * MLA_ROW..pos * MLA_ROW + KV_LORA_RANK], &ms.sel[..n]);
+                pl.mla_out(l, n);
                 lap(&mut p.mla_out);
             }
-            pl.ffn(l);
+            pl.ffn(l, n);
             if let Some(m) = moe {
-                pl.ffn_input(l, &mut s.x, &mut s.f_score);
+                pl.ffn_input(l, n, &mut s.b_x, &mut s.b_score);
                 lap(&mut p.kda_card);
-                rmsnorm::<H>(&s.x, &lw.post_ln, RMS_NORM_EPS, &mut s.xn);
-                tr.edge(l, "ffn_in", &s.xn);
-                let mut fs = ffn::Scratch { gu: &mut s.f_gu, h: &mut s.f_h, expert_out: &mut s.f_expert_out, shared: &mut s.f_shared, score: &mut s.f_score };
-                let picks = ffn::moe_routed_logits(l, m, &s.xn, &mut fs, &mut s.routed, forced.map(|f| &f[l - FIRST_K_DENSE_REPLACE]), tr, &mut s.y);
-                pl.ffn_routed(l, &s.y);
-                account(p, &mut s.last_picks, &mut s.freq, s.pool, l, picks, pre_picks);
+                // every token's picks and weights from the card's router logits; the step's experts as one grouped run
+                let mut picks = [[0usize; TOP_K]; STEP];
+                let mut wts = [[0f32; TOP_K]; STEP];
+                for i in 0..n {
+                    rmsnorm::<H>(&s.b_x[i * H..(i + 1) * H], &lw.post_ln, RMS_NORM_EPS, &mut s.b_xn[i * H..(i + 1) * H]);
+                    if n == 1 {
+                        tr.edge(l, "ffn_in", &s.b_xn[..H]);
+                    }
+                    let mut fs = ffn::Scratch { gu: &mut s.f_gu, h: &mut s.f_h, expert_out: &mut s.f_expert_out, shared: &mut s.f_shared, score: &mut s.b_score[i * E..(i + 1) * E] };
+                    let (idx, wt) = ffn::route_logits(l, m, &mut fs, forced.map(|f| &f[l - FIRST_K_DENSE_REPLACE]), tr);
+                    picks[i] = idx;
+                    wts[i] = wt;
+                }
+                s.routed.run_batch(l, &picks[..n], &s.b_xn[..n * H], &mut s.b_out[..n * TOP_K * H]);
+                for i in 0..n {
+                    let y = &mut s.b_y[i * H..(i + 1) * H];
+                    y.fill(0.0);
+                    for k in 0..TOP_K {
+                        let eo = &s.b_out[(i * TOP_K + k) * H..(i * TOP_K + k + 1) * H];
+                        if n == 1 {
+                            tr.routed(l, k, eo);
+                        }
+                        for d in 0..H {
+                            y[d] += wts[i][k] * eo[d];
+                        }
+                    }
+                }
+                if n == 1 {
+                    tr.edge(l, "routed", &s.b_y[..H]);
+                }
+                pl.ffn_routed(l, n, &s.b_y[..n * H]);
+                for i in 0..n {
+                    account(p, &mut s.last_picks, &mut s.freq, s.pool, l, picks[i], if i == 0 { pre_picks } else { [E; TOP_K] });
+                }
                 let e = s.routed.elapsed();
                 p.experts += e;
                 lap(&mut p.route);
                 p.route -= e;
             }
-            if tr.wants_edges() {
-                pl.layer_out(l, &mut s.mean);
+            if tr.wants_edges() && n == 1 {
+                pl.layer_out(l, 0, &mut s.mean);
                 tr.edge(l, "out", &s.mean);
             }
         }
         if logits {
-            pl.logits(&mut s.logits);
-            tr.edge(NONE, "logits", &s.logits);
+            pl.logits(n - 1, &mut s.logits);
+            if n == 1 {
+                tr.edge(NONE, "logits", &s.logits);
+            }
         } else {
             pl.finish();
         }

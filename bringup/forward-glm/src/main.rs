@@ -9,6 +9,7 @@
 //!                                     bundle's INT4 bytes dequantized through f32 arithmetic (the oracle's q4 recipe), or
 //!                                     the checkpoint's unquantized experts — what separates the recipe's cost from a kernel error
 //!               [--positions N]       stop after N computed positions
+//!               [--step N]            with --gpu: the positions again in steps of N tokens, bit for bit the single tokens'
 //!               [--gpu]               with --cpu: the blocks on the gfx1100 cards (node/src/glm_kfd.rs), the bundle's code object
 //!               [--force-picks]   every MoE layer takes the oracle's expert picks (weights still its own): separates tie flips from the rest
 //!               [--detail 1e-3]   also print every row past this relative error, and every position whose picks differ
@@ -264,7 +265,49 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
     let scored = (n - FIRST_POS - 1) as f64;
     println!("head: top-1 agrees with the oracle's at {agree_oracle}/{}; with the text {:.3} (oracle {:.3}); NLL {:.4} (oracle {:.4}); picks differ {flips}", n - FIRST_POS, agree as f64 / scored, meta["top1_agreement"].as_f64().unwrap_or(f64::NAN), nll / scored, meta["nll"].as_f64().unwrap_or(f64::NAN));
     report.print();
-    std::process::exit(if report.failures() > 0 { 1 } else { 0 });
+    // --step N: the same positions again as steps of N tokens on the cards, against a token at a
+    // time — every position's rows, the last logits and the recurrent state must be bit-identical
+    let step_gate = if let Some(st) = arg("--step") {
+        let st: usize = st.to_str().unwrap().parse().unwrap();
+        assert!(model.placed.is_some() && st > 1, "--step needs --gpu and a step of two or more");
+        let position = glm_5_3_flash::layout::POSITION;
+        let snap_len = glm_5_3_flash::layout::SNAPSHOT;
+        let run = |model: &mut CpuModel<_>, step: usize| -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+            model.seed_prefix(&w, &prefix);
+            let mut t = FIRST_POS;
+            while t < n {
+                let m = (n - t).min(step);
+                if m == 1 {
+                    model.step(&w, ids[t] as u32, t, None, &mut common::trace::NoTrace, true);
+                } else {
+                    let toks: Vec<u32> = ids[t..t + m].iter().map(|&i| i as u32).collect();
+                    model.step_batch(&w, &toks, t, None, &mut common::trace::NoTrace, true);
+                }
+                t += m;
+            }
+            let mut rows = vec![0f32; n * position];
+            for p in FIRST_POS..n {
+                model.rows(p, &mut rows[p * position..(p + 1) * position]);
+            }
+            let mut snap = vec![0f32; snap_len];
+            model.snapshot(&mut snap);
+            (model.logits.clone(), rows, snap)
+        };
+        let t0 = std::time::Instant::now();
+        let (lg1, rows1, snap1) = run(&mut model, 1);
+        let t1 = t0.elapsed().as_secs_f32();
+        let t0 = std::time::Instant::now();
+        let (lg2, rows2, snap2) = run(&mut model, st);
+        let t2 = t0.elapsed().as_secs_f32();
+        let diff = |a: &[f32], b: &[f32]| a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+        let (dl, dr, ds) = (diff(&lg1, &lg2), diff(&rows1, &rows2), diff(&snap1, &snap2));
+        let maxd = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        println!("step gate: {} positions a token at a time in {t1:.1} s, in steps of {st} in {t2:.1} s ({:.1}×); differing f32s — logits {dl} (max {:.2e}), rows {dr} (max {:.2e}), state {ds} (max {:.2e})", n - FIRST_POS, t1 / t2, maxd(&lg1, &lg2), maxd(&rows1, &rows2), maxd(&snap1, &snap2));
+        dl + dr + ds == 0
+    } else {
+        true
+    };
+    std::process::exit(if report.failures() > 0 || !step_gate { 1 } else { 0 });
 }
 
 /// Routed experts in f32 arithmetic with f32 activations (the oracle's recipe), from whatever

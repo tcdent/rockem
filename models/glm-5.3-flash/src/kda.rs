@@ -233,15 +233,16 @@ pub mod gfx11 {
 
     /// `rows_d` over two inputs: rows below `split` read `x[0..KDA_DIM]`, rows from `split` read
     /// `x[KDA_DIM..2·KDA_DIM]` — f_b over f_a's output and g_b over g_a's as one launch (the
-    /// weights and the outputs back to back, `split` a multiple of a workgroup's 8 rows).
+    /// weights and the outputs back to back, `split` a multiple of a workgroup's 8 rows); token
+    /// `i`'s input at `x[i · xs]` (the stride of the launch that made it).
     #[no_mangle]
-    pub extern "gpu-kernel" fn rows_d2(x: *const f32, w: *const u16, out: *mut f32, m: u32, n: u32, split: u32) {
+    pub extern "gpu-kernel" fn rows_d2(x: *const f32, w: *const u16, out: *mut f32, m: u32, n: u32, split: u32, xs: u32) {
         unsafe {
             let tid = workitem_id_x();
-            let (m, n) = (m as usize, n as usize);
+            let (m, n, xs) = (m as usize, n as usize, xs as usize);
             let t = tid as usize;
             let x = if core::arch::amdgpu::workgroup_id_x() * 8 >= split { x.add(KDA_DIM) } else { x };
-            rows_over::<KDA_DIM, false>(tid, w, core::ptr::null(), m, n, 0.0, |i, s| if s * 256 + t < KDA_DIM { *x.add(i * 2 * KDA_DIM + s * 256 + t) } else { 0.0 }, || {}, |row, i, y| *out.add(i * m + row) = y);
+            rows_over::<KDA_DIM, false>(tid, w, core::ptr::null(), m, n, 0.0, |i, s| if s * 256 + t < KDA_DIM { *x.add(i * xs + s * 256 + t) } else { 0.0 }, || {}, |row, i, y| *out.add(i * m + row) = y);
         }
     }
 
@@ -280,9 +281,9 @@ pub mod gfx11 {
     }
 
     /// One head of the layer through the step's `n` tokens, in order. Inputs
-    /// per token i, the part's own: `mixed[i]` (`[3][PART_QKV]`: the q, k, v
-    /// projections of the part's heads), `f[i]` and `gate[i]` (`[PART_QKV]`);
-    /// the layer's `beta[i]` (`[KDA_HEADS]`); the
+    /// per token i, the part's own: `mixed[i · ms]` (`[3][PART_QKV]`: the q, k, v
+    /// projections of the part's heads), `f[i · fs]` and `gate[i · fs]` (`[PART_QKV]`);
+    /// the layer's `beta[i · bs]` (`[KDA_HEADS]`); the
     /// layer's `taps` (`[3][KDA_QKV][CONV_TAPS]` bf16), `dt_bias`, `a_log`,
     /// `o_norm`; its state, `window` (`[CONV_TAPS-1][CONV_DIM]`) and `mem`
     /// (`[KDA_HEADS][KDA_DIM][KDA_DIM]`, the layer's, by head), advanced by `n`
@@ -294,8 +295,10 @@ pub mod gfx11 {
     /// CPU's (two halves, then their sum), as the card's stream already does.
     /// Grid: STEP_GRID, over heads `head0..`; LDS: STEP_LDS.
     #[no_mangle]
-    pub extern "gpu-kernel" fn kda_step(mixed: *const f32, taps: *const u16, window: *mut f32, f: *const f32, dt_bias: *const f32, a_log: *const f32, beta: *const f32, gate: *const f32, mem: *mut f32, o_norm: *const f32, normed: *mut f32, head0: u32, n: u32) {
+    pub extern "gpu-kernel" fn kda_step(mixed: *const f32, taps: *const u16, window: *mut f32, f: *const f32, dt_bias: *const f32, a_log: *const f32, beta: *const f32, gate: *const f32, mem: *mut f32, o_norm: *const f32, normed: *mut f32, head0: u32, n: u32, ms: u32, fs: u32, bs: u32) {
         unsafe {
+            // token i's inputs: `mixed[i · ms]`, `f[i · fs]`, `gate[i · fs]`, `beta[i · bs]` — the strides of the launches that made them
+            let (ms, fs, bs) = (ms as usize, fs as usize, bs as usize);
             let hl = workgroup_id_x() as usize; // the head within the part: its buffers' index
             let h = head0 as usize + hl; // the head within the layer: the state's and the small tensors' index
             let tid = workitem_id_x();
@@ -325,7 +328,7 @@ pub mod gfx11 {
                     let g = part * KDA_QKV + h * D + c % D;
                     let tp = taps.add((part * KDA_QKV + h * D + c % D) * CONV_TAPS);
                     let (w0, w1, w2) = (*window.add(g), *window.add(CONV_DIM + g), *window.add(2 * CONV_DIM + g));
-                    let x = *mixed.add(i * 3 * PART_QKV + part * PART_QKV + hl * D + c % D);
+                    let x = *mixed.add(i * ms + part * PART_QKV + hl * D + c % D);
                     let acc = widen(*tp) * w0 + widen(*tp.add(1)) * w1 + widen(*tp.add(2)) * w2 + widen(*tp.add(3)) * x;
                     *conv.add(c) = silu(acc);
                     *window.add(g) = w1;
@@ -335,7 +338,7 @@ pub mod gfx11 {
                 }
                 // the forget factors: log-decay in (LOWER, 0) per key channel
                 if t < D {
-                    *e.add(t) = exp(LINEAR_GATE_LOWER_BOUND * sigmoid(decay * (*f.add(i * PART_QKV + hl * D + t) + *dt_bias.add(h * D + t))));
+                    *e.add(t) = exp(LINEAR_GATE_LOWER_BOUND * sigmoid(decay * (*f.add(i * fs + hl * D + t) + *dt_bias.add(h * D + t))));
                 }
                 workgroup_sync();
                 // l2-normed q (wave 0) and k (wave 1): four channels a lane
@@ -357,7 +360,7 @@ pub mod gfx11 {
                     }
                 }
                 workgroup_sync();
-                let b = sigmoid(*beta.add(i * KDA_HEADS + h));
+                let b = sigmoid(*beta.add(i * bs + h));
                 // sweep one: decay the rows, read S·k
                 let mut d = 0f32;
                 let mut r = 0;
@@ -391,7 +394,7 @@ pub mod gfx11 {
                     workgroup_sync_waves4(red);
                     let total = *red.add(0) + *red.add(1) + *red.add(2) + *red.add(3);
                     let rn = rsqrt(total / D as f32 + RMS_NORM_EPS);
-                    *normed.add(i * PART_QKV + hl * D + vv) = *o_norm.add(vv) * (ov * rn) * sigmoid(*gate.add(i * PART_QKV + hl * D + vv));
+                    *normed.add(i * PART_QKV + hl * D + vv) = *o_norm.add(vv) * (ov * rn) * sigmoid(*gate.add(i * fs + hl * D + vv));
                 } else {
                     workgroup_sync_waves4(red);
                 }

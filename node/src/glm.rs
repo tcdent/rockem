@@ -14,13 +14,13 @@ use common::trace::{NoTrace, Trace, NONE};
 use glm_5_3_flash::construct::{physical_cores, CpuExperts, CpuModel, Threads};
 use glm_5_3_flash::layout::{self, POSITION, SNAPSHOT};
 use glm_5_3_flash::weights::Weights;
-use glm_5_3_flash::{EOS_TOKENS, FIRST_POS, H, NUM_HIDDEN_LAYERS, PREFIX_IDS, SAMPLING, SEED, TOKENS, TOP_K, VOCAB_SIZE};
+use glm_5_3_flash::{EOS_TOKENS, FIRST_POS, H, NUM_HIDDEN_LAYERS, PREFIX_IDS, SAMPLING, SEED, STEP, TOP_K, VOCAB_SIZE};
 
 /// Every layer's residual output and routing for each token of a step.
 struct DebugTrace {
     tok: usize,
-    layers: Vec<f32>, // [TOKENS][NUM_HIDDEN_LAYERS][H]
-    topk: Vec<u32>,   // [TOKENS][NUM_HIDDEN_LAYERS][TOP_K], 0 for the dense layers
+    layers: Vec<f32>, // [STEP][NUM_HIDDEN_LAYERS][H]
+    topk: Vec<u32>,   // [STEP][NUM_HIDDEN_LAYERS][TOP_K], 0 for the dense layers
 }
 impl Trace for DebugTrace {
     fn edge(&mut self, layer: usize, name: &str, data: &[f32]) {
@@ -128,9 +128,9 @@ impl Glm {
             model,
             prefix,
             prefix_logits,
-            logits: vec![0.0; TOKENS * VOCAB_SIZE],
+            logits: vec![0.0; STEP * VOCAB_SIZE],
             last_pos: 0,
-            dtr: DebugTrace { tok: 0, layers: vec![0.0; TOKENS * NUM_HIDDEN_LAYERS * H], topk: vec![0; TOKENS * NUM_HIDDEN_LAYERS * TOP_K] },
+            dtr: DebugTrace { tok: 0, layers: vec![0.0; STEP * NUM_HIDDEN_LAYERS * H], topk: vec![0; STEP * NUM_HIDDEN_LAYERS * TOP_K] },
         })
     }
     /// Fold the profile's per-node run ends into the training accumulators.
@@ -176,7 +176,7 @@ impl Engine for Glm {
         EOS_TOKENS.contains(&id)
     }
     fn tokens(&self) -> usize {
-        TOKENS
+        STEP
     }
     fn prefix_ids(&self) -> &[u32] {
         &PREFIX_IDS
@@ -204,19 +204,27 @@ impl Engine for Glm {
     }
     /// One token after another: `n` tokens are `n` steps.
     fn run(&mut self, toks: &[u32], pos: usize, trace: bool, all_logits: bool) {
-        assert!(!toks.is_empty() && toks.len() <= TOKENS);
+        assert!(!toks.is_empty() && toks.len() <= STEP);
         self.last_pos = pos;
-        for (i, &tok) in toks.iter().enumerate() {
-            let logits = all_logits || i == toks.len() - 1;
-            if trace {
-                self.dtr.tok = i;
-                self.model.step(&self.w, tok, pos + i, None, &mut self.dtr, logits);
-            } else {
-                self.model.step(&self.w, tok, pos + i, None, &mut NoTrace, logits);
+        if (trace || all_logits || self.model.placed.is_none()) || toks.len() == 1 {
+            // a token at a time: every token's logits (scoring, tracing), or the CPU realization
+            for (i, &tok) in toks.iter().enumerate() {
+                let logits = all_logits || i == toks.len() - 1;
+                if trace {
+                    self.dtr.tok = i;
+                    self.model.step(&self.w, tok, pos + i, None, &mut self.dtr, logits);
+                } else {
+                    self.model.step(&self.w, tok, pos + i, None, &mut NoTrace, logits);
+                }
+                if logits {
+                    self.logits[i * VOCAB_SIZE..(i + 1) * VOCAB_SIZE].copy_from_slice(&self.model.logits);
+                }
             }
-            if logits {
-                self.logits[i * VOCAB_SIZE..(i + 1) * VOCAB_SIZE].copy_from_slice(&self.model.logits);
-            }
+        } else {
+            // the step at once on the cards: the last token's logits
+            self.model.step_batch(&self.w, toks, pos, None, &mut NoTrace, true);
+            let i = toks.len() - 1;
+            self.logits[i * VOCAB_SIZE..(i + 1) * VOCAB_SIZE].copy_from_slice(&self.model.logits);
         }
         if self.profile_every > 0 && self.model.profile.tokens >= self.profile_every {
             for l in self.model.profile.line().split('\n') {

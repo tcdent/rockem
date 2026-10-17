@@ -16,6 +16,7 @@ use common::swiglu::swiglu_clamped;
 /// (`layout::placement`), so the table is the one definition of where an item is and the
 /// file layout never has to change with the box (tcdent, 2026-10-16: the observed ratios
 /// place the experts so every node's share ends at once).
+#[cfg(any(feature = "std", test))]
 pub struct Stream<'a> {
     pub bytes: &'a [u8],
     /// Byte offset in `bytes` of every item, `[MOE_LAYERS][E][ITEMS]` (gate/up items, then down).
@@ -29,6 +30,7 @@ pub struct Stream<'a> {
     pub regions: std::sync::Mutex<std::vec::Vec<Region>>,
 }
 #[derive(Clone, Copy, Debug)]
+#[cfg(any(feature = "std", test))]
 pub struct Region {
     pub base: usize,
     pub cap: usize,
@@ -39,6 +41,7 @@ pub const ITEMS: usize = GU_ITEMS + DOWN_ITEMS;
 pub const fn item_index(l: usize, e: usize, j: usize) -> usize {
     ((l - crate::FIRST_K_DENSE_REPLACE) * crate::E + e) * ITEMS + j
 }
+#[cfg(any(feature = "std", test))]
 impl<'a> Stream<'a> {
     /// The file's own layout: an item where `layout` puts it.
     pub fn file(bytes: &'a [u8]) -> Self {
@@ -146,6 +149,7 @@ pub const DOWN_PARTS: usize = DOWN_ITEMS * SUB;
 const _: () = assert!(GU_ROWS % common::q4::TILE == 0 && DOWN_ROWS % common::q4::TILE == 0);
 
 /// One expert of the stream, read by item (`layout`): the unit a core streams.
+#[cfg(any(feature = "std", test))]
 pub struct Weights<'a> {
     stream: &'a Stream<'a>,
     l: usize,
@@ -158,6 +162,7 @@ fn f32s(b: &[u8]) -> &[f32] {
     m
 }
 
+#[cfg(any(feature = "std", test))]
 impl<'a> Weights<'a> {
     /// Expert `e` of MoE layer `l` in `stream`.
     #[inline(always)]
@@ -284,6 +289,7 @@ impl Default for ScratchBuf {
 
 /// The realization this target ships.
 #[inline(always)]
+#[cfg(any(feature = "std", test))]
 pub fn forward(w: &Weights, x: &[f32], s: &mut Scratch, out: &mut [f32]) {
     s.xa.quantize(&x[..H]);
     let xa = s.xa.act();
@@ -305,6 +311,7 @@ pub fn forward(w: &Weights, x: &[f32], s: &mut Scratch, out: &mut [f32]) {
 /// mirrored to the host, so both tiers' experts see the same `xq`: `xq` is
 /// `[H]`, `xs` and `xg` `[H / GROUP]`.
 #[inline(always)]
+#[cfg(any(feature = "std", test))]
 pub fn forward_q(w: &Weights, xq: &[i8], xs: &[f32], xg: &[i32], s: &mut Scratch, out: &mut [f32]) {
     s.xa.q.copy_from_slice(&xq[..H]);
     s.xa.scale.copy_from_slice(&xs[..H / q4::GROUP]);
@@ -325,6 +332,7 @@ pub fn forward_q(w: &Weights, xq: &[i8], xs: &[f32], xg: &[i32], s: &mut Scratch
 }
 
 /// Same composition over the scalar inner loop, to diff against.
+#[cfg(any(feature = "std", test))]
 pub fn forward_scalar(w: &Weights, x: &[f32], s: &mut Scratch, out: &mut [f32]) {
     s.xa.quantize(&x[..H]);
     let xa = s.xa.act();
