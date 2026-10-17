@@ -22,6 +22,7 @@ MANIFEST = "manifest.toml"
 VOCAB_FILE = "vocab.bin"
 TOKENIZER_FILE = "tokenizer.json"
 TOKENIZER_CONFIG_FILE = "tokenizer_config.json"
+CHAT_TEMPLATE_FILE = "chat_template.jinja"
 
 FNV_BASIS = 0xCBF29CE484222325
 FNV_PRIME = 0x100000001B3
@@ -60,6 +61,8 @@ class Manifest:
     bos: int
     eos: int
     vocab_size: int
+    prefix: tuple[int, ...]  # the ids every sequence begins with; [bos] unless the manifest says
+    eos_tokens: frozenset[int]  # every id that ends a turn; {eos} unless the manifest says
     files: dict[str, str]
     checkpoint: Checkpoint | None
 
@@ -80,6 +83,8 @@ class Manifest:
                 bos=m["bos"],
                 eos=m["eos"],
                 vocab_size=m["vocab_size"],
+                prefix=tuple(m.get("prefix", [m["bos"]])),
+                eos_tokens=frozenset(m.get("eos_tokens", [m["eos"]])),
                 files=files,
                 checkpoint=cls._checkpoint(raw),
             )
@@ -178,6 +183,14 @@ class Bundle:
     def vocab_size(self) -> int:
         return self.manifest.vocab_size
 
+    @property
+    def prefix(self) -> tuple[int, ...]:
+        return self.manifest.prefix
+
+    @property
+    def eos_tokens(self) -> frozenset[int]:
+        return self.manifest.eos_tokens
+
     def present(self) -> list[str]:
         """The listed files that are in the directory, in manifest order."""
         return [f for f in self.manifest.files if (self.path / f).exists()]
@@ -210,7 +223,10 @@ class Bundle:
 
     @cached_property
     def chat_template(self) -> str:
-        """The Jinja source of the checkpoint's chat template, from `tokenizer_config.json`."""
+        """The Jinja source of the model's chat template: `chat_template.jinja` when the bundle
+        has one (it wins, as it does in transformers), else `tokenizer_config.json`'s."""
+        if CHAT_TEMPLATE_FILE in self.manifest.files:
+            return self.read(CHAT_TEMPLATE_FILE).decode()
         try:
             return json.loads(self.read(TOKENIZER_CONFIG_FILE))["chat_template"]
         except (json.JSONDecodeError, KeyError, TypeError) as e:

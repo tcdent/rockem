@@ -11,15 +11,15 @@ IDENTITY = 0x0123456789ABCDEF
 
 
 def test_hello_is_the_documented_bytes():
-    assert wire.hello(0) == b"rock\x03\x00\x00\x00" + b"\x00" * 8
-    assert wire.hello(IDENTITY) == b"rock" + struct.pack("<IQ", 3, IDENTITY)
+    assert wire.hello(0) == b"rock\x04\x00\x00\x00" + b"\x00" * 8
+    assert wire.hello(IDENTITY) == b"rock" + struct.pack("<IQ", 4, IDENTITY)
 
 
 def test_header_parses_and_refuses():
-    h = wire.parse_header(b"rock" + struct.pack("<IQI", 3, IDENTITY, 2047))
+    h = wire.parse_header(b"rock" + struct.pack("<IQI", 4, IDENTITY, 2047))
     assert h == Header(IDENTITY, 2047)
     with pytest.raises(WireError):
-        wire.parse_header(b"rocj" + struct.pack("<IQI", 3, 0, 1))
+        wire.parse_header(b"rocj" + struct.pack("<IQI", 4, 0, 1))
     with pytest.raises(WireError):
         wire.parse_header(b"rock" + struct.pack("<IQI", 1, 0, 1))
     with pytest.raises(Refused):
@@ -49,7 +49,8 @@ def test_session_mirrors_the_budget():
         s.feed([BOS])
     with pytest.raises(WireError):
         s.feed([VOCAB])
-    assert s.generate() == b"\xff\xff\xff\xff"
+    assert s.generate() == b"\xff\xff\xff\xff\x00\x00\x00\x00"
+    assert s.generate(7) == b"\xff\xff\xff\xff\x07\x00\x00\x00"
     # one id fills the context, one more is the draw the node writes before it closes
     assert s.receive(struct.pack("<2I", 9, 10)) == [9, 10]
     assert s.remaining == -1
@@ -158,3 +159,28 @@ async def test_client_refused_on_identity(node):
         await connect(node, identity=IDENTITY ^ 1)
     async with await connect(node, identity=IDENTITY) as c:
         assert c.header.identity == IDENTITY
+
+
+def test_session_takes_a_prefix_and_several_end_ids():
+    s = Session(Header(IDENTITY, 4), (BOS, 5), {EOS, 9}, VOCAB)
+    assert (s.bos, s.prefix, s.ends) == (BOS, (BOS, 5), frozenset({EOS, 9}))
+    s.start()
+    s.feed([1])
+    s.generate()
+    assert s.receive(struct.pack("<2I", 3, 9)) == [3, 9] and s.ended  # any end id ends the turn
+
+
+@pytest.mark.anyio
+async def test_client_sends_the_whole_prefix_once(node):
+    # a two-id prefix: the second id travels like any id after BOS (this fake node feeds it;
+    # the real node checks and swallows it, outside the budget, which is why the mirror skips it)
+    async with await wire.Client.connect(node.addr, (BOS, 5), {EOS}, VOCAB) as c:
+        await c.prompt([BOS, 5, 1, 2])  # what a template that writes the prefix yields
+        assert c.session.remaining == 7 - 2
+        await collect(c.generate())
+        await c.prompt([1])  # raw ids: the prefix goes first
+        await collect(c.generate())
+        with pytest.raises(WireError):
+            await c.prompt([BOS, 1])  # half a prefix
+    await asyncio.sleep(0.05)
+    assert [t[:3] for t in node.transcripts[:2]] == [[5, 1, 2], [5, 1, 10]]

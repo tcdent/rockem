@@ -50,16 +50,14 @@ class GenerationView(BaseView):
 
 
 class InternalView(GenerationView):
-    async def post(self, body: internal.Request) -> internal.Response:
+    async def post(self, body: internal.Request) -> StreamingResponse:
+        """Generate: a stream of `data:` lines, one event each (docs/api.md)."""
         try:
             req = internal.to_request(body)
         except ValueError as e:
             raise HTTPException(400, str(e)) from e
         run = await self._start(req)
-        if body.stream:
-            return self._sse(internal.stream(run.events(), self.model, self.identity))
-        text, ids, done = await run.fold()
-        return internal.fold(text, ids, done, self.model, self.identity)
+        return self._sse(internal.stream(run.events(), self.model, self.identity))
 
 
 class OpenAIChatView(GenerationView):
@@ -72,7 +70,7 @@ class OpenAIChatView(GenerationView):
         if body.stream:
             include_usage = bool((body.stream_options or {}).get("include_usage"))
             return self._sse(openai.stream(run.events(), self.model, include_usage))
-        text, _, done = await run.fold()
+        text, _, _, done = await run.fold()
         return openai.fold(text, done, self.model)
 
 
@@ -85,7 +83,7 @@ class AnthropicMessagesView(GenerationView):
         run = await self._start(req)
         if body.stream:
             return self._sse(anthropic.stream(run.events(), self.model, run.prompt_tokens))
-        text, _, done = await run.fold()
+        text, _, _, done = await run.fold()
         return anthropic.fold(text, done, self.model)
 
 

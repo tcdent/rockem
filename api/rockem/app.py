@@ -39,7 +39,7 @@ def parse_nodes(spec: str) -> list[Addr]:
 def build(bundle_path: str, nodes: list[Addr], identity: str = "bundle") -> Engine:
     bundle = Bundle(bundle_path)
     want = bundle.identity if identity == "bundle" else 0
-    return Engine(Edge(bundle), Scheduler(nodes, bundle.bos, bundle.eos, bundle.vocab_size, want))
+    return Engine(Edge(bundle), Scheduler(nodes, bundle.prefix, bundle.eos_tokens, bundle.vocab_size, want))
 
 
 @asynccontextmanager
@@ -50,7 +50,7 @@ async def lifespan(app: FastAPI):
 
 
 router = APIRouter()
-router.add_view("/v1/generate", InternalView, tags=["internal"])
+router.add_view("/rockem/v1/generate", InternalView, tags=["rockem"])
 router.add_view("/v1/chat/completions", OpenAIChatView, tags=["openai"])
 router.add_view("/v1/messages", AnthropicMessagesView, tags=["anthropic"])
 router.add_view("/health", HealthView, tags=["internal"])

@@ -6,9 +6,12 @@
 //!
 //!   client → node   header, then words: BOS starts a sequence (the sink is
 //!                   re-seeded, the cache is the sink's), ids are fed to the
-//!                   model as they arrive, GENERATE means "sample from here",
-//!                   SCORE means "from here, answer every id I feed with its
-//!                   log-probability before feeding it"
+//!                   model as they arrive, GENERATE means "sample from here" and is
+//!                   followed by one word, the ids wanted at most (0: the node's
+//!                   budget) — the node stops exactly where the client does, so
+//!                   the state it keeps at the reply's end is the reply the client
+//!                   has (v4, 2026-10-16); SCORE means "from here, answer every id
+//!                   I feed with its log-probability before feeding it"
 //!   node → client   header, then every sampled id the moment it exists,
 //!                   EOS included, each fed back so the cache holds exactly
 //!                   the stream; after EOS the node reads again, so more ids
@@ -27,7 +30,7 @@
 //! closing it. Nagle is off, so a token leaves as it is sampled. The console is
 //! the text twin: decimal ids in, a newline for GENERATE, token bytes out.
 
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 pub const GENERATE: u32 = u32::MAX;
 pub const SCORE: u32 = u32::MAX - 1;
 /// client → node: magic, version, identity

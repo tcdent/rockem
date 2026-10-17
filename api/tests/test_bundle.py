@@ -100,3 +100,11 @@ def test_real_bundle_round_trip():
     d = v.decoder()
     assert "".join(d.feed(i) for i in ids[1:]) + d.flush() == text
     assert "User: " in b.chat_template
+
+
+def test_manifest_prefix_and_end_ids(tiny):
+    b = Bundle(tiny)
+    assert b.prefix == (6,) and b.eos_tokens == frozenset({7})  # defaults: [bos], {eos}
+    raw = manifest({}).replace(b"vocab_size = 8", b"vocab_size = 8\nprefix = [6, 3]\neos_tokens = [7, 4, 5]")
+    m = Manifest.parse(raw)
+    assert m.prefix == (6, 3) and m.eos_tokens == frozenset({7, 4, 5})

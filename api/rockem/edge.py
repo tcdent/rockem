@@ -6,13 +6,32 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from jinja2.ext import loopcontrols
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 from .bundle import Bundle, Decoder
+from .calls import FORMATS, Format
 
 
 class TemplateError(Exception):
     """The chat template refused the messages."""
+
+
+def template_env() -> ImmutableSandboxedEnvironment:
+    """The environment transformers renders chat templates in, so a template behaves as
+    its model's publishers tested it: sandboxed, trimmed blocks, loop controls, their
+    `tojson` (non-ASCII kept unless asked) and `raise_exception`."""
+    env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=[loopcontrols])
+
+    def tojson(x, ensure_ascii=False, indent=None, separators=None, sort_keys=False):
+        return json.dumps(x, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys)
+
+    def raise_exception(message: str):
+        raise TemplateError(message)
+
+    env.filters["tojson"] = tojson
+    env.globals["raise_exception"] = raise_exception
+    return env
 
 
 class Edge:
@@ -20,20 +39,20 @@ class Edge:
         self.bundle = bundle
         self.bos_text = bundle.vocab[bundle.bos].decode()
         self.eos_text = bundle.vocab[bundle.eos].decode()
-        # the environment transformers renders with, so the template behaves as published
-        env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
-        env.filters["tojson"] = lambda v, **kw: json.dumps(v, ensure_ascii=False, **kw)
+        self._template = template_env().from_string(bundle.chat_template)
+        # how this model's calls and turns read back out of its text; None: no format known
+        self.format: Format | None = FORMATS.get(bundle.manifest.model)
 
-        def raise_exception(message: str):
-            raise TemplateError(message)
-
-        env.globals["raise_exception"] = raise_exception
-        self._template = env.from_string(bundle.chat_template)
-
-    def render(self, messages: list[dict[str, Any]], add_generation_prompt: bool = True) -> str:
-        """The transcript the template makes of the messages, BOS as text at the front."""
+    def render(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None, add_generation_prompt: bool = True) -> str:
+        """The transcript the template makes of the messages and tools, BOS as text at the
+        front. Messages and tools are in the shape chat templates take (transformers'): an
+        assistant message's `tool_calls` are `{id, type, function: {name, arguments}}`, a
+        result is `{role: "tool", tool_call_id, content}`, a tool is `{type, function}`.
+        Everything the model reads about tools is the template's; the edge adds nothing."""
+        if tools and self.format is None:
+            raise TemplateError(f"{self.bundle.manifest.model}: no tool-call format for this model")
         try:
-            return self._template.render(messages=messages, bos_token=self.bos_text, eos_token=self.eos_text, add_generation_prompt=add_generation_prompt)
+            return self._template.render(messages=messages, tools=tools or None, bos_token=self.bos_text, eos_token=self.eos_text, add_generation_prompt=add_generation_prompt)
         except TemplateError:
             raise
         except Exception as e:
@@ -43,8 +62,8 @@ class Edge:
         """Ids for text. The tokenizer adds nothing: BOS is present only if the text has it."""
         return self.bundle.tokenizer.encode(text).ids
 
-    def encode_chat(self, messages: list[dict[str, Any]]) -> list[int]:
-        return self.encode(self.render(messages))
+    def encode_chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> list[int]:
+        return self.encode(self.render(messages, tools))
 
     def decoder(self) -> Decoder:
         return self.bundle.vocab.decoder()

@@ -35,6 +35,7 @@ class FakeNode:
     def __init__(self, identity: int, max_ctx: int, draws: list[int], bos: int = BOS, eos: int = EOS, vocab: int = VOCAB):
         self.identity, self.max_ctx, self.draws = identity, max_ctx, draws
         self.bos, self.eos, self.vocab = bos, eos, vocab
+        self.close_after: int | None = None  # drop the connection after this many generated ids
         self.srv = socket.socket()
         self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.srv.bind(("127.0.0.1", 0))
@@ -72,7 +73,11 @@ class FakeNode:
                         self.transcripts.append(ids)
                         ok = True
                     elif word == wire.GENERATE:
-                        ok = started and self._generate(s, pos, drawn, ids)
+                        lw = read_exact(s, 4)
+                        if len(lw) != 4:
+                            break
+                        (limit,) = struct.unpack("<I", lw)
+                        ok = started and self._generate(s, pos, drawn, ids, limit or None)
                         if ok:
                             pos, drawn = self._pos, self._drawn
                     elif word < self.vocab:
@@ -85,14 +90,18 @@ class FakeNode:
                     if not ok:
                         break
 
-    def _generate(self, s, pos, drawn, ids) -> bool:
-        # Session::generate: sample, emit, feed, until EOS; false when the context filled
-        while True:
+    def _generate(self, s, pos, drawn, ids, limit=None) -> bool:
+        # Session::generate: sample, emit, feed, until EOS or `limit` ids; false when the context filled
+        n = 0
+        while limit is None or n < limit:
+            n += 1
             id = self.draws[drawn] if drawn < len(self.draws) else self.eos
             drawn += 1
             try:
                 s.sendall(struct.pack("<I", id))
             except OSError:
+                return False
+            if self.close_after is not None and drawn >= self.close_after:
                 return False
             if pos >= self.max_ctx:
                 return False
@@ -101,6 +110,8 @@ class FakeNode:
             if id == self.eos:
                 self._pos, self._drawn = pos, drawn
                 return True
+        self._pos, self._drawn = pos, drawn
+        return True
 
     def close(self):
         self.srv.close()

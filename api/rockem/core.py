@@ -11,6 +11,8 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
+import logging
+
 from .calls import Call, Parser, Text
 from .edge import Edge, Stops
 from .scheduler import Scheduler
@@ -61,6 +63,7 @@ class Done:
 
 
 Event = Delta | ToolCall | Done
+log = logging.getLogger("rockem")
 
 
 class Engine:
@@ -102,6 +105,7 @@ class Engine:
             out.extend(self.edge.encode(before[len(done):] + opened[len(before):]))
             out.extend(ids)
             done = after
+            log.info("turn %d rendered from its %d generated ids", i, len(ids))
         out.extend(self.edge.encode(full[len(done):]))
         return out
 
@@ -182,7 +186,7 @@ class Run:
             return out
 
         try:
-            async for id in client.generate():
+            async for id in client.generate(limit or 0):
                 n += 1
                 if id in client.session.ends:
                     reason = Reason.END_TURN

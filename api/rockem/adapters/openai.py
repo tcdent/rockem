@@ -80,7 +80,7 @@ def to_request(body: Request) -> core.Request:
 
 
 def _finish(done: core.Done) -> str:
-    return "stop" if done.reason in (core.Reason.EOS, core.Reason.STOP_SEQUENCE) else "length"
+    return "stop" if done.reason in (core.Reason.END_TURN, core.Reason.TOOL_USE, core.Reason.STOP_SEQUENCE) else "length"
 
 
 def _usage(done: core.Done) -> Usage:
@@ -98,6 +98,8 @@ async def stream(events: AsyncIterator[core.Event], model: str, include_usage: b
     id, created = f"chatcmpl-{uuid.uuid4().hex[:24]}", int(time.time())
     yield _chunk(id, created, model, {"role": "assistant", "content": ""}, None)
     async for ev in events:
+        if isinstance(ev, core.ToolCall):
+            continue  # tools are not mapped on this surface yet
         if isinstance(ev, core.Delta):
             if ev.text:
                 yield _chunk(id, created, model, {"content": ev.text}, None)

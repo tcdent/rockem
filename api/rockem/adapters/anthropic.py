@@ -69,7 +69,7 @@ def to_request(body: Request) -> core.Request:
 
 
 def _stop(done: core.Done) -> str:
-    return {core.Reason.EOS: "end_turn", core.Reason.STOP_SEQUENCE: "stop_sequence", core.Reason.MAX_TOKENS: "max_tokens", core.Reason.CONTEXT_FULL: "max_tokens"}[done.reason]
+    return {core.Reason.END_TURN: "end_turn", core.Reason.TOOL_USE: "end_turn", core.Reason.STOP_SEQUENCE: "stop_sequence", core.Reason.MAX_TOKENS: "max_tokens", core.Reason.CONTEXT_FULL: "max_tokens"}[done.reason]
 
 
 def _sse(event: str, data: dict[str, Any]) -> bytes:
@@ -81,6 +81,8 @@ async def stream(events: AsyncIterator[core.Event], model: str, prompt_tokens: i
     yield _sse("message_start", {"type": "message_start", "message": {"id": id, "type": "message", "role": "assistant", "model": model, "content": [], "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": prompt_tokens, "output_tokens": 0}}})
     yield _sse("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})
     async for ev in events:
+        if isinstance(ev, core.ToolCall):
+            continue  # tools are not mapped on this surface yet
         if isinstance(ev, core.Delta):
             if ev.text:
                 yield _sse("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": ev.text}})

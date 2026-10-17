@@ -14,10 +14,10 @@ import asyncio
 import enum
 import socket
 import struct
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Collection, Sequence
 from dataclasses import dataclass
 
-VERSION = 3
+VERSION = 4
 GENERATE = 0xFFFFFFFF
 SCORE = 0xFFFFFFFE
 MAGIC = b"rock"
@@ -81,9 +81,16 @@ class Session:
     writes the id and then closes, so exactly one id can arrive past the budget; it is
     real output and never entered the cache."""
 
-    def __init__(self, header: Header, bos: int, eos: int, vocab_size: int):
+    def __init__(self, header: Header, bos: int | Sequence[int], eos: int | Collection[int], vocab_size: int):
+        """`bos` is the model's prefix, the ids every sequence begins with (one id, or the
+        manifest's `prefix`); `eos` every id that ends a turn (one id, or `eos_tokens`).
+        The prefix takes no positions: the node's budget counts from after it."""
         self.positions = header.positions
-        self.bos, self.eos, self.vocab_size = bos, eos, vocab_size
+        self.prefix = (bos,) if isinstance(bos, int) else tuple(bos)
+        self.ends = frozenset((eos,) if isinstance(eos, int) else eos)
+        self.bos = self.prefix[0]
+        self.eos = eos if isinstance(eos, int) else min(self.ends)
+        self.vocab_size = vocab_size
         self.remaining = 0
         self.started = False
         self.ended = False  # the last word received was EOS
@@ -124,11 +131,13 @@ class Session:
         self.scoring = True
         return struct.pack("<I", SCORE)
 
-    def generate(self) -> bytes:
+    def generate(self, limit: int = 0) -> bytes:
+        """GENERATE and the ids wanted at most (0: the node's budget): the node stops exactly
+        where this side does, and keeps the sequence state at that end for the next turn."""
         if not self.started:
             raise WireError("GENERATE before BOS")
         self.ended = False
-        return struct.pack("<I", GENERATE)
+        return struct.pack("<II", GENERATE, limit)
 
     # --- in ---
 
@@ -145,7 +154,7 @@ class Session:
             if self.remaining < 0:
                 raise WireError("an id after the one past the budget")
             self.remaining -= 1
-            self.ended = id == self.eos
+            self.ended = id in self.ends
         return ids
 
     def receive_scores(self, data: bytes) -> list[float]:
@@ -205,14 +214,17 @@ class Client:
         return self.header.positions
 
     async def prompt(self, ids: list[int]) -> None:
-        """A new sequence: BOS then the ids. A leading BOS in `ids`, which is what encoding
-        a rendered chat template yields, is that BOS; otherwise one is sent first. Nothing
-        is sent if the ids do not fit."""
+        """A new sequence: the model's prefix, then the ids. A leading prefix in `ids`, which
+        is what encoding a rendered chat template yields, is that prefix; otherwise it is
+        sent first. Nothing is sent if the ids do not fit."""
         s = self.session
-        if ids and ids[0] == s.bos:
-            ids = ids[1:]
-        bos = s.start()
-        self.writer.write(bos + s.feed(ids))
+        n = len(s.prefix)
+        if list(ids[:n]) == list(s.prefix):
+            ids = ids[n:]
+        elif ids and ids[0] == s.bos:
+            raise WireError(f"ids begin with {ids[:n]}, not the prefix {list(s.prefix)}")
+        head = s.start() + struct.pack(f"<{n - 1}I", *s.prefix[1:])
+        self.writer.write(head + s.feed(ids))
         await self.writer.drain()
 
     async def feed(self, ids: list[int]) -> None:
@@ -235,12 +247,13 @@ class Client:
             out.extend(s.receive_scores(data))
         return out
 
-    async def generate(self) -> AsyncIterator[int]:
-        """GENERATE, then every id as it arrives, EOS included, until EOS or the stream ends.
-        `self.finish` says which; `Disconnected` if the end was neither."""
+    async def generate(self, limit: int = 0) -> AsyncIterator[int]:
+        """GENERATE (`limit` ids at most; 0: the node's budget), then every id as it arrives, EOS
+        included, until EOS or the stream ends. `self.finish` says which; `Disconnected` if the
+        end was neither."""
         s = self.session
         self.finish = None
-        self.writer.write(s.generate())
+        self.writer.write(s.generate(limit))
         await self.writer.drain()
         while True:
             data = await self.reader.read(65536)
@@ -249,7 +262,7 @@ class Client:
                 return
             for id in s.receive(data):
                 yield id
-                if id == s.eos:
+                if id in s.ends:
                     self.finish = Finish.STOP
                     return
 

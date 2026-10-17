@@ -12,7 +12,10 @@ from rockem.app import app, build
 from fake_node import FakeNode
 
 WORDS = ["hello", "world", "paris", "stop", "x", "y"]  # ids 0..5; 6 BOS, 7 EOS
-BOS, EOS, VOCAB = 6, 7, 8
+# ids 8.. decode only (vocab.bin); the node draws them: a call in the tiny model's format, a turn marker
+EXTRA = ["<tool_call>", '{"name": "read", "arguments": {"path": "a"}}', "</tool_call>", "\nUser:"]
+CALL_START, CALL_BODY, CALL_END, NEXT_TURN = 8, 9, 10, 11
+BOS, EOS, VOCAB = 6, 7, 12
 IDENTITY = 0x0123456789ABCDEF
 
 
@@ -29,7 +32,7 @@ def tokenizer_json() -> str:
 
 
 def vocab_bin() -> bytes:
-    tokens = [(" " + w).encode() for w in WORDS] + [b"<bos>", b"<eos>"]
+    tokens = [(" " + w).encode() for w in WORDS] + [b"<bos>", b"<eos>"] + [t.encode() for t in EXTRA]
     offs, body = [], b""
     for t in tokens:
         offs.append(len(body))
@@ -63,7 +66,11 @@ def node():
 
 
 @pytest.fixture
-def engine(tiny_bundle, node):
+def engine(tiny_bundle, node, monkeypatch):
+    from rockem import calls
+
+    # the tiny model speaks the JSON call format and opens its next turn with "\nUser:"
+    monkeypatch.setitem(calls.FORMATS, "tiny", calls.FORMATS["deepseek-v2-lite"])
     return build(str(tiny_bundle), [node.addr], "any")
 
 

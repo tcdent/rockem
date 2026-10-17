@@ -328,6 +328,7 @@ impl Session {
         }
         self.pos = at;
         self.hits = at - first;
+        println!("context  : {} of a cached transcript's {} positions matched; resumed at {at}, {} replayed", n, self.store.contexts[src].as_ref().unwrap().ids.len(), replay.len());
         replay.is_empty() || self.feed_many(&replay, &mut |_| {})
     }
     /// The sequence state now, kept with the active context at this position (the end of a
@@ -439,7 +440,9 @@ impl Session {
     }
     /// GENERATE: sample, emit, feed, until EOS or `limit` tokens. Every emitted
     /// id goes through the model, so the sequence can continue from it. False
-    /// when the context filled or `emit` refused.
+    /// when the context filled or `emit` refused. The state is kept at the prompt's
+    /// end and at the reply's end — before the EOS, or after the `limit`th id — the
+    /// two places a chat's next turn can match to.
     fn generate(&mut self, limit: usize, mut emit: impl FnMut(u32) -> bool) -> bool {
         if !self.settle() {
             return false;
@@ -454,16 +457,16 @@ impl Session {
             let id = self.next;
             let eos = self.e.is_eos(id);
             if eos {
-                // the state before EOS: the reply as the next turn re-renders it, which never carries the EOS
                 self.mark();
             }
             if !emit(id) || !self.feed(id) {
                 return false;
             }
             if eos {
-                break;
+                return true;
             }
         }
+        self.mark();
         true
     }
 }
@@ -520,7 +523,17 @@ fn serve(listen: &str, session: &mut Session, identity: u64) {
                     session.start();
                     ok
                 }
-                wire::GENERATE => flush(session, &mut ids, &mut s) && session.started && session.generate(session.max_ctx, |id| s.write_all(&id.to_le_bytes()).is_ok()),
+                wire::GENERATE => {
+                    let mut lw = [0u8; 4];
+                    if s.read_exact(&mut lw).is_err() {
+                        break;
+                    }
+                    let limit = match u32::from_le_bytes(lw) as usize {
+                        0 => session.max_ctx,
+                        n => n,
+                    };
+                    flush(session, &mut ids, &mut s) && session.started && session.generate(limit, |id| s.write_all(&id.to_le_bytes()).is_ok())
+                }
                 wire::SCORE => {
                     let ok = flush(session, &mut ids, &mut s);
                     session.scoring = session.started;

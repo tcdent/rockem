@@ -15,7 +15,8 @@ Addr = tuple[str, int]
 
 
 class Scheduler:
-    def __init__(self, nodes: list[Addr], bos: int, eos: int, vocab_size: int, identity: int = 0):
+    def __init__(self, nodes: list[Addr], bos, eos, vocab_size: int, identity: int = 0):
+        """`bos` and `eos` as the wire client takes them: one id each, or the prefix and the end ids."""
         self.nodes = list(nodes)
         self.bos, self.eos, self.vocab_size, self.identity = bos, eos, vocab_size, identity
         self._free: asyncio.Queue[Addr] = asyncio.Queue()
