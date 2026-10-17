@@ -100,6 +100,11 @@ pub fn head_scale(iw: &mut [f32]) {
         *v *= wscale;
     }
 }
+/// The two scales of the indexer's score (`score_pools`'s), for a card running it: the host's
+/// values, so the card never takes its own root.
+pub fn score_scales() -> (f32, f32) {
+    (1.0 / sqrt(INDEX_HEAD_DIM as f32), 1.0 / sqrt(INDEX_N_HEADS as f32))
+}
 /// Whether query `pos` selects among its pools (past `KEEP` complete ones) or attends them all.
 #[inline(always)]
 pub fn selects(pos: usize) -> bool {
@@ -553,6 +558,46 @@ pub mod gfx11 {
                 }
                 i += 1;
             }
+        }
+    }
+    /// The indexer's scores on the card: a thread a (token, pool) of the step, the host's
+    /// `score_pools` arithmetic — the dot over the key's channels in order, the heads in order,
+    /// the head weights scaled once — so the picks are the host's (`scale` and `wscale` come from
+    /// the host, computed once there). `iq: [tokens][INDEX_N_HEADS][INDEX_HEAD_DIM]`, `ix:
+    /// [tokens][IX_ROWS]` (the head weights at `2 · INDEX_HEAD_DIM`), `pools: [pools]
+    /// [INDEX_HEAD_DIM]`, `score: [tokens][stride]`; token `i` at `pos0 + i` scores its complete
+    /// pools when it selects among them. Grid: tokens × `nb` (256 pools a workgroup). One host
+    /// thread scored a token's 5.4k pools at 21k positions in 6 ms (2026-10-17).
+    #[no_mangle]
+    pub extern "gpu-kernel" fn ix_score(iq: *const f32, ix: *const f32, pools: *const f32, score: *mut f32, pos0: u32, nb: u32, stride: u32, scale: f32, wscale: f32) {
+        unsafe {
+            use core::arch::amdgpu::workgroup_id_x;
+            let wg = workgroup_id_x();
+            let i = (wg / nb) as usize;
+            let j = ((wg % nb) * 256 + workitem_id_x()) as usize;
+            let pos = pos0 as usize + i;
+            let visible = (pos + 1) / INDEX_KPOOL;
+            if visible <= super::KEEP || j >= visible {
+                return;
+            }
+            let key = pools.add(j * INDEX_HEAD_DIM);
+            let q = iq.add(i * INDEX_N_HEADS * INDEX_HEAD_DIM);
+            let iw = ix.add(i * IX_ROWS + 2 * INDEX_HEAD_DIM);
+            let mut sc = 0f32;
+            let mut h = 0;
+            while h < INDEX_N_HEADS {
+                let qh = q.add(h * INDEX_HEAD_DIM);
+                let mut d = 0f32;
+                let mut c = 0;
+                while c < INDEX_HEAD_DIM {
+                    d += *qh.add(c) * *key.add(c);
+                    c += 1;
+                }
+                let d = d * scale;
+                sc += (*iw.add(h) * wscale) * if d > 0.0 { d } else { 0.0 };
+                h += 1;
+            }
+            *score.add(i * stride as usize + j) = sc;
         }
     }
     const _: () = assert!(V_HEAD_DIM % 8 == 0 && KV_LORA_RANK % 256 == 0 && Q_HEAD <= 256);

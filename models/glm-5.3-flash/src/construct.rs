@@ -806,8 +806,15 @@ pub trait Placed {
     /// The early router's logits (`[E]`) of a one-token step.
     fn early_logits(&mut self, l: usize, logits: &mut [f32]);
     fn mla_post(&mut self, l: usize, n: usize);
-    /// Token `i`'s projections of the step (the launch waited for at `i == 0`).
-    fn mla_wait(&mut self, l: usize, i: usize, kva: &mut [f32], ik: &mut [f32], igate: &mut [f32], iq: &mut [f32], iw: &mut [f32]);
+    /// Token `i`'s projections of the step (the launch waited for at `i == 0`): the latent before its
+    /// norm, the indexer's key before its norm, the position's gate.
+    fn mla_wait(&mut self, l: usize, i: usize, kva: &mut [f32], ik: &mut [f32], igate: &mut [f32]);
+    /// The pool keys `from..to` into the card's mirror (every pool completed, by a step or a seed, goes
+    /// there before any token scores among them).
+    fn ix_pools(&mut self, l: usize, pools: &[f32], from: usize, to: usize);
+    /// The indexer's scores of every token's complete pools (`scores: [n][stride]`, `mla::score_pools`'s
+    /// values) on the card, from the mirrored pools.
+    fn ix_scores(&mut self, l: usize, pos: usize, n: usize, scores: &mut [f32], stride: usize);
     /// The step's `n` tokens (at `pos..`) attend over their selections (`sels: [n][DENSE_BELOW]`,
     /// `counts[i]` positions each), one launch; their latents (`[n][KV_LORA_RANK]`) into the mirror first.
     fn mla_attend(&mut self, l: usize, n: usize, pos: usize, latents: &[f32], sels: &[usize], counts: &[usize]);
@@ -952,8 +959,6 @@ pub struct CpuModel<'p, R: Routed> {
     m_pidx: Vec<u32>,
     m_sel: Vec<usize>,
     // a step's MLA selection, a token a row: indexer queries, head weights, pool scores, the pick's scratch, the selections and their lengths
-    b_iq: Vec<f32>,
-    b_iw: Vec<f32>,
     b_pscore: Vec<f32>,
     b_pidx: Vec<u32>,
     b_sel: Vec<usize>,
@@ -1019,8 +1024,6 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             m_pscore: vec![0.0; max_ctx.div_ceil(INDEX_KPOOL) + 1],
             m_pidx: vec![0; max_ctx.div_ceil(INDEX_KPOOL) + 1],
             m_sel: vec![0; DENSE_BELOW],
-            b_iq: vec![0.0; STEP * INDEX_N_HEADS * INDEX_HEAD_DIM],
-            b_iw: vec![0.0; STEP * INDEX_N_HEADS],
             b_pscore: vec![0.0; STEP * max_ctx.div_ceil(INDEX_KPOOL)],
             b_pidx: vec![0; STEP * max_ctx.div_ceil(INDEX_KPOOL)],
             b_sel: vec![0; STEP * DENSE_BELOW],
@@ -1088,6 +1091,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                         for p in 0..n {
                             pl.mla_seed(l, p, &cache[p * MLA_ROW..p * MLA_ROW + KV_LORA_RANK]);
                         }
+                        pl.ix_pools(l, pools, 0, n / INDEX_KPOOL);
                     }
                     mi += 1;
                 }
@@ -1287,34 +1291,24 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             }
             lap(&mut p.slot);
             if let (Attn::Mla(a), LayerState::Mla { cache, pools }) = (&lw.attn, &mut s.layers[l]) {
-                const IQ: usize = INDEX_N_HEADS * INDEX_HEAD_DIM;
                 let npools = s.max_ctx.div_ceil(INDEX_KPOOL);
                 // every token's projections off the card into its cache row, its indexer query and head
                 // weights kept; the pools completed along the way gain their keys
                 for i in 0..n {
                     let (latent, ikey, igate) = mla::row(cache, pos + i);
-                    let (iq, iw) = (&mut s.b_iq[i * IQ..(i + 1) * IQ], &mut s.b_iw[i * INDEX_N_HEADS..(i + 1) * INDEX_N_HEADS]);
-                    pl.mla_wait(l, i, &mut s.m_kva, &mut s.m_ik, igate, iq, iw);
+                    pl.mla_wait(l, i, &mut s.m_kva, &mut s.m_ik, igate);
                     mla::finish_row(a, &s.m_kva, &s.m_ik, latent, ikey);
-                    mla::head_scale(iw);
                     mla::pool_done(a, cache, pools, pos + i);
                 }
                 lap(&mut p.mla_proj);
-                // every token's selection: the pools scored in blocks over the thread pool (a token's pools
-                // are independent, as are the tokens'), then each token's picks — the one-token path had
-                // scored and picked on one thread, 150 ms a token at 17k positions (2026-10-17)
-                let blocks = ((pos + n) / INDEX_KPOOL).div_ceil(mla::SCORE_BLOCK);
+                // every token's selection: the pools scored on the card (this step's completed pools mirrored
+                // first), each token's picks over the thread pool — the one-token path had scored and picked on
+                // one thread, 150 ms a token at 17k positions (2026-10-17)
+                pl.ix_pools(l, pools, pos / INDEX_KPOOL, (pos + n) / INDEX_KPOOL);
+                if mla::selects(pos + n - 1) {
+                    pl.ix_scores(l, pos, n, &mut s.b_pscore, npools);
+                }
                 {
-                    let (iq, iw, pools_r) = (&s.b_iq, &s.b_iw, &*pools);
-                    let ps_p = s.b_pscore.as_mut_ptr() as usize;
-                    s.pool.run(n * blocks, &move |it| {
-                        let (i, b) = (it / blocks, it % blocks);
-                        let (j0, visible) = (b * mla::SCORE_BLOCK, (pos + i + 1) / INDEX_KPOOL);
-                        if mla::selects(pos + i) && j0 < visible {
-                            let pscore = unsafe { std::slice::from_raw_parts_mut((ps_p as *mut f32).add(i * npools), npools) };
-                            mla::score_pools(&iq[i * IQ..(i + 1) * IQ], &iw[i * INDEX_N_HEADS..(i + 1) * INDEX_N_HEADS], pools_r, j0, (j0 + mla::SCORE_BLOCK).min(visible), pscore);
-                        }
-                    });
                     let (pscore, pidx_p, sel_p, seln_p) = (&s.b_pscore, s.b_pidx.as_mut_ptr() as usize, s.b_sel.as_mut_ptr() as usize, s.b_seln.as_mut_ptr() as usize);
                     s.pool.run(n, &move |i| unsafe {
                         let pidx = std::slice::from_raw_parts_mut((pidx_p as *mut u32).add(i * npools), npools);
