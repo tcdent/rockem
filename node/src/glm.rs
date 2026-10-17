@@ -39,6 +39,11 @@ impl Trace for DebugTrace {
 
 pub struct Glm {
     pool: &'static Threads,
+    experts: &'static glm_5_3_flash::expert::Stream<'static>,
+    /// Serving's expert runs since the last re-placement: each node's items and run ends, and the tokens.
+    train: ([usize; 8], [f64; 8], usize),
+    /// The profile's token count already folded into `train`.
+    train_seen: usize,
     /// `rockem.profile=N`: a line of the token's time by phase every N tokens (0: never).
     profile_every: usize,
     w: Weights<'static>,
@@ -57,7 +62,7 @@ impl Glm {
         let dense = loader::load(&bundle.join(layout::DENSE_FILE), mem);
         // the experts, placed equally first; the pool then measures where each node ends its runs
         // and the items move so every node ends at once (below, once the pool is up)
-        let mut stream = loader::load_placed(&bundle.join(layout::EXPERTS_FILE), mem, &layout::placement(&vec![1.0; glm_5_3_flash::construct::node_count() as usize]));
+        let stream = loader::load_placed(&bundle.join(layout::EXPERTS_FILE), mem, &layout::placement(&vec![1.0; glm_5_3_flash::construct::node_count() as usize]));
         println!("bundle   : {} loaded in {:.1}s ({:.1} GB)", bundle.display(), t0.elapsed().as_secs_f32(), (dense.len() + stream.bytes.len()) as f64 / 1e9);
         let w = Weights::from_dense(dense);
         let prefix_b = loader::load(&bundle.join(layout::PREFIX_FILE), loader::Mem::Anon);
@@ -76,17 +81,14 @@ impl Glm {
         }
         let used: Vec<String> = by_node.iter().filter(|&&n| n > 0).map(|&n| format!("{:.1}", n as f64 * 2.0 / 1024.0)).collect();
         println!("threads  : {} pinned, one per physical core; the weights' 2 MiB pages by node: {} GB", cores.len(), used.join(" / "));
-        // the placement trained on the pool itself: the rates its nodes show on real expert runs
-        if stream.regions.len() > 1 {
-            let t2 = std::time::Instant::now();
-            let rates = calibrate(&stream, pool, 24);
-            let total: f64 = rates.iter().sum();
-            let (moved, bytes) = stream.migrate(&layout::placement_from(&stream.node, &rates));
-            let after = calibrate(&stream, pool, 24);
-            let fmt = |v: &[f64]| v.iter().map(|r| format!("{r:.0}")).collect::<Vec<_>>().join(" / ");
-            println!("placement: the pool's node rates {} items/ms → shares {} %; {moved} items ({:.1} GB) moved in {:.1} s; after: {} items/ms", fmt(&rates), rates.iter().map(|r| format!("{:.1}", 100.0 * r / total)).collect::<Vec<_>>().join(" / "), bytes as f64 / 1e9, t2.elapsed().as_secs_f64(), fmt(&after));
-        }
         let experts: &'static glm_5_3_flash::expert::Stream<'static> = Box::leak(Box::new(stream));
+        // the placement trained on the pool itself: the rates its nodes show on real expert runs, at
+        // start on random picks (below), then on serving's own runs between requests (`retrain`)
+        if experts.nodes() > 1 {
+            let rates = calibrate(experts, pool, 24);
+            let r = place(experts, &rates, None);
+            println!("placement: at start, {r}");
+        }
         let mut model = CpuModel::new(CpuExperts::new(experts, pool), pool, max_ctx);
         if gpu {
             // the KDA layers on the cards, split by layer order between them; everything else here
@@ -115,6 +117,9 @@ impl Glm {
         model.profile = Default::default();
         Box::new(Glm {
             pool,
+            experts,
+            train: ([0; 8], [0.0; 8], 0),
+            train_seen: 0,
             profile_every,
             w,
             model,
@@ -124,6 +129,36 @@ impl Glm {
             last_pos: 0,
             dtr: DebugTrace { tok: 0, layers: vec![0.0; TOKENS * NUM_HIDDEN_LAYERS * H], topk: vec![0; TOKENS * NUM_HIDDEN_LAYERS * TOP_K] },
         })
+    }
+    /// Fold the profile's per-node run ends into the training accumulators.
+    fn take_training(&mut self) {
+        let p = &mut self.model.profile;
+        for d in 0..8 {
+            self.train.0[d] += p.node_items[d];
+            self.train.1[d] += p.node_end[d];
+            p.node_items[d] = 0;
+            p.node_end[d] = 0.0;
+        }
+        self.train.2 += p.tokens - self.train_seen;
+        self.train_seen = p.tokens;
+    }
+    /// Between requests: re-place the experts from serving's own run ends when a node ends its runs
+    /// later than the others by more than the grain of an item — the placement trained on traffic.
+    fn retrain(&mut self) {
+        self.take_training();
+        self.train_seen = self.model.profile.tokens;
+        let (items, ends, tokens) = self.train;
+        if tokens < 32 || self.experts.nodes() < 2 {
+            return;
+        }
+        let nodes = self.experts.nodes();
+        let rates: Vec<f64> = (0..nodes).map(|d| items[d] as f64 / (1e3 * ends[d]).max(1e-9f64)).collect();
+        let (lo, hi) = ends[..nodes].iter().fold((f64::MAX, 0f64), |(lo, hi), &e| (lo.min(e), hi.max(e)));
+        if hi > lo * 1.02 {
+            let r = place(self.experts, &rates, Some(&mut self.model.routed));
+            println!("placement: after {tokens} tokens, {r}");
+        }
+        self.train = ([0; 8], [0.0; 8], 0);
     }
 }
 
@@ -183,6 +218,7 @@ impl Engine for Glm {
             }
             let c = self.model.coverage(&[8, 16, 32, 64]);
             println!("experts  : since start, a layer's 8 / 16 / 32 / 64 most-picked experts took {:.0} / {:.0} / {:.0} / {:.0} % of its picks", 100.0 * c[0], 100.0 * c[1], 100.0 * c[2], 100.0 * c[3]);
+            self.take_training();
             self.model.profile = Default::default();
         }
     }
@@ -202,6 +238,7 @@ impl Engine for Glm {
         common::softmax::log_prob(&self.prefix_logits, id as usize)
     }
     fn idle(&mut self) {
+        self.retrain();
         self.pool.idle()
     }
     fn trace(&mut self, i: usize) -> (&[f32], &[u32], &[f32]) {
@@ -212,9 +249,28 @@ impl Engine for Glm {
 
 const _: () = assert!(Sampling::GREEDY.top_k == 1);
 
+/// Re-place the stream's items by `rates` with the fewest moves; `routed` (serving's experts, if
+/// any) relearns its slices' nodes. Returns the line to log.
+fn place(experts: &'static glm_5_3_flash::expert::Stream<'static>, rates: &[f64], routed: Option<&mut CpuExperts<'static>>) -> String {
+    let t0 = std::time::Instant::now();
+    let total: f64 = rates.iter().sum();
+    let fmt = |v: &[f64]| v.iter().map(|r| format!("{r:.0}")).collect::<Vec<_>>().join(" / ");
+    let shares = rates.iter().map(|r| format!("{:.1}", 100.0 * r / total)).collect::<Vec<_>>().join(" / ");
+    let new = layout::placement_from(&experts.node_of_items(), rates);
+    match experts.migrate(&new) {
+        Ok((moved, bytes)) => {
+            if let Some(r) = routed {
+                r.relearn();
+            }
+            format!("node rates {} items/ms → shares {shares} %: {moved} items ({:.2} GB) moved in {:.2} s", fmt(rates), bytes as f64 / 1e9, t0.elapsed().as_secs_f64())
+        }
+        Err(d) => format!("node rates {} items/ms → shares {shares} %: node {d}'s region has no room; placement kept", fmt(rates)),
+    }
+}
+
 /// Each node's rate on real expert runs (items a ms): `tokens` tokens' worth of MoE layers with
 /// random picks and a random input through the pool, the ends read from it.
-fn calibrate(stream: &glm_5_3_flash::expert::Stream, pool: &'static Threads, tokens: usize) -> Vec<f64> {
+fn calibrate(stream: &'static glm_5_3_flash::expert::Stream<'static>, pool: &'static Threads, tokens: usize) -> Vec<f64> {
     use common::pool::Pool;
     use glm_5_3_flash::ffn::Routed;
     use glm_5_3_flash::{E, FIRST_K_DENSE_REPLACE};
@@ -244,5 +300,5 @@ fn calibrate(stream: &glm_5_3_flash::expert::Stream, pool: &'static Threads, tok
         }
     }
     let (items, ends) = pool.node_ends();
-    (0..stream.regions.len()).map(|d| items[d] as f64 / (1e3 * ends[d]).max(1e-9f64)).collect()
+    (0..stream.nodes()).map(|d| items[d] as f64 / (1e3 * ends[d]).max(1e-9f64)).collect()
 }

@@ -442,6 +442,13 @@ use crate::layout::{DOWN_CHUNK, DOWN_ITEMS, GU_CHUNK as CHUNK, GU_ITEMS};
 impl<'a> CpuExperts<'a> {
     pub fn new(stream: &'a expert::Stream<'a>, pool: &'a dyn Pool) -> Self {
         use common::q4::GROUP;
+        let mut this = CpuExperts { stream, pool, slice_node: Vec::new(), xq: vec![0; H], xs: vec![0.0; H / GROUP], xg: vec![0; H / GROUP], h: vec![0.0; TOP_K * D_FF], elapsed: 0.0 };
+        this.relearn();
+        this
+    }
+    /// The slices' nodes read again from the placement: after the stream's items were re-placed.
+    pub fn relearn(&mut self) {
+        let (stream, pool) = (self.stream, self.pool);
         let mut slice_node = Vec::with_capacity(layout::MOE_LAYERS * E * (GU_ITEMS + DOWN_ITEMS));
         for l in FIRST_K_DENSE_REPLACE..NUM_HIDDEN_LAYERS {
             for e in 0..E {
@@ -454,7 +461,7 @@ impl<'a> CpuExperts<'a> {
                 }
             }
         }
-        CpuExperts { stream, pool, slice_node, xq: vec![0; H], xs: vec![0.0; H / GROUP], xg: vec![0; H / GROUP], h: vec![0.0; TOP_K * D_FF], elapsed: 0.0 }
+        self.slice_node = slice_node;
     }
     /// The node of slice `j` (gate/up slices first, then down) of expert `e` of layer `l`.
     fn slice_node(&self, l: usize, e: usize, j: usize) -> usize {

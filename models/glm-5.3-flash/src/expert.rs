@@ -19,12 +19,14 @@ use common::swiglu::swiglu_clamped;
 pub struct Stream<'a> {
     pub bytes: &'a [u8],
     /// Byte offset in `bytes` of every item, `[MOE_LAYERS][E][ITEMS]` (gate/up items, then down).
-    pub addr: std::vec::Vec<u64>,
+    /// Atomics (relaxed; free to read) so `migrate` can retrain the placement on a shared stream
+    /// between runs — the caller sees to it that no run is in flight.
+    pub addr: std::vec::Vec<core::sync::atomic::AtomicU64>,
     /// The node of every item, as placed.
-    pub node: std::vec::Vec<u8>,
+    pub node: std::vec::Vec<core::sync::atomic::AtomicU8>,
     /// A placed stream's regions, one a node: where it starts in `bytes`, its capacity, and the
     /// bytes used — items moved to a node by `migrate` go at the end of its region.
-    pub regions: std::vec::Vec<Region>,
+    pub regions: std::sync::Mutex<std::vec::Vec<Region>>,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct Region {
@@ -52,13 +54,22 @@ impl<'a> Stream<'a> {
                 }
             }
         }
-        Stream { bytes, addr, node: std::vec![0; layout::MOE_LAYERS * crate::E * ITEMS], regions: std::vec::Vec::new() }
+        Self::placed(bytes, addr, std::vec![0; layout::MOE_LAYERS * crate::E * ITEMS], std::vec::Vec::new())
     }
     /// A placed copy: the loader's regions, with the table it filled.
     pub fn placed(bytes: &'a [u8], addr: std::vec::Vec<u64>, node: std::vec::Vec<u8>, regions: std::vec::Vec<Region>) -> Self {
+        use core::sync::atomic::{AtomicU64, AtomicU8};
         assert_eq!(addr.len(), layout::MOE_LAYERS * crate::E * ITEMS);
         assert_eq!(node.len(), addr.len());
-        Stream { bytes, addr, node, regions }
+        Stream { bytes, addr: addr.into_iter().map(AtomicU64::new).collect(), node: node.into_iter().map(AtomicU8::new).collect(), regions: std::sync::Mutex::new(regions) }
+    }
+    /// How many regions (nodes) the stream is placed over; 0 for the file's own layout.
+    pub fn nodes(&self) -> usize {
+        self.regions.lock().unwrap().len()
+    }
+    /// The node of every item, a copy.
+    pub fn node_of_items(&self) -> std::vec::Vec<u8> {
+        self.node.iter().map(|n| n.load(core::sync::atomic::Ordering::Relaxed)).collect()
     }
     #[inline(always)]
     pub const fn item_len(j: usize) -> usize {
@@ -66,25 +77,33 @@ impl<'a> Stream<'a> {
     }
     /// Re-place the items: every item whose node differs in `node` is copied to the end of its new
     /// node's region and the table points there (the old copy stays, dead). Returns (items moved,
-    /// bytes). The caller owns the mapping behind `bytes` and nothing reads it meanwhile.
-    pub fn migrate(&mut self, node: &[u8]) -> (usize, usize) {
+    /// bytes), or the node whose region has no room — then nothing is changed. No run may be in
+    /// flight: the table changes under the readers' feet.
+    pub fn migrate(&self, node: &[u8]) -> Result<(usize, usize), usize> {
+        use core::sync::atomic::Ordering::Relaxed;
         assert_eq!(node.len(), self.node.len());
         let base = self.bytes.as_ptr() as usize;
-        let nodes = self.regions.len();
+        let mut regions = self.regions.lock().unwrap();
+        let nodes = regions.len();
         // the moves by destination node, then one thread a destination copies them in order
         let mut moves: std::vec::Vec<std::vec::Vec<usize>> = std::vec![std::vec::Vec::new(); nodes];
         for i in 0..node.len() {
-            if node[i] != self.node[i] {
+            if node[i] != self.node[i].load(Relaxed) {
                 moves[node[i] as usize].push(i);
+            }
+        }
+        for (d, list) in moves.iter().enumerate() {
+            let need: usize = list.iter().map(|&i| Self::item_len(i % ITEMS)).sum();
+            if regions[d].used + need > regions[d].cap {
+                return Err(d);
             }
         }
         let (mut n_moved, mut b_moved) = (0, 0);
         let mut dst_of = std::vec![0u64; node.len()];
         for (d, list) in moves.iter().enumerate() {
-            let r = &mut self.regions[d];
+            let r = &mut regions[d];
             for &i in list {
                 let len = Self::item_len(i % ITEMS);
-                assert!(r.used + len <= r.cap, "node {d}'s region is full: {} moves of {} bytes into {} spare", list.len(), len, r.cap - r.used);
                 dst_of[i] = (r.base + r.used) as u64;
                 r.used += len;
                 n_moved += 1;
@@ -97,18 +116,20 @@ impl<'a> Stream<'a> {
                 sc.spawn(move || {
                     for &i in list {
                         let len = Self::item_len(i % ITEMS);
-                        unsafe { core::ptr::copy_nonoverlapping((base + addr[i] as usize) as *const u8, (base + dst_of[i] as usize) as *mut u8, len) };
+                        unsafe { core::ptr::copy_nonoverlapping((base + addr[i].load(Relaxed) as usize) as *const u8, (base + dst_of[i] as usize) as *mut u8, len) };
                     }
                 });
             }
         });
         for list in &moves {
             for &i in list {
-                self.addr[i] = dst_of[i];
+                self.addr[i].store(dst_of[i], Relaxed);
             }
         }
-        self.node.copy_from_slice(node);
-        (n_moved, b_moved)
+        for (i, &n) in node.iter().enumerate() {
+            self.node[i].store(n, Relaxed);
+        }
+        Ok((n_moved, b_moved))
     }
 }
 
@@ -147,12 +168,12 @@ impl<'a> Weights<'a> {
     /// The item's bytes, for a core to pull through its caches.
     #[inline(always)]
     pub fn gu_bytes(&self, c: usize) -> &'a [u8] {
-        let a = self.stream.addr[item_index(self.l, self.e, c)] as usize;
+        let a = self.stream.addr[item_index(self.l, self.e, c)].load(core::sync::atomic::Ordering::Relaxed) as usize;
         &self.stream.bytes[a..a + layout::GU_ITEM]
     }
     #[inline(always)]
     pub fn down_bytes(&self, c: usize) -> &'a [u8] {
-        let a = self.stream.addr[item_index(self.l, self.e, GU_ITEMS + c)] as usize;
+        let a = self.stream.addr[item_index(self.l, self.e, GU_ITEMS + c)].load(core::sync::atomic::Ordering::Relaxed) as usize;
         &self.stream.bytes[a..a + layout::DOWN_ITEM]
     }
 }
