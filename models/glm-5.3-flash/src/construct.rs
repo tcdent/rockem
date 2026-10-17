@@ -771,7 +771,8 @@ impl Routed for CpuExperts<'_> {
 /// posted with `attention` (a KDA layer) or `mla_post`, `mla_wait`,
 /// `mla_attend` (an MLA layer, the host selecting the positions between);
 /// `early_logits` reads the FFN router run early on the attention block's
-/// input (the prefetch's predictor); `ffn` posts the FFN half, which for a
+/// input (the prefetch's predictor, a one-token step's: a step of many tokens
+/// names most experts and runs no early router); `ffn` posts the FFN half, which for a
 /// MoE layer collapses the block input to the host (`ffn_input`) and folds
 /// the routed experts the host computes (`ffn_routed`) into the streams with
 /// the shared expert's rows; `logits` is the head over the streams' mean.
@@ -782,8 +783,8 @@ pub trait Placed {
     /// The step's `n` tokens' embeddings (`[n][H]`) into every card's streams; the handoffs restart.
     fn begin(&mut self, rows: &[f32], n: usize);
     fn attention(&mut self, l: usize, n: usize);
-    /// The early router's logits for every token of the step, `[n][E]`.
-    fn early_logits(&mut self, l: usize, n: usize, logits: &mut [f32]);
+    /// The early router's logits (`[E]`) of a one-token step.
+    fn early_logits(&mut self, l: usize, logits: &mut [f32]);
     fn mla_post(&mut self, l: usize, n: usize);
     /// Token `i`'s projections of the step (the launch waited for at `i == 0`).
     fn mla_wait(&mut self, l: usize, i: usize, kva: &mut [f32], ik: &mut [f32], igate: &mut [f32], iq: &mut [f32], iw: &mut [f32]);
@@ -1237,16 +1238,13 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             }
             lap(&mut p.hc);
             // the prefetch's predictor: the FFN router over the attention block's input, read as soon as it
-            // is there; a step of many tokens names most experts, so only a token's worth is prefetched
+            // is there; a step of many tokens names most experts and runs none
             let mut pre_picks = [E; TOP_K];
-            if let Some(m) = moe {
-                pl.early_logits(l, n, &mut s.b_score);
+            if let (Some(m), 1) = (moe, n) {
+                pl.early_logits(l, &mut s.f_score);
                 lap(&mut p.early);
-                if n == 1 {
-                    s.f_score.copy_from_slice(&s.b_score[..E]);
-                    pre_picks = ffn::picks(m, &mut s.f_score);
-                    s.routed.prefetch(l, pre_picks);
-                }
+                pre_picks = ffn::picks(m, &mut s.f_score);
+                s.routed.prefetch(l, pre_picks);
             }
             lap(&mut p.slot);
             if let (Attn::Mla(a), LayerState::Mla { cache, pools }) = (&lw.attn, &mut s.layers[l]) {
@@ -1270,34 +1268,45 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             if let Some(m) = moe {
                 pl.ffn_input(l, n, &mut s.b_x, &mut s.b_score);
                 lap(&mut p.kda_card);
-                // every token's picks and weights from the card's router logits; the step's experts as one grouped run
+                // every token's norm, picks and weights from the card's router logits, a token an item over
+                // the pool (one token runs inline); the step's experts as one grouped run
                 let mut picks = [[0usize; TOP_K]; STEP];
                 let mut wts = [[0f32; TOP_K]; STEP];
-                for i in 0..n {
-                    rmsnorm::<H>(&s.b_x[i * H..(i + 1) * H], &lw.post_ln, RMS_NORM_EPS, &mut s.b_xn[i * H..(i + 1) * H]);
-                    if n == 1 {
-                        tr.edge(l, "ffn_in", &s.b_xn[..H]);
-                    }
-                    let mut fs = ffn::Scratch { gu: &mut s.f_gu, h: &mut s.f_h, expert_out: &mut s.f_expert_out, shared: &mut s.f_shared, score: &mut s.b_score[i * E..(i + 1) * E] };
-                    let (idx, wt) = ffn::route_logits(l, m, &mut fs, forced.map(|f| &f[l - FIRST_K_DENSE_REPLACE]), tr);
-                    picks[i] = idx;
-                    wts[i] = wt;
-                }
-                s.routed.run_batch(l, &picks[..n], &s.b_xn[..n * H], &mut s.b_out[..n * TOP_K * H]);
-                for i in 0..n {
-                    let y = &mut s.b_y[i * H..(i + 1) * H];
-                    y.fill(0.0);
-                    for k in 0..TOP_K {
-                        let eo = &s.b_out[(i * TOP_K + k) * H..(i * TOP_K + k + 1) * H];
-                        if n == 1 {
-                            tr.routed(l, k, eo);
-                        }
-                        for d in 0..H {
-                            y[d] += wts[i][k] * eo[d];
-                        }
-                    }
+                {
+                    let (xn_p, sc_p, pk_p, wt_p) = (s.b_xn.as_mut_ptr() as usize, s.b_score.as_mut_ptr() as usize, picks.as_mut_ptr() as usize, wts.as_mut_ptr() as usize);
+                    let (x, post_ln, forced_l) = (&s.b_x, lw.post_ln, forced.map(|f| &f[l - FIRST_K_DENSE_REPLACE]));
+                    s.pool.run(n, &move |i| unsafe {
+                        let xn = std::slice::from_raw_parts_mut((xn_p as *mut f32).add(i * H), H);
+                        rmsnorm::<H>(&x[i * H..(i + 1) * H], post_ln, RMS_NORM_EPS, xn);
+                        let score = std::slice::from_raw_parts_mut((sc_p as *mut f32).add(i * E), E);
+                        let (idx, wt) = ffn::route_scores(m, score, forced_l);
+                        *(pk_p as *mut [usize; TOP_K]).add(i) = idx;
+                        *(wt_p as *mut [f32; TOP_K]).add(i) = wt;
+                    });
                 }
                 if n == 1 {
+                    tr.edge(l, "ffn_in", &s.b_xn[..H]);
+                    tr.topk(l, &picks[0], &wts[0]);
+                }
+                s.routed.run_batch(l, &picks[..n], &s.b_xn[..n * H], &mut s.b_out[..n * TOP_K * H]);
+                // each token's weighted sum of its experts' outputs, likewise
+                {
+                    let (y_p, out, wts_r) = (s.b_y.as_mut_ptr() as usize, &s.b_out, &wts);
+                    s.pool.run(n, &move |i| {
+                        let y = unsafe { std::slice::from_raw_parts_mut((y_p as *mut f32).add(i * H), H) };
+                        y.fill(0.0);
+                        for k in 0..TOP_K {
+                            let eo = &out[(i * TOP_K + k) * H..(i * TOP_K + k + 1) * H];
+                            for d in 0..H {
+                                y[d] += wts_r[i][k] * eo[d];
+                            }
+                        }
+                    });
+                }
+                if n == 1 {
+                    for k in 0..TOP_K {
+                        tr.routed(l, k, &s.b_out[k * H..(k + 1) * H]);
+                    }
                     tr.edge(l, "routed", &s.b_y[..H]);
                 }
                 pl.ffn_routed(l, n, &s.b_y[..n * H]);

@@ -64,7 +64,7 @@ pub const TOKENS: usize = common::gemv::TOKENS;
 /// Tokens a prefill step takes at most: the card's buffers are this deep, the rows kernels run it in
 /// passes of `TOKENS`, the KDA step loops it in the kernel, the host's experts group it by expert
 /// (tcdent 2026-10-16: 128 first, the sweet spot to be found).
-pub const STEP: usize = 128;
+pub const STEP: usize = 256;
 
 pub mod expert;
 pub mod ffn;

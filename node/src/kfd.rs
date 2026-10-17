@@ -294,6 +294,8 @@ pub struct Kfd {
     /// This card's place among the gfx1100 cards, in topology order.
     pub index: usize,
     pub visible_vram: usize,
+    /// The card's compute units: what a launch that needs its whole grid resident is sized against.
+    pub cu: usize,
     ring: Mem,
     queue: Mem, // AmdQueue
     kernargs: Mem,
@@ -380,6 +382,7 @@ impl Kfd {
             gpu_id,
             index,
             visible_vram,
+            cu: 0,
             ring: Mem { va: 0, size: 0, handle: 0 },
             queue: Mem { va: 0, size: 0, handle: 0 },
             kernargs: Mem { va: 0, size: 0, handle: 0 },
@@ -419,6 +422,7 @@ impl Kfd {
         let cwsr_size = sysfs_prop(&props, "cwsr_size ") as usize;
         let ctl_stack = sysfs_prop(&props, "ctl_stack_size ") as u32;
         let cu = (sysfs_prop(&props, "simd_count ") / sysfs_prop(&props, "simd_per_cu ").max(1)) as usize;
+        k.cu = cu;
         let debug = (cu * 32 * 32 + 63) & !63;
         let cwsr = k.alloc(cwsr_size + debug, MEM_GTT | MEM_COHERENT | MEM_WRITABLE | MEM_EXECUTABLE, true, cwsr_size + debug);
         unsafe {

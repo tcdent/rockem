@@ -10,6 +10,7 @@
 //!                                     the checkpoint's unquantized experts — what separates the recipe's cost from a kernel error
 //!               [--positions N]       stop after N computed positions
 //!               [--step N]            with --gpu: the positions again in steps of N tokens, bit for bit the single tokens'
+//!               [--step-ids <file>]   the step gate over these ids (the model's prefix first, then any text's: longer than the goldens)
 //!               [--gpu]               with --cpu: the blocks on the gfx1100 cards (node/src/glm_kfd.rs), the bundle's code object
 //!               [--force-picks]   every MoE layer takes the oracle's expert picks (weights still its own): separates tie flips from the rest
 //!               [--detail 1e-3]   also print every row past this relative error, and every position whose picks differ
@@ -190,6 +191,9 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
     use glm_5_3_flash::layout;
     assert_eq!(layers, NUM_HIDDEN_LAYERS, "--cpu runs every layer: the realization has no partial forward");
     let n = ids.len();
+    // --step-ids: the step gate's own ids, for steps longer than the goldens' positions
+    let step_ids: Option<Vec<usize>> = arg("--step-ids").map(|f| std::fs::read_to_string(&f).unwrap_or_else(|e| panic!("{}: {e}", f.to_string_lossy())).split_whitespace().map(|t| t.parse().unwrap()).collect());
+    let ctx = n.max(step_ids.as_ref().map_or(0, Vec::len)).max(FIRST_POS + 1);
     let map = |name: &str| -> memmap2::Mmap {
         let f = std::fs::File::open(bundle.join(name)).unwrap_or_else(|e| panic!("{}: {e}", bundle.join(name).display()));
         unsafe { memmap2::Mmap::map(&f).unwrap() }
@@ -208,10 +212,10 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
         "f32" => Box::new(F32Experts { get: Box::new(move |l, e| { let x = load_expert(l, e, &|n| ck.f32s(n)); (x.gate_up, x.down) }) }),
         m => panic!("--experts {m}: a8, q4f32 or f32"),
     };
-    let mut model = CpuModel::new(routed, &pool, n.max(FIRST_POS + 1));
+    let mut model = CpuModel::new(routed, &pool, ctx);
     if harness::flag("--gpu") {
         let elf = std::fs::read(bundle.join(layout::KERNELS_FILE)).unwrap_or_else(|e| panic!("{}: {e}", bundle.join(layout::KERNELS_FILE).display()));
-        model.placed = Some(Box::new(glm_kfd::Cards::new(&elf, &w, n.max(FIRST_POS + 1), false)));
+        model.placed = Some(Box::new(glm_kfd::Cards::new(&elf, &w, ctx, false)));
     }
     model.seed_prefix(&w, &prefix);
     for (t, &id) in ids.iter().enumerate().take(FIRST_POS) {
@@ -270,6 +274,13 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
     let step_gate = if let Some(st) = arg("--step") {
         let st: usize = st.to_str().unwrap().parse().unwrap();
         assert!(model.placed.is_some() && st > 1, "--step needs --gpu and a step of two or more");
+        let (ids, n) = match &step_ids {
+            Some(s) => {
+                assert!(s.len() > FIRST_POS && s[..FIRST_POS].iter().zip(PREFIX_IDS).all(|(&a, b)| a as u32 == b), "--step-ids must start with the model's prefix");
+                (&s[..], s.len())
+            }
+            None => (ids, n),
+        };
         let position = glm_5_3_flash::layout::POSITION;
         let snap_len = glm_5_3_flash::layout::SNAPSHOT;
         let run = |model: &mut CpuModel<_>, step: usize| -> (Vec<f32>, Vec<f32>, Vec<f32>) {
@@ -303,6 +314,14 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
         let (dl, dr, ds) = (diff(&lg1, &lg2), diff(&rows1, &rows2), diff(&snap1, &snap2));
         let maxd = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
         println!("step gate: {} positions a token at a time in {t1:.1} s, in steps of {st} in {t2:.1} s ({:.1}×); differing f32s — logits {dl} (max {:.2e}), rows {dr} (max {:.2e}), state {ds} (max {:.2e})", n - FIRST_POS, t1 / t2, maxd(&lg1, &lg2), maxd(&rows1, &rows2), maxd(&snap1, &snap2));
+        if dr > 0 {
+            // where it starts: the first position with a differing row, and how many of its floats differ
+            let first = rows1.iter().zip(&rows2).position(|(x, y)| x.to_bits() != y.to_bits()).unwrap();
+            let p = first / position;
+            let in_row = rows1[p * position..(p + 1) * position].iter().zip(&rows2[p * position..(p + 1) * position]).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+            let positions_differing = (FIRST_POS..n).filter(|&q| rows1[q * position..(q + 1) * position].iter().zip(&rows2[q * position..(q + 1) * position]).any(|(x, y)| x.to_bits() != y.to_bits())).count();
+            println!("step gate: rows first differ at position {p} (float {} of the row, {in_row} of {position} in it); {positions_differing} positions differ", first % position);
+        }
         dl + dr + ds == 0
     } else {
         true

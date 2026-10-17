@@ -90,7 +90,7 @@ struct Card {
     mqa: Mem,    // [STEP][Q_LORA_RANK] f32: q_a's output, the input of q_b and the indexer's query
     mq: Mem,     // [STEP][MLA_HEADS·Q_HEAD] f32: the query, the attention's input
     mproj: Mem,  // host memory: kva [STEP][KV_LORA_RANK] | ix [STEP][IX_ROWS] | iq [STEP][INDEX_N_HEADS·INDEX_HEAD_DIM]
-    msel: Mem,   // [DENSE_BELOW] u32, host-visible: the positions a token attends
+    msel: Mem,   // [STEP][DENSE_BELOW] u32, host-visible: the positions each token of the step attends (a list a token: the launch reading one is queued when the next is uploaded)
     mheads: Mem, // [STEP][O_IN] f32: the heads' outputs, the output projection's input
 }
 /// Host memory every card and the host see (`Kfd::host_shared`): what one produces and
@@ -103,7 +103,7 @@ struct Shared {
     my: [Mem; 2],  // [STEP][H] f32: the MLA card's output projection
     yexp: [Mem; 2], // [STEP][H] f32: the host's routed experts
     xh: Mem,       // [STEP][H] f32: a MoE layer's FFN input for the host
-    scores: Mem,   // [STEP][E] f32: the early router's logits for the host
+    scores: Mem,   // [E] f32: the early router's logits for the host (a one-token step's)
     scores_ffn: Mem, // [STEP][E] f32: the FFN half's router over its input, for the host's picks
     words: Mem,    // the handoff words, a cache line each: `word()`
 }
@@ -264,13 +264,18 @@ impl Cards {
                     mqa: alloc(STEP * Q_LORA_RANK),
                     mq: alloc(STEP * MLA_HEADS * Q_HEAD),
                     mproj: k.host(MPROJ * 4),
-                    msel: alloc(DENSE_BELOW),
+                    msel: alloc(STEP * DENSE_BELOW),
                     mheads: alloc(STEP * O_IN),
                     k,
                 }
             })
             .collect();
         assert!(n <= MAX_CARDS, "{n} cards: the handoff words are laid out for {MAX_CARDS}");
+        // hc_pre's workgroups wait for the last of them: the grid must fit the card's LDS at once (64 KB a CU)
+        for c in &cards {
+            let per_cu = (PRE_GRID as usize).div_ceil(c.k.cu);
+            assert!(per_cu * PRE_LDS as usize <= 64 * 1024, "hc_pre: {PRE_GRID} workgroups at {PRE_LDS} B of LDS are {per_cu} a CU on {} CUs and cannot all be resident", c.k.cu);
+        }
         Kfd::clocks_high();
         // the handoffs: host memory card 0 allocates and every other card maps too
         let shared = {
@@ -283,7 +288,7 @@ impl Cards {
                 my: [buf(), buf()],
                 yexp: [buf(), buf()],
                 xh: buf(),
-                scores: k0.host_shared(STEP * glm_5_3_flash::E * 4, &others),
+                scores: k0.host_shared(glm_5_3_flash::E * 4, &others),
                 scores_ffn: k0.host_shared(STEP * glm_5_3_flash::E * 4, &others),
                 words: {
                     let m = k0.host_shared(word(W_KINDS, 0), &others);
@@ -537,8 +542,10 @@ impl Cards {
         a.ptr(c.mix.va).ptr(ya).ptr(yb.unwrap_or(0)).ptr(c.streams.va).ptr(src).ptr(dst).u32(n as u32).ptr(at(mine)).ptr(at(w0)).ptr(at(w1)).u32(value).ptr(c.go.va).u32(tokens as u32);
         c.k.launch(&c.hc_post, CHANNEL_GRID, g::WG, 0, &a);
     }
-    /// The early router's place: on the FFN card of a MoE layer, `hc_pre` runs layer `l`'s FFN router over the
-    /// attention block's input (normed with the FFN half's norm) and hands its logits to the host with the half's word.
+    /// The FFN router's place: on the FFN card of a MoE layer, `hc_pre` runs layer `l`'s FFN router over
+    /// the half's collapsed input (normed with the FFN half's norm) and hands its logits to the host with
+    /// the half's word. Over the attention block's input (`W_ROUTE`) it is the early router, the
+    /// prefetch's predictor, which runs for a step of one token only.
     fn early_router(&self, l: usize, c: &Card, scores: usize, kind: usize) -> Option<(usize, usize, usize, usize)> {
         let f = self.ffns[l].as_ref().unwrap();
         f.router.as_ref().filter(|_| c.k.index == f.card).map(|r| (f.ln.va, r.va, scores, self.shared.words.at(word(kind, f.card))))
@@ -562,19 +569,23 @@ impl Cards {
     /// A launch takes `TOKENS` tokens at most (the kernels' slab), so a step is passes of that many.
     #[allow(clippy::too_many_arguments)]
     fn rows8(&self, c: &Card, kernel: &crate::kfd::Kernel, x: usize, ln: Option<usize>, w: usize, s: usize, out: usize, m: usize, k_width: usize, n: usize) {
-        self.rows8_at(c, kernel, x, ln, w, s, out, m, k_width, n, true)
+        self.rows8_at(c, kernel, x, k_width, ln, w, s, out, m, k_width, n, true)
     }
     #[allow(clippy::too_many_arguments)]
     fn rows8_free(&self, c: &Card, kernel: &crate::kfd::Kernel, x: usize, ln: Option<usize>, w: usize, s: usize, out: usize, m: usize, k_width: usize, n: usize) {
-        self.rows8_at(c, kernel, x, ln, w, s, out, m, k_width, n, false)
+        self.rows8_at(c, kernel, x, k_width, ln, w, s, out, m, k_width, n, false)
     }
+    /// `rows8` with the input's token stride `xs` given: the down kernels read token `i`'s gate|up row
+    /// at `x[i · 2 · k_width]` (`swiglu_at`), so a pass past the first starts at the stride's multiple,
+    /// not the width's (the second pass of a step's dense and shared-expert down read from the
+    /// middle of token 16's row until 2026-10-16; a step of 32 or fewer tokens is one pass and never saw it).
     #[allow(clippy::too_many_arguments)]
-    fn rows8_at(&self, c: &Card, kernel: &crate::kfd::Kernel, x: usize, ln: Option<usize>, w: usize, s: usize, out: usize, m: usize, k_width: usize, n: usize, barrier: bool) {
+    fn rows8_at(&self, c: &Card, kernel: &crate::kfd::Kernel, x: usize, xs: usize, ln: Option<usize>, w: usize, s: usize, out: usize, m: usize, k_width: usize, n: usize, barrier: bool) {
         let mut p0 = 0;
         while p0 < n {
             let np = (n - p0).min(TOKENS);
             let mut a = Args::new();
-            a.ptr(x + p0 * k_width * 4);
+            a.ptr(x + p0 * xs * 4);
             if let Some(ln) = ln {
                 a.ptr(ln);
             }
@@ -641,7 +652,7 @@ impl Placed for Cards {
         self.half_seq[l][0] = value;
         let f = self.ffns[l].as_ref().unwrap();
         for c in &self.cards {
-            let router = self.early_router(l, c, self.shared.scores.va, W_ROUTE);
+            let router = self.early_router(l, c, self.shared.scores.va, W_ROUTE).filter(|_| n == 1);
             self.hc_pre(c, &f.hc[c.k.index][0], None, value, router, n);
         }
         let lay = self.layers[l].as_ref().unwrap();
@@ -675,17 +686,17 @@ impl Placed for Cards {
         }
         self.attention_out(value, parity, &parts, n);
     }
-    fn early_logits(&mut self, l: usize, n: usize, logits: &mut [f32]) {
+    fn early_logits(&mut self, l: usize, logits: &mut [f32]) {
         let f = self.ffns[l].as_ref().unwrap();
         crate::kfd::wait_word(self.word_ptr(W_ROUTE, f.card), self.half_seq[l][0]);
-        read(&self.shared.scores, 0, &mut logits[..n * glm_5_3_flash::E]);
+        read(&self.shared.scores, 0, &mut logits[..glm_5_3_flash::E]);
     }
     fn mla_post(&mut self, l: usize, n: usize) {
         let value = self.next_seq();
         self.half_seq[l][0] = value;
         let f = self.ffns[l].as_ref().unwrap();
         for c in &self.cards {
-            let router = self.early_router(l, c, self.shared.scores.va, W_ROUTE);
+            let router = self.early_router(l, c, self.shared.scores.va, W_ROUTE).filter(|_| n == 1);
             self.hc_pre(c, &f.hc[c.k.index][0], None, value, router, n);
         }
         let m = self.mlas[l].as_ref().unwrap();
@@ -725,9 +736,9 @@ impl Placed for Cards {
         // the position's latent into the mirror, the selection, the heads of token i
         c.k.upload(&m.lat, pos * KV_LORA_RANK * 4, raw(&latent[..KV_LORA_RANK]));
         let sel32: Vec<u32> = sel.iter().map(|&p| p as u32).collect();
-        c.k.upload(&c.msel, 0, raw(&sel32));
+        c.k.upload(&c.msel, i * DENSE_BELOW * 4, raw(&sel32));
         let mut a = Args::new();
-        a.ptr(c.mq.at(i * MLA_HEADS * Q_HEAD * 4)).ptr(m.kv_b.va).ptr(m.lat.va).ptr(c.msel.va).u32(sel.len() as u32).ptr(c.mheads.at(i * O_IN * 4));
+        a.ptr(c.mq.at(i * MLA_HEADS * Q_HEAD * 4)).ptr(m.kv_b.va).ptr(m.lat.va).ptr(c.msel.at(i * DENSE_BELOW * 4)).u32(sel.len() as u32).ptr(c.mheads.at(i * O_IN * 4));
         c.k.launch(&c.mla_attend, ATTEND_GRID, g::WG, ATTEND_LDS as u32, &a);
     }
     fn mla_out(&mut self, l: usize, n: usize) {
@@ -757,7 +768,7 @@ impl Placed for Cards {
         let (rows, down, k_width) = if f.dense { (DENSE_GU_ROWS, &c.ffn_down_dense, INTERMEDIATE_SIZE) } else { (SHARED_GU_ROWS, &c.ffn_down_shared, N_SHARED_EXPERTS * D_FF) };
         let fy = self.shared.fy[parity].va;
         self.rows8(c, &c.ffn_gu, c.x.va, Some(f.ln.va), f.gu_w.va, f.gu_s.va, c.gu.va, rows, H, n);
-        self.rows8(c, down, c.gu.va, None, f.down_w.va, f.down_s.va, c.fyv.va, H, k_width, n);
+        self.rows8_at(c, down, c.gu.va, 2 * k_width, None, f.down_w.va, f.down_s.va, c.fyv.va, H, k_width, n, true);
         for o in &self.cards {
             let producer = o.k.index == f.card;
             let copy = producer.then_some((o.fyv.va, fy, n * H));

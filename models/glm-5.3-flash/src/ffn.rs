@@ -84,23 +84,30 @@ pub fn route(l: usize, w: &weights::Moe, xn: &[f32], s: &mut Scratch, pool: &dyn
 /// `route` from the router's logits already in `s.score` (a card ran the GEMV).
 #[inline(always)]
 pub fn route_logits(l: usize, w: &weights::Moe, s: &mut Scratch, forced: Option<&[usize; TOP_K]>, tr: &mut impl Trace) -> ([usize; TOP_K], [f32; TOP_K]) {
+    let (idx, wt) = route_scores(w, s.score, forced);
+    tr.topk(l, &idx, &wt);
+    (idx, wt)
+}
+/// `route_logits` on the logits alone (`[E]`, turned into scores in place), nothing traced: a step's
+/// tokens route in parallel.
+#[inline(always)]
+pub fn route_scores(w: &weights::Moe, score: &mut [f32], forced: Option<&[usize; TOP_K]>) -> ([usize; TOP_K], [f32; TOP_K]) {
     // the scores weight the picks whoever makes them (forced picks skipped the sigmoid from
     // 1cc1e03 to ebfe97a: the gate failed, serving — the router's own picks — was unaffected)
-    scores(s.score);
+    scores(score);
     let mut idx = match forced {
         Some(f) => *f,
-        None => top(w, s.score),
+        None => top(w, score),
     };
     idx.sort_unstable();
     let mut sum = 1e-20f32;
     for &e in &idx {
-        sum += s.score[e];
+        sum += score[e];
     }
     let mut wt = [0f32; TOP_K];
     for k in 0..TOP_K {
-        wt[k] = s.score[idx[k]] / sum * ROUTED_SCALING_FACTOR;
+        wt[k] = score[idx[k]] / sum * ROUTED_SCALING_FACTOR;
     }
-    tr.topk(l, &idx, &wt);
     (idx, wt)
 }
 
