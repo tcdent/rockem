@@ -133,6 +133,18 @@ impl<'a> Stream<'a> {
     }
 }
 
+/// The compute's unit is a part of a file item: `SUB` parts a gate/up item (`GU_ROWS` hidden rows
+/// each) and a down item (`DOWN_ROWS` output rows). A file item is placed and prefetched whole;
+/// its parts are what a core streams at a time — halving the grain of a run's end (a core's
+/// last part) and of an expert's split across the nodes (2026-10-16). A part's rows and scales
+/// are contiguous inside the item (whole `q4` tiles), so this is addressing, not a copy.
+pub const SUB: usize = 2;
+pub const GU_ROWS: usize = GU_CHUNK / SUB;
+pub const GU_PARTS: usize = GU_ITEMS * SUB;
+pub const DOWN_ROWS: usize = layout::DOWN_CHUNK / SUB;
+pub const DOWN_PARTS: usize = DOWN_ITEMS * SUB;
+const _: () = assert!(GU_ROWS % common::q4::TILE == 0 && DOWN_ROWS % common::q4::TILE == 0);
+
 /// One expert of the stream, read by item (`layout`): the unit a core streams.
 pub struct Weights<'a> {
     stream: &'a Stream<'a>,
@@ -153,17 +165,19 @@ impl<'a> Weights<'a> {
         debug_assert_eq!(stream.bytes.as_ptr() as usize % 4, 0);
         Weights { stream, l, e }
     }
-    /// Gate/up item `c`: (gate rows, up rows, gate scales, up scales) — each `q4` slices over `GU_CHUNK` rows of width `H`.
+    /// Gate/up part `c` (of `GU_PARTS`): (gate rows, up rows, gate scales, up scales) — each `q4` slices over `GU_ROWS` rows of width `H`.
     #[inline(always)]
     pub fn gu(&self, c: usize) -> (&'a [u8], &'a [u8], &'a [f32], &'a [f32]) {
-        let it = self.gu_bytes(c);
-        (&it[..GU_W], &it[GU_W..2 * GU_W], f32s(&it[2 * GU_W..2 * GU_W + 4 * GU_S]), f32s(&it[2 * GU_W + 4 * GU_S..]))
+        let it = self.gu_bytes(c / SUB);
+        let (h, w, sc) = (c % SUB, GU_W / SUB, 4 * GU_S / SUB);
+        (&it[h * w..(h + 1) * w], &it[GU_W + h * w..GU_W + (h + 1) * w], f32s(&it[2 * GU_W + h * sc..2 * GU_W + (h + 1) * sc]), f32s(&it[2 * GU_W + 4 * GU_S + h * sc..2 * GU_W + 4 * GU_S + (h + 1) * sc]))
     }
-    /// Down item `c`: (rows, scales) — `q4` slices over `DOWN_CHUNK` rows of width `D_FF`.
+    /// Down part `c` (of `DOWN_PARTS`): (rows, scales) — `q4` slices over `DOWN_ROWS` rows of width `D_FF`.
     #[inline(always)]
     pub fn down(&self, c: usize) -> (&'a [u8], &'a [f32]) {
-        let it = self.down_bytes(c);
-        (&it[..layout::DOWN_W], f32s(&it[layout::DOWN_W..]))
+        let it = self.down_bytes(c / SUB);
+        let (h, w, sc) = (c % SUB, layout::DOWN_W / SUB, 4 * layout::DOWN_S / SUB);
+        (&it[h * w..(h + 1) * w], f32s(&it[layout::DOWN_W + h * sc..layout::DOWN_W + (h + 1) * sc]))
     }
     /// The item's bytes, for a core to pull through its caches.
     #[inline(always)]
@@ -273,17 +287,17 @@ impl Default for ScratchBuf {
 pub fn forward(w: &Weights, x: &[f32], s: &mut Scratch, out: &mut [f32]) {
     s.xa.quantize(&x[..H]);
     let xa = s.xa.act();
-    for c in 0..GU_ITEMS {
+    for c in 0..GU_PARTS {
         let (gw, uw, gs, us) = w.gu(c);
-        q4::gemv::<H>(GU_CHUNK, gw, gs, &xa, &mut s.gu[c * GU_CHUNK..(c + 1) * GU_CHUNK]);
-        q4::gemv::<H>(GU_CHUNK, uw, us, &xa, &mut s.gu[D_FF + c * GU_CHUNK..D_FF + (c + 1) * GU_CHUNK]);
+        q4::gemv::<H>(GU_ROWS, gw, gs, &xa, &mut s.gu[c * GU_ROWS..(c + 1) * GU_ROWS]);
+        q4::gemv::<H>(GU_ROWS, uw, us, &xa, &mut s.gu[D_FF + c * GU_ROWS..D_FF + (c + 1) * GU_ROWS]);
     }
     swiglu_clamped::<D_FF>(s.gu, crate::SWIGLU_LIMIT, s.h);
     s.ha.quantize(s.h);
     let ha = s.ha.act();
-    for c in 0..DOWN_ITEMS {
+    for c in 0..DOWN_PARTS {
         let (dw, ds) = w.down(c);
-        q4::gemv::<D_FF>(layout::DOWN_CHUNK, dw, ds, &ha, &mut out[c * layout::DOWN_CHUNK..(c + 1) * layout::DOWN_CHUNK]);
+        q4::gemv::<D_FF>(DOWN_ROWS, dw, ds, &ha, &mut out[c * DOWN_ROWS..(c + 1) * DOWN_ROWS]);
     }
 }
 
@@ -296,17 +310,17 @@ pub fn forward_q(w: &Weights, xq: &[i8], xs: &[f32], xg: &[i32], s: &mut Scratch
     s.xa.scale.copy_from_slice(&xs[..H / q4::GROUP]);
     s.xa.gsum.copy_from_slice(&xg[..H / q4::GROUP]);
     let xa = s.xa.act();
-    for c in 0..GU_ITEMS {
+    for c in 0..GU_PARTS {
         let (gw, uw, gs, us) = w.gu(c);
-        q4::gemv::<H>(GU_CHUNK, gw, gs, &xa, &mut s.gu[c * GU_CHUNK..(c + 1) * GU_CHUNK]);
-        q4::gemv::<H>(GU_CHUNK, uw, us, &xa, &mut s.gu[D_FF + c * GU_CHUNK..D_FF + (c + 1) * GU_CHUNK]);
+        q4::gemv::<H>(GU_ROWS, gw, gs, &xa, &mut s.gu[c * GU_ROWS..(c + 1) * GU_ROWS]);
+        q4::gemv::<H>(GU_ROWS, uw, us, &xa, &mut s.gu[D_FF + c * GU_ROWS..D_FF + (c + 1) * GU_ROWS]);
     }
     swiglu_clamped::<D_FF>(s.gu, crate::SWIGLU_LIMIT, s.h);
     s.ha.quantize(s.h);
     let ha = s.ha.act();
-    for c in 0..DOWN_ITEMS {
+    for c in 0..DOWN_PARTS {
         let (dw, ds) = w.down(c);
-        q4::gemv::<D_FF>(layout::DOWN_CHUNK, dw, ds, &ha, &mut out[c * layout::DOWN_CHUNK..(c + 1) * layout::DOWN_CHUNK]);
+        q4::gemv::<D_FF>(DOWN_ROWS, dw, ds, &ha, &mut out[c * DOWN_ROWS..(c + 1) * DOWN_ROWS]);
     }
 }
 
@@ -314,17 +328,17 @@ pub fn forward_q(w: &Weights, xq: &[i8], xs: &[f32], xg: &[i32], s: &mut Scratch
 pub fn forward_scalar(w: &Weights, x: &[f32], s: &mut Scratch, out: &mut [f32]) {
     s.xa.quantize(&x[..H]);
     let xa = s.xa.act();
-    for c in 0..GU_ITEMS {
+    for c in 0..GU_PARTS {
         let (gw, uw, gs, us) = w.gu(c);
-        q4::gemv_scalar(H, GU_CHUNK, gw, gs, &xa, &mut s.gu[c * GU_CHUNK..(c + 1) * GU_CHUNK]);
-        q4::gemv_scalar(H, GU_CHUNK, uw, us, &xa, &mut s.gu[D_FF + c * GU_CHUNK..D_FF + (c + 1) * GU_CHUNK]);
+        q4::gemv_scalar(H, GU_ROWS, gw, gs, &xa, &mut s.gu[c * GU_ROWS..(c + 1) * GU_ROWS]);
+        q4::gemv_scalar(H, GU_ROWS, uw, us, &xa, &mut s.gu[D_FF + c * GU_ROWS..D_FF + (c + 1) * GU_ROWS]);
     }
     swiglu_clamped::<D_FF>(s.gu, crate::SWIGLU_LIMIT, s.h);
     s.ha.quantize(s.h);
     let ha = s.ha.act();
-    for c in 0..DOWN_ITEMS {
+    for c in 0..DOWN_PARTS {
         let (dw, ds) = w.down(c);
-        q4::gemv_scalar(D_FF, layout::DOWN_CHUNK, dw, ds, &ha, &mut out[c * layout::DOWN_CHUNK..(c + 1) * layout::DOWN_CHUNK]);
+        q4::gemv_scalar(D_FF, DOWN_ROWS, dw, ds, &ha, &mut out[c * DOWN_ROWS..(c + 1) * DOWN_ROWS]);
     }
 }
 

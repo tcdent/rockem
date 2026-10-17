@@ -290,7 +290,7 @@ impl glm_5_3_flash::ffn::Routed for F32Experts<'_> {
 fn dequant_expert(stream: &glm_5_3_flash::expert::Stream, l: usize, e: usize) -> (Vec<f32>, Vec<f32>) {
     use common::q4::{self, GROUP};
     use glm_5_3_flash::expert::Weights;
-    use glm_5_3_flash::layout::{DOWN_CHUNK, DOWN_ITEMS, GU_CHUNK, GU_ITEMS};
+    use glm_5_3_flash::expert::{DOWN_PARTS, DOWN_ROWS, GU_PARTS, GU_ROWS};
     let w = Weights::at(stream, l, e);
     // an item's rows expanded into their place in the full matrix (`[rows][k]`)
     let expand = |rows: usize, k: usize, iw: &[u8], is: &[f32], r_base: usize, out: &mut [f32]| {
@@ -301,15 +301,15 @@ fn dequant_expert(stream: &glm_5_3_flash::expert::Stream, l: usize, e: usize) ->
         }
     };
     let mut gu = vec![0f32; 2 * D_FF * H];
-    for c in 0..GU_ITEMS {
+    for c in 0..GU_PARTS {
         let (gw, uw, gs, us) = w.gu(c);
-        expand(GU_CHUNK, H, gw, gs, c * GU_CHUNK, &mut gu);
-        expand(GU_CHUNK, H, uw, us, D_FF + c * GU_CHUNK, &mut gu);
+        expand(GU_ROWS, H, gw, gs, c * GU_ROWS, &mut gu);
+        expand(GU_ROWS, H, uw, us, D_FF + c * GU_ROWS, &mut gu);
     }
     let mut down = vec![0f32; H * D_FF];
-    for c in 0..DOWN_ITEMS {
+    for c in 0..DOWN_PARTS {
         let (dw, ds) = w.down(c);
-        expand(DOWN_CHUNK, D_FF, dw, ds, c * DOWN_CHUNK, &mut down);
+        expand(DOWN_ROWS, D_FF, dw, ds, c * DOWN_ROWS, &mut down);
     }
     (gu, down)
 }

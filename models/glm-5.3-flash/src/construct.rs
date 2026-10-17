@@ -491,7 +491,7 @@ pub struct CpuExperts<'a> {
     elapsed: f64,
 }
 /// An item is the record's (`layout::gu_item`, `layout::down_item`): 32 gate/up items and 20 down items an expert.
-use crate::layout::{DOWN_CHUNK, DOWN_ITEMS, GU_CHUNK as CHUNK, GU_ITEMS};
+use crate::layout::{DOWN_ITEMS, GU_ITEMS};
 
 impl<'a> CpuExperts<'a> {
     pub fn new(stream: &'a expert::Stream<'a>, pool: &'a dyn Pool) -> Self {
@@ -592,14 +592,14 @@ impl Routed for CpuExperts<'_> {
         let (i1, i2, i3) = (items.clone(), items.clone(), items);
         let node = move |i: usize| i1[i].1;
         let ccd = move |i: usize| i2[i].2;
-        // the touching yields between 16 KB chunks once the job is overtaken: the run that overtakes it
+        // the touching yields between 4 KB chunks once the job is overtaken: the run that overtakes it
         // waits for the items in flight (the run's slotting time was 13 µs with 64 KB chunks, 2026-10-16)
         let pool_s: &'static dyn Pool = unsafe { std::mem::transmute::<&dyn Pool, &'static dyn Pool>(pool) };
         let f = move |i: usize| {
             let it = &i3[i];
             let w = expert::Weights::at(stream, l, idx[it.0]);
             let touch_yielding = |b: &[u8]| -> bool {
-                for chunk in b.chunks(16 << 10) {
+                for chunk in b.chunks(4 << 10) {
                     if pool_s.abandoned() {
                         return false;
                     }
@@ -624,37 +624,38 @@ impl Routed for CpuExperts<'_> {
         let xa = Act { q: &self.xq, scale: &self.xs, gsum: &self.xg };
         let stream = self.stream;
         let (h_p, out_p) = (self.h.as_mut_ptr() as usize, out.as_mut_ptr() as usize);
+        use expert::{DOWN_PARTS, DOWN_ROWS, GU_PARTS, GU_ROWS, SUB};
         let slice_node = &self.slice_node;
         let node_of = |e: usize, j: usize| slice_node[((l - FIRST_K_DENSE_REPLACE) * E + e) * (GU_ITEMS + DOWN_ITEMS) + j] as usize;
-        // the gate/up rows: item (k, c) owns expert k's hidden channels c·CHUNK..; its node from the table
-        let gate_node = move |i: usize| node_of(idx[i / GU_ITEMS], i % GU_ITEMS);
-        // a slice's core complex within its node: a function of the EXPERT and the slice, never of the
-        // expert's position among the picks, so a prefetch and the compute meet in one L3
-        let gate_ccd = move |i: usize| idx[i / GU_ITEMS] * GU_ITEMS + i % GU_ITEMS;
-        self.pool.run_on(TOP_K * GU_ITEMS, &gate_node, &gate_ccd, &move |i| {
-            let (k, c) = (i / GU_ITEMS, i % GU_ITEMS);
+        // the gate/up rows: part (k, c) owns expert k's hidden channels c·GU_ROWS..; its node is its file item's
+        let gate_node = move |i: usize| node_of(idx[i / GU_PARTS], i % GU_PARTS / SUB);
+        // a part's core complex within its node: its file item's, a function of the EXPERT and the item, never
+        // of the expert's position among the picks, so a prefetch and the compute meet in one L3
+        let gate_ccd = move |i: usize| idx[i / GU_PARTS] * GU_ITEMS + i % GU_PARTS / SUB;
+        self.pool.run_on(TOP_K * GU_PARTS, &gate_node, &gate_ccd, &move |i| {
+            let (k, c) = (i / GU_PARTS, i % GU_PARTS);
             let w = expert::Weights::at(stream, l, idx[k]);
             let (gw, uw, gs, us) = w.gu(c);
-            let mut gu = [0f32; 2 * CHUNK];
-            q4::gemv::<H>(CHUNK, gw, gs, &xa, &mut gu[..CHUNK]);
-            q4::gemv::<H>(CHUNK, uw, us, &xa, &mut gu[CHUNK..]);
-            let h = unsafe { std::slice::from_raw_parts_mut((h_p as *mut f32).add(k * D_FF + c * CHUNK), CHUNK) };
-            swiglu_clamped::<CHUNK>(&gu, SWIGLU_LIMIT, h);
+            let mut gu = [0f32; 2 * GU_ROWS];
+            q4::gemv::<H>(GU_ROWS, gw, gs, &xa, &mut gu[..GU_ROWS]);
+            q4::gemv::<H>(GU_ROWS, uw, us, &xa, &mut gu[GU_ROWS..]);
+            let h = unsafe { std::slice::from_raw_parts_mut((h_p as *mut f32).add(k * D_FF + c * GU_ROWS), GU_ROWS) };
+            swiglu_clamped::<GU_ROWS>(&gu, SWIGLU_LIMIT, h);
         });
-        // the down rows: item (k, c) owns rows c·DOWN_CHUNK.. of expert k's output over its whole hidden state, quantized here
+        // the down rows: part (k, c) owns rows c·DOWN_ROWS.. of expert k's output over its whole hidden state, quantized here
         let h = &self.h;
-        let down_node = move |i: usize| node_of(idx[i / DOWN_ITEMS], GU_ITEMS + i % DOWN_ITEMS);
-        let down_ccd = move |i: usize| idx[i / DOWN_ITEMS] * DOWN_ITEMS + i % DOWN_ITEMS;
-        self.pool.run_on(TOP_K * DOWN_ITEMS, &down_node, &down_ccd, &move |i| {
-            let (k, c) = (i / DOWN_ITEMS, i % DOWN_ITEMS);
+        let down_node = move |i: usize| node_of(idx[i / DOWN_PARTS], GU_ITEMS + i % DOWN_PARTS / SUB);
+        let down_ccd = move |i: usize| idx[i / DOWN_PARTS] * DOWN_ITEMS + i % DOWN_PARTS / SUB;
+        self.pool.run_on(TOP_K * DOWN_PARTS, &down_node, &down_ccd, &move |i| {
+            let (k, c) = (i / DOWN_PARTS, i % DOWN_PARTS);
             let w = expert::Weights::at(stream, l, idx[k]);
             let (mut hq, mut hs, mut hg) = ([0i8; D_FF], [0f32; D_FF / GROUP], [0i32; D_FF / GROUP]);
             QAct { q: &mut hq, scale: &mut hs, gsum: &mut hg }.quantize(&h[k * D_FF..(k + 1) * D_FF]);
             let ha = Act { q: &hq, scale: &hs, gsum: &hg };
-            let r0 = c * DOWN_CHUNK;
+            let r0 = c * DOWN_ROWS;
             let (dw, ds) = w.down(c);
-            let o = unsafe { std::slice::from_raw_parts_mut((out_p as *mut f32).add(k * H + r0), DOWN_CHUNK) };
-            q4::gemv::<D_FF>(DOWN_CHUNK, dw, ds, &ha, o);
+            let o = unsafe { std::slice::from_raw_parts_mut((out_p as *mut f32).add(k * H + r0), DOWN_ROWS) };
+            q4::gemv::<D_FF>(DOWN_ROWS, dw, ds, &ha, o);
         });
         self.elapsed += t0.elapsed().as_secs_f64();
     }
