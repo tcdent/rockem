@@ -452,10 +452,15 @@ impl Session {
         }
         for _ in 0..limit {
             let id = self.next;
+            let eos = self.e.is_eos(id);
+            if eos {
+                // the state before EOS: the reply as the next turn re-renders it, which never carries the EOS
+                self.mark();
+            }
             if !emit(id) || !self.feed(id) {
                 return false;
             }
-            if self.e.is_eos(id) {
+            if eos {
                 break;
             }
         }
