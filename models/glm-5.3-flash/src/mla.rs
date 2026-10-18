@@ -17,6 +17,7 @@ use crate::layout::MLA_ROW;
 use crate::weights;
 use crate::*;
 use common::gemv;
+use common::math::bf16_round;
 use common::math::{exp, sqrt};
 use common::pool::Pool;
 use common::rmsnorm::rmsnorm;
@@ -58,11 +59,13 @@ pub fn pool_key(w: &weights::Mla, cache: &[f32], j: usize, out: &mut [f32]) {
             logit[i] = exp(logit[i] - mx);
             sum += logit[i];
         }
+        // the pool as the reference forms it: the softmax weights cast to the keys' dtype (bf16), the
+        // weighted sum accumulated in f32 and stored at bf16 precision
         let mut acc = 0f32;
         for i in 0..INDEX_KPOOL {
-            acc += logit[i] / sum * cache[(j * INDEX_KPOOL + i) * MLA_ROW + KV_LORA_RANK + c];
+            acc += bf16_round(logit[i] / sum) * cache[(j * INDEX_KPOOL + i) * MLA_ROW + KV_LORA_RANK + c];
         }
-        out[c] = acc;
+        out[c] = bf16_round(acc);
     }
 }
 
@@ -184,7 +187,12 @@ pub fn project(w: &weights::Mla, xn: &[f32], s: &mut Scratch, igate: &mut [f32],
 /// The cache row's normed latent and the indexer's key (LayerNorm, eps 1e-6) from the projections.
 #[inline(always)]
 pub fn finish_row(w: &weights::Mla, kva: &[f32], ik: &[f32], latent: &mut [f32], ikey: &mut [f32]) {
+    // the stored attention state follows the reference's dtype (tcdent, 2026-10-17): the latent
+    // and the indexer's key at bf16 precision (the arithmetic on them stays f32), the KDA state f32
     rmsnorm::<KV_LORA_RANK>(kva, &w.kv_a_ln, RMS_NORM_EPS, latent);
+    for v in latent.iter_mut() {
+        *v = bf16_round(*v);
+    }
     let mut mean = 0f32;
     for &v in ik.iter() {
         mean += v;
@@ -196,7 +204,7 @@ pub fn finish_row(w: &weights::Mla, kva: &[f32], ik: &[f32], latent: &mut [f32],
     }
     let rs = 1.0 / sqrt(var / INDEX_HEAD_DIM as f32 + 1e-6);
     for c in 0..INDEX_HEAD_DIM {
-        ikey[c] = (ik[c] - mean) * rs * w.ix_k_norm_w[c] + w.ix_k_norm_b[c];
+        ikey[c] = bf16_round((ik[c] - mean) * rs * w.ix_k_norm_w[c] + w.ix_k_norm_b[c]);
     }
 }
 /// The pool position `pos` completes, if any, gains its key (`pool_key`).

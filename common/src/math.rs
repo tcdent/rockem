@@ -145,3 +145,15 @@ mod tests {
         assert_eq!(sqrt(9.0), 3.0);
     }
 }
+
+/// `x` rounded to the nearest bf16 (ties to even, as torch narrows), as an f32: a value stored at
+/// bf16 precision in an f32 buffer.
+#[inline(always)]
+pub fn bf16_round(x: f32) -> f32 {
+    let b = x.to_bits();
+    if (b & 0x7f80_0000) == 0x7f80_0000 {
+        return x; // inf, nan
+    }
+    let r = ((b >> 16) & 1) + 0x7fff;
+    f32::from_bits((b.wrapping_add(r)) & 0xffff_0000)
+}

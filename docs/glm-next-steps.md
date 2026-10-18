@@ -386,7 +386,19 @@ against the f32 goldens as a numeric distance, and the goldens stay what they ar
   overlap above is the measurement that would.
 - **FP8 KDA projections:** **Unimplemented; tcdent's decision** (§6).
 
-**Status 2026-10-17 evening: decided above, not yet built.** What the decision changes in the
+**Status 2026-10-17 21:40: the first phase built and deployed; the numbers below.** The latent
+and the indexer's key are stored at bf16 precision (rounded to nearest even at `finish_row` and on
+the bundle's seeded rows; the buffers, kernels and mirrors unchanged, so the arithmetic on them is
+still f32), the pool keys formed as the reference forms them (weights cast to bf16, the sum at
+bf16), the KDA state f32. Measured against the f32 build on the long SCORE text (3632 ids,
+`bringup/gates/score_diff.py`): mean |Δ logprob| 9.1e-3 nats, 99.4 % of positions moved, one
+position by 5.8 nats (a near-tie), **NLL 0.0414 → 0.0446**. Decode step cost unchanged; acceptance
+on the short text 0.88–1.00 across runs (0.92 before). The second phase — bf16 buffers for the
+latents and pools (half the bytes the attend and scorer read, the 1M arithmetic) — is layout work on
+the host cache, the cards' mirrors, `mla_attend`, `ix_score` and the host's `heads`, gated by the same
+comparison. The selection-overlap measurement at 18k is still to be made.
+
+**Status 2026-10-17 evening (before the build):** What the decision changes in the
 tree: the MLA cache row keeps its latent in bf16 (host `cache: [max_ctx][MLA_ROW]`, the cards'
 `lat` mirror, `finish_row` writes it, `mla_attend` and the host's `heads` read it); the indexer's
 per-token keys in bf16 with the pool's four-key sum at bf16 (`pool_key`, the cards' `pools`

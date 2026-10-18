@@ -1141,6 +1141,10 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 (LayerState::Mla { cache, pools }, Attn::Mla(mw)) => {
                     for p in 0..n {
                         cache[p * MLA_ROW..(p + 1) * MLA_ROW].copy_from_slice(&rows[p * POSITION + mi * MLA_ROW..p * POSITION + (mi + 1) * MLA_ROW]);
+                        // the bundle's rows are f32: the latent and the key at the stored precision (`finish_row`)
+                        for v in &mut cache[p * MLA_ROW..p * MLA_ROW + KV_LORA_RANK + INDEX_HEAD_DIM] {
+                            *v = common::math::bf16_round(*v);
+                        }
                     }
                     for j in 0..n / INDEX_KPOOL {
                         let (c, pk) = (&*cache, &mut pools[j * INDEX_HEAD_DIM..(j + 1) * INDEX_HEAD_DIM]);
