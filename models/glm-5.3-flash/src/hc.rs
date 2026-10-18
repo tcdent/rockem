@@ -235,7 +235,10 @@ pub mod gfx11_consts {
     pub const PRE_BARRIERS: usize = 3;
     pub const PRE_COUNTS: usize = PRE_BARRIERS * 2 * COEF_ROWS + 2;
     /// Router rows a workgroup takes in `hc_pre`'s tail.
-    pub const ROUTER_ROWS_PER_WG: usize = E.div_ceil(COEF_ROWS * SLICES);
+    /// Rows the FFN half's router launch carries: layer l's router over the FFN input, then layer l+1's
+    /// (the prefetch's predictor, named a layer ahead); `scores` is `[tokens][ROUTE_ROWS]`.
+    pub const ROUTE_ROWS: usize = 2 * E;
+    pub const ROUTER_ROWS_PER_WG: usize = ROUTE_ROWS.div_ceil(COEF_ROWS * SLICES);
     /// `hc_pre`'s partials in VRAM: the coefficient dots `[COEF_ROWS][SLICES]`, then every workgroup's sum of squares of its channel slice.
     pub const PRE_PARTS: usize = COEF_ROWS * SLICES + COEF_ROWS * SLICES;
     /// Channels of the collapse a workgroup takes.
@@ -318,14 +321,14 @@ pub mod gfx11 {
     /// `x[i][d] = Σ_j pre_ij · stream_ij[d]`, into `x` and, when `x_host` is not null, there too
     /// (the routed experts' input). Then, when `router` is not null (the FFN card: the early router over the
     /// attention block's input, or the FFN router over its own), the workgroups arrive again, each
-    /// takes its `ROUTER_ROWS_PER_WG` rows of the `[E][H]` bf16 router over every token's `x`
+    /// takes its `ROUTER_ROWS_PER_WG` rows of the `[ROUTE_ROWS][H]` bf16 router (the first `rows` live) over every token's `x`
     /// normed with `ln` (a wave a token, no reduction through LDS) straight into `scores` (host
     /// memory), and the last of them writes `value` to `word`. One token is n = 1 through the
     /// same launch; the tokens go through the LDS `PRE_TOKENS` at a time (the partials, then the
     /// coefficients), a token's arithmetic the same whichever round it is in. Counts back at 0 when
     /// the launch leaves. LDS: PRE_LDS.
     #[no_mangle]
-    pub extern "gpu-kernel" fn hc_pre(streams: *const f32, w: *const u16, part: *mut f32, base: *const f32, scale: *const f32, mix: *mut f32, x: *mut f32, x_host: *mut f32, count: *mut u32, value: u32, ln: *const u16, router: *const u16, scores: *mut f32, word: *mut u32, n: u32) {
+    pub extern "gpu-kernel" fn hc_pre(streams: *const f32, w: *const u16, part: *mut f32, base: *const f32, scale: *const f32, mix: *mut f32, x: *mut f32, x_host: *mut f32, count: *mut u32, value: u32, ln: *const u16, router: *const u16, scores: *mut f32, word: *mut u32, rows: u32, n: u32) {
         unsafe {
             let n = n as usize;
             let t = workitem_id_x() as usize;
@@ -539,7 +542,7 @@ pub mod gfx11 {
                     let mut r = 0;
                     while r < ROUTER_ROWS_PER_WG {
                         let rrow = wg + r * COEF_ROWS * SLICES;
-                        if rrow < E {
+                        if rrow < rows as usize {
                             let wr = router.add(rrow * H);
                             let mut acc = 0f32;
                             let mut k = t;
@@ -559,7 +562,7 @@ pub mod gfx11 {
                                     sum += *red.add(k);
                                     k += 1;
                                 }
-                                *scores.add(i * E + rrow) = sum * rr;
+                                *scores.add(i * ROUTE_ROWS + rrow) = sum * rr;
                             }
                             workgroup_sync();
                         }
@@ -588,7 +591,7 @@ pub mod gfx11 {
                 let mut r = 0;
                 while r < ROUTER_ROWS_PER_WG {
                     let rrow = wg + r * COEF_ROWS * SLICES;
-                    if rrow < E {
+                    if rrow < rows as usize {
                         let wr = router.add(rrow * H);
                         // the workgroup's order on one wave, so a score's bits are what the 256-thread
                         // reduction gave: thread (lane + 32·w) summed elements lane + 32·w + 256·j in
@@ -606,7 +609,7 @@ pub mod gfx11 {
                             w += 1;
                         }
                         if lane == 0 {
-                            *scores.add(i * E + rrow) = acc * rr;
+                            *scores.add(i * ROUTE_ROWS + rrow) = acc * rr;
                         }
                     }
                     r += 1;

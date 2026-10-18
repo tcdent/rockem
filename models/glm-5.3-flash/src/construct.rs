@@ -4,6 +4,7 @@
 //! kernel is diffed against — with the step that ties the fused kernels
 //! together one token at a time. `std` only; nothing on the token path allocates.
 
+use crate::hc::gfx11_consts::ROUTE_ROWS;
 use crate::ffn::Routed;
 use crate::layout::{self, KDA_MEMORY, KDA_WINDOW, MLA_ROW, POSITION};
 use crate::weights::{Attn, Ffn, Weights};
@@ -808,8 +809,6 @@ pub trait Placed {
     fn attention(&mut self, l: usize, n: usize);
     /// A KDA layer's state back to what it was after token `slot` of the last verify-sized step.
     fn kda_rewind(&mut self, l: usize, slot: usize);
-    /// The early router's logits (`[E]`) of a one-token step.
-    fn early_logits(&mut self, l: usize, logits: &mut [f32]);
     fn mla_post(&mut self, l: usize, n: usize);
     /// Token `i`'s projections of the step (the launch waited for at `i == 0`): the latent before its
     /// norm, the indexer's key before its norm, the position's gate.
@@ -867,8 +866,7 @@ pub struct Profile {
     pub tokens: usize,
     /// The hyper-connections on the host, or, with cards, the posting of a layer's launches.
     pub hc: f64,
-    /// With cards: the wait for the early router's logits; then their picks and the prefetch's slotting.
-    pub early: f64,
+    /// With cards: the next layer's predicted picks and the prefetch's slotting.
     pub slot: f64,
     pub kda_card: f64,
     pub kda_cpu: f64,
@@ -931,8 +929,8 @@ impl Profile {
         let n = self.tokens.max(1) as f64 / 1e3;
         let mla = self.mla_proj + self.mla_attn + self.mla_out;
         let rs = self.route + self.shared;
-        let sum = self.hc + self.early + self.slot + self.kda_card + self.kda_cpu + mla + self.dense_ffn + rs + self.experts + self.head + self.draft;
-        format!("{} tokens: hc {:.1}  early {:.1}  slot {:.1}  kda card {:.1}  kda cpu {:.1}  mla {:.1} (proj {:.1} attn {:.1} out {:.1})  dense ffn {:.1}  router+shared {:.1} (route {:.1} shared {:.1})  experts {:.1} (reused {:.2} of {} from the previous token, {:.2} named on the attention input; {:.0}% of the predicted slices pulled; {:.0}% of items on their CCD)  head {:.1}  draft {:.1}  = {:.1} ms a token{}", self.tokens, self.hc / n, self.early / n, self.slot / n, self.kda_card / n, self.kda_cpu / n, mla / n, self.mla_proj / n, self.mla_attn / n, self.mla_out / n, self.dense_ffn / n, rs / n, self.route / n, self.shared / n, self.experts / n, self.reuse as f64 / self.moe_layers.max(1) as f64, TOP_K, self.pre_agree as f64 / self.moe_layers.max(1) as f64, 100.0 * self.prefetched as f64 / self.prefetch_items.max(1) as f64, 100.0 * self.local_items as f64 / self.items.max(1) as f64, self.head / n, self.draft / n, sum / n, self.nodes())
+        let sum = self.hc + self.slot + self.kda_card + self.kda_cpu + mla + self.dense_ffn + rs + self.experts + self.head + self.draft;
+        format!("{} tokens: hc {:.1}  slot {:.1}  kda card {:.1}  kda cpu {:.1}  mla {:.1} (proj {:.1} attn {:.1} out {:.1})  dense ffn {:.1}  router+shared {:.1} (route {:.1} shared {:.1})  experts {:.1} (reused {:.2} of {} from the previous token, {:.2} named on the attention input; {:.0}% of the predicted slices pulled; {:.0}% of items on their CCD)  head {:.1}  draft {:.1}  = {:.1} ms a token{}", self.tokens, self.hc / n, self.slot / n, self.kda_card / n, self.kda_cpu / n, mla / n, self.mla_proj / n, self.mla_attn / n, self.mla_out / n, self.dense_ffn / n, rs / n, self.route / n, self.shared / n, self.experts / n, self.reuse as f64 / self.moe_layers.max(1) as f64, TOP_K, self.pre_agree as f64 / self.moe_layers.max(1) as f64, 100.0 * self.prefetched as f64 / self.prefetch_items.max(1) as f64, 100.0 * self.local_items as f64 / self.items.max(1) as f64, self.head / n, self.draft / n, sum / n, self.nodes())
     }
 }
 
@@ -1070,7 +1068,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             b_x: vec![0.0; STEP * H],
             b_xn: vec![0.0; STEP * H],
             b_y: vec![0.0; STEP * H],
-            b_score: vec![0.0; STEP * E],
+            b_score: vec![0.0; STEP * ROUTE_ROWS],
             b_out: vec![0.0; STEP * TOP_K * H],
         }
     }
@@ -1457,6 +1455,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
         };
         let p = &mut s.profile;
         p.tokens += n;
+        let mut pre_next = [[E; TOP_K]; SPEC_TOKENS];
         for l in 0..NUM_HIDDEN_LAYERS {
             let lw = &w.layers[l];
             let moe = match &lw.ffn {
@@ -1470,27 +1469,9 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 pl.attention(l, n);
             }
             lap(&mut p.hc);
-            // the prefetch's predictor: the FFN router over the attention block's input, read as soon as it
-            // is there, for a step of a few tokens (a token's, or a verify step's: the union of their picks);
-            // a step of many tokens names most experts and runs none
-            let mut pre_picks = [[E; TOP_K]; SPEC_TOKENS];
-            if let (Some(m), true) = (moe, n <= SPEC_TOKENS) {
-                pl.early_logits(l, &mut s.b_score[..n * E]);
-                lap(&mut p.early);
-                let mut union = [E; SPEC_TOKENS * TOP_K];
-                let mut nu = 0;
-                for i in 0..n {
-                    pre_picks[i] = ffn::picks(m, &mut s.b_score[i * E..(i + 1) * E]);
-                    for &e in &pre_picks[i] {
-                        if !union[..nu].contains(&e) {
-                            union[nu] = e;
-                            nu += 1;
-                        }
-                    }
-                }
-                s.routed.prefetch(l, &union[..nu]);
-            }
-            lap(&mut p.slot);
+            // the prefetch's predictor for this layer: the layer before named its picks over its own FFN
+            // input (the next layer's router rows ride in that router launch); `pre_picks` scores it
+            let pre_picks = std::mem::replace(&mut pre_next, [[E; TOP_K]; SPEC_TOKENS]);
             if let (Attn::Mla(a), LayerState::Mla { cache, pools }) = (&lw.attn, &mut s.layers[l]) {
                 // every token's projections off the card into its cache row, its indexer query and head
                 // weights kept; the pools completed along the way gain their keys
@@ -1534,7 +1515,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     s.pool.run(n, &move |i| unsafe {
                         let xn = std::slice::from_raw_parts_mut((xn_p as *mut f32).add(i * H), H);
                         rmsnorm::<H>(&x[i * H..(i + 1) * H], post_ln, RMS_NORM_EPS, xn);
-                        let score = std::slice::from_raw_parts_mut((sc_p as *mut f32).add(i * E), E);
+                        let score = std::slice::from_raw_parts_mut((sc_p as *mut f32).add(i * ROUTE_ROWS), E);
                         let (idx, wt) = ffn::route_scores(m, score, forced_l);
                         *(pk_p as *mut [usize; TOP_K]).add(i) = idx;
                         *(wt_p as *mut [f32; TOP_K]).add(i) = wt;
@@ -1574,6 +1555,24 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 p.experts += e;
                 lap(&mut p.route);
                 p.route -= e;
+                // the next MoE layer's picks, predicted by its router over this layer's FFN input (the second
+                // half of each token's scores), prefetched now that this layer's run is done (a run abandons
+                // the prefetches in flight); a step of many tokens names most experts and runs none
+                if let (true, Some(Ffn::Moe(m2))) = (n <= SPEC_TOKENS, w.layers.get(l + 1).map(|lw| &lw.ffn)) {
+                    let mut union = [E; SPEC_TOKENS * TOP_K];
+                    let mut nu = 0;
+                    for i in 0..n {
+                        pre_next[i] = ffn::picks(m2, &mut s.b_score[i * ROUTE_ROWS + E..(i + 1) * ROUTE_ROWS]);
+                        for &e in &pre_next[i] {
+                            if !union[..nu].contains(&e) {
+                                union[nu] = e;
+                                nu += 1;
+                            }
+                        }
+                    }
+                    s.routed.prefetch(l + 1, &union[..nu]);
+                    lap(&mut p.slot);
+                }
             }
             if tr.wants_edges() && n == 1 {
                 pl.layer_out(l, 0, &mut s.mean);
