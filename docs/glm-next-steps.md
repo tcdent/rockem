@@ -37,6 +37,13 @@ MLA projections 0.9, experts 2.2 against a 1.0 ms DRAM floor; the indexer's sele
   CPU (routed experts); each idles while the other works. A verify step's expert phase is the
   union of its tokens' picks (23 ms for two tokens, 31.5 for three).
 
+**Status 2026-10-17 evening:** ~29.7 ms an emitted token at short context and ~32 at 18k, by
+speculative decoding (§6): a two-token verify step of 57 ms at 0.92 acceptance (28.1–29.0 ms a
+step token: kda card 9.3, mla 2.8, experts 10.5, router 1.8, head 1.1, draft 1.9, slot 1.0). The
+indexer's selection is on the card (attention lap 6.3 → 0.0 at 18k). New target: **24 ms**
+(tcdent). The arithmetic puts it in §3: the expert phase (21 ms a step) is at the DRAM floor and
+the card phase has ~3 ms left in it.
+
 ## Rules this round keeps
 
 - Serial first: the fastest single request is the priority.
@@ -90,6 +97,11 @@ of peer access. Before writing it: each card's `p2p_links` in the KFD topology a
 streams, `hc_post`) to peer writes if (1) shows a real difference. This pays before any expert
 moves.
 
+**Status 2026-10-17: not measured.** The KFD layer maps host memory on every card but has no
+VRAM peer mapping, so the ping-pong bench is new code before a number exists. Lower priority than
+it was: the layer-ahead router (§4) retired the attention-half early router and its handoff, and
+§3's design below needs no card-to-card handoff.
+
 ## 2. The expert phase controlled by a card
 
 tcdent, 2026-10-17:
@@ -129,6 +141,12 @@ a millisecond (estimate); the larger gain is what §3 can place behind it.
 
 **Status: Unimplemented.** Waits on §1's peer mapping and benches.
 
+**Status 2026-10-17: deferred, not rejected.** §3 turned out not to depend on it: the card
+realization of a routed expert is bit-identical to the CPU's (same integer group sums, flush and
+f32 order), so the host can keep the join — summing the picks in pick order from either tier — and
+a refreshed residency stays reproducible. §2 returns if the host-side wait for the cards' outputs
+shows up in the layer; measure that first.
+
 ## 3. Routed experts on the cards
 
 The cards idle through the expert phase.
@@ -156,6 +174,24 @@ The cards idle through the expert phase.
 ~0.5 ms per 13.4 MB expert over PCIe and run off the critical path. Policy: LFU wins on code,
 LRU on chat; replay an adaptive policy (ARC) on both traces before choosing — **Unimplemented.**
 
+**Status 2026-10-17: measured and the kernels built; the step integration pending.**
+
+- Free VRAM: ~12 GB a card at the 32k context (15.2 GB used across both cards plus the draft
+  layer's 0.09) — ~41 experts a layer across both cards at 13.4 MB each.
+- Routing-trace replay (`forward-glm --routing-trace`, `bringup/gates/routing_replay.py`; code
+  654 positions / chat 1998): at 48 experts a layer LRU serves 0.49 / 0.53 of picks, LFU
+  0.62 / 0.47, Belady 0.74 / 0.74; a static list from the code text applied to chat 0.19 — a
+  cache refreshed within the conversation, never a hotlist (the 2026-09-30 finding holds).
+- `xpt_gu` / `xpt_down` (`expert::gfx11`): a (token, pick) job over an expert in a card slot,
+  **bit-identical to the CPU** (32768/32768 outputs over 8 experts, `bench-xpt`), 19 µs an expert
+  at 4 jobs (713 GB/s), 58 µs alone (launch + sync).
+- Expected once integrated: experts 21 → ~11 ms a step → ~24–25 ms an emitted token.
+- Integration: resident picks' jobs to their card with the token's quantized activation (4.3 KB a
+  token over the BAR), outputs copied to host memory with a word, `run_batch` on the rest
+  meanwhile, the host's pick-order sum unchanged; a per-layer slot table a card filled from the
+  node's frequency counts after a warm-up, refreshed later. Sized for the 32k context unless
+  tcdent trades VRAM between experts and context.
+
 ## 4. Routing: the predictor and the boundary
 
 **Layer-ahead prediction.** Layer l+1's router applied to layer l's FFN input.
@@ -178,6 +214,16 @@ arithmetic noise, and an unforced flip gives a different path of equal quality (
 
 **Status: Unimplemented; tcdent's decision** (exploiting needs §3's cache to have anything to
 prefer).
+
+**Status 2026-10-17: layer-ahead built and deployed (0ea8ebc); the boundary question is still
+open.** Scored first on the routing trace: layer l+1's router over layer l's FFN input names
+4.88 / 5.06 of 8 picks (code / chat) against 4.12 / 4.63 for the attention-input predictor;
+served 5.59 vs 5.2–5.5. Built as the FFN half's one router launch carrying both layers' rows
+(`ROUTE_ROWS`), the prefetch issued when the layer's run returns (a run abandons prefetches in
+flight), the attention-half early router and the `early` lap retired. Gain **0.5 ms a step
+token** (29.0 → 28.1–29.0): the better prediction is partly eaten by the shorter window (34 % of
+predicted slices pulled before the run, 60 % before). Resolve-vs-exploit for the 8th/9th
+boundary: unchanged, tcdent's call.
 
 ## 5. Prefill kernels
 
@@ -218,6 +264,20 @@ prefer).
 - **Chunked KDA (FlashKDA v1, CHUNK 16): Unimplemented, low priority** — `kda_step` is 0.13 ms a
   prompt token. Its value returns with longer verify steps (§6).
 
+**Status 2026-10-17.**
+
+- WMMA rate measured (`bench-wmma`, `bringup/kernels`): iu8 WMMA **87 TOP/s**, bf16 WMMA 85
+  TFLOP/s, scalar f32 FMA 17.5 TFLOP/s at four chains — against the rows kernels' ~1.4 TFLOPS,
+  so an Ozaki-form pair has 10× or more rate headroom after the slice products; its bound is
+  staging operands, not the matrix unit. iu8 measured no faster than bf16 (RDNA3 lists 2×): try
+  eight chains before trusting the ratio. The pair itself is not built.
+- The rows kernels at a few tokens: a third pass width `FEW = 4` with four-step rounds (for the
+  verify step's 2–4 tokens) — the card's two-token step 21.7 → 17.6 ms of kernels; bf16 launches
+  1.18× one token's, FP8 still 1.7–2×. **Rejected:** one or two rows a wave for that width (a
+  wider grid): FP8 worse (ffn_down_shared 1277 / 1208 µs a step vs 994 at four rows), bf16 the
+  same — the FP8 gap is not occupancy. Open.
+- The attend dot, hc_pre, the prefill experts' gap, chunked KDA: unchanged.
+
 ## 6. Decode levers beyond placement
 
 - **Speculative decoding with the draft layer (MTP), depth 1: Resolved** (`1855eb7`,
@@ -244,6 +304,17 @@ prefer).
 - **The KDA projections' bytes (4.6 ms a token a card at bf16):** lossless DFloat11 (Huffman
   coding of the bf16 exponent) or FP8 (tcdent's dense-precision decision): **Unimplemented.**
 
+**Status 2026-10-17: MTP built, deployed, the lever that paid.** One draft after every step
+(the draft layer on the head's card), a two-token verify step with the KDA ring and a rejection
+sampler; acceptance 0.86 greedy on the gate text, 0.92 served (0.84–0.90 on a real coding
+session); 36 → ~30 ms an emitted token, 41 → ~32 at 18k. What made it pay: the verify step's
+expert prefetch (the early router for n ≤ SPEC_TOKENS, then layer-ahead) and the FEW pass width.
+**Rejected: depth 2.** The second draft's top-1 is the main model's at 0.50 (0.42 under the
+sampler); served, a three-token step cost 75–78 ms for 2.45 tokens — 30.6–31.8 ms an emitted
+token against 30.2, and a loss at 0.84 acceptance. The loop stays generic (`DRAFT_DEPTH = 1`);
+depth 2 pays once a three-token step is cheaper than ~65 ms, which the expert union bounds (§3).
+Persistent per-layer kernels, DFloat11, FP8 KDA projections: unchanged.
+
 ## 7. Precision decisions, with their measurements
 
 - **bf16 MLA latents.** Half the latent bytes (64 MB a layer at 32k). Not "native" to the
@@ -255,6 +326,11 @@ prefer).
   overlap of the indexer's top-2048 selection at 16k–100k positions — a number nobody has
   published. **Status: Unimplemented.**
 - **FP8 KDA projections:** **Unimplemented; tcdent's decision** (§6).
+
+**Status 2026-10-17: neither measured.** bf16 latents need a bf16 cache variant to measure KL
+and the indexer's selection overlap; FP8 KDA projections wait on tcdent's dense-precision
+decision. Both are behind §3 in expected gain (the KDA projections are ~4.6 ms a token a card at
+bf16 — real, but the expert phase is 21 ms a step).
 
 ## 8. Approximate menu (each needs its eval cost)
 
@@ -270,16 +346,20 @@ prefer).
 - Bit-plane expert storage (high plane first): precision per pick by gate weight, progressive
   prefetch, a bit-serial kernel's input, from one layout.
 
-## Order (what remains)
+**Status 2026-10-17: none evaluated.** Each is an eval run (KL, top-1, the evals.toml suite)
+before it can be weighed, and all are behind §3. Which ones get a run is tcdent's call.
 
-1. §1: check `p2p_links` and `pcie_p2p` on the box, the peer VRAM helper, the three benches.
-2. §1 then §2: peer-write handoffs if the ping-pong says so, then the card-controlled expert
-   phase.
-3. §3: the expert cache on the cards (ARC replayed first), then depth-2 drafting revisited.
-4. §5: the iu8 eight-chain rerun and the WMMA/Ozaki rows kernel; the attend's split positions
-   (after a timeline at 18k); the traced expert-phase gap; the FP8 few-token cost.
-5. §6: the shared indexer picks for the draft; persistent kernels re-costed.
-6. The timeline on/off offset, whenever a measurement boot is convenient.
+## Order
+
+1. ~~The cheap measurements~~ done 2026-10-17 but §1's benches: free VRAM, the routing-trace
+   replay, the iu8 WMMA rate.
+2. ~~MTP with KDA commit-after-verify (§6)~~ deployed 2026-10-17.
+3. ~~Layer-ahead routing (§4)~~ deployed 2026-10-17.
+4. **Experts on the cards (§3), host join** — the 24 ms lever; kernels built and gated, the step
+   integration next.
+5. Then §2 only if the host join's wait shows; §1's benches if a handoff is on the path.
+6. Prefill: WMMA rows (Ozaki or plain), the attend dot, the traced expert-phase gap (§5).
+7. Depth-2 drafting again once the step is cheap (§6); the precision measurements (§7).
 
 ## Decisions open for tcdent
 
