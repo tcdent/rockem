@@ -45,6 +45,8 @@ const MAP_PRIVATE: i32 = 2;
 const MAP_ANONYMOUS: i32 = 0x20;
 const HUGEPAGES: &str = "/dev/hugepages";
 const GB: usize = 1 << 30;
+/// The loader's progress line on the console: every this many bytes of a file, and at its end.
+const PROGRESS: usize = 10 * GB;
 
 /// The NUMA node of every 2 MiB page of a loaded region (`construct::PAGE`), asked of the
 /// kernel (`move_pages` with no destination): the truth a placed pool runs its items by.
@@ -141,7 +143,7 @@ pub fn load_placed(path: &std::path::Path, mem: Mem, node_of_item: &[u8]) -> glm
             let (src, done, name, addr) = (&src, &done, &name, &addr);
             sc.spawn(move || {
                 let mut staging = vec![0u8; layout::RUN];
-                let mut next_mark = GB;
+                let mut next_mark = PROGRESS;
                 for u in (t..runs).step_by(READERS) {
                     let (l, b, r) = (FIRST_K_DENSE_REPLACE + u / (E / layout::XBLOCK * layout::RUNS), u / layout::RUNS % (E / layout::XBLOCK), u % layout::RUNS);
                     let run_start = layout::share(l, b * layout::XBLOCK, r);
@@ -159,7 +161,7 @@ pub fn load_placed(path: &std::path::Path, mem: Mem, node_of_item: &[u8]) -> glm
                     let d = done.fetch_add(layout::RUN, std::sync::atomic::Ordering::Relaxed) + layout::RUN;
                     if t == 0 && d >= next_mark {
                         println!("loading  : {name} {:.1}/{:.1} GB ({:.0} MB/s, placed by item)", d as f64 / 1e9, len as f64 / 1e9, d as f64 / 1e6 / t0.elapsed().as_secs_f64());
-                        next_mark += GB;
+                        next_mark += PROGRESS;
                     }
                 }
             });
@@ -167,6 +169,7 @@ pub fn load_placed(path: &std::path::Path, mem: Mem, node_of_item: &[u8]) -> glm
     });
     assert_eq!(done.load(std::sync::atomic::Ordering::Relaxed), len, "placed load: bytes copied");
     println!("loading  : {name} {:.1} GB in {:.0} s ({:.0} MB/s, placed by item; regions {} GB of {} mapped)", len as f64 / 1e9, t0.elapsed().as_secs_f64(), len as f64 / 1e6 / t0.elapsed().as_secs_f64(), bytes.iter().map(|b| format!("{:.1}", *b as f64 / 1e9)).collect::<Vec<_>>().join(" / "), total as f64 / 1e9);
+    prow::row!("track-boot", "boot", { "what" => name.as_str(), "s" => t0.elapsed().as_secs_f64(), "gb" => len as f64 / 1e9 });
     if mem == Mem::Hugetlb {
         assert_eq!(unsafe { mlock(dst, total) }, 0, "mlock: {}", std::io::Error::last_os_error());
     }
@@ -208,14 +211,14 @@ fn load_with(path: &std::path::Path, mem: Mem) -> &'static [u8] {
             if mem == Mem::Hugetlb {
                 interleave(true);
             }
-            let (mut done, mut next_mark) = (0, GB);
+            let (mut done, mut next_mark) = (0, PROGRESS);
             while done < len {
                 let n = src.read(&mut buf[done..(done + 64 << 20).min(len)]).unwrap();
                 assert!(n > 0, "short read on {}", path.display());
                 done += n;
                 if done >= next_mark || done == len {
                     println!("loading  : {name} {:.1}/{:.1} GB ({:.0} MB/s)", done as f64 / 1e9, len as f64 / 1e9, done as f64 / 1e6 / t0.elapsed().as_secs_f64());
-                    next_mark += GB;
+                    next_mark += PROGRESS;
                 }
             }
             if mem == Mem::Hugetlb {
@@ -223,6 +226,7 @@ fn load_with(path: &std::path::Path, mem: Mem) -> &'static [u8] {
             }
         }
     }
+    prow::row!("track-boot", "boot", { "what" => name.as_str(), "s" => t0.elapsed().as_secs_f64(), "gb" => len as f64 / 1e9 });
     if mem == Mem::Hugetlb {
         assert_eq!(unsafe { mlock(dst, len) }, 0, "mlock: {}", std::io::Error::last_os_error());
     }

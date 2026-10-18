@@ -20,13 +20,14 @@
 //!   rockem.max=64              console: tokens to generate per line (the wire runs to EOS or a full context)
 //!   rockem.cache=<GB>          host memory for cached contexts (default: half of what is free)
 //!   rockem.debug=<dir>         dev: write every position's logits as <dir>/pos<N>.f32 and print the top-2 margin
-//!   rockem.profile=N           GLM: a line of the token's time by phase every N tokens
-//!   rockem.timeline=1          GLM, with rockem.gpu: each card's launches stamped; every 16 tokens a line per card
 //!   rockem.resident=<GB>       GLM, with rockem.gpu: VRAM a card may spend on resident routed experts (default: what is free past a reserve, up to 12); 0 leaves the cards to a gate or bench beside the node
-//!                              of the token's time by kernel and the gaps between launches
+//!   rockem.prow=<host:port>    the prow server the run's rows go to (default PROW_SERVER below)
 //!   rockem.probe=1             measure this box (DRAM, GEMV rates, each card's VRAM, link and BAR) with
 //!                              the bundle's code object if there is one, report, and idle: the baseline
 //!   rockem.shell=1 / rockem.exit=1   dev conveniences (see os/qemu.sh)
+//!
+//! Measurements are prow rows, not console lines: the categories compiled in (`node/Cargo.toml`)
+//! decide what is recorded, and the console is the server's log — what it runs, and what went wrong.
 mod engine;
 mod glm;
 mod glm_kfd;
@@ -46,6 +47,13 @@ use std::io::{BufRead, Read, Write};
 /// wins, as for the kernel's own parameters — so a netboot line that repeats ours overrides
 /// the image's, and an argument given by hand overrides both (a node run from a shell on a
 /// booted box listens where it is told, not where the image's node does).
+/// Where the run's rows go: prow-server's ingest on elsenor (`rockem.prow` overrides).
+const PROW_SERVER: &str = "192.168.88.3:7380";
+/// The prow sender's core: the SMT sibling of physical core 72, a housekeeping core (`dev.cmdline`'s
+/// isolation leaves 0/24/48/72 and their siblings to the kernel). The pool holds one thread a physical
+/// core, the main thread core 0 and the expert loader core 24; the sender wakes every 100 ms.
+const PROW_CORE: usize = 168;
+
 fn config(key: &str) -> Option<String> {
     let cmd = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
     cmd.split_whitespace().map(String::from).chain(std::env::args().skip(1)).filter_map(|t| t.strip_prefix(&format!("{key}=")).map(String::from)).last()
@@ -263,6 +271,10 @@ struct Session {
 const DRAFT_SALT: u64 = 0x5eed_d4af_7000_0001;
 const RESIDUAL_SALT: u64 = 0x5eed_d4af_7000_0002;
 impl Session {
+    /// The prompt's positions past the prefix: fed, or matched in the store and not yet resumed.
+    fn prompt(&self) -> usize {
+        self.pending.map_or(self.pos, |(_, n)| n) - self.first_pos()
+    }
     fn first_pos(&self) -> usize {
         self.e.first_pos()
     }
@@ -380,7 +392,7 @@ impl Session {
         }
         self.pos = at;
         self.hits = at - first;
-        println!("context  : {} of a cached transcript's {} positions matched; resumed at {at}{}, {} replayed", n, self.store.contexts[src].as_ref().unwrap().ids.len(), if drawn { " with its logits" } else { "" }, replay.len());
+        prow::row!("track-store", "store_resume", { "matched" => n, "transcript" => self.store.contexts[src].as_ref().unwrap().ids.len(), "at" => at, "drawn" => drawn, "replayed" => replay.len() });
         replay.is_empty() || self.feed_many(&replay, &mut |_| {})
     }
     /// The sequence state now, kept with the active context at this position (the end of a
@@ -398,7 +410,7 @@ impl Session {
         let mut snap = vec![0f32; len];
         self.e.snapshot(&mut snap);
         let logits = self.e.logits_row(self.last_row).to_vec();
-        println!("context  : state at {} positions kept ({:.0} MB in {:.0} ms)", self.pos, 4.0 * len as f64 / 1e6, t0.elapsed().as_secs_f64() * 1e3);
+        prow::row!("track-store", "store_keep", { "pos" => self.pos, "mb" => 4.0 * len as f64 / 1e6, "ms" => t0.elapsed().as_secs_f64() * 1e3 });
         c.marks.push((self.pos, snap, logits));
         // the newest MARKS_KEPT stay; every kept state is charged to the budget, which evicts other contexts
         let dropped = c.marks.len().saturating_sub(MARKS_KEPT);
@@ -676,11 +688,14 @@ fn serve(listen: &str, session: &mut Session, identity: u64) {
                         0 => session.max_ctx,
                         n => n,
                     };
-                    let ok = flush(session, &mut ids, &mut s) && session.started && session.generate(limit, |id| s.write_all(&id.to_le_bytes()).is_ok());
-                    if session.verified > 0 {
-                        println!("spec     : {} verify steps, {} drafts accepted ({:.2} a step)", session.verified, session.accepted, session.accepted as f32 / session.verified as f32);
-                        session.verified = 0;
-                        session.accepted = 0;
+                    let mut ok = flush(session, &mut ids, &mut s) && session.started;
+                    if ok {
+                        let (prompt, t0, mut n) = (session.prompt(), std::time::Instant::now(), 0usize);
+                        ok = session.generate(limit, |id| {
+                            n += 1;
+                            s.write_all(&id.to_le_bytes()).is_ok()
+                        });
+                        request_row(session, "wire", prompt, n, t0.elapsed().as_secs_f64() * 1e3);
                     }
                     ok
                 }
@@ -709,6 +724,14 @@ fn serve(listen: &str, session: &mut Session, identity: u64) {
         }
         session.e.idle();
     }
+}
+
+/// A generated continuation: the prompt's positions past the prefix (`hits` of them from the store),
+/// the ids generated and the time it took; the verify steps and drafts accepted since the last.
+fn request_row(session: &mut Session, mode: &str, prompt: usize, generated: usize, ms: f64) {
+    prow::row!("track-store", "request", { "mode" => mode, "prompt" => prompt, "hits" => session.hits, "generated" => generated, "ms" => ms, "verified" => session.verified, "accepted" => session.accepted });
+    session.verified = 0;
+    session.accepted = 0;
 }
 
 fn halt(msg: &str) -> ! {
@@ -753,15 +776,27 @@ fn main() {
     };
 
     // --- construction: the manifest names the model, its engine builds it ---
+    let max_ctx: usize = config("rockem.ctx").and_then(|v| v.parse().ok()).unwrap_or(2048);
+    let gpu = config("rockem.gpu").is_some();
     let mem = if config("rockem.mem").as_deref() == Some("anon") { loader::Mem::Anon } else { loader::Mem::Hugetlb };
     let bundle = std::path::Path::new(&bundle);
     let manifest = std::fs::read(bundle.join("manifest.toml")).unwrap_or_else(|e| halt(&format!("{}: {e}", bundle.join("manifest.toml").display())));
     let name = model_name(&String::from_utf8_lossy(&manifest)).unwrap_or_else(|| halt("the manifest names no model ([model] name)"));
-    let max_ctx: usize = config("rockem.ctx").and_then(|v| v.parse().ok()).unwrap_or(2048);
-    let (gpu, experts_host) = (config("rockem.gpu").is_some(), config("rockem.experts").as_deref() == Some("host"));
+    prow::Run::new("rockem")
+        .attrs(prow::build_attrs!())
+        .server(config("rockem.prow").unwrap_or_else(|| PROW_SERVER.into()))
+        .core(PROW_CORE)
+        .attr("model", name.as_str())
+        .attr("bundle", bundle.display().to_string())
+        .attr("ctx", max_ctx)
+        .attr("gpu", gpu)
+        .attr("cmdline", cmdline.trim())
+        .attr("image", std::fs::read_to_string("/etc/rockem-profile").unwrap_or_default().trim())
+        .start();
+    let experts_host = config("rockem.experts").as_deref() == Some("host");
     let e: Box<dyn Engine> = match name.as_str() {
         "deepseek-v2-lite" => v2lite::V2Lite::open(bundle, mem, max_ctx, gpu, experts_host),
-        "glm-5.3-flash" => glm::Glm::open(bundle, mem, max_ctx, gpu, config("rockem.profile").and_then(|v| v.parse().ok()).unwrap_or(0), config("rockem.timeline").is_some(), config("rockem.resident").and_then(|v| v.parse::<usize>().ok()).map_or(glm_kfd::RESIDENT_BYTES, |gb| gb << 30)),
+        "glm-5.3-flash" => glm::Glm::open(bundle, mem, max_ctx, gpu, config("rockem.resident").and_then(|v| v.parse::<usize>().ok()).map_or(glm_kfd::RESIDENT_BYTES, |gb| gb << 30)),
         other => halt(&format!("the manifest names model {other:?}, which this node does not carry")),
     };
     assert!(max_ctx > e.first_pos(), "rockem.ctx must leave room after the prefix");
@@ -824,6 +859,7 @@ fn main() {
             continue;
         }
         let t_prefill = t1.elapsed();
+        let prompt = session.prompt();
         let t2 = std::time::Instant::now();
         let mut n = 0;
         session.generate(max_new, |id| {
@@ -832,6 +868,7 @@ fn main() {
             out.flush().is_ok()
         });
         let t_gen = t2.elapsed();
+        request_row(&mut session, "console", prompt, n, t_gen.as_secs_f64() * 1e3);
         println!();
         println!("[{} prompt tokens in {:.2}s ({} cached), {n} generated at {:.2} tok/s]", ids.len(), t_prefill.as_secs_f32(), session.hits, n as f32 / t_gen.as_secs_f32());
     }

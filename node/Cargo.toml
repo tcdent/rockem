@@ -2,9 +2,31 @@
 name = "node"
 version = "0.0.0"
 edition = "2021"
-description = "rockem node binary — PID 1 after /init: report the platform, load the bundle into hugetlbfs, construct the model, serve token ids on the console. Static musl; depends on the model crates and nothing else."
+description = "rockem node binary — PID 1 after /init: report the platform, load the bundle into hugetlbfs, construct the model, serve token ids on the console. Static musl; depends on the model crates and prow (std and libc) and nothing else."
 
 [dependencies]
 common = { path = "../common" }
 deepseek_v2_lite = { path = "../models/deepseek-v2-lite", features = ["std"] }
 glm_5_3_flash = { path = "../models/glm-5.3-flash", features = ["std"] }
+prow = { path = "../../prow" }
+
+[build-dependencies]
+prow = { path = "../../prow" }
+
+# The prow categories the node's hooks name (docs/kernel-tuning-feedback.md, Observation). The dev image carries the defaults;
+# `--no-default-features` is the build that records nothing, the baseline for what tracking costs.
+[features]
+default = ["track-step", "track-store", "track-boot", "track-zones"]
+# GLM: a row a step of the token's time by phase (the CPU model's `Profile`), the step's expert runs
+# by NUMA node, and every 16 positions the experts' coverage and the cards' resident slots
+track-step = []
+# GLM, with rockem.gpu: every launch on every card as a zone, from the launches' completion stamps
+# (each dispatch carries a signal: ~1.7 µs a launch, and the resident experts' host check runs too)
+track-launches = []
+# the context store's resumes and kept states, a row a request, the placement's re-trainings
+track-store = []
+# the loader's files and the engine's construction, timed
+track-boot = []
+# GLM: the step's phases as zones, by time (glm_5_3_flash's category: every layer's laps, the routed
+# experts, the pool's runs, the join), so they stack and their gaps show
+track-zones = ["glm_5_3_flash/track-zones"]

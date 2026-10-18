@@ -12,7 +12,8 @@
 //!               [--step N]            with --gpu: the positions again in steps of N tokens, bit for bit the single tokens'
 //!               [--step-ids <file>]   the step gate over these ids (the model's prefix first, then any text's: longer than the goldens)
 //!               [--elf <path>]        with --gpu: this code object instead of the bundle's (a kernel under test)
-//!               [--timeline]          with --gpu: the cards' kernel laps a step (every multi-token step, every 16th token)
+//!               [--timeline]          with --gpu: the launches stamped, every launch a step a prow zone (`zones`, lanes card0/card1);
+//!                                     the run's `args` attribute names the --elf, so variants compare across runs
 //!               [--routing-trace <file>] with --gpu: every MoE layer's picks a position over the --step-ids text, and the layer-ahead predictor scored
 //!               [--mtp-accept]        with --gpu: the draft layer's acceptance over the --step-ids text (greedy, and under the model's sampler)
 //!               [--gpu]               with --cpu: the blocks on the gfx1100 cards (node/src/glm_kfd.rs), the bundle's code object
@@ -38,6 +39,12 @@ use std::io::Write;
 use std::path::PathBuf;
 
 fn main() {
+    prow::Run::new("rockem")
+        .attrs(prow::build_attrs!())
+        .server(std::env::var("PROW_SERVER").unwrap_or_else(|_| "192.168.88.3:7380".into()))
+        .attr("tool", "forward-glm")
+        .attr("args", std::env::args().skip(1).collect::<Vec<_>>().join(" "))
+        .start();
     let gdir = arg_required("--goldens");
     let ckpt = arg("--ckpt").unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap()).join("hf-cache/glm-5.3-flash"));
     let layers: usize = arg("--layers").map_or(NUM_HIDDEN_LAYERS, |v| v.to_str().unwrap().parse().unwrap());
@@ -219,7 +226,7 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
     };
     let mut model = CpuModel::new(routed, &pool, ctx);
     if harness::flag("--gpu") {
-        // the bundle's code object, or one under test (`--elf`); `--timeline` prints the cards' kernel laps a step
+        // the bundle's code object, or one under test (`--elf`); `--timeline` records the cards' launches as zones
         let elf_path = arg("--elf").unwrap_or_else(|| bundle.join(layout::KERNELS_FILE));
         let elf = std::fs::read(&elf_path).unwrap_or_else(|e| panic!("{}: {e}", elf_path.display()));
         model.placed = Some(Box::new(glm_kfd::Cards::new(&elf, &w, ctx, harness::flag("--timeline"), 1 << 30)));

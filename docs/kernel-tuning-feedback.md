@@ -28,7 +28,7 @@ And it comes in three kinds, each answering one question:
 | kind | question | their instrument | ours |
 |---|---|---|---|
 | correctness | is the computation right? | kernel paths compared against unpartitioned implementations, under the deployment's real partitioning | the scalar twin at **equality**; launchers against the CPU's real layer state (`bringup/gpu/*.py`); the placement matrix (`node rockem.debug=`) |
-| system behaviour | where is the time going? | execution traces, runtime events, timelines across compute / waiting / communication | the launch timeline (see Observation), read by `bench-token`; not yet reported by the node itself |
+| system behaviour | where is the time going? | execution traces, runtime events, timelines across compute / waiting / communication | the launch timeline (see Observation), read by `bench-token`, and recorded by the node and `forward-glm --timeline` as prow zones; the node's `step` rows (see *Rows*) |
 | performance | which approach, under which conditions? | microbenchmarks under specific input shapes, then end-to-end confirmation | `bringup/bench` with the bandwidth ceiling measured in the same run; the rotating working set; end-to-end tok/s on the node |
 
 The correspondence is close enough that their three example cases each have a
@@ -153,7 +153,7 @@ kernel that ships is the kernel that was measured. Four channels, with where eac
 
 | channel | what it observes | mechanism | status |
 |---|---|---|---|
-| **timeline** | where the time goes: every launch's start and end on the card's 100 MHz clock, and the gap before it | every dispatch carries a signal from a ring in the launcher; the command processor stamps it; `Kfd::timeline()` after a wait (`node/src/kfd.rs`) | **in force**, always on; `bench-token` accounts a token by kernel with it; the node does not yet report it |
+| **timeline** | where the time goes: every launch's start and end on the card's 100 MHz clock, and the gap before it | every dispatch carries a signal from a ring in the launcher; the command processor stamps it; `Kfd::timeline()` after a wait (`node/src/kfd.rs`) | **in force**; `bench-token` accounts a token by kernel with it; the GLM node built with `track-launches`, and `forward-glm --timeline`, record every launch as a prow zone (see *Rows*) |
 | **edge mirrors** | the values at a kernel's edges: this position's cache rows, each layer's residual, the routing, the logits | a kernel writes its edge to a host-memory mirror as well as its device buffer — one extra store, no branch — read once after the token's wait (`KfdModel::token_trace`) | **in force** for the four edges the store and the debug dumps need; a named edge table for the rest is the extension |
 | **static** | registers, LDS, scratch, occupancy per kernel | the kernel descriptors in `kernels.gfx1100.elf` (`*.kd`: rsrc1/rsrc2, private and group segment sizes) | scratch is asserted zero at load; a report tool is not written |
 | **statistics** | what a kernel knows about itself: the time of each phase inside it, a value at a point in its epilogue — one entry per wave, so the host averages or ranks after the fact and no wave is a representative | `common::stats`: `stat!(slot, value)` and `stat_clock!()`, expanding to nothing without the `stats` feature; a slab `[launch][slot][wave]` of f32 bits the kernel finds by its own dispatch id (the timeline's index), the launcher fills the slab's address into `ROCKEM_STATS` in the loaded image; slot names declared next to each kernel (`stat_names`); the stats code object is a bring-up build (`--features stats`, `bundles/kernels-stats.gfx1100.elf`), the release object is byte-identical to one without the feature | **in force** for `route` (four phases), `attn_mla` (three), and the down kernels (the residual's magnitude, the sink detector); read by `bench-token` |
@@ -184,6 +184,42 @@ the timeline reports each kernel as a fraction of that ceiling — the bench har
 by the launcher. With that, the node's own per-token account, printed on request from the
 shipped binary, is the system-behaviour feedback the table above calls missing. *Not yet
 done; the next item.*
+
+## Rows: what the node and the bring-up tools record
+
+Measurements leave the node as prow rows (`~/Work/prow`), not console lines; the console is the
+server's log (what it runs, what went wrong). A hook names a category, a Cargo feature of the
+crate that calls it, so what is recorded is decided at build time and a build records it from
+the first step on; `node --no-default-features` records nothing and is the baseline for what
+recording costs. Every run's manifest carries `build.commit`, `build.dirty`, `build.features`
+and the node's `model`, `bundle`, `ctx`, `gpu`, `cmdline` and `image`; `forward-glm` runs carry
+`tool` and `args`. The node sends to `192.168.88.3:7380` (`rockem.prow=` overrides), from core 168.
+
+| category | crate | sites |
+|---|---|---|
+| `track-step` (default) | node | `step`: a row a GLM step, the CPU model's `Profile` summed over the step's tokens (`*_ms` phases, the pick and item counts); `step_node`: the step's expert runs by NUMA node; `experts`: every 16 positions, the coverage since start and the cards' resident slots |
+| `track-store` (default) | node | `request`: a generated continuation (prompt, hits, generated, ms, verify steps, drafts accepted); `store_resume`, `store_keep`; `messages`: the placement's re-trainings |
+| `track-boot` (default) | node | `boot`: each loaded file, the bundle, the prefix, the cards' upload (`what`, `s`, `gb`) |
+| `track-launches` | node, forward-glm | `zones`: every launch on lanes `card0`, `card1` (name, start, `dur_ns`), from the completion stamps through the card's clock. Stamping costs ~1.7 µs a launch and turns on the resident experts' host check, so the dev image leaves it out: `make node NODE_FEATURES="--features track-launches"`. A step of more launches than the ring holds keeps its last 512 |
+
+Queried with `~/Work/prow/bin/prow-sql rockem "<SQL>"` (DuckDB; a view per site and `runs`,
+joined on `run`). The time by phase a token over a run's single-token steps:
+
+```sql
+SELECT count(*) steps, round(avg(experts_ms), 2) experts, round(avg(mla_attn_ms), 2) attend,
+       round(avg(hc_ms + slot_ms + kda_card_ms + kda_cpu_ms + mla_proj_ms + mla_attn_ms + mla_out_ms
+             + dense_ffn_ms + route_ms + shared_ms + experts_ms + head_ms + draft_ms), 2) total
+FROM step WHERE run = '<run>' AND width = 1;
+```
+
+A kernel variant against another (what `tl_agg.awk` summed from the old timeline lines), µs a
+launch per card, one `forward-glm --elf <variant> --timeline` run each:
+
+```sql
+SELECT r.args, z.lane, z.name, count(*) launches, round(avg(z.dur_ns) / 1e3, 1) us
+FROM zones z JOIN runs r USING (run) WHERE r.tool = 'forward-glm' AND z.category = 'track-launches'
+GROUP BY ALL ORDER BY z.lane, us DESC;
+```
 
 ## Skeletons
 

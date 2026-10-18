@@ -23,8 +23,8 @@ kernels-glm:      ## GLM-5.3-Flash's gfx1100 code object and its static report
 	cd models/glm-5.3-flash/gpu && cargo +nightly build --release
 	python3 bringup/kernel_report.py models/glm-5.3-flash/gpu/target/amdgcn-amd-amdhsa/release/glm_5_3_flash_gpu.elf
 
-node:             ## the static node binary (musl)
-	$(RUN) cargo build --release --target x86_64-unknown-linux-musl -p node
+node:             ## the static node binary (musl); NODE_FEATURES="--features track-launches" adds a prow category, "--no-default-features" records nothing
+	$(RUN) cargo build --release --target x86_64-unknown-linux-musl -p node $(NODE_FEATURES)
 
 initramfs: node   ## initramfs.cpio.zst for $(PROFILE)
 	$(RUN) os/initramfs/build.sh $(PROFILE)

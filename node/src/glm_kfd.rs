@@ -306,18 +306,15 @@ pub struct Cards {
     head: (usize, Mem, Mem),
     mtp: Option<MtpOn>,
     resident: Resident,
-    /// Built with the launches stamped (`rockem.timeline`): the bring-up checks run too.
+    /// Built with the launches stamped (`track-launches`): the bring-up checks run too.
     instrument: bool,
     /// The handoff sequence: a value a half of a layer's words carry, and each layer's (attention, FFN) values this token.
     seq: u32,
     half_seq: Vec<[u32; 2]>,
-    /// With the launches stamped: each card's first packet of the token, and the tokens since the last report.
+    /// With the launches stamped: each card's first packet of the step.
     token_from: Vec<u64>,
-    /// The step's token count (`begin`), for the report at `finish`.
-    last_n: usize,
     /// Pools the context can hold: the scores' row stride.
     npools: usize,
-    tokens: u32,
 }
 
 fn raw_i8(v: &[i8]) -> &[u8] {
@@ -642,6 +639,7 @@ impl Cards {
             bytes += norm.size + lm.size;
             (card, norm, lm)
         };
+        prow::row!("track-boot", "boot", { "what" => "cards", "s" => t0.elapsed().as_secs_f64(), "gb" => bytes as f64 / 1e9 });
         println!("gpu      : {} KDA layers, {mla_n} MLA layers (their latents to {max_ctx} positions), {dense} dense FFNs, {shared_n} shared experts, the hyper-connections, the streams and the head on {} card{} ({:.1} GB with their state) in {:.1}s", kda_layers.len(), n, if n == 1 { "" } else { "s" }, bytes as f64 / 1e9, t0.elapsed().as_secs_f32());
         // the draft layer: its MLA attention as layer MTP_LAYER on the head's card (the shared lm_head is
         // there), its own pieces beside it
@@ -1431,13 +1429,13 @@ impl Placed for Cards {
         for c in &self.cards {
             c.k.sync();
         }
-        self.timeline_report(self.last_n);
+        self.timeline_report();
     }
     fn finish(&mut self) {
         for c in &self.cards {
             c.k.sync();
         }
-        self.timeline_report(self.last_n);
+        self.timeline_report();
     }
     fn kda_rewind(&mut self, l: usize, slot: usize) {
         // every part: its state buffers from the ring's slot (a copy launch each; the ring holds every

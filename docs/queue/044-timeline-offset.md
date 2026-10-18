@@ -5,8 +5,9 @@
 **Gain:** a few ms of free time at the end (unmeasured)
 
 ## Proposal
-`rockem.timeline=1` puts a completion signal on every launch; it is on while the work needs it.
-Measure the current build with it on and off once, to know the offset and subtract it.
+A node built with `track-launches` puts a completion signal on every launch; it is in the build
+while the work needs it. Compare the `step` rows of a build with it and one without once, to know
+the offset and subtract it.
 
 ## Source
 tcdent, 2026-10-17: disabling it is "a free optimization" for late.

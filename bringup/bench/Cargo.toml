@@ -10,6 +10,8 @@ common = { path = "../../common", features = ["std"] }
 deepseek_v2_lite = { path = "../../models/deepseek-v2-lite", features = ["std"] }
 glm_5_3_flash = { path = "../../models/glm-5.3-flash", features = ["std"] }
 memmap2 = "0.9"
+# the card clock behind node/src/kfd.rs's `utc` (included by #[path])
+prow = { path = "../../../prow" }
 
 [[bin]]
 name = "bench-experts"

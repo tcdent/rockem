@@ -272,6 +272,7 @@ impl Threads {
             }
             return;
         }
+        prow::zone!("track-zones", "pool.run");
         let entered = std::time::Instant::now();
         let job = self.post(n, at, node, ccd, slot, f, None);
         unsafe { work(job, &self.order, self.node) };
@@ -680,6 +681,7 @@ impl Routed for CpuExperts<'_> {
         use common::q4::{self, Act, QAct, GEMM_TOKENS, GROUP};
         use common::swiglu::swiglu_clamped;
         use expert::{DOWN_PARTS, DOWN_ROWS, GU_PARTS, GU_ROWS, SUB};
+        prow::zone!("track-zones", "experts");
         let t0 = std::time::Instant::now();
         let n = idx.len();
         assert!(n <= STEP);
@@ -886,8 +888,8 @@ pub enum LayerState {
     Mla { cache: Vec<u16>, pools: Vec<u16> },
 }
 
-/// A token's time by phase, summed over steps until `take`n (bring-up and the node's
-/// `rockem.profile` line). The experts are the routed realization's own count.
+/// A token's time by phase, summed over steps until reset (bring-up, and the node's `step` rows
+/// under its `track-step` category). The experts are the routed realization's own count.
 #[derive(Default, Clone, Copy)]
 pub struct Profile {
     pub tokens: usize,
@@ -941,32 +943,6 @@ pub struct Profile {
     pub post_drain: f64,
     pub post_free: f64,
 }
-impl Profile {
-    /// The expert runs by node: each node's share of the items, when its last item finished (ms a
-    /// token, over the gate/up and down runs of every MoE layer), and its rate in items a ms — the
-    /// shares a placement should give the nodes are in proportion to these rates.
-    fn nodes(&self) -> String {
-        let used: Vec<usize> = (0..MAX_NODES).filter(|&d| self.node_items[d] > 0).collect();
-        if used.len() < 2 {
-            return String::new();
-        }
-        let n = self.tokens.max(1) as f64;
-        let total: usize = used.iter().map(|&d| self.node_items[d]).sum();
-        let share: Vec<String> = used.iter().map(|&d| format!("{:.1}", 100.0 * self.node_items[d] as f64 / total as f64)).collect();
-        let end: Vec<String> = used.iter().map(|&d| format!("{:.2}", 1e3 * self.node_end[d] / n)).collect();
-        let rate: Vec<String> = used.iter().map(|&d| format!("{:.1}", self.node_items[d] as f64 / (1e3 * self.node_end[d]).max(1e-9))).collect();
-        format!("\nprofile  : nodes — items {} %, run ends {} ms a token, {} items/ms; a token's {:.1} runs end at {:.2} ms (the last node each run) and spend {:.2} ms slotting (sort {:.2}, drain {:.2}, alloc+free {:.2}), {:.2} waking, {:.2} in the tail", share.join(" / "), end.join(" / "), rate.join(" / "), self.runs as f64 / n, 1e3 * self.run_last / n, 1e3 * self.run_slot / n, 1e3 * self.post_sort / n, 1e3 * self.post_drain / n, 1e3 * self.post_free / n, 1e3 * self.run_wake / n, 1e3 * self.run_tail / n)
-    }
-    /// One line of milliseconds a token, the phases in order and their sum.
-    pub fn line(&self) -> String {
-        let n = self.tokens.max(1) as f64 / 1e3;
-        let mla = self.mla_proj + self.mla_attn + self.mla_out;
-        let rs = self.route + self.shared;
-        let sum = self.hc + self.slot + self.kda_card + self.kda_cpu + mla + self.dense_ffn + rs + self.experts + self.head + self.draft;
-        format!("{} tokens: hc {:.1}  slot {:.1}  kda card {:.1}  kda cpu {:.1}  mla {:.1} (proj {:.1} attn {:.1} out {:.1})  dense ffn {:.1}  router+shared {:.1} (route {:.1} shared {:.1})  experts {:.1} (reused {:.2} of {} from the previous token, {:.2} named on the attention input; {:.0}% of the predicted slices pulled; {:.0}% of items on their CCD; {:.0}% of picks resident)  head {:.1}  draft {:.1}  join {:.2}  = {:.1} ms a token{}", self.tokens, self.hc / n, self.slot / n, self.kda_card / n, self.kda_cpu / n, mla / n, self.mla_proj / n, self.mla_attn / n, self.mla_out / n, self.dense_ffn / n, rs / n, self.route / n, self.shared / n, self.experts / n, self.reuse as f64 / self.moe_layers.max(1) as f64, TOP_K, self.pre_agree as f64 / self.moe_layers.max(1) as f64, 100.0 * self.prefetched as f64 / self.prefetch_items.max(1) as f64, 100.0 * self.local_items as f64 / self.items.max(1) as f64, 100.0 * self.resident as f64 / self.picks.max(1) as f64, self.head / n, self.draft / n, self.join / n, sum / n, self.nodes())
-    }
-}
-
 pub struct CpuModel<'p, R: Routed> {
     pub routed: R,
     pub pool: &'p dyn Pool,
@@ -1283,6 +1259,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
     /// cache has every position.
     pub fn draft_batch(&mut self, w: &Weights, hiddens: &[f32], nexts: &[u32], pos: usize, n: usize, logits: &mut [f32], tr: &mut impl Trace) {
         let s = self;
+        prow::zone!("track-zones", "draft");
         let t0 = std::time::Instant::now();
         let m = w.mtp.as_ref().expect("the weights carry no draft layer");
         let LayerState::Mla { cache, pools } = s.mtp.as_mut().expect("no draft state") else { unreachable!() };
@@ -1390,6 +1367,8 @@ impl<'p, R: Routed> CpuModel<'p, R> {
         if self.placed.is_some() {
             return self.step_batch(w, &[tok], pos, forced, tr, if logits { Logits::Last } else { Logits::None });
         }
+        // the CPU realization's own zone (with cards, step_batch names the step)
+        prow::zone!("track-zones", "token");
         let s = self;
         let row = &w.embed[tok as usize * H..(tok as usize + 1) * H];
         for j in 0..HC {
@@ -1399,10 +1378,20 @@ impl<'p, R: Routed> CpuModel<'p, R> {
         }
         tr.edge(NONE, "embed", &s.streams[..H]);
         let mut t = std::time::Instant::now();
-        let mut lap = |acc: &mut f64| {
+        // a lap is a phase from the previous lap to now: its time goes to the profile and, with
+        // track-zones, it is a zone of that name on this thread's lane
+        #[cfg(feature = "track-zones")]
+        let mut mark = prow::Timestamp::now();
+        let mut lap = |acc: &mut f64, _name: &'static str| {
             let now = std::time::Instant::now();
             *acc += (now - t).as_secs_f64();
             t = now;
+            #[cfg(feature = "track-zones")]
+            {
+                let end = prow::Timestamp::now();
+                prow::zone_at!("track-zones", _name, prow::lane(), mark, end);
+                mark = end;
+            }
         };
         let p = &mut s.profile;
         p.tokens += 1;
@@ -1412,12 +1401,12 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             let mix = hc::pre(&lw.hc_attn, &s.streams, &mut hcs, s.pool, &mut s.x);
             rmsnorm::<H>(&s.x, &lw.input_ln, RMS_NORM_EPS, &mut s.xn);
             tr.edge(l, "attn_in", &s.xn);
-            lap(&mut p.hc);
+            lap(&mut p.hc, "hc");
             match (&lw.attn, &mut s.layers[l]) {
                 (Attn::Kda(a), LayerState::Kda { window, mem }) => {
                     let mut ks = kda::Scratch { mixed: &mut s.k_mixed, conv: &mut s.k_conv, fa: &mut s.k_fa, f: &mut s.k_f, beta: &mut s.k_beta, ga: &mut s.k_ga, gate: &mut s.k_gate, normed: &mut s.k_normed, heads: &mut s.k_heads };
                     kda::step(l, a, &s.xn, window, mem, &mut ks, s.pool, tr, &mut s.y);
-                    lap(&mut p.kda_cpu);
+                    lap(&mut p.kda_cpu, "kda_cpu");
                 }
                 (Attn::Mla(a), LayerState::Mla { cache, pools }) => {
                     let mut ms = mla::Scratch { qr: &mut s.m_qr, qa: &mut s.m_qa, q: &mut s.m_q, kva: &mut s.m_kva, ik: &mut s.m_ik, iq: &mut s.m_iq, iw: &mut s.m_iw, pscore: &mut s.m_pscore, pidx: &mut s.m_pidx, sel: &mut s.m_sel, heads: &mut s.m_heads, hs: &mut s.m_hs };
@@ -1426,12 +1415,12 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                         mla::project(a, &s.xn, &mut ms, igate, s.pool);
                         mla::finish_row(a, ms.kva, ms.ik, latent, ikey);
                     }
-                    lap(&mut p.mla_proj);
+                    lap(&mut p.mla_proj, "mla_proj");
                     let n = mla::select_at(l, a, cache, pools, pos, &mut ms, tr);
                     mla::heads(l, a, cache, &mut ms, n, s.pool, tr);
-                    lap(&mut p.mla_attn);
+                    lap(&mut p.mla_attn, "mla_attn");
                     mla::output(a, ms.heads, &mut s.y, s.pool);
-                    lap(&mut p.mla_out);
+                    lap(&mut p.mla_out, "mla_out");
                 }
                 _ => unreachable!("a layer's state and weights disagree"),
             }
@@ -1442,26 +1431,26 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             let mix = hc::pre(&lw.hc_ffn, &s.streams, &mut hcs, s.pool, &mut s.x);
             rmsnorm::<H>(&s.x, &lw.post_ln, RMS_NORM_EPS, &mut s.xn);
             tr.edge(l, "ffn_in", &s.xn);
-            lap(&mut p.hc);
+            lap(&mut p.hc, "hc");
             let mut fs = ffn::Scratch { gu: &mut s.f_gu, h: &mut s.f_h, expert_out: &mut s.f_expert_out, shared: &mut s.f_shared, score: &mut s.f_score };
             match &lw.ffn {
                 Ffn::Dense(d) => {
                     ffn::dense(l, d, &s.xn, &mut fs, s.pool, tr, &mut s.y);
-                    lap(&mut p.dense_ffn);
+                    lap(&mut p.dense_ffn, "dense_ffn");
                 }
                 Ffn::Moe(m) => {
                     let picks = ffn::moe_routed(l, m, &s.xn, &mut fs, s.pool, &mut s.routed, forced.map(|f| &f[l - FIRST_K_DENSE_REPLACE]), tr, &mut s.y);
                     account(p, &mut s.last_picks, &mut s.freq, s.pool, l, picks, [E; TOP_K]);
                     let e = s.routed.elapsed();
                     p.experts += e;
-                    lap(&mut p.route);
+                    lap(&mut p.route, "route");
                     p.route -= e;
                     ffn::moe_shared(m, &s.xn, &mut fs, s.pool);
                     tr.edge(l, "shared", fs.shared);
                     for i in 0..H {
                         s.y[i] += fs.shared[i];
                     }
-                    lap(&mut p.shared);
+                    lap(&mut p.shared, "shared");
                 }
             }
             tr.edge(l, "ffn_out", &s.y);
@@ -1474,14 +1463,14 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 s.mean[d] = acc / HC as f32;
             }
             tr.edge(l, "out", &s.mean);
-            lap(&mut p.hc);
+            lap(&mut p.hc, "hc");
         }
         if logits {
             rmsnorm::<H>(&s.mean, &w.norm, RMS_NORM_EPS, &mut s.xn);
             gemv::bf16_par::<VOCAB_SIZE, H>(w.lm_head, &s.xn, &mut s.logits[..VOCAB_SIZE], s.pool);
             tr.edge(NONE, "logits", &s.logits[..VOCAB_SIZE]);
         }
-        lap(&mut p.head);
+        lap(&mut p.head, "head");
     }
 
     /// A step of `toks` (at `pos..pos + n`, `n ≤ STEP`) on the cards: the host posts each layer's
@@ -1492,6 +1481,15 @@ impl<'p, R: Routed> CpuModel<'p, R> {
     /// the hyper-connections), `route` the host's router and sum around the experts, the MLA laps
     /// the host's selection, `head` the wait for the logits.
     pub fn step_batch(&mut self, w: &Weights, toks: &[u32], pos: usize, forced: Option<&[[usize; TOP_K]]>, tr: &mut impl Trace, logits: Logits) {
+        // the step's zone is named by what the step is: a prefill step (wider than a verify step), a
+        // SCORE step (prefill-shaped, every token's logits), a verify step (a token and its drafts) or
+        // a single token with no draft to verify
+        prow::zone!("track-zones", match toks.len() {
+            n if n > crate::SPEC_TOKENS && matches!(logits, Logits::All) => "score",
+            n if n > crate::SPEC_TOKENS => "prefill",
+            1 => "token",
+            _ => "verify",
+        });
         let s = self;
         let n = toks.len();
         assert!(n >= 1 && n <= STEP && pos + n <= s.max_ctx);
@@ -1507,10 +1505,20 @@ impl<'p, R: Routed> CpuModel<'p, R> {
         let pl = s.placed.as_mut().unwrap();
         pl.begin(&s.b_x[..n * H], n);
         let mut t = std::time::Instant::now();
-        let mut lap = |acc: &mut f64| {
+        // a lap is a phase from the previous lap to now: its time goes to the profile and, with
+        // track-zones, it is a zone of that name on this thread's lane
+        #[cfg(feature = "track-zones")]
+        let mut mark = prow::Timestamp::now();
+        let mut lap = |acc: &mut f64, _name: &'static str| {
             let now = std::time::Instant::now();
             *acc += (now - t).as_secs_f64();
             t = now;
+            #[cfg(feature = "track-zones")]
+            {
+                let end = prow::Timestamp::now();
+                prow::zone_at!("track-zones", _name, prow::lane(), mark, end);
+                mark = end;
+            }
         };
         let p = &mut s.profile;
         p.tokens += n;
@@ -1527,7 +1535,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             } else {
                 pl.attention(l, n);
             }
-            lap(&mut p.hc);
+            lap(&mut p.hc, "hc");
             // the prefetch's predictor for this layer: the layer before named its picks over its own FFN
             // input (the next layer's router rows ride in that router launch); `pre_picks` scores it
             let pre_picks = std::mem::replace(&mut pre_next, [[E; TOP_K]; SPEC_TOKENS]);
@@ -1540,7 +1548,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     mla::finish_row(a, &s.m_kva, &s.m_ik, latent, ikey);
                     mla::pool_done(a, cache, pools, pos + i);
                 }
-                lap(&mut p.mla_proj);
+                lap(&mut p.mla_proj, "mla_proj");
                 // every token's selection on the card (this step's completed pools mirrored first): the
                 // scores, the picks, straight into the attend's lists — the one-token path had scored and
                 // picked on one thread, 150 ms a token at 17k positions (2026-10-17); then the host's round
@@ -1551,19 +1559,19 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 if n == 1 && tr.wants_edges() {
                     tr.edge(l, "self_attn.indexer.count", &[count as f32]);
                 }
-                lap(&mut p.mla_attn);
+                lap(&mut p.mla_attn, "mla_attn");
                 // the step's latents gathered off the cache rows; every token's attention in one launch
                 for i in 0..n {
                     s.b_lat[i * KV_LORA_RANK..(i + 1) * KV_LORA_RANK].copy_from_slice(mla::latent(cache, pos + i));
                 }
                 pl.mla_attend(l, n, pos, &s.b_lat[..n * KV_LORA_RANK]);
                 pl.mla_out(l, n);
-                lap(&mut p.mla_out);
+                lap(&mut p.mla_out, "mla_out");
             }
             pl.ffn(l, n);
             if let Some(m) = moe {
                 pl.ffn_input(l, n, &mut s.b_x, &mut s.b_score);
-                lap(&mut p.kda_card);
+                lap(&mut p.kda_card, "kda_card");
                 // every token's norm, picks and weights from the card's router logits, a token an item over
                 // the pool (one token runs inline); the step's experts as one grouped run
                 let mut picks = [[0usize; TOP_K]; STEP];
@@ -1607,7 +1615,10 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 s.routed.run_batch(l, &picks[..n], &s.b_xn[..n * H], &mut s.b_out[..n * TOP_K * H]);
                 if jobs > 0 {
                     let t_join = std::time::Instant::now();
-                    pl.xpt_join(l, &mut s.b_out[..n * TOP_K * H]);
+                    {
+                        prow::zone!("track-zones", "join");
+                        pl.xpt_join(l, &mut s.b_out[..n * TOP_K * H]);
+                    }
                     p.join += t_join.elapsed().as_secs_f64();
                     // bring-up (a traced run): every resident pick's output against the host's on the same bytes
                     if tr.wants_edges() || pl.checks() {
@@ -1655,7 +1666,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 }
                 let e = s.routed.elapsed();
                 p.experts += e;
-                lap(&mut p.route);
+                lap(&mut p.route, "route");
                 p.route -= e;
                 // the next MoE layer's picks, predicted by its router over this layer's FFN input (the second
                 // half of each token's scores), prefetched now that this layer's run is done (a run abandons
@@ -1673,7 +1684,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                         }
                     }
                     s.routed.prefetch(l + 1, &union[..nu]);
-                    lap(&mut p.slot);
+                    lap(&mut p.slot, "slot");
                 }
             }
             if tr.wants_edges() && n == 1 {
@@ -1689,7 +1700,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
         if n == 1 && !matches!(logits, Logits::None) {
             tr.edge(NONE, "logits", &s.logits[..VOCAB_SIZE]);
         }
-        lap(&mut p.head);
+        lap(&mut p.head, "head");
     }
 }
 

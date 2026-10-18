@@ -49,8 +49,6 @@ pub struct Glm {
     train_seen: usize,
     /// A region ran out of room: no more rounds.
     train_stopped: bool,
-    /// `rockem.profile=N`: a line of the token's time by phase every N tokens (0: never).
-    profile_every: usize,
     w: Weights<'static>,
     model: CpuModel<'static, CpuExperts<'static>>,
     prefix: &'static [f32],
@@ -65,13 +63,14 @@ pub struct Glm {
 }
 
 impl Glm {
-    pub fn open(bundle: &std::path::Path, mem: loader::Mem, max_ctx: usize, gpu: bool, profile_every: usize, timeline: bool, resident_bytes: usize) -> Box<dyn Engine> {
+    pub fn open(bundle: &std::path::Path, mem: loader::Mem, max_ctx: usize, gpu: bool, resident_bytes: usize) -> Box<dyn Engine> {
         let t0 = std::time::Instant::now();
         let dense = loader::load(&bundle.join(layout::DENSE_FILE), mem);
         // the experts, placed equally first; the pool then measures where each node ends its runs
         // and the items move so every node ends at once (below, once the pool is up)
         let stream = loader::load_placed(&bundle.join(layout::EXPERTS_FILE), mem, &layout::placement_runs(glm_5_3_flash::construct::node_count()));
         println!("bundle   : {} loaded in {:.1}s ({:.1} GB)", bundle.display(), t0.elapsed().as_secs_f32(), (dense.len() + stream.bytes.len()) as f64 / 1e9);
+        prow::row!("track-boot", "boot", { "what" => "bundle", "s" => t0.elapsed().as_secs_f64(), "gb" => (dense.len() + stream.bytes.len()) as f64 / 1e9 });
         let w = Weights::from_dense(dense);
         let prefix_b = loader::load(&bundle.join(layout::PREFIX_FILE), loader::Mem::Anon);
         let (p, prefix, q) = unsafe { prefix_b.align_to::<f32>() };
@@ -101,7 +100,7 @@ impl Glm {
         if gpu {
             // the KDA layers on the cards, split by layer order between them; everything else here
             let elf = loader::load(&bundle.join(layout::KERNELS_FILE), loader::Mem::Anon);
-            model.placed = Some(Box::new(crate::glm_kfd::Cards::new(elf, &w, max_ctx, timeline, resident_bytes)));
+            model.placed = Some(Box::new(crate::glm_kfd::Cards::new(elf, &w, max_ctx, cfg!(feature = "track-launches"), resident_bytes)));
             model.placed.as_mut().unwrap().xpt_loader(Box::new(move |l, e, out| glm_5_3_flash::expert::Weights::at(experts, l, e).slot_bytes(out)));
         }
         // the prefix from nothing: its logits, and the realization against the bundle's state
@@ -126,6 +125,7 @@ impl Glm {
         let dev = |a: &[f32], b: &[f32]| a.iter().zip(b).fold((0f32, 0f32), |(d, m), (x, y)| (d.max((x - y).abs()), m.max(y.abs())));
         let (dr, mr) = dev(&rows, prows);
         let (ds, ms) = dev(&snap, psnap);
+        prow::row!("track-boot", "boot", { "what" => "prefix", "s" => t1.elapsed().as_secs_f64(), "gb" => 0.0 });
         println!("prefix   : {} tokens in {:.1}s; this realization vs the bundle's f32 state: rows {:.1e} of {:.1e}, memory {:.1e} of {:.1e}", FIRST_POS, t1.elapsed().as_secs_f32(), dr, mr, ds, ms);
         model.seed_prefix(&w, prefix);
         println!("model    : glm-5.3-flash, ctx {max_ctx}, temperature {}, top-k {}, top-p {}, dense native, experts q4 in DRAM, {}", SAMPLING.temperature, SAMPLING.top_k, SAMPLING.top_p, if gpu { "the KDA layers on the cards, the rest on this CPU's cores" } else { "every op on this CPU's cores" });
@@ -136,7 +136,6 @@ impl Glm {
             train: ([0; 8], [0.0; 8], 0),
             train_seen: 0,
             train_stopped: false,
-            profile_every,
             w,
             model,
             prefix,
@@ -159,6 +158,39 @@ impl Glm {
         self.train.2 += p.tokens - self.train_seen;
         self.train_seen = p.tokens;
     }
+    /// The step's rows: its time by phase and its counts (the profile, summed over the step's tokens;
+    /// the draft after a step lands in the next step's row), its expert runs by node, and every 16
+    /// positions the experts' coverage since start and the cards' resident slots. Then the profile
+    /// starts over, its node runs folded into the placement's training first.
+    #[cfg(feature = "track-step")]
+    fn step_rows(&mut self, width: usize, pos: usize, scoring: bool) {
+        let p = &self.model.profile;
+        let ms = |s: f64| s * 1e3;
+        prow::row!("track-step", "step", {
+            "pos" => pos, "width" => width, "scoring" => scoring, "cards" => self.model.placed.is_some(), "tokens" => p.tokens,
+            "hc_ms" => ms(p.hc), "slot_ms" => ms(p.slot), "kda_card_ms" => ms(p.kda_card), "kda_cpu_ms" => ms(p.kda_cpu),
+            "mla_proj_ms" => ms(p.mla_proj), "mla_attn_ms" => ms(p.mla_attn), "mla_out_ms" => ms(p.mla_out), "dense_ffn_ms" => ms(p.dense_ffn),
+            "route_ms" => ms(p.route), "shared_ms" => ms(p.shared), "experts_ms" => ms(p.experts), "head_ms" => ms(p.head),
+            "draft_ms" => ms(p.draft), "join_ms" => ms(p.join),
+            "moe_layers" => p.moe_layers, "reuse" => p.reuse, "pre_agree" => p.pre_agree, "resident" => p.resident, "picks" => p.picks,
+            "local_items" => p.local_items, "items" => p.items, "prefetched" => p.prefetched, "prefetch_items" => p.prefetch_items,
+            "runs" => p.runs, "run_last_ms" => ms(p.run_last), "run_slot_ms" => ms(p.run_slot), "run_wake_ms" => ms(p.run_wake), "run_tail_ms" => ms(p.run_tail),
+            "post_sort_ms" => ms(p.post_sort), "post_drain_ms" => ms(p.post_drain), "post_free_ms" => ms(p.post_free),
+        });
+        for d in 0..p.node_items.len() {
+            if p.node_items[d] > 0 {
+                prow::row!("track-step", "step_node", { "pos" => pos, "node" => d, "items" => p.node_items[d], "end_ms" => ms(p.node_end[d]) });
+            }
+        }
+        if (pos + width) / 16 != pos / 16 {
+            let c = self.model.coverage(&[8, 16, 32, 64]);
+            let (filled, slots, loads) = self.model.placed.as_ref().map_or((0, 0, 0), |p| p.resident_stats());
+            prow::row!("track-step", "experts", { "pos" => pos + width, "top8" => c[0], "top16" => c[1], "top32" => c[2], "top64" => c[3], "filled" => filled, "slots" => slots, "loads" => loads });
+        }
+        self.take_training();
+        self.model.profile = Default::default();
+        self.train_seen = 0;
+    }
     /// Between requests: re-place the experts from serving's own run ends when a node ends its runs
     /// later than the others by more than the grain of an item — the placement trained on traffic.
     fn retrain(&mut self) {
@@ -172,7 +204,7 @@ impl Glm {
         let (lo, hi) = ends[..nodes].iter().fold((f64::MAX, 0f64), |(lo, hi), &e| (lo.min(e), hi.max(e)));
         if hi > lo * 1.02 {
             let r = place(self.experts, &rates, Some(&mut self.model.routed));
-            println!("placement: after {tokens} tokens, {r}");
+            prow::message!("track-store", format!("placement after {tokens} tokens: {r}"));
             self.train_stopped = r.contains("no room");
         }
         self.train = ([0; 8], [0.0; 8], 0);
@@ -239,17 +271,8 @@ impl Engine for Glm {
             // the step at once on the cards: every token's logits (scoring) or the last token's
             self.model.step_batch(&self.w, toks, pos, None, &mut NoTrace, if all_logits { Logits::All } else { Logits::Last });
         }
-        if self.profile_every > 0 && self.model.profile.tokens >= self.profile_every {
-            for l in self.model.profile.line().split('\n') {
-                println!("profile  : {}", l.trim_start_matches("profile  : "));
-            }
-            let c = self.model.coverage(&[8, 16, 32, 64]);
-            let (filled, slots, loads) = self.model.placed.as_ref().map_or((0, 0, 0), |p| p.resident_stats());
-            println!("experts  : since start, a layer's 8 / 16 / 32 / 64 most-picked experts took {:.0} / {:.0} / {:.0} / {:.0} % of its picks; {filled} of {slots} resident slots claimed, {loads} loads", 100.0 * c[0], 100.0 * c[1], 100.0 * c[2], 100.0 * c[3]);
-            self.take_training();
-            self.model.profile = Default::default();
-            self.train_seen = 0;
-        }
+        #[cfg(feature = "track-step")]
+        self.step_rows(toks.len(), pos, all_logits);
     }
     fn rows(&self, i: usize, out: &mut [f32]) {
         self.model.rows(self.last_pos + i, out)

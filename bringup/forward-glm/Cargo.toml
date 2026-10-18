@@ -10,6 +10,17 @@ common = { path = "../../common" }
 glm_5_3_flash = { path = "../../models/glm-5.3-flash", features = ["std"] }
 memmap2 = "0.9"
 serde_json = "1"
+prow = { path = "../../../prow" }
+
+[build-dependencies]
+prow = { path = "../../../prow" }
+
+# prow categories (node/Cargo.toml has the node's), the ones node/src/glm_kfd.rs names: with --timeline,
+# every launch on every card as a zone; the cards' construction, timed
+[features]
+default = ["track-launches"]
+track-launches = []
+track-boot = []
 
 [profile.release]
 opt-level = 3

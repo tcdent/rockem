@@ -323,6 +323,8 @@ pub struct Kfd {
     grids: std::cell::RefCell<Vec<u32>>,
     /// The statistics slab (`common::stats`), when the code object has `ROCKEM_STATS`.
     stats: Option<Mem>,
+    /// The card's 100 MHz clock as UTC (`utc`), fitted on first use.
+    clock: std::cell::OnceCell<prow::clock::Card>,
     token_start: Cell<u64>,
     last_span: Cell<(u64, u64)>, // the launches between the previous two waits
     code: Mem,
@@ -399,6 +401,7 @@ impl Kfd {
             names: std::cell::RefCell::new(vec![""; RING_PACKETS]),
             grids: std::cell::RefCell::new(vec![0; RING_PACKETS]),
             stats: None,
+            clock: std::cell::OnceCell::new(),
             token_start: Cell::new(0),
             last_span: Cell::new((0, 0)),
             code: Mem { va: 0, size: 0, handle: 0 },
@@ -854,6 +857,11 @@ impl Kfd {
                 (names[slot], s.start_ts, s.end_ts)
             })
             .collect()
+    }
+    /// A stamp of the card's 100 MHz clock (a timeline's start or end) in UTC.
+    pub fn utc(&self, ticks: u64) -> prow::Timestamp {
+        use std::os::fd::AsFd;
+        self.clock.get_or_init(|| prow::clock::Card::new(self.kfd.as_fd(), self.gpu_id).expect("the card's clock counters")).at(ticks)
     }
     /// Whether the launches are stamped (`open`'s `instrument`).
     pub fn instrumented(&self) -> bool {

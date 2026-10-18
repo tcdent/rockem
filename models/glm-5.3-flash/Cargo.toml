@@ -5,8 +5,13 @@ edition = "2021"
 description = "GLM-5.3-Flash: the pinned config, its constants, and the f32 transcription of the reference forward that bring-up diffs against the oracle."
 
 [features]
-std = ["common/std"]
+std = ["common/std", "dep:prow"]
 stats = ["common/stats"]
+# prow categories (host only: prow comes with `std`; the GPU build of this crate never links it).
+# The step's phases as zones on the main thread, each layer's lap from its start to its end, with
+# the routed experts, the pool's runs and the host's join for the cards' experts nested inside by time.
+track-zones = []
 
 [dependencies]
 common = { path = "../../common" }
+prow = { path = "../../../prow", optional = true }
