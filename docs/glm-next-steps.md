@@ -144,11 +144,11 @@ a millisecond (estimate); the larger gain is what §3 can place behind it.
 **Status 2026-10-17: deferred, not rejected.** §3 turned out not to depend on it: the card
 realization of a routed expert is bit-identical to the CPU's (same integer group sums, flush and
 f32 order), so the host can keep the join — summing the picks in pick order from either tier — and
-a refreshed residency stays reproducible. What §2 could remove is the host's wait for the cards'
-expert outputs after its own run: from the next deploy the profile prints it (`join`, ms a step
-token); the cards' jobs (~7 a layer at two tokens, ~20 µs each) finish well inside the host's
-half, so the expectation is a few tenths of a millisecond a step token, below the device barriers
-§2 would add. If `join` reads higher, §2 is back on.
+a refreshed residency stays reproducible. **Rejected on measurement (2026-10-18):** what §2 could remove is the host's wait for the
+cards' expert outputs after its own run; the profile's `join` lap reads **0.01–0.02 ms a step
+token** (the cards' ~7 jobs a layer finish inside the host's half). Nothing to take off the layer;
+the device barriers §2 would add cost more than that. §2 returns only with a placement where the
+cards hold the larger share of a layer's picks.
 
 ## 3. Routed experts on the cards
 
