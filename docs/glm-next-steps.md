@@ -144,8 +144,11 @@ a millisecond (estimate); the larger gain is what §3 can place behind it.
 **Status 2026-10-17: deferred, not rejected.** §3 turned out not to depend on it: the card
 realization of a routed expert is bit-identical to the CPU's (same integer group sums, flush and
 f32 order), so the host can keep the join — summing the picks in pick order from either tier — and
-a refreshed residency stays reproducible. §2 returns if the host-side wait for the cards' outputs
-shows up in the layer; measure that first.
+a refreshed residency stays reproducible. What §2 could remove is the host's wait for the cards'
+expert outputs after its own run: from the next deploy the profile prints it (`join`, ms a step
+token); the cards' jobs (~7 a layer at two tokens, ~20 µs each) finish well inside the host's
+half, so the expectation is a few tenths of a millisecond a step token, below the device barriers
+§2 would add. If `join` reads higher, §2 is back on.
 
 ## 3. Routed experts on the cards
 
@@ -276,7 +279,15 @@ boundary: unchanged, tcdent's call.
   1.18× one token's, FP8 still 1.7–2×. **Rejected:** one or two rows a wave for that width (a
   wider grid): FP8 worse (ffn_down_shared 1277 / 1208 µs a step vs 994 at four rows), bf16 the
   same — the FP8 gap is not occupancy. Open.
-- The attend dot, hc_pre, the prefill experts' gap, chunked KDA: unchanged.
+- **The prefill experts' gap, traced from the 512-step profile (2026-10-17):** experts 2.2 ms a
+  prompt token against the 1.0 DRAM floor. The nodes' run ends are 1.72–1.78 ms a token with a
+  0.02 ms slotting, 0.00 waking and 0.00 tail — no scheduling gap, the four nodes end together. The
+  streaming itself is the time: 316 MB a token in 1.75 ms is ~180 GB/s against the 323 GB/s
+  ceiling, because at 512 tokens a weight read feeds 512 dots and the q4 `gemm` is compute-bound
+  (17 GOP a token: 8.7 TOP a step in ~1.1 s ≈ 7.7 TOPS of the ~12.5 the 96 cores' `vpmaddubsw`
+  pipes give). So the floor at a 512 step is compute, ~1.4 ms, and the lever is the `gemm`
+  kernel's efficiency (the ik_llama r8 shape is already in; next would be a wider tile or int8
+  activations in `vpmaddwd` directly), not placement. The attend dot, hc_pre, chunked KDA: unchanged.
 
 ## 6. Decode levers beyond placement
 
