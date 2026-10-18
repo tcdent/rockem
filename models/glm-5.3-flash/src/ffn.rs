@@ -99,14 +99,19 @@ pub fn route_scores(w: &weights::Moe, score: &mut [f32], forced: Option<&[usize;
         Some(f) => *f,
         None => top(w, score),
     };
-    idx.sort_unstable();
+    // the reference mass: every ranked pick's score, whether it runs or not
     let mut sum = 1e-20f32;
     for &e in &idx {
         sum += score[e];
     }
+    // the picks past ROUTED_K (ranked best first) are dropped: `E` marks a slot no expert runs in
+    for k in crate::ROUTED_K..TOP_K {
+        idx[k] = E;
+    }
+    idx.sort_unstable();
     let mut wt = [0f32; TOP_K];
     for k in 0..TOP_K {
-        wt[k] = score[idx[k]] / sum * ROUTED_SCALING_FACTOR;
+        wt[k] = if idx[k] < E { score[idx[k]] / sum * ROUTED_SCALING_FACTOR } else { 0.0 };
     }
     (idx, wt)
 }

@@ -43,6 +43,14 @@ pub const KVB_HEAD: usize = QK_NOPE_HEAD_DIM + V_HEAD_DIM;
 /// attention is dense causal attention exactly — the oracle-free test of the sparse path.
 pub const DENSE_BELOW: usize = INDEX_TOPK + INDEX_KPOOL - 1;
 pub const TOP_K: usize = NUM_EXPERTS_PER_TOK;
+/// Routed experts a token runs, of the `TOP_K` the router ranks: the rest are dropped with their
+/// weights (the kept weights still normalized by all `TOP_K` scores — the reference mass, so the
+/// routed sum keeps its scale). An approximation (docs/glm-next-steps.md §8), measured at 4 on
+/// 2026-10-17: the expert phase 6.0 → 3.9 ms a step token warmed (a verify step ~40 ms, ~21 ms an
+/// emitted token), the long SCORE text's NLL 0.0446 → 0.0426 (f32 build 0.0414), acceptance on the
+/// short decode text 0.78–0.85 (0.88–0.92); its eval cost is the model's GSM8K at 4 against 8.
+/// `TOP_K` is the model; anything less is tcdent's to adopt.
+pub const ROUTED_K: usize = TOP_K;
 pub const E: usize = N_ROUTED_EXPERTS;
 pub const D_FF: usize = MOE_INTERMEDIATE_SIZE;
 

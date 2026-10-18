@@ -424,8 +424,16 @@ does not move the 24 ms figure, which §3 owns. FP8 KDA projections: unchanged, 
 - Bit-plane expert storage (high plane first): precision per pick by gate weight, progressive
   prefetch, a bit-serial kernel's input, from one layout.
 
-**Status 2026-10-17: none evaluated.** Each is an eval run (KL, top-1, the evals.toml suite)
-before it can be weighed, and all are behind §3. Which ones get a run is tcdent's call.
+**Status 2026-10-17 22:15: one measured — halving k.** `ROUTED_K` (lib.rs): the top 4 of the
+router's 8 run, their weights normalized by all 8 scores (the reference mass); the dropped slots are
+the same sentinel the resident experts use, so nothing else changes. Measured on the resident-experts
+build: the expert phase 6.0 → 3.9 ms a step token warmed, **a verify step ~40 ms, ~21 ms an emitted
+token** (24–25 at k = 8); the long SCORE text's NLL **0.0426** against 0.0446 at k = 8 (the f32 build
+0.0414) — on that low-perplexity text the cost is not visible; acceptance on the short decode text
+0.78–0.85 (0.88–0.92). A full GSM8K at k = 4 is running on the box (22:15), the k = 8 baseline to
+follow; the pair is the eval cost the entry asks for. Adopting it is tcdent's call; the source
+stays at `TOP_K`. Expert deferral, intra-expert sparsity, bit-plane storage: not evaluated — each
+is a storage or scheduling change before any run.
 
 ## Order
 

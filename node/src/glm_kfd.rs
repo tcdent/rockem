@@ -978,6 +978,9 @@ impl Placed for Cards {
         for i in 0..n {
             for k in 0..TOP_K {
                 let e = picks[i][k];
+                if e >= e_n {
+                    continue; // a slot no expert runs in
+                }
                 r.count[ml * e_n + e] += 1;
                 let at = r.table[ml * e_n + e].load(Ordering::Acquire);
                 if at != NONE && at != PENDING {

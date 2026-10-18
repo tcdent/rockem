@@ -1680,7 +1680,9 @@ fn account(p: &mut Profile, last_picks: &mut [[usize; TOP_K]], freq: &mut [u32],
     p.moe_layers += 1;
     last_picks[l] = picks;
     for &e in &picks {
-        freq[l * E + e] += 1;
+        if e < E {
+            freq[l * E + e] += 1;
+        }
     }
     let (local, items) = pool.locality();
     p.local_items += local;
