@@ -629,6 +629,32 @@ pub mod gfx11 {
             rows_over::<{ 2 * H }, false, ROWS>(tid, w, core::ptr::null(), m, n, 0.0, |i, s| *x.add(i * 2 * H + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
         }
     }
+    /// The MLA projections on the matrix path for a step of many tokens (`rows_wmma_with`). Grid: wmma_grid(m, n), LDS WMMA_LDS.
+    #[no_mangle]
+    pub extern "gpu-kernel" fn mla_qb_w(qa: *const f32, ln: *const u16, w: *const u8, s: *const f32, out: *mut f32, m: u32, n: u32) {
+        unsafe {
+            common::gemv::gfx11::rows_wmma_with::<Q_LORA_RANK, true, _>(workitem_id_x(), common::gemv::gfx11::WFp8 { w, s }, ln, m as usize, n as usize, RMS_NORM_EPS, |i, k| *qa.add(i * Q_LORA_RANK + k), out);
+        }
+    }
+    #[no_mangle]
+    pub extern "gpu-kernel" fn mla_iq_w(qa: *const f32, ln: *const u16, w: *const u16, out: *mut f32, m: u32, n: u32) {
+        unsafe {
+            common::gemv::gfx11::rows_wmma::<Q_LORA_RANK, true>(workitem_id_x(), w, ln, m as usize, n as usize, RMS_NORM_EPS, qa, out);
+        }
+    }
+    #[no_mangle]
+    pub extern "gpu-kernel" fn mla_o_w(heads: *const f32, w: *const u8, s: *const f32, out: *mut f32, m: u32, n: u32) {
+        unsafe {
+            common::gemv::gfx11::rows_wmma_with::<O_IN, false, _>(workitem_id_x(), common::gemv::gfx11::WFp8 { w, s }, core::ptr::null(), m as usize, n as usize, 0.0, |i, k| *heads.add(i * O_IN + k), out);
+        }
+    }
+    /// `mtp_eh` on the matrix path for a step of many tokens (`rows_wmma`). Grid: wmma_grid(m, n), LDS WMMA_LDS.
+    #[no_mangle]
+    pub extern "gpu-kernel" fn mtp_eh_w(x: *const f32, w: *const u16, out: *mut f32, m: u32, n: u32) {
+        unsafe {
+            common::gemv::gfx11::rows_wmma::<{ 2 * H }, false>(workitem_id_x(), w, core::ptr::null(), m as usize, n as usize, 0.0, x, out);
+        }
+    }
     /// The indexer's scores on the card: a thread a (token, pool) of the step, the host's
     /// `score_pools` arithmetic — the dot over the key's channels in order, the heads in order,
     /// the head weights scaled once — so the picks are the host's (`scale` and `wscale` come from

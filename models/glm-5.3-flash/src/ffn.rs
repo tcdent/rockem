@@ -229,6 +229,28 @@ pub mod gfx11 {
         }
     }
 
+    /// The FP8 rows kernels on the matrix path for a step of many tokens (`rows_wmma_with`). Grid: wmma_grid(m, n), LDS WMMA_LDS.
+    #[no_mangle]
+    pub extern "gpu-kernel" fn ffn_gu_w(x: *const f32, ln: *const u16, w: *const u8, s: *const f32, out: *mut f32, m: u32, n: u32) {
+        unsafe {
+            common::gemv::gfx11::rows_wmma_with::<H, true, _>(workitem_id_x(), common::gemv::gfx11::WFp8 { w, s }, ln, m as usize, n as usize, RMS_NORM_EPS, |i, k| *x.add(i * H + k), out);
+        }
+    }
+    #[no_mangle]
+    pub extern "gpu-kernel" fn ffn_down_shared_w(gu: *const f32, w: *const u8, s: *const f32, out: *mut f32, m: u32, n: u32) {
+        unsafe {
+            const N: usize = N_SHARED_EXPERTS * D_FF;
+            common::gemv::gfx11::rows_wmma_with::<N, false, _>(workitem_id_x(), common::gemv::gfx11::WFp8 { w, s }, core::ptr::null(), m as usize, n as usize, 0.0, |i, k| swiglu_at::<N>(gu, i, k), out);
+        }
+    }
+    #[no_mangle]
+    pub extern "gpu-kernel" fn ffn_down_dense_w(gu: *const f32, w: *const u8, s: *const f32, out: *mut f32, m: u32, n: u32) {
+        unsafe {
+            const N: usize = INTERMEDIATE_SIZE;
+            common::gemv::gfx11::rows_wmma_with::<N, false, _>(workitem_id_x(), common::gemv::gfx11::WFp8 { w, s }, core::ptr::null(), m as usize, n as usize, 0.0, |i, k| swiglu_at::<N>(gu, i, k), out);
+        }
+    }
+
     /// The clamped SwiGLU of element `k` of token `i`'s gate|up output (`[n][2·N]`).
     #[inline(always)]
     unsafe fn swiglu_at<const N: usize>(gu: *const f32, i: usize, k: usize) -> f32 {

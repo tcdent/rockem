@@ -837,9 +837,51 @@ pub mod gfx11 {
     fn to_bf16(x: f32) -> u16 {
         (crate::math::bf16_round(x).to_bits() >> 16) as u16
     }
+    /// The weights' side of a WMMA step: 16 bf16 of row `row`, `k..k + 16`, as the B fragment.
+    pub trait WmmaW<const K: usize>: Copy {
+        unsafe fn frag(self, row: usize, k: usize) -> v16i16;
+    }
+    #[derive(Clone, Copy)]
+    pub struct WBf16(pub *const u16);
+    impl<const K: usize> WmmaW<K> for WBf16 {
+        #[inline(always)]
+        unsafe fn frag(self, row: usize, k: usize) -> v16i16 {
+            core::ptr::read_unaligned(self.0.add(row * K + k) as *const v16i16)
+        }
+    }
+    /// FP8 e4m3 rows with an f32 scale a `FP8_BLOCK` square block: each weight times its block's scale,
+    /// rounded to bf16 — the reference's dequantization of these checkpoints (fp8 × scale → bf16).
+    #[derive(Clone, Copy)]
+    pub struct WFp8 {
+        pub w: *const u8,
+        pub s: *const f32,
+    }
+    impl<const K: usize> WmmaW<K> for WFp8 {
+        #[inline(always)]
+        unsafe fn frag(self, row: usize, k: usize) -> v16i16 {
+            const { assert!(K % super::FP8_BLOCK == 0) };
+            let b: [u8; 16] = core::ptr::read_unaligned(self.w.add(row * K + k) as *const [u8; 16]);
+            let sc = *self.s.add(row / super::FP8_BLOCK * (K / super::FP8_BLOCK) + k / super::FP8_BLOCK);
+            let mut v = [0i16; 16];
+            let mut i = 0;
+            while i < 16 {
+                v[i] = to_bf16(super::e4m3_sel(b[i]) * sc) as i16;
+                i += 1;
+            }
+            v16i16(v)
+        }
+    }
+    /// `rows_wmma` over bf16 weights and an activation matrix in memory.
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn rows_wmma<const K: usize, const NORM: bool>(tid: u32, w: *const u16, ln: *const u16, m: usize, n: usize, eps: f32, x: *const f32, out: *mut f32) {
+        rows_wmma_with::<K, NORM, WBf16>(tid, WBf16(w), ln, m, n, eps, |i, k| *x.add(i * K + k), out)
+    }
+    /// The matrix path over any weights (`WmmaW`) and any activation source: `load(token, k)` is the
+    /// activation's element (the down projections' SwiGLU of the gate|up output, say).
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn rows_wmma_with<const K: usize, const NORM: bool, W: WmmaW<K>>(tid: u32, wt: W, ln: *const u16, m: usize, n: usize, eps: f32, load: impl Fn(usize, usize) -> f32, out: *mut f32) {
         use core::arch::amdgpu::workgroup_id_x;
         const { assert!(K % WMMA_K == 0 && WMMA_K % 16 == 0 && WMMA_ROWS == 8 * 16 && WMMA_TOKENS == 8 * 16) };
         const STEPS: usize = WMMA_K / 16;
@@ -860,10 +902,9 @@ pub mod gfx11 {
                 let tok = tok0 + ltok;
                 let mut ss = 0f32;
                 if tok < n {
-                    let xr = x.add(tok * K);
                     let mut k = lane;
                     while k < K {
-                        let v = *xr.add(k);
+                        let v = load(tok, k);
                         ss += v * v;
                         k += 32;
                     }
@@ -877,7 +918,7 @@ pub mod gfx11 {
         }
         // the wave's 16 rows of W, clamped into the matrix (a row past it is computed and never written)
         let myrow = row0 + lane % 16;
-        let wrow = w.add((if myrow < m { myrow } else { m - 1 }) * K);
+        let wrow = if myrow < m { myrow } else { m - 1 };
         let mut acc = [v8f32([0.0; 8]); TILES];
         let mut k0 = 0;
         while k0 < K {
@@ -889,7 +930,7 @@ pub mod gfx11 {
                 let mut tok = t / WMMA_K;
                 while tok < WMMA_TOKENS {
                     let gtok = tok0 + tok;
-                    let v = if gtok < n { *x.add(gtok * K + k0 + kk) * wl } else { 0.0 };
+                    let v = if gtok < n { load(gtok, k0 + kk) * wl } else { 0.0 };
                     *xs.add(tok * WMMA_XS + kk) = to_bf16(v);
                     tok += 256 / WMMA_K;
                 }
@@ -897,7 +938,7 @@ pub mod gfx11 {
             crate::gfx11::workgroup_sync();
             let mut s = 0;
             while s < STEPS {
-                let b = core::ptr::read_unaligned(wrow.add(k0 + s * 16) as *const v16i16);
+                let b = wt.frag(wrow, k0 + s * 16);
                 let mut tt = 0;
                 while tt < TILES {
                     let a = core::ptr::read_unaligned(xs.add((tt * 16 + lane % 16) * WMMA_XS + s * 16) as *const v16i16);

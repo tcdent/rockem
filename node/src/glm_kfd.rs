@@ -111,6 +111,13 @@ struct Card {
     rows_d2: crate::kfd::Kernel,
     rows_part: crate::kfd::Kernel,
     rows_part_w: crate::kfd::Kernel,
+    mtp_eh_w: crate::kfd::Kernel,
+    ffn_gu_w: crate::kfd::Kernel,
+    ffn_down_shared_w: crate::kfd::Kernel,
+    ffn_down_dense_w: crate::kfd::Kernel,
+    mla_qb_w: crate::kfd::Kernel,
+    mla_iq_w: crate::kfd::Kernel,
+    mla_o_w: crate::kfd::Kernel,
     step: crate::kfd::Kernel,
     copy: crate::kfd::Kernel,
     ffn_gu: crate::kfd::Kernel,
@@ -315,6 +322,13 @@ impl Cards {
                     rows_h: k.kernel("rows_h"),
                     rows_h_w: k.kernel("rows_h_w"),
                     rows_part_w: k.kernel("rows_part_w"),
+                    mtp_eh_w: k.kernel("mtp_eh_w"),
+                    ffn_gu_w: k.kernel("ffn_gu_w"),
+                    ffn_down_shared_w: k.kernel("ffn_down_shared_w"),
+                    ffn_down_dense_w: k.kernel("ffn_down_dense_w"),
+                    mla_qb_w: k.kernel("mla_qb_w"),
+                    mla_iq_w: k.kernel("mla_iq_w"),
+                    mla_o_w: k.kernel("mla_o_w"),
                     rows_d2: k.kernel("rows_d2"),
                     rows_part: k.kernel("rows_part"),
                     step: k.kernel("kda_step"),
@@ -779,13 +793,29 @@ impl Cards {
     fn mla_rows(&self, m: &MlaOn, n: usize) {
         let c = &self.cards[m.card];
         let ln = Some(m.input_ln.va);
-        self.rows8(c, &c.ffn_gu, c.x.va, ln, m.q_a.0.va, m.q_a.1.va, c.mqa.va, Q_LORA_RANK, H, n, ROWS_GU);
-        self.rows8_free(c, &c.ffn_gu, c.x.va, ln, m.kv_a.0.va, m.kv_a.1.va, c.mproj.at(MKVA * 4), KV_LORA_RANK, H, n, ROWS_GU);
-        self.rows_free(c, &c.rows_h, c.x.va, ln, m.ix.va, c.mproj.at(MIX * 4), IX_ROWS, H, n, ROWS);
+        if n > SPEC_TOKENS {
+            self.rows_w(c, &c.ffn_gu_w, c.x.va, ln, m.q_a.0.va, Some(m.q_a.1.va), c.mqa.va, Q_LORA_RANK, n, false);
+            self.rows_w(c, &c.ffn_gu_w, c.x.va, ln, m.kv_a.0.va, Some(m.kv_a.1.va), c.mproj.at(MKVA * 4), KV_LORA_RANK, n, true);
+        } else {
+            self.rows8(c, &c.ffn_gu, c.x.va, ln, m.q_a.0.va, m.q_a.1.va, c.mqa.va, Q_LORA_RANK, H, n, ROWS_GU);
+            self.rows8_free(c, &c.ffn_gu, c.x.va, ln, m.kv_a.0.va, m.kv_a.1.va, c.mproj.at(MKVA * 4), KV_LORA_RANK, H, n, ROWS_GU);
+        }
+        if n > SPEC_TOKENS {
+            let mut a = Args::new();
+            a.ptr(c.x.va).ptr(m.input_ln.va).ptr(m.ix.va).ptr(c.mproj.at(MIX * 4)).u32(IX_ROWS as u32).u32(n as u32);
+            c.k.launch_free(&c.rows_h_w, g::wmma_grid(IX_ROWS, n), g::WG, g::WMMA_LDS, &a);
+        } else {
+            self.rows_free(c, &c.rows_h, c.x.va, ln, m.ix.va, c.mproj.at(MIX * 4), IX_ROWS, H, n, ROWS);
+        }
         // over q_a's output normed with q_a's norm: the query and, alongside it, the indexer's query (VRAM: the card scores the pools)
         let qln = Some(m.qa_ln.va);
-        self.rows8(c, &c.mla_qb, c.mqa.va, qln, m.q_b.0.va, m.q_b.1.va, c.mq.va, MLA_HEADS * Q_HEAD, Q_LORA_RANK, n, ROWS_QB);
-        self.rows_free(c, &c.mla_iq, c.mqa.va, qln, m.ix_wq_b.va, c.miq.va, INDEX_N_HEADS * INDEX_HEAD_DIM, Q_LORA_RANK, n, ROWS);
+        if n > SPEC_TOKENS {
+            self.rows_w(c, &c.mla_qb_w, c.mqa.va, qln, m.q_b.0.va, Some(m.q_b.1.va), c.mq.va, MLA_HEADS * Q_HEAD, n, false);
+            self.rows_w(c, &c.mla_iq_w, c.mqa.va, qln, m.ix_wq_b.va, None, c.miq.va, INDEX_N_HEADS * INDEX_HEAD_DIM, n, true);
+        } else {
+            self.rows8(c, &c.mla_qb, c.mqa.va, qln, m.q_b.0.va, m.q_b.1.va, c.mq.va, MLA_HEADS * Q_HEAD, Q_LORA_RANK, n, ROWS_QB);
+            self.rows_free(c, &c.mla_iq, c.mqa.va, qln, m.ix_wq_b.va, c.miq.va, INDEX_N_HEADS * INDEX_HEAD_DIM, Q_LORA_RANK, n, ROWS);
+        }
         c.k.fence();
     }
     /// `x[..n·H] += a + b` on card `c` (`b` 0 for none): the draft layer's residual.
@@ -804,6 +834,26 @@ impl Cards {
     #[allow(clippy::too_many_arguments)]
     fn rows(&self, c: &Card, kernel: &crate::kfd::Kernel, x: usize, ln: Option<usize>, w: usize, out: usize, m: usize, k_width: usize, n: usize, r: usize) {
         self.rows_at(c, kernel, x, ln, w, out, m, k_width, n, r, true)
+    }
+    /// A matrix-path rows launch over a step of many tokens (`rows_wmma`): the kernel's args in the scalar
+    /// twin's order (x, [ln], w, [s], out, m, n); the grid covers the rows and the tokens at once.
+    #[allow(clippy::too_many_arguments)]
+    fn rows_w(&self, c: &Card, kernel: &crate::kfd::Kernel, x: usize, ln: Option<usize>, w: usize, s: Option<usize>, out: usize, m: usize, n: usize, free: bool) {
+        let mut a = Args::new();
+        a.ptr(x);
+        if let Some(ln) = ln {
+            a.ptr(ln);
+        }
+        a.ptr(w);
+        if let Some(s) = s {
+            a.ptr(s);
+        }
+        a.ptr(out).u32(m as u32).u32(n as u32);
+        if free {
+            c.k.launch_free(kernel, g::wmma_grid(m, n), g::WG, g::WMMA_LDS, &a);
+        } else {
+            c.k.launch(kernel, g::wmma_grid(m, n), g::WG, g::WMMA_LDS, &a);
+        }
     }
     /// `rows` launched free: as soon as the launch before it has launched, so the two run together —
     /// for a launch whose inputs were complete when the one before it launched.
@@ -1102,7 +1152,13 @@ impl Placed for Cards {
         let c = &self.cards[t.card];
         // eh_proj over the staged inputs into the block input slots, then the attention's projections
         c.k.upload(&t.dx, 0, raw(&cat[..n * 2 * H]));
-        self.rows(c, &c.mtp_eh, t.dx.va, None, t.eh.va, c.x.va, H, 2 * H, n, ROWS);
+        if n > SPEC_TOKENS {
+            let mut a = Args::new();
+            a.ptr(t.dx.va).ptr(t.eh.va).ptr(c.x.va).u32(H as u32).u32(n as u32);
+            c.k.launch(&c.mtp_eh_w, g::wmma_grid(H, n), g::WG, g::WMMA_LDS, &a);
+        } else {
+            self.rows(c, &c.mtp_eh, t.dx.va, None, t.eh.va, c.x.va, H, 2 * H, n, ROWS);
+        }
         let m = self.mlas[glm_5_3_flash::layout::MTP_LAYER].as_ref().unwrap();
         self.mla_rows(m, n);
     }
@@ -1191,7 +1247,11 @@ impl Placed for Cards {
         let c = &self.cards[m.card];
         let my = self.shared.my[l % 2].va;
         // the output projection over every token's heads, then the streams
-        self.rows8(c, &c.mla_o, c.mheads.va, None, m.o.0.va, m.o.1.va, c.myv.va, H, O_IN, n, ROWS);
+        if n > SPEC_TOKENS {
+            self.rows_w(c, &c.mla_o_w, c.mheads.va, None, m.o.0.va, Some(m.o.1.va), c.myv.va, H, n, false);
+        } else {
+            self.rows8(c, &c.mla_o, c.mheads.va, None, m.o.0.va, m.o.1.va, c.myv.va, H, O_IN, n, ROWS);
+        }
         self.hc_post(c, Some((c.myv.va, my, n * H)), Some((W_Y, m.card)), None, None, self.half_seq[l][0], my, None, n);
     }
     fn mla_seed(&mut self, l: usize, pos: usize, latent: &[f32]) {
@@ -1210,8 +1270,14 @@ impl Placed for Cards {
         }
         let c = &self.cards[f.card];
         let (rows, down, k_width) = if f.dense { (DENSE_GU_ROWS, &c.ffn_down_dense, INTERMEDIATE_SIZE) } else { (SHARED_GU_ROWS, &c.ffn_down_shared, N_SHARED_EXPERTS * D_FF) };
-        self.rows8(c, &c.ffn_gu, c.x.va, Some(f.ln.va), f.gu_w.va, f.gu_s.va, c.gu.va, rows, H, n, ROWS_GU);
-        self.rows8_at(c, down, c.gu.va, 2 * k_width, None, f.down_w.va, f.down_s.va, c.fyv.va, H, k_width, n, ROWS, true);
+        if n > SPEC_TOKENS {
+            let down_w = if f.dense { &c.ffn_down_dense_w } else { &c.ffn_down_shared_w };
+            self.rows_w(c, &c.ffn_gu_w, c.x.va, Some(f.ln.va), f.gu_w.va, Some(f.gu_s.va), c.gu.va, rows, n, false);
+            self.rows_w(c, down_w, c.gu.va, None, f.down_w.va, Some(f.down_s.va), c.fyv.va, H, n, false);
+        } else {
+            self.rows8(c, &c.ffn_gu, c.x.va, Some(f.ln.va), f.gu_w.va, f.gu_s.va, c.gu.va, rows, H, n, ROWS_GU);
+            self.rows8_at(c, down, c.gu.va, 2 * k_width, None, f.down_w.va, f.down_s.va, c.fyv.va, H, k_width, n, ROWS, true);
+        }
         // a dense layer's output half now; a MoE layer's waits for the host's experts and is posted after the
         // resident experts' launches (`ffn_post`): a queue is in order, and the output half spins on the word
         if f.dense {
@@ -1263,7 +1329,13 @@ impl Placed for Cards {
             let mut a = Args::new();
             a.ptr(c.streams.at((from + p0) * HC * H * 4)).ptr(c.fx.va).u32(np as u32);
             c.k.launch(&c.hc_mean, CHANNEL_GRID, g::WG, 0, &a);
-            self.rows(c, &c.rows_h, c.fx.va, Some(norm.va), lm.va, c.lg.va, VOCAB_SIZE, H, np, ROWS);
+            if np > SPEC_TOKENS {
+                let mut a = Args::new();
+                a.ptr(c.fx.va).ptr(norm.va).ptr(lm.va).ptr(c.lg.va).u32(VOCAB_SIZE as u32).u32(np as u32);
+                c.k.launch(&c.rows_h_w, g::wmma_grid(VOCAB_SIZE, np), g::WG, g::WMMA_LDS, &a);
+            } else {
+                self.rows(c, &c.rows_h, c.fx.va, Some(norm.va), lm.va, c.lg.va, VOCAB_SIZE, H, np, ROWS);
+            }
             c.k.sync();
             read(&c.lg, 0, &mut logits[p0 * VOCAB_SIZE..(p0 + np) * VOCAB_SIZE]);
             p0 += np;
