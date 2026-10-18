@@ -848,6 +848,10 @@ pub trait Placed {
     fn xpt_join(&mut self, l: usize, out: &mut [f32]);
     /// Whether expert `e` of layer `l` is resident on a card (the prefetch leaves those to the cards).
     fn resident(&self, l: usize, e: usize) -> bool;
+    /// The residency's slots claimed, slots in all, and loads made since the start.
+    fn resident_stats(&self) -> (usize, usize, usize) {
+        (0, 0, 0)
+    }
     /// Whether the bring-up checks run this boot (the cards instrumented).
     fn checks(&self) -> bool;
     fn mtp_begin(&mut self, cat: &[f32], n: usize);

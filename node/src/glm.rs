@@ -244,7 +244,8 @@ impl Engine for Glm {
                 println!("profile  : {}", l.trim_start_matches("profile  : "));
             }
             let c = self.model.coverage(&[8, 16, 32, 64]);
-            println!("experts  : since start, a layer's 8 / 16 / 32 / 64 most-picked experts took {:.0} / {:.0} / {:.0} / {:.0} % of its picks", 100.0 * c[0], 100.0 * c[1], 100.0 * c[2], 100.0 * c[3]);
+            let (filled, slots, loads) = self.model.placed.as_ref().map_or((0, 0, 0), |p| p.resident_stats());
+            println!("experts  : since start, a layer's 8 / 16 / 32 / 64 most-picked experts took {:.0} / {:.0} / {:.0} / {:.0} % of its picks; {filled} of {slots} resident slots claimed, {loads} loads", 100.0 * c[0], 100.0 * c[1], 100.0 * c[2], 100.0 * c[3]);
             self.take_training();
             self.model.profile = Default::default();
             self.train_seen = 0;

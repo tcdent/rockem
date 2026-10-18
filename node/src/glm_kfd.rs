@@ -71,6 +71,10 @@ struct Resident {
     /// Picks seen, `[MOE_LAYERS][E]`, halved every `RESIDENT_HALF_LIFE` positions (`seen` counts them).
     count: Vec<u32>,
     seen: usize,
+    /// The layer whose misses claim first this step (`ticks % MOE_LAYERS`): the one load a step goes to the
+    /// earliest layer with a miss, so without a turn the first layers took every load and the rest stayed
+    /// empty — 3–4 % of picks resident after 2,600 steps (2026-10-18 10:05).
+    turn: usize,
     /// Per card: each slot's (layer, expert), or `NONE`; the free slots; the slots a layer holds.
     owner: Vec<Vec<(u32, u32)>>,
     free: Vec<Vec<u32>>,
@@ -668,7 +672,7 @@ impl Cards {
                 per_layer.push(count / moe);
                 counts.push(count);
             }
-            Resident { table: std::sync::Arc::new((0..moe * glm_5_3_flash::E).map(|_| AtomicU32::new(NONE)).collect()), loader: None, inflight: Default::default(), ticks: Default::default(), count: vec![0; moe * glm_5_3_flash::E], seen: 0, owner: counts.iter().map(|&k| vec![(NONE, NONE); k]).collect(), free: counts.iter().map(|&k| (0..k as u32).rev().collect()).collect(), held: (0..n).map(|_| vec![0; moe]).collect(), per_layer, slots, jobs: (0..n).map(|_| Vec::new()).collect(), uploads: 0 }
+            Resident { table: std::sync::Arc::new((0..moe * glm_5_3_flash::E).map(|_| AtomicU32::new(NONE)).collect()), loader: None, inflight: Default::default(), ticks: Default::default(), count: vec![0; moe * glm_5_3_flash::E], seen: 0, turn: 0, owner: counts.iter().map(|&k| vec![(NONE, NONE); k]).collect(), free: counts.iter().map(|&k| (0..k as u32).rev().collect()).collect(), held: (0..n).map(|_| vec![0; moe]).collect(), per_layer, slots, jobs: (0..n).map(|_| Vec::new()).collect(), uploads: 0 }
         };
         Cards { cards, shared, layers, ffns, mlas, head, mtp, resident, instrument, seq: 0, half_seq: vec![[0; 2]; NUM_HIDDEN_LAYERS], token_from: vec![0; n], last_n: 1, npools: max_ctx.div_ceil(INDEX_KPOOL), tokens: 0 }
     }
@@ -1000,6 +1004,12 @@ impl Placed for Cards {
     fn checks(&self) -> bool {
         self.instrument
     }
+    fn resident_stats(&self) -> (usize, usize, usize) {
+        let r = &self.resident;
+        let total: usize = r.owner.iter().map(|o| o.len()).sum();
+        let free: usize = r.free.iter().map(|f| f.len()).sum();
+        (total - free, total, r.uploads)
+    }
     fn resident(&self, l: usize, e: usize) -> bool {
         let at = self.resident.table[(l - glm_5_3_flash::FIRST_K_DENSE_REPLACE) * glm_5_3_flash::E + e].load(std::sync::atomic::Ordering::Relaxed);
         at != NONE && at != PENDING
@@ -1050,7 +1060,8 @@ impl Placed for Cards {
             j.clear();
         }
         if ml == 0 {
-            r.ticks.fetch_add(1, Ordering::AcqRel);
+            let t = r.ticks.fetch_add(1, Ordering::AcqRel);
+            r.turn = t as usize % r.held[0].len();
             // the counts age with the positions: halved at every half-life this step crosses
             let crossed = (r.seen + n) / RESIDENT_HALF_LIFE - r.seen / RESIDENT_HALF_LIFE;
             r.seen += n;
@@ -1084,7 +1095,7 @@ impl Placed for Cards {
         // else the layer's least-picked resident when the miss leads it by the margin (one a layer a step)
         let mut replaced = false;
         for &e in &misses {
-            if r.inflight.load(Ordering::Acquire) >= LOADS_IN_FLIGHT {
+            if ml < r.turn || r.inflight.load(Ordering::Acquire) >= LOADS_IN_FLIGHT {
                 break;
             }
             let mut pick_card = None;

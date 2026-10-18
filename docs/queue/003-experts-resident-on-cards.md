@@ -23,7 +23,7 @@ Our measurements (free VRAM, routing concentration), 2026-10-15 and 2026-10-17.
   runs (zero mismatches over ~4,650 steps). Warmed: 23–24 ms a step token (kda card 8.6, mla 2.7,
   experts 6.0, router 2.6, draft 1.8, head 1.1, slot 0.7).
 - 2026-10-18 (`ade33d7`): `rockem.resident=<GB>` sizes the residency.
-- 2026-10-18 09:00 (boot of `971f5df`): 938 / 832 experts resident (12.5 / 11.1 GB; 21 / 19 a layer). After a single 79-position warm-up the expert lap on the short decode text reads 9.0–9.9 ms a step token (26–30 ms a step token, 0.88 acceptance → ~28 an emitted token); the 6.0 / 24–25 figures are after sixteen warm-up rounds. The gap between the two is the cache filling (one load a step), i.e. 004 and 031.
+- 2026-10-18 09:00 (boot of `971f5df`): 938 / 832 experts resident (12.5 / 11.1 GB; 21 / 19 a layer). After a single 79-position warm-up the expert lap on the short decode text reads 9.0–9.9 ms a step token (26–30 ms a step token, 0.88 acceptance → ~28 an emitted token); the 6.0 / 24–25 figures are after sixteen warm-up rounds. The gap between the two is the cache filling (one load a step), i.e. 004 and 031 — and 004 found the loads all went to the first layers (fixed 10:29: 30–40 % of picks resident after the warm-up, expert lap 6.7–7.4).
 
 ## Next
 - The cache policy (004), sizing by the context in use (031), use in prefill (038), loading by

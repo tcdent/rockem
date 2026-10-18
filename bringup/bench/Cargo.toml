@@ -89,3 +89,11 @@ path = "src/wmma_layout.rs"
 [[bin]]
 name = "bench-p2p"
 path = "src/p2p.rs"
+
+[[bin]]
+name = "bench-rows-w"
+path = "src/rows_w.rs"
+
+[[bin]]
+name = "bench-fp8-rows"
+path = "src/fp8_rows.rs"

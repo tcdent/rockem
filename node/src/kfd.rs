@@ -555,6 +555,7 @@ impl Kfd {
     /// writes): the receiver's side of a card-to-card handoff (docs/queue/001). Fine-grained
     /// (`MEM_COHERENT`: gfx11 maps it MTYPE UC), so this card's loads of what a peer wrote bypass its
     /// L2; host-visible, so the host seeds and reads it. The peer map failing is the test of peer access.
+    #[allow(dead_code)] // the node keeps its handoffs in host memory (docs/queue/001); bench-p2p uses it
     pub fn vram_shared(&self, size: usize, others: &[&Kfd]) -> Mem {
         let m = self.alloc(size, MEM_VRAM | MEM_COHERENT | MEM_WRITABLE | MEM_PUBLIC, true, size);
         for o in others {

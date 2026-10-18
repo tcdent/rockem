@@ -1,8 +1,8 @@
 # 004 — The expert cache's replacement policy (ARC)
 
-**Status:** Built (aged counts) — the replay done, the served number pending the 2026-10-18 09:30 deploy
+**Status:** Done (aged counts + a layer turn for the one load a step; measured 2026-10-18 10:29)
 **Area:** decode
-**Gain:** unknown; bounded by Belady 0.74 against today's hit rates
+**Gain:** measured — after sixteen warm-up rounds 30–40 % of picks resident (was 3–4 %), the expert lap 9.3–10.0 → 6.7–7.4 ms a step token, a verify step 26.1–26.9 → 23.6–24.3
 
 ## Proposal
 LFU wins on code, LRU on chat (003's replay). An adaptive policy between recency and frequency
@@ -39,7 +39,19 @@ LFU wins on code, LRU on chat (003's replay). An adaptive policy between recency
   of a boot, and no short measure sees a policy. The 6.0 ms / 24–25 ms figures (003) need the
   sixteen-round warm-up; the policy's served number is taken that way (`deploy14.sh`).
 
+- 2026-10-18 10:05, sixteen warm-up rounds (~2,600 steps) on the aged counts: **3–4 % of picks
+  resident**, expert lap 9.3–10.0. Not the policy: the one load a step goes to the *earliest* MoE
+  layer with a miss (`inflight` is global, the claim loop runs layer by layer), so the first layers took
+  every load and the rest stayed empty — true of yesterday's code too; the 6.0 ms figure in 003 did not
+  reproduce under this warm-up.
+- 2026-10-18 10:29: a rotating turn (`Resident::turn = ticks % MOE_LAYERS`; layers before the turn
+  skip claiming that step) and a console line `N of 1770 resident slots claimed, M loads` every profile
+  window. Same warm-up: 1,521 of 1,770 slots claimed after ~2,700 steps, 2,763 loads; **30–40 % of
+  picks resident** (the replay's 0.36–0.44 for these texts), expert lap **6.7–7.4 ms a step token**,
+  a verify step **23.6–24.3** (0.78–0.83 acceptance on the warm text). SCORE bit-identical, decode
+  text unchanged.
+
 ## Next
-The expert lap and resident share after sixteen warm-up rounds (lifetime counts: 6.0 ms a step
-token); then Done. The gap to Belady (0.11 / 0.21) is the residency's remaining
+None. The fill takes ~1,800 steps from a cold boot (one load a step); 031 (sizing by the context in
+use) and 045 (loads by the card's copy engine, more than one a step) are the levers on that. The gap to Belady (0.11 / 0.21) is the residency's remaining
 ceiling; 031 (sizing by context) and 038 (prefill) change what the cache holds, not how it replaces.
