@@ -15,9 +15,9 @@ fn main() {
     let wgs: u32 = arg("--wgs").map_or(672, |v| v.to_str().unwrap().parse().unwrap());
     let k = kfd::Kfd::open(&elf, false, 0);
     let threads = wgs as usize * 256;
-    let out = k.vram(threads * 4 * 32);
+    let out = k.vram(threads * 8 * 32);
     let waves = threads as f64 / 32.0;
-    for (name, ops_per_round_wave) in [("rate_wmma_iu8", 4.0 * 2.0 * 4096.0), ("rate_wmma_bf16", 4.0 * 2.0 * 4096.0), ("rate_fma_f32", 4.0 * 2.0 * 32.0)] {
+    for (name, ops_per_round_wave) in [("rate_wmma_iu8", 4.0 * 2.0 * 4096.0), ("rate_wmma_iu8_8", 8.0 * 2.0 * 4096.0), ("rate_wmma_bf16", 4.0 * 2.0 * 4096.0), ("rate_fma_f32", 4.0 * 2.0 * 32.0)] {
         let kern = k.kernel(name);
         let run = |it: u32| {
             let mut a = kfd::Args::new();
@@ -34,6 +34,6 @@ fn main() {
         }
         us.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let ops = waves * iters as f64 * ops_per_round_wave;
-        println!("{name:<16} {:8.1} µs  {:7.1} T{}/s  ({wgs} workgroups × 8 waves, {iters} rounds of 4 chains)", us[2], ops / us[2] / 1e6, if name.contains("fma") || name.contains("bf16") { "FLOP" } else { "OP" });
+        println!("{name:<16} {:8.1} µs  {:7.1} T{}/s  ({wgs} workgroups × 8 waves, {iters} rounds of {} chains)", us[2], ops / us[2] / 1e6, if name.contains("fma") || name.contains("bf16") { "FLOP" } else { "OP" }, if name.ends_with("_8") { 8 } else { 4 });
     }
 }

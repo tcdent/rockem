@@ -97,3 +97,7 @@ path = "src/rows_w.rs"
 [[bin]]
 name = "bench-fp8-rows"
 path = "src/fp8_rows.rs"
+
+[[bin]]
+name = "bench-mla-attend"
+path = "src/mla_attend.rs"

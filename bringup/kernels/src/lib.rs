@@ -53,6 +53,32 @@ pub extern "gpu-kernel" fn rate_wmma_iu8(out: *mut v8i32, iters: u32) {
     }
 }
 
+/// `rate_wmma_iu8` with eight independent chains a wave (docs/queue/011: four may not cover the
+/// iu8 issue latency — iu8 measured no faster than bf16 at four): 8 · 2 · 16³ ops a round a wave.
+#[no_mangle]
+pub extern "gpu-kernel" fn rate_wmma_iu8_8(out: *mut v8i32, iters: u32) {
+    unsafe {
+        let g = (workgroup_id_x() * 256 + workitem_id_x()) as usize;
+        let a = v4i32([g as i32, 0x0102_0304, 0x0506_0708, 0x090a_0b0c]);
+        let b = v4i32([0x0c0b_0a09, 0x0807_0605, 0x0403_0201, g as i32]);
+        let mut c = [v8i32([0; 8]), v8i32([1; 8]), v8i32([2; 8]), v8i32([3; 8]), v8i32([4; 8]), v8i32([5; 8]), v8i32([6; 8]), v8i32([7; 8])];
+        let mut i = 0;
+        while i < iters {
+            let mut j = 0;
+            while j < 8 {
+                c[j] = wmma_i32_iu8(true, a, true, b, c[j], false);
+                j += 1;
+            }
+            i += 1;
+        }
+        let mut j = 0;
+        while j < 8 {
+            *out.add(g * 8 + j) = c[j];
+            j += 1;
+        }
+    }
+}
+
 /// The same with bf16 WMMA (f32 accumulation): 4 · 2 · 16³ flops a round a wave.
 #[no_mangle]
 pub extern "gpu-kernel" fn rate_wmma_bf16(out: *mut v8f32, iters: u32) {
