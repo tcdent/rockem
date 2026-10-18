@@ -324,7 +324,18 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
         let diff = |a: &[f32], b: &[f32]| a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
         let (dl, dr, ds) = (diff(&lg1, &lg2), diff(&rows1, &rows2), diff(&snap1, &snap2));
         let maxd = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
-        println!("step gate: {} positions a token at a time in {t1:.1} s, in steps of {st} in {t2:.1} s ({:.1}×); differing f32s — logits {dl} of every position's (max {:.2e}), rows {dr} (max {:.2e}), state {ds} (max {:.2e})", n - FIRST_POS, t1 / t2, maxd(&lg1, &lg2), maxd(&rows1, &rows2), maxd(&snap1, &snap2));
+        // the numeric distance too (a prefill kernel pair is gated by it): top-1 agreement and the mean KL of
+        // the step path's distributions from the token-at-a-time path's, over the positions computed
+        let (mut agree, mut kl, mut npos) = (0usize, 0f64, 0usize);
+        for t in FIRST_POS..n {
+            let (a, b) = (&lg1[t * VOCAB_SIZE..(t + 1) * VOCAB_SIZE], &lg2[t * VOCAB_SIZE..(t + 1) * VOCAB_SIZE]);
+            agree += (argmax(a) == argmax(b)) as usize;
+            let (ma, mb) = (a.iter().cloned().fold(f32::NEG_INFINITY, f32::max), b.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+            let (za, zb): (f64, f64) = (a.iter().map(|&v| ((v - ma) as f64).exp()).sum(), b.iter().map(|&v| ((v - mb) as f64).exp()).sum());
+            kl += a.iter().zip(b).map(|(&x, &y)| { let p = ((x - ma) as f64).exp() / za; p * (((x - ma) as f64 - za.ln()) - ((y - mb) as f64 - zb.ln())) }).sum::<f64>();
+            npos += 1;
+        }
+        println!("step gate: {} positions a token at a time in {t1:.1} s, in steps of {st} in {t2:.1} s ({:.1}×); differing f32s — logits {dl} of every position's (max {:.2e}), rows {dr} (max {:.2e}), state {ds} (max {:.2e}); top-1 agreement {:.4}, mean KL {:.3e}", n - FIRST_POS, t1 / t2, maxd(&lg1, &lg2), maxd(&rows1, &rows2), maxd(&snap1, &snap2), agree as f64 / npos as f64, kl / npos as f64);
         if dr > 0 {
             // where it starts: the first position with a differing row, and how many of its floats differ
             let first = rows1.iter().zip(&rows2).position(|(x, y)| x.to_bits() != y.to_bits()).unwrap();

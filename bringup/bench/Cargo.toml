@@ -81,3 +81,7 @@ path = "src/wmma.rs"
 [[bin]]
 name = "bench-xpt"
 path = "src/xpt.rs"
+
+[[bin]]
+name = "bench-wmma-layout"
+path = "src/wmma_layout.rs"

@@ -148,6 +148,12 @@ pub mod gfx11_consts {
     /// The rows kernels: 8 rows per workgroup.
     /// Workgroups of a rows launch over `m` rows for `n` tokens, the kernel's `r` rows a wave
     /// (`common::gemv::rows_per_wg`).
+    /// The matrix-path rows kernels (`rows_wmma`): their grid and LDS.
+    pub const WMMA_TOKENS: usize = 128;
+    pub const WMMA_LDS: u32 = (WMMA_TOKENS * (64 + 8) * 2 + WMMA_TOKENS * 4) as u32;
+    pub const fn wmma_grid(m: usize, n: usize) -> u32 {
+        (m.div_ceil(128) * n.div_ceil(WMMA_TOKENS)) as u32
+    }
     pub const fn rows_grid(m: usize, n: usize, r: usize) -> u32 {
         m.div_ceil(common::gemv::rows_per_wg(n, r)) as u32
     }
@@ -221,6 +227,21 @@ pub mod gfx11 {
         }
     }
 
+
+    /// `rows_h` on the matrix path for a step of many tokens (`rows_wmma`). Grid: wmma_grid(m, n), LDS WMMA_LDS.
+    #[no_mangle]
+    pub extern "gpu-kernel" fn rows_h_w(x: *const f32, ln: *const u16, w: *const u16, out: *mut f32, m: u32, n: u32) {
+        unsafe {
+            common::gemv::gfx11::rows_wmma::<H, true>(workitem_id_x(), w, ln, m as usize, n as usize, RMS_NORM_EPS, x, out);
+        }
+    }
+    /// `rows_part` on the matrix path for a step of many tokens (`rows_wmma`). Grid: wmma_grid(m, n), LDS WMMA_LDS.
+    #[no_mangle]
+    pub extern "gpu-kernel" fn rows_part_w(x: *const f32, w: *const u16, out: *mut f32, m: u32, n: u32) {
+        unsafe {
+            common::gemv::gfx11::rows_wmma::<PART_QKV, false>(workitem_id_x(), w, core::ptr::null(), m as usize, n as usize, 0.0, x, out);
+        }
+    }
 
     /// `out[i][row] = W[row] · x[i]` for a `[m][KDA_QKV]` bf16 matrix over `x: [n][KDA_QKV]`: the output projection. Grid: rows_grid(m).
     #[no_mangle]

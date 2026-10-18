@@ -799,4 +799,133 @@ pub mod gfx11 {
             PASS
         }
     }
+
+    /// The matrix path for a step of many tokens: `out[i][row] = W[row] · x[i]` over `x: [n][K]` f32 and
+    /// `W: [m][K]` bf16 on `v_wmma_f32_16x16x16_bf16`, the activations rounded to bf16 as they are staged
+    /// (the reference runs its activations in bf16), f32 accumulation. A workgroup takes WMMA_ROWS rows ×
+    /// WMMA_TOKENS tokens (a wave 16 rows, eight 16-token tiles in registers); a round stages WMMA_K of the
+    /// activations as bf16 in LDS and each wave runs its 4 k-steps against them, B (the weights' 16 rows
+    /// × 16 k, one 32-byte load a lane) reused across the eight tiles. With NORM the pre-norm scale is
+    /// folded in: the norm weight on the staged values, each token's 1/rms on its outputs (the scalar
+    /// `rows_pass` does the same). Numerically a different sum (bf16 operands, 16-wide accumulation
+    /// order): a prefill kernel, gated numerically against the token-at-a-time path, never a decode one.
+    /// Grid: `wmma_grid(m, n)` workgroups of 256; LDS `WMMA_LDS` bytes.
+    pub const WMMA_TOKENS: usize = 128;
+    pub const WMMA_ROWS: usize = 128;
+    pub const WMMA_K: usize = 64;
+    /// A staged token row's stride in halfwords: the round's k plus a pad, so the sixteen rows an A fragment
+    /// is read from fall in different LDS banks (at exactly 128 bytes a row every lane hit the same banks).
+    pub const WMMA_XS: usize = WMMA_K + 8;
+    pub const WMMA_LDS: usize = WMMA_TOKENS * WMMA_XS * 2 + WMMA_TOKENS * 4;
+    pub const fn wmma_grid(m: usize, n: usize) -> u32 {
+        (m.div_ceil(WMMA_ROWS) * n.div_ceil(WMMA_TOKENS)) as u32
+    }
+    #[repr(simd)]
+    #[derive(Clone, Copy)]
+    #[allow(non_camel_case_types)]
+    pub struct v16i16(pub [i16; 16]);
+    #[repr(simd)]
+    #[derive(Clone, Copy)]
+    #[allow(non_camel_case_types)]
+    pub struct v8f32(pub [f32; 8]);
+    unsafe extern "C" {
+        #[link_name = "llvm.amdgcn.wmma.f32.16x16x16.bf16.v8f32.v16i16"]
+        fn wmma_f32_bf16(a: v16i16, b: v16i16, c: v8f32) -> v8f32;
+    }
+    /// `x` rounded to bf16 (ties to even), as the 16 bits.
+    #[inline(always)]
+    fn to_bf16(x: f32) -> u16 {
+        (crate::math::bf16_round(x).to_bits() >> 16) as u16
+    }
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn rows_wmma<const K: usize, const NORM: bool>(tid: u32, w: *const u16, ln: *const u16, m: usize, n: usize, eps: f32, x: *const f32, out: *mut f32) {
+        use core::arch::amdgpu::workgroup_id_x;
+        const { assert!(K % WMMA_K == 0 && WMMA_K % 16 == 0 && WMMA_ROWS == 8 * 16 && WMMA_TOKENS == 8 * 16) };
+        const STEPS: usize = WMMA_K / 16;
+        const TILES: usize = WMMA_TOKENS / 16;
+        let t = tid as usize;
+        let (wave, lane) = (t / 32, t % 32);
+        let row_blocks = m.div_ceil(WMMA_ROWS);
+        let wg = workgroup_id_x() as usize;
+        let (rb, tb) = (wg % row_blocks, wg / row_blocks);
+        let (row0, tok0) = (rb * WMMA_ROWS + wave * 16, tb * WMMA_TOKENS);
+        let xs: *mut u16 = crate::gfx11::lds();
+        let rr = xs.add(WMMA_TOKENS * WMMA_XS) as *mut f32;
+        // each token's 1/rms (NORM): a wave takes 16 tokens, its lanes 32 consecutive floats a load
+        if NORM {
+            let mut tt = 0;
+            while tt < 16 {
+                let ltok = wave * 16 + tt;
+                let tok = tok0 + ltok;
+                let mut ss = 0f32;
+                if tok < n {
+                    let xr = x.add(tok * K);
+                    let mut k = lane;
+                    while k < K {
+                        let v = *xr.add(k);
+                        ss += v * v;
+                        k += 32;
+                    }
+                }
+                let total = crate::gfx11::wave_sum(lane as u32, ss);
+                if lane == 0 {
+                    *rr.add(ltok) = crate::math::rsqrt(total / K as f32 + eps);
+                }
+                tt += 1;
+            }
+        }
+        // the wave's 16 rows of W, clamped into the matrix (a row past it is computed and never written)
+        let myrow = row0 + lane % 16;
+        let wrow = w.add((if myrow < m { myrow } else { m - 1 }) * K);
+        let mut acc = [v8f32([0.0; 8]); TILES];
+        let mut k0 = 0;
+        while k0 < K {
+            // stage: a lane keeps one k of the round (a wave reads 32 consecutive floats of a token a load),
+            // the norm weight folded in, bf16; tokens past n stage zeros
+            {
+                let kk = t % WMMA_K;
+                let wl = if NORM { super::widen(*ln.add(k0 + kk)) } else { 1.0 };
+                let mut tok = t / WMMA_K;
+                while tok < WMMA_TOKENS {
+                    let gtok = tok0 + tok;
+                    let v = if gtok < n { *x.add(gtok * K + k0 + kk) * wl } else { 0.0 };
+                    *xs.add(tok * WMMA_XS + kk) = to_bf16(v);
+                    tok += 256 / WMMA_K;
+                }
+            }
+            crate::gfx11::workgroup_sync();
+            let mut s = 0;
+            while s < STEPS {
+                let b = core::ptr::read_unaligned(wrow.add(k0 + s * 16) as *const v16i16);
+                let mut tt = 0;
+                while tt < TILES {
+                    let a = core::ptr::read_unaligned(xs.add((tt * 16 + lane % 16) * WMMA_XS + s * 16) as *const v16i16);
+                    acc[tt] = wmma_f32_bf16(a, b, acc[tt]);
+                    tt += 1;
+                }
+                s += 1;
+            }
+            crate::gfx11::workgroup_sync();
+            k0 += WMMA_K;
+        }
+        // D's register r of lane l is (token 2r + l/16 of the tile, row l % 16 of the wave's)
+        if myrow < m {
+            let mut tt = 0;
+            while tt < TILES {
+                let d: [f32; 8] = core::mem::transmute(acc[tt]);
+                let mut r = 0;
+                while r < 8 {
+                    let ltok = tt * 16 + 2 * r + lane / 16;
+                    let tok = tok0 + ltok;
+                    if tok < n {
+                        let y = if NORM { d[r] * *rr.add(ltok) } else { d[r] };
+                        *out.add(tok * m + myrow) = y;
+                    }
+                    r += 1;
+                }
+                tt += 1;
+            }
+        }
+    }
 }

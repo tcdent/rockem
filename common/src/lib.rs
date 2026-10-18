@@ -36,7 +36,7 @@
 //! - **Test data comes from `common::testing`** (a seeded xorshift), so two
 //!   tests never disagree about what "random" meant.
 #![no_std]
-#![cfg_attr(target_arch = "amdgpu", feature(link_llvm_intrinsics, stdarch_amdgpu, core_intrinsics, gpu_intrinsics, gpu_launch_sized_workgroup_mem, asm_experimental_arch))]
+#![cfg_attr(target_arch = "amdgpu", feature(link_llvm_intrinsics, stdarch_amdgpu, core_intrinsics, gpu_intrinsics, gpu_launch_sized_workgroup_mem, asm_experimental_arch, repr_simd, simd_ffi))]
 #![allow(clippy::missing_safety_doc, clippy::too_many_arguments, internal_features)]
 
 #[cfg(any(test, feature = "std"))]

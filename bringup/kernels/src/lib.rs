@@ -99,3 +99,32 @@ pub extern "gpu-kernel" fn rate_fma_f32(out: *mut f32, iters: u32) {
 fn panic(_: &core::panic::PanicInfo) -> ! {
     loop {}
 }
+
+/// The wave32 bf16 WMMA's operand layout, found empirically: lane `l` loads A as `a[l * 16 .. l * 16 + 16]`
+/// and B as `b[l * 16 .. ]` (16 bf16 each, as the compiler's fragments want them), the product's 8 f32 a
+/// lane go out as `out[l * 8 + r]`; the host knows what it put in and solves for which (row, col) each
+/// (lane, register) holds. Grid: one wave (a workgroup of 32).
+#[no_mangle]
+pub extern "gpu-kernel" fn wmma_layout(a: *const u16, b: *const u16, out: *mut f32) {
+    unsafe {
+        let l = workitem_id_x() as usize;
+        if l >= 32 {
+            return;
+        }
+        let mut av = [0i16; 16];
+        let mut bv = [0i16; 16];
+        let mut i = 0;
+        while i < 16 {
+            av[i] = *a.add(l * 16 + i) as i16;
+            bv[i] = *b.add(l * 16 + i) as i16;
+            i += 1;
+        }
+        let d = wmma_f32_bf16(v16i16(av), v16i16(bv), v8f32([0.0; 8]));
+        let dv: [f32; 8] = core::mem::transmute(d);
+        let mut r = 0;
+        while r < 8 {
+            *out.add(l * 8 + r) = dv[r];
+            r += 1;
+        }
+    }
+}

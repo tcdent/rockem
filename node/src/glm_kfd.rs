@@ -107,8 +107,10 @@ struct Card {
     xgu: Mem,
     xout: Mem,
     rows_h: crate::kfd::Kernel,
+    rows_h_w: crate::kfd::Kernel,
     rows_d2: crate::kfd::Kernel,
     rows_part: crate::kfd::Kernel,
+    rows_part_w: crate::kfd::Kernel,
     step: crate::kfd::Kernel,
     copy: crate::kfd::Kernel,
     ffn_gu: crate::kfd::Kernel,
@@ -311,6 +313,8 @@ impl Cards {
                 let alloc = |floats: usize| k.vram_visible(floats * 4);
                 Card {
                     rows_h: k.kernel("rows_h"),
+                    rows_h_w: k.kernel("rows_h_w"),
+                    rows_part_w: k.kernel("rows_part_w"),
                     rows_d2: k.kernel("rows_d2"),
                     rows_part: k.kernel("rows_part"),
                     step: k.kernel("kda_step"),
@@ -859,8 +863,15 @@ impl Placed for Cards {
         for (i, p) in lay.parts.iter().enumerate() {
             let c = &self.cards[p.card];
             let (smix, fg, normed) = (&c.smixs[i], &c.fgs[i], &c.normeds[i]);
-            // the gates' first halves and beta, then q | k | v: one launch over the normed block input, [n][M_SMALL]
-            self.rows(c, &c.rows_h, c.x.va, Some(p.input_ln.va), p.sq.va, smix.va, M_SMALL, H, n, ROWS);
+            // the gates' first halves and beta, then q | k | v: one launch over the normed block input, [n][M_SMALL];
+            // a step of many tokens takes the matrix path (bf16 activations, numerically its own)
+            if n > SPEC_TOKENS {
+                let mut a = Args::new();
+                a.ptr(c.x.va).ptr(p.input_ln.va).ptr(p.sq.va).ptr(smix.va).u32(M_SMALL as u32).u32(n as u32);
+                c.k.launch(&c.rows_h_w, g::wmma_grid(M_SMALL, n), g::WG, g::WMMA_LDS, &a);
+            } else {
+                self.rows(c, &c.rows_h, c.x.va, Some(p.input_ln.va), p.sq.va, smix.va, M_SMALL, H, n, ROWS);
+            }
             // the gates' second halves as one launch: f_b over f_a's output, g_b over g_a's — token i's input at smix[i · M_SMALL]
             let mut p0 = 0;
             while p0 < n {
@@ -875,7 +886,13 @@ impl Placed for Cards {
             let mut a = Args::new();
             a.ptr(mixed).ptr(p.taps.va).ptr(p.window.va).ptr(fg.va).ptr(p.dt_bias.va).ptr(p.a_log.va).ptr(smix.at(2 * KDA_DIM * 4)).ptr(fg.at(g::PART_QKV * 4)).ptr(p.mem.va).ptr(p.o_norm.va).ptr(normed.va).u32(p.head0 as u32).u32(n as u32).u32(M_SMALL as u32).u32(2 * g::PART_QKV as u32).u32(M_SMALL as u32).ptr(if ring { p.ring.va } else { 0 }).ptr(if ring { p.ring_w.va } else { 0 });
             c.k.launch(&c.step, g::STEP_GRID, g::WG, g::STEP_LDS as u32, &a);
-            self.rows(c, &c.rows_part, normed.va, None, p.o.va, c.yv.at(i * STEP * H * 4), H, g::PART_QKV, n, ROWS);
+            if n > SPEC_TOKENS {
+                let mut a = Args::new();
+                a.ptr(normed.va).ptr(p.o.va).ptr(c.yv.at(i * STEP * H * 4)).u32(H as u32).u32(n as u32);
+                c.k.launch(&c.rows_part_w, g::wmma_grid(H, n), g::WG, g::WMMA_LDS, &a);
+            } else {
+                self.rows(c, &c.rows_part, normed.va, None, p.o.va, c.yv.at(i * STEP * H * 4), H, g::PART_QKV, n, ROWS);
+            }
         }
         // each card's shares out and its word; every card folds the sum into its streams
         let mut parts: Vec<Vec<usize>> = vec![Vec::new(); self.cards.len()];
