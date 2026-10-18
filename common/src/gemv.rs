@@ -866,9 +866,16 @@ pub mod gfx11 {
         #[link_name = "llvm.amdgcn.wmma.f32.16x16x16.bf16.v8f32.v16i16"]
         fn wmma_f32_bf16(a: v16i16, b: v16i16, c: v8f32) -> v8f32;
     }
+    /// One WMMA step: `c + a · b` over 16×16×16, bf16 fragments, f32 accumulators (the fragment
+    /// layout: lane l supplies row l % 16 of A and column l % 16 of B as 16 consecutive k; register
+    /// r of lane l holds D[2r + l / 16][l % 16]; measured 2026-10-18, bench-wmma-layout).
+    #[inline(always)]
+    pub unsafe fn wmma(a: v16i16, b: v16i16, c: v8f32) -> v8f32 {
+        wmma_f32_bf16(a, b, c)
+    }
     /// `x` rounded to bf16 (ties to even), as the 16 bits.
     #[inline(always)]
-    fn to_bf16(x: f32) -> u16 {
+    pub fn to_bf16(x: f32) -> u16 {
         (crate::math::bf16_round(x).to_bits() >> 16) as u16
     }
     /// The weights' side of a WMMA step: 16 bf16 of row `row`, `k..k + 16`, as the B fragment.
@@ -917,13 +924,19 @@ pub mod gfx11 {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn rows_wmma_with<const K: usize, const NORM: bool, W: WmmaW<K>>(tid: u32, wt: W, ln: *const u16, m: usize, n: usize, eps: f32, load: impl Fn(usize, usize) -> f32, out: *mut f32) {
         use core::arch::amdgpu::workgroup_id_x;
+        rows_wmma_into::<K, NORM, W>(tid, workgroup_id_x() as usize, wt, ln, m, n, eps, load, |tok, row, y| *out.add(tok * m + row) = y)
+    }
+    /// `rows_wmma_with` for a workgroup index of the caller's (a kernel whose grid also runs over
+    /// heads, say) and an output closure `store(token, row, y)`.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn rows_wmma_into<const K: usize, const NORM: bool, W: WmmaW<K>>(tid: u32, wg: usize, wt: W, ln: *const u16, m: usize, n: usize, eps: f32, load: impl Fn(usize, usize) -> f32, store: impl Fn(usize, usize, f32)) {
         const { assert!(K % WMMA_K == 0 && WMMA_K % 16 == 0 && WMMA_ROWS == 8 * 16 && WMMA_TOKENS == 8 * 16) };
         const STEPS: usize = WMMA_K / 16;
         const TILES: usize = WMMA_TOKENS / 16;
         let t = tid as usize;
         let (wave, lane) = (t / 32, t % 32);
         let row_blocks = m.div_ceil(WMMA_ROWS);
-        let wg = workgroup_id_x() as usize;
         let (rb, tb) = (wg % row_blocks, wg / row_blocks);
         let (row0, tok0) = (rb * WMMA_ROWS + wave * 16, tb * WMMA_TOKENS);
         let xs: *mut u16 = crate::gfx11::lds();
@@ -995,7 +1008,7 @@ pub mod gfx11 {
                     let tok = tok0 + ltok;
                     if tok < n {
                         let y = if NORM { d[r] * *rr.add(ltok) } else { d[r] };
-                        *out.add(tok * m + myrow) = y;
+                        store(tok, myrow, y);
                     }
                     r += 1;
                 }

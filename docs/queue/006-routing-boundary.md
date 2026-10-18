@@ -1,8 +1,8 @@
 # 006 — The 8th/9th routing boundary: resolve exactly or exploit
 
-**Status:** Decision (tcdent)
+**Status:** Decision (tcdent) — the speed half estimated 2026-10-18 at ~0.02 ms a step token; the determinism half is not a speed item
 **Area:** decode, determinism
-**Gain:** exploit — some resident hits; resolve — reproducibility across realizations
+**Gain:** exploit — ~0.3 % more resident picks (4–13 % of positions near a tie × ~23 % chance the 9th is resident and the 8th not at 35 % residency × one pick of eight): ~0.02 ms a step token, an estimate (the routing trace keeps only the top eight, so no replay); resolve — reproducibility, at a cost in router arithmetic
 
 ## Proposal
 4–13 % of positions a layer have 8th/9th margins under 1e-3; flips there are arithmetic noise,
@@ -21,4 +21,4 @@ report: non-deterministic top-k "caused drastic performance degradation during R
 - 2026-10-17: posed as a fork; not decided.
 
 ## Next
-tcdent's call. Exploiting has something to prefer now that 003 exists.
+tcdent's call on determinism. Exploiting is on the shelf by its estimate (~0.02 ms a step token); a trace that records the 9th pick and the margin would make it a replay.

@@ -25,6 +25,13 @@ pub unsafe fn workgroup_sync() {
     core::arch::asm!("", options(nostack));
 }
 
+/// A wave's own LDS traffic settled before its lanes read what other lanes of the same wave
+/// wrote (the LDS serves one wave's requests in order; this pins the compiler's order too).
+#[inline(always)]
+pub unsafe fn wave_lds_sync() {
+    core::arch::asm!("s_waitcnt lgkmcnt(0)", options(nostack));
+}
+
 /// Spin until the word (VRAM, polled through L2) reads `value`, a short sleep between looks:
 /// hundreds of waves polling one line back to back starve the workgroup they wait for
 /// (`hc_pre`, 2026-10-16).

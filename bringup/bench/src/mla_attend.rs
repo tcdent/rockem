@@ -10,7 +10,7 @@
 mod kfd;
 
 use glm_5_3_flash::kda::gfx11_consts as g;
-use glm_5_3_flash::mla::gfx11_consts::{IX_ROWS, SELECT_LDS};
+use glm_5_3_flash::mla::gfx11_consts::{aw_chunk, aw_chunks, AW_HEAD_TILES, AW_LDS, AW_MERGE_LDS, AW_PART, AW_WG, IX_ROWS, SELECT_LDS};
 use glm_5_3_flash::{DENSE_BELOW, INDEX_HEAD_DIM, INDEX_KPOOL, INDEX_N_HEADS, KVB_HEAD, KV_LORA_RANK, MLA_HEADS, Q_HEAD, V_HEAD_DIM};
 use harness::arg;
 
@@ -47,7 +47,15 @@ fn main() {
     }
     let sel = k.vram(maxn * DENSE_BELOW * 4);
     let counts = k.vram_visible(maxn * 4);
-    let heads = k.vram(maxn * MLA_HEADS * V_HEAD_DIM * 4);
+    let heads = k.vram_visible(maxn * MLA_HEADS * V_HEAD_DIM * 4);
+    let heads_w = k.vram_visible(maxn * MLA_HEADS * V_HEAD_DIM * 4);
+    // the WMMA attend's chunking: derived from the step, or forced (`--chunk <positions>`; 0 = derived)
+    let chunk_override: usize = arg("--chunk").map_or(0, |v| v.to_str().unwrap().parse().unwrap());
+    let max_chunks = DENSE_BELOW.div_ceil(if chunk_override > 0 { chunk_override } else { aw_chunk(1).min(aw_chunk(512)) });
+    // the partials exist only for chunked launches (a verify step's few tokens, or a forced chunk): sized so,
+    // not for 512 tokens × 9 chunks (600 MB — beside the node's residency that evicted buffers under the CP)
+    let part_tokens = if chunk_override > 0 { maxn } else { maxn.min(glm_5_3_flash::SPEC_TOKENS) };
+    let part = k.vram_visible(part_tokens * AW_HEAD_TILES * max_chunks * AW_PART * 4);
     // the indexer's
     let iq = k.vram_visible(maxn * INDEX_N_HEADS * INDEX_HEAD_DIM * 4);
     upload_f32(&iq, &(0..maxn * INDEX_N_HEADS * INDEX_HEAD_DIM).map(|_| rng.unit()).collect::<Vec<f32>>());
@@ -58,8 +66,12 @@ fn main() {
     let score = k.vram(maxn * npools * 4);
     let (scale, wscale) = glm_5_3_flash::mla::score_scales();
     let (k_score, k_select, k_attend) = (k.kernel("ix_score"), k.kernel("ix_select"), k.kernel("mla_attend"));
+    let (k_attend_w, k_merge, k_qabs, k_uv, k_uv_s) = (k.kernel("mla_attend_w"), k.kernel("mla_attend_merge"), k.kernel("mla_qabs"), k.kernel("mla_uv_w"), k.kernel("mla_uv"));
+    let k_qabs_w = k.kernel("mla_qabs_w");
+    let qabs = k.vram(maxn * MLA_HEADS * KV_LORA_RANK * 2);
+    let olat = k.vram(maxn * MLA_HEADS * KV_LORA_RANK * 4);
     println!("bench-mla-attend: {MLA_HEADS} heads, latents {KV_LORA_RANK} bf16, {INDEX_N_HEADS}×{INDEX_HEAD_DIM} indexer, {npools} pools allocated; µs a launch (a token)");
-    println!("{:>9} {:>6} {:>22} {:>22} {:>22}", "positions", "tokens", "ix_score", "ix_select", "mla_attend");
+    println!("{:>9} {:>6} {:>22} {:>22} {:>22} {:>26}", "positions", "tokens", "ix_score", "ix_select", "mla_attend", "qabs+attend_w(+merge)+uv_w");
     for &pos in &positions {
         for &n in &tokens {
             let nb = ((pos + n) / INDEX_KPOOL).div_ceil(256);
@@ -90,9 +102,84 @@ fn main() {
                 a.ptr(q.va).ptr(kvb.va).ptr(lat.va).ptr(sel.va).ptr(counts.va).ptr(heads.va);
                 k.launch(&k_attend, attend_grid * n as u32, g::WG, attend_lds, &a);
             });
+            // the merge unrolls over the constant decode chunk count, so a forced chunk only shapes the one-chunk form
+            let (chunk, chunks) = if chunk_override > 0 && DENSE_BELOW.div_ceil(chunk_override) == 1 { (chunk_override, 1) } else { (aw_chunk(n), aw_chunks(n)) };
+            // the three launches timed apart (each after the one before it completed)
+            let t_qabs = time(&|| {
+                let mut a = kfd::Args::new();
+                a.ptr(q.va).ptr(kvb.va).ptr(qabs.va);
+                if n > glm_5_3_flash::SPEC_TOKENS {
+                    a.u32(n as u32);
+                    k.launch(&k_qabs_w, (MLA_HEADS as u32) * g::wmma_grid(KV_LORA_RANK, n), g::WG, g::WMMA_LDS, &a);
+                } else {
+                    k.launch(&k_qabs, (n * MLA_HEADS) as u32, 256, 0, &a);
+                }
+            });
+            let t_aw = time(&|| {
+                let mut a = kfd::Args::new();
+                a.ptr(qabs.va).ptr(lat.va).ptr(sel.va).ptr(counts.va).ptr(olat.va).ptr(part.va).u32(chunks as u32).u32(chunk as u32);
+                k.launch(&k_attend_w, (n * AW_HEAD_TILES * chunks) as u32, AW_WG, AW_LDS as u32, &a);
+            });
+            let t_merge = if chunks > 1 {
+                time(&|| {
+                    let mut a = kfd::Args::new();
+                    a.ptr(part.va).ptr(olat.va);
+                    k.launch(&k_merge, (n * AW_HEAD_TILES) as u32, AW_WG, AW_MERGE_LDS as u32, &a);
+                })
+            } else {
+                0.0
+            };
+            let t_uv = time(&|| {
+                let mut a = kfd::Args::new();
+                a.ptr(olat.va).ptr(kvb.va).ptr(heads_w.va);
+                if n > glm_5_3_flash::SPEC_TOKENS {
+                    a.u32(n as u32);
+                    k.launch(&k_uv, (MLA_HEADS as u32) * g::wmma_grid(V_HEAD_DIM, n), g::WG, g::WMMA_LDS, &a);
+                } else {
+                    k.launch(&k_uv_s, (n * MLA_HEADS) as u32, 256, (KV_LORA_RANK * 4) as u32, &a);
+                }
+            });
+            let t_w = t_qabs + t_aw + t_merge + t_uv;
+            // the two attends' outputs: the largest difference against the largest magnitude
+            let (mut dmax, mut vmax, mut nans) = (0f32, 0f32, 0usize);
+            {
+                let a = unsafe { std::slice::from_raw_parts(heads.ptr() as *const f32, n * MLA_HEADS * V_HEAD_DIM) };
+                let b = unsafe { std::slice::from_raw_parts(heads_w.ptr() as *const f32, n * MLA_HEADS * V_HEAD_DIM) };
+                for (x, y) in a.iter().zip(b) {
+                    if !y.is_finite() {
+                        nans += 1;
+                    } else {
+                        dmax = dmax.max((x - y).abs());
+                    }
+                    vmax = vmax.max(x.abs());
+                }
+                if nans > 0 {
+                    // where the non-finite values sit: by head and by channel eighth, token 0
+                    let mut by_head = [0usize; MLA_HEADS];
+                    let mut by_ch = [0usize; 8];
+                    for h in 0..MLA_HEADS {
+                        for r in 0..V_HEAD_DIM {
+                            if !b[h * V_HEAD_DIM + r].is_finite() {
+                                by_head[h] += 1;
+                                by_ch[r / (V_HEAD_DIM / 8)] += 1;
+                            }
+                        }
+                    }
+                    println!("    non-finite by head {:?}", by_head);
+                    println!("    non-finite by channel eighth {:?}", by_ch);
+                }
+                if nans > 0 || std::env::args().any(|a| a == "--show") {
+                    println!("    scalar {:?}", &a[..4]);
+                    println!("    wmma   {:?}", &b[..4]);
+                    if chunks > 1 {
+                        let pp = unsafe { std::slice::from_raw_parts(part.ptr() as *const f32, AW_PART) };
+                        println!("    part0 m {:?} l {:?} o {:?}", &pp[..4], &pp[16..20], &pp[32..36]);
+                    }
+                }
+            }
             let mut c = vec![0u32; n];
             unsafe { std::ptr::copy_nonoverlapping(counts.ptr() as *const u32, c.as_mut_ptr(), n) };
-            println!("{pos:>9} {n:>6} {t_score:>12.1} ({:>7.2}) {t_select:>12.1} ({:>7.2}) {t_attend:>12.1} ({:>7.2})   selected {}", t_score / n as f64, t_select / n as f64, t_attend / n as f64, c[n - 1]);
+            println!("{pos:>9} {n:>6} {t_score:>12.1} ({:>7.2}) {t_select:>12.1} ({:>7.2}) {t_attend:>12.1} ({:>7.2}) {t_w:>12.1} ({:>7.2}) ×{chunks:<2} = qabs {t_qabs:.0} + attend {t_aw:.0} + merge {t_merge:.0} + uv {t_uv:.0}  selected {}; |Δ|max {dmax:.2e} of {vmax:.2e}, non-finite {nans}", t_score / n as f64, t_select / n as f64, t_attend / n as f64, t_w / n as f64, c[n - 1]);
         }
     }
 }

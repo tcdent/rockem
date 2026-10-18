@@ -414,6 +414,45 @@ pub mod gfx11_consts {
     const _: () = assert!(MLA_HEADS % ATTEND_H == 0 && ATTEND_LDS <= 60 * 1024);
     /// `ix_select`'s LDS: a 256-bin histogram and the scan's eight wave totals, u32.
     pub const SELECT_LDS: usize = 4 * (256 + 8);
+
+    /// `mla_attend_w` (docs/queue/018, 017): a workgroup takes a WMMA tile of 16 heads of one token
+    /// over a chunk of its selected positions, 256 threads (eight waves). LDS in bytes: `q_abs` as
+    /// bf16 rows padded off the 128-byte bank width, two staged latent tiles (16 positions each),
+    /// each wave's score tile for its transpose. The chunk follows the step: every position in one chunk past `SPEC_TOKENS`
+    /// (prefill: a token is four workgroups), `AW_DECODE_CHUNK` positions a workgroup at a verify
+    /// step (the card has 84 CUs and a token is otherwise four workgroups), the chunks' partial
+    /// softmaxes merged by `mla_attend_merge`.
+    pub const AW_H: usize = 16;
+    pub const AW_WG: u32 = 256;
+    pub const AW_XS: usize = KV_LORA_RANK + 8; // rows 16-byte aligned (1040 B), spread over eight banks
+    pub const AW_QABS: usize = 0;
+    /// Two latent tiles (16 positions each): the next tile is staged while the current one is mixed.
+    pub const AW_LAT: usize = AW_QABS + AW_H * AW_XS * 2;
+    /// The eight waves' partial score tiles, f32 `[8][16 heads][AW_RS]`: each wave's 64 channels of the
+    /// dot; a row of 20 so the lanes' reads of their heads' rows spread over the banks (16 was an
+    /// 8-way conflict on 128 reads a lane a tile — the kernel's whole cost until 2026-10-18 13:00)
+    /// and read four positions at a time.
+    pub const AW_RS: usize = 20; // 80 B: 16-byte aligned rows (b128 reads of four positions), eight banks
+    pub const AW_RED: usize = AW_LAT + 2 * 16 * AW_XS * 2;
+    pub const AW_LDS: usize = AW_RED + 8 * 16 * AW_RS * 4;
+    pub const AW_HEAD_TILES: usize = MLA_HEADS / AW_H;
+    pub const AW_DECODE_CHUNK: usize = 256;
+    /// A partial: m[16], l[16], O[16][KV_LORA_RANK], f32.
+    pub const AW_PART: usize = 2 * AW_H + AW_H * KV_LORA_RANK;
+    pub const fn aw_chunk(n: usize) -> usize {
+        if n > SPEC_TOKENS { DENSE_BELOW.div_ceil(16) * 16 } else { AW_DECODE_CHUNK }
+    }
+    pub const fn aw_chunks(n: usize) -> usize {
+        DENSE_BELOW.div_ceil(aw_chunk(n))
+    }
+    pub const fn aw_grid(n: usize) -> u32 {
+        (n * AW_HEAD_TILES * aw_chunks(n)) as u32
+    }
+    /// The chunks of a verify step's attend, a constant: `mla_attend_merge` unrolls over them.
+    pub const AW_DECODE_CHUNKS: usize = aw_chunks(1);
+    /// `mla_attend_merge`'s LDS: the chunks' (m, l) and weights, `[3][16][AW_DECODE_CHUNKS]`, and the heads' 1/l.
+    pub const AW_MERGE_LDS: usize = 3 * AW_H * AW_DECODE_CHUNKS * 4 + AW_H * 4;
+    const _: () = assert!(V_HEAD_DIM == 256 && AW_LDS <= 60 * 1024 && MLA_HEADS % AW_H == 0 && KV_LORA_RANK % 128 == 0 && AW_DECODE_CHUNK % 16 == 0 && SPEC_TOKENS * AW_HEAD_TILES * aw_chunks(1) <= 4096 && AW_DECODE_CHUNKS <= 16);
 }
 
 #[cfg(target_arch = "amdgpu")]
@@ -637,6 +676,398 @@ pub mod gfx11 {
                 }
                 h += 1;
             }
+        }
+    }
+    /// `q_abs = W_ukᵀ q` for every head of every token of the step, as bf16 `[tokens][MLA_HEADS][KV_LORA_RANK]`
+    /// — the attend's A operand, computed once a token (in every attend workgroup it was 16k dependent
+    /// loads a thread). A workgroup per (token, head), two latent channels a thread, the products summed
+    /// over the query's channels in order (the scalar kernel's prologue). Grid: tokens × MLA_HEADS, 256 threads.
+    #[no_mangle]
+    pub extern "gpu-kernel" fn mla_qabs(q: *const f32, kvb: *const u16, qabs: *mut u16) {
+        unsafe {
+            use common::gemv::gfx11::to_bf16;
+            use core::arch::amdgpu::workgroup_id_x;
+            const D: usize = KV_LORA_RANK;
+            let wg = workgroup_id_x() as usize;
+            let (i, h) = (wg / MLA_HEADS, wg % MLA_HEADS);
+            let t = workitem_id_x() as usize;
+            let qh = q.add((i * MLA_HEADS + h) * Q_HEAD);
+            let wk = kvb.add(h * KVB_HEAD * D);
+            let out = qabs.add((i * MLA_HEADS + h) * D);
+            let mut j = t;
+            while j < D {
+                let mut acc = 0f32;
+                let mut c = 0;
+                while c < QK_NOPE_HEAD_DIM {
+                    acc += widen(*wk.add(c * D + j)) * *qh.add(c);
+                    c += 1;
+                }
+                *out.add(j) = to_bf16(acc);
+                j += 256;
+            }
+        }
+    }
+    /// The sparse attend on the matrix path (docs/queue/018, 017): a workgroup is a token's 16 heads
+    /// (one WMMA tile of heads) over a chunk of its selected positions, eight waves. `q_abs`
+    /// (`mla_qabs`) for the heads into LDS as bf16; then a tile of 16 positions at a time, the latent
+    /// rows staged into LDS (a row past the chunk stages the chunk's last row, its probability
+    /// zero) with the next tile's rows loaded into registers under the current tile's work and two
+    /// tiles' room so the stage overlaps the mix: the scores `[16 heads × 512] · [512 × 16]` with
+    /// each wave 64 channels of the dot (4 WMMAs; its partial tile to LDS, the eight summed by every
+    /// wave — eight waves each doing the whole dot ran LDS-bound at 66 clocks a WMMA, 57 % of the
+    /// kernel), the running softmax in registers (lane `l % 16` keeps head `l % 16`'s max and sum;
+    /// the probabilities become the A fragment in registers), and the mix `[16 × 16] · [16 × 512]`
+    /// with each wave its 64 channels. With one chunk the normalized mix goes out to `olat[i][h]`
+    /// (f32; `mla_uv_w` applies W_uv over the step — a W_uv epilogue in every workgroup was 512
+    /// dependent row reads a wave); with several, the chunk's (m, l, O) go to `part[(i · 4 + head
+    /// tile) · chunks + chunk]` for `mla_attend_merge`. The reference's attention runs in bf16 (q_abs, the
+    /// probabilities) with f32 sums, as here; the scalar kernel's f32 throughout was the
+    /// bit-identical-to-the-host form. Grid: aw_grid(n), 256 threads, LDS AW_LDS.
+    #[no_mangle]
+    pub extern "gpu-kernel" fn mla_attend_w(qabs_in: *const u16, lat: *const u16, sel: *const u32, counts: *const u32, olat: *mut f32, part: *mut f32, chunks: u32, chunk: u32) {
+        unsafe {
+            use common::gemv::gfx11::{to_bf16, v16i16, v8f32, wmma};
+            use common::gfx11::{lane_read, lds, workgroup_sync};
+            use core::arch::amdgpu::workgroup_id_x;
+            const D: usize = KV_LORA_RANK;
+            const XS: usize = AW_XS;
+            let wg = workgroup_id_x() as usize;
+            let (chunks, chunk) = (chunks as usize, chunk as usize);
+            let (i, rest) = (wg / (AW_HEAD_TILES * chunks), wg % (AW_HEAD_TILES * chunks));
+            let (ht, c) = (rest / chunks, rest % chunks);
+            let h0 = ht * AW_H;
+            let sel = sel.add(i * DENSE_BELOW);
+            let n = *counts.add(i) as usize;
+            let p0 = c * chunk;
+            let p1 = if (c + 1) * chunk < n { (c + 1) * chunk } else { n };
+            let t = workitem_id_x() as usize;
+            let (lane, wave) = (t % 32, t / 32);
+            let hl = lane % 16; // the head this lane keeps the softmax of, and supplies as the A row
+            let base: *mut u8 = lds();
+            let qabs = base.add(AW_QABS) as *mut u16;
+            let lat0 = base.add(AW_LAT) as *mut u16;
+            let red = base.add(AW_RED) as *mut f32;
+            let scale = 1.0 / common::math::sqrt(Q_HEAD as f32);
+            // the 16 heads' q_abs rows (`mla_qabs`, bf16) into LDS: a thread copies 32 halfwords of a row
+            {
+                let (h, e) = (t / 16, t % 16);
+                let src = qabs_in.add((i * MLA_HEADS + h0 + h) * D + e * 32);
+                let dst = qabs.add(h * XS + e * 32);
+                let rd = |k: usize| core::ptr::read_unaligned(src.add(k * 8) as *const [u64; 2]);
+                let (b0, b1, b2, b3) = (rd(0), rd(1), rd(2), rd(3));
+                *(dst as *mut [u64; 2]) = b0;
+                *(dst.add(8) as *mut [u64; 2]) = b1;
+                *(dst.add(16) as *mut [u64; 2]) = b2;
+                *(dst.add(24) as *mut [u64; 2]) = b3;
+            }
+            // a thread's share of a tile's stage: 32 halfwords of row `r`; the row past the chunk stages the last row
+            let (r, e) = (t / 16, t % 16);
+            // held as scalars: an array lives in memory, and across a barrier (an `asm!` memory clobber)
+            // that memory is scratch
+            let fetch = |pos: usize| -> [u64; 8] {
+                let p = pos + r;
+                let src = lat.add(*sel.add(if p < p1 { p } else { p1 - 1 }) as usize * D + e * 32) as *const u64;
+                let rd = |k: usize| core::ptr::read_unaligned(src.add(k));
+                [rd(0), rd(1), rd(2), rd(3), rd(4), rd(5), rd(6), rd(7)]
+            };
+            let store = |buf: *mut u16, b: [u64; 8]| {
+                let dst = buf.add(r * XS + e * 32) as *mut u64;
+                let mut k = 0;
+                while k < 8 {
+                    *dst.add(k) = b[k];
+                    k += 1;
+                }
+            };
+            let mut m_h = f32::NEG_INFINITY;
+            let mut l_h = 0f32;
+            let mut acc = [v8f32([0.0; 8]); 4]; // this wave's 64 output channels
+            let mut pos = p0;
+            if pos < p1 {
+                store(lat0, fetch(pos));
+            }
+            workgroup_sync();
+            while pos < p1 {
+                let latt = lat0.add(((pos - p0) / 16 % 2) * 16 * XS);
+                // the next tile's rows, in flight under this tile's work
+                let next = pos + 16;
+                let (q0, q1, q2, q3, q4, q5, q6, q7) = {
+                    let f = fetch(if next < p1 { next } else { pos }); // unconditional: a conditional one went to scratch
+                    (f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7])
+                };
+                // this wave's 64 channels of the tile's scores: D[head 2r + lane/16][position lane % 16]
+                let mut sacc = v8f32([0.0; 8]);
+                let mut k = wave * 64;
+                while k < wave * 64 + 64 {
+                    let a: v16i16 = core::ptr::read_unaligned(qabs.add(hl * XS + k) as *const v16i16);
+                    let b: v16i16 = core::ptr::read_unaligned(latt.add(hl * XS + k) as *const v16i16);
+                    sacc = wmma(a, b, sacc);
+                    k += 16;
+                }
+                {
+                    let d: [f32; 8] = core::mem::transmute(sacc);
+                    let mut rr = 0;
+                    while rr < 8 {
+                        *red.add((wave * 16 + 2 * rr + lane / 16) * AW_RS + hl) = d[rr];
+                        rr += 1;
+                    }
+                }
+                workgroup_sync();
+                // the eight partials summed for this lane's head, scaled, masked past the chunk
+                let mut sc = [0f32; 16];
+                let mut mx = m_h;
+                let mut qq = 0;
+                while qq < 4 {
+                    let mut v = [0f32; 4];
+                    let mut w = 0;
+                    while w < 8 {
+                        let part4: [f32; 4] = *(red.add((w * 16 + hl) * AW_RS + qq * 4) as *const [f32; 4]);
+                        v[0] += part4[0];
+                        v[1] += part4[1];
+                        v[2] += part4[2];
+                        v[3] += part4[3];
+                        w += 1;
+                    }
+                    let mut u = 0;
+                    while u < 4 {
+                        let cidx = qq * 4 + u;
+                        let vv = v[u] * scale;
+                        sc[cidx] = vv;
+                        if pos + cidx < p1 && vv > mx {
+                            mx = vv;
+                        }
+                        u += 1;
+                    }
+                    qq += 1;
+                }
+                let alpha = if m_h == f32::NEG_INFINITY { 0.0 } else { exp(m_h - mx) };
+                let mut pr = [0i16; 16];
+                let mut sum = 0f32;
+                let mut cidx = 0;
+                while cidx < 16 {
+                    let ev = if pos + cidx < p1 { exp(sc[cidx] - mx) } else { 0.0 };
+                    sum += ev;
+                    pr[cidx] = to_bf16(ev) as i16;
+                    cidx += 1;
+                }
+                l_h = l_h * alpha + sum;
+                m_h = mx;
+                // the mix: rescale the accumulators by their heads' alpha (lanes 2r + lane/16 hold them), then P · L
+                let mut rr = 0;
+                while rr < 8 {
+                    let al = lane_read((2 * rr + lane / 16) as u32, alpha);
+                    let mut nt = 0;
+                    while nt < 4 {
+                        let mut d: [f32; 8] = core::mem::transmute(acc[nt]);
+                        d[rr] *= al;
+                        acc[nt] = core::mem::transmute(d);
+                        nt += 1;
+                    }
+                    rr += 1;
+                }
+                let a = v16i16(pr);
+                let mut nt = 0;
+                while nt < 4 {
+                    let dim = wave * 64 + nt * 16 + hl;
+                    let mut bv = [0i16; 16];
+                    let mut p = 0;
+                    while p < 16 {
+                        bv[p] = *latt.add(p * XS + dim) as i16;
+                        p += 1;
+                    }
+                    acc[nt] = wmma(a, v16i16(bv), acc[nt]);
+                    nt += 1;
+                }
+                if next < p1 {
+                    store(lat0.add(((next - p0) / 16 % 2) * 16 * XS), [q0, q1, q2, q3, q4, q5, q6, q7]);
+                }
+                workgroup_sync();
+                pos = next;
+            }
+            if chunks == 1 {
+                // the normalized mix out as f32 `[tokens][MLA_HEADS][D]`: `mla_uv_w` applies W_uv over the step
+                let olat = olat.add((i * MLA_HEADS + h0) * D);
+                let mut rr = 0;
+                while rr < 8 {
+                    let inv = 1.0 / lane_read((2 * rr + lane / 16) as u32, l_h);
+                    let h = 2 * rr + lane / 16;
+                    let mut nt = 0;
+                    while nt < 4 {
+                        let d: [f32; 8] = core::mem::transmute(acc[nt]);
+                        *olat.add(h * D + wave * 64 + nt * 16 + hl) = d[rr] * inv;
+                        nt += 1;
+                    }
+                    rr += 1;
+                }
+            } else {
+                let part = part.add(((i * AW_HEAD_TILES + ht) * chunks + c) * AW_PART);
+                if t < AW_H {
+                    *part.add(t) = m_h;
+                    *part.add(AW_H + t) = l_h;
+                }
+                let o = part.add(2 * AW_H);
+                let mut nt = 0;
+                while nt < 4 {
+                    let d: [f32; 8] = core::mem::transmute(acc[nt]);
+                    let mut rr = 0;
+                    while rr < 8 {
+                        *o.add((2 * rr + lane / 16) * D + wave * 64 + nt * 16 + hl) = d[rr];
+                        rr += 1;
+                    }
+                    nt += 1;
+                }
+            }
+        }
+    }
+    /// The `AW_DECODE_CHUNKS` partial softmaxes of a verify step's `mla_attend_w` merged — each chunk's
+    /// weight `exp(m_c − M)`, the sums and mixes combined in chunk order, normalized — into `olat`
+    /// for `mla_uv_w`. A workgroup per (token, head tile), AW_WG threads: the (m, l) of every
+    /// (head, chunk) loaded by a thread each, the weights by a thread a head, the 8,192 channels of the
+    /// mix 32 a thread with the chunk loop unrolled (a thread walking the chunks a head at a time with
+    /// dependent loads took 356 µs a layer at nine chunks). LDS AW_MERGE_LDS.
+    #[no_mangle]
+    pub extern "gpu-kernel" fn mla_attend_merge(part: *const f32, olat: *mut f32) {
+        unsafe {
+            use common::gfx11::{lds, workgroup_sync};
+            use core::arch::amdgpu::workgroup_id_x;
+            const D: usize = KV_LORA_RANK;
+            const C: usize = AW_DECODE_CHUNKS;
+            let wg = workgroup_id_x() as usize;
+            let (i, ht) = (wg / AW_HEAD_TILES, wg % AW_HEAD_TILES);
+            let h0 = ht * AW_H;
+            let t = workitem_id_x() as usize;
+            let ms: *mut f32 = lds(); // [16][C] m, then [16][C] l, then [16][C] weights, then [16] 1/l
+            let ls = ms.add(AW_H * C);
+            let ws = ls.add(AW_H * C);
+            let inv = ws.add(AW_H * C);
+            let part = part.add((i * AW_HEAD_TILES + ht) * C * AW_PART);
+            if t < AW_H * C {
+                let (h, c) = (t / C, t % C);
+                *ms.add(h * C + c) = *part.add(c * AW_PART + h);
+                *ls.add(h * C + c) = *part.add(c * AW_PART + AW_H + h);
+            }
+            workgroup_sync();
+            if t < AW_H {
+                let h = t;
+                let mut m = f32::NEG_INFINITY;
+                let mut c = 0;
+                while c < C {
+                    let mc = *ms.add(h * C + c);
+                    if mc > m {
+                        m = mc;
+                    }
+                    c += 1;
+                }
+                let mut l = 0f32;
+                let mut c = 0;
+                while c < C {
+                    let mc = *ms.add(h * C + c);
+                    let w = if mc == f32::NEG_INFINITY { 0.0 } else { exp(mc - m) };
+                    *ws.add(h * C + c) = w;
+                    l += *ls.add(h * C + c) * w;
+                    c += 1;
+                }
+                *inv.add(h) = 1.0 / l;
+            }
+            workgroup_sync();
+            let olat = olat.add((i * MLA_HEADS + h0) * D);
+            let mut o = t;
+            while o < AW_H * D {
+                let h = o / D;
+                let mut acc = 0f32;
+                let mut c = 0;
+                while c < C {
+                    acc += *part.add(c * AW_PART + 2 * AW_H + o) * *ws.add(h * C + c);
+                    c += 1;
+                }
+                *olat.add(o) = acc * *inv.add(h);
+                o += AW_WG as usize;
+            }
+        }
+    }
+    /// `heads[i][h] = W_uv[h] · olat[i][h]` for every head over the step, on the matrix path: a head's
+    /// `W_uv` (`[V_HEAD_DIM][KV_LORA_RANK]` bf16 inside `kvb`) as the rows of a `rows_wmma` over the
+    /// step's tokens, the mixes staged as bf16 (the reference's dtype for the attention output).
+    /// Grid: MLA_HEADS × wmma_grid(V_HEAD_DIM, n), 256 threads, LDS WMMA_LDS (`kda::gfx11_consts`).
+    #[no_mangle]
+    pub extern "gpu-kernel" fn mla_uv_w(olat: *const f32, kvb: *const u16, heads: *mut f32, n: u32) {
+        unsafe {
+            use common::gemv::gfx11::{rows_wmma_into, WBf16};
+            use core::arch::amdgpu::workgroup_id_x;
+            const D: usize = KV_LORA_RANK;
+            let n = n as usize;
+            let per_head = crate::kda::gfx11_consts::wmma_grid(V_HEAD_DIM, n) as usize;
+            let wg = workgroup_id_x() as usize;
+            let (h, sub) = (wg / per_head, wg % per_head);
+            let w_uv = kvb.add(h * KVB_HEAD * D + QK_NOPE_HEAD_DIM * D);
+            rows_wmma_into::<D, false, _>(workitem_id_x(), sub, WBf16(w_uv), core::ptr::null(), V_HEAD_DIM, n, 0.0, |tok, k| *olat.add((tok * MLA_HEADS + h) * D + k), |tok, row, y| *heads.add((tok * MLA_HEADS + h) * V_HEAD_DIM + row) = y);
+        }
+    }
+    /// `mla_uv_w`'s twin for a step of up to `SPEC_TOKENS` tokens (the matrix path pads a verify step's two
+    /// tokens to 128): a workgroup per (token, head), a thread a row of `W_uv` against the head's mix in
+    /// LDS. Grid: tokens × MLA_HEADS, 256 threads, LDS KV_LORA_RANK × 4.
+    #[no_mangle]
+    pub extern "gpu-kernel" fn mla_uv(olat: *const f32, kvb: *const u16, heads: *mut f32) {
+        unsafe {
+            use common::gemv::gfx11::bf16_row;
+            use common::gfx11::{lds, workgroup_sync};
+            use core::arch::amdgpu::workgroup_id_x;
+            const D: usize = KV_LORA_RANK;
+            let wg = workgroup_id_x() as usize;
+            let (i, h) = (wg / MLA_HEADS, wg % MLA_HEADS);
+            let t = workitem_id_x() as usize;
+            let (lane, wave) = (t % 32, t / 32);
+            let x: *mut f32 = lds();
+            let mut j = t;
+            while j < D {
+                *x.add(j) = *olat.add((i * MLA_HEADS + h) * D + j);
+                j += 256;
+            }
+            workgroup_sync();
+            // a row a wave at a time, the lanes along the row (a row a thread serialized 64 loads)
+            let w_uv = kvb.add(h * KVB_HEAD * D + QK_NOPE_HEAD_DIM * D);
+            let out = heads.add((i * MLA_HEADS + h) * V_HEAD_DIM);
+            let mut r = wave * (V_HEAD_DIM / 8);
+            while r < (wave + 1) * (V_HEAD_DIM / 8) {
+                let y = bf16_row::<D>(lane as u32, w_uv.add(r * D), x);
+                if lane == 0 {
+                    *out.add(r) = y;
+                }
+                r += 1;
+            }
+        }
+    }
+    /// `W_uk`'s rows for the matrix path: `q_abs[j] = Σ_c W_uk[c][j] · q[c]` wants row `j` with `c` as k,
+    /// and `kvb` keeps `[c][j]` (j contiguous): the fragment's sixteen k are sixteen strided loads.
+    #[derive(Clone, Copy)]
+    struct WUkT(*const u16);
+    impl common::gemv::gfx11::WmmaW<QK_NOPE_HEAD_DIM> for WUkT {
+        #[inline(always)]
+        unsafe fn frag(self, row: usize, k: usize) -> common::gemv::gfx11::v16i16 {
+            let mut v = [0i16; 16];
+            let mut i = 0;
+            while i < 16 {
+                v[i] = *self.0.add((k + i) * KV_LORA_RANK + row) as i16;
+                i += 1;
+            }
+            common::gemv::gfx11::v16i16(v)
+        }
+    }
+    /// `mla_qabs` on the matrix path for a step of many tokens: a head's `W_uk` as the 512 rows of a
+    /// `rows_wmma` over the step's tokens with K = QK_NOPE_HEAD_DIM, the queries staged as bf16 (the
+    /// reference's dtype), the output rounded to bf16. Grid: MLA_HEADS × wmma_grid(KV_LORA_RANK, n),
+    /// 256 threads, LDS WMMA_LDS.
+    #[no_mangle]
+    pub extern "gpu-kernel" fn mla_qabs_w(q: *const f32, kvb: *const u16, qabs: *mut u16, n: u32) {
+        unsafe {
+            use common::gemv::gfx11::{rows_wmma_into, to_bf16};
+            use core::arch::amdgpu::workgroup_id_x;
+            const D: usize = KV_LORA_RANK;
+            let n = n as usize;
+            let per_head = crate::kda::gfx11_consts::wmma_grid(D, n) as usize;
+            let wg = workgroup_id_x() as usize;
+            let (h, sub) = (wg / per_head, wg % per_head);
+            let w_uk = WUkT(kvb.add(h * KVB_HEAD * D));
+            rows_wmma_into::<QK_NOPE_HEAD_DIM, false, _>(workitem_id_x(), sub, w_uk, core::ptr::null(), D, n, 0.0, |tok, c| *q.add((tok * MLA_HEADS + h) * Q_HEAD + c), |tok, row, y| *qabs.add((tok * MLA_HEADS + h) * D + row) = to_bf16(y));
         }
     }
     /// `out[i][row] = W[row] · x[i]` for the draft layer's `eh_proj` (`[H][2·H]` bf16) over `x: [n][2·H]`

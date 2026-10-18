@@ -1,6 +1,6 @@
 # 017 — Attend: positions split across workgroups (decode at long context)
 
-**Status:** Quantified (bench, 2026-10-18) — the attend is 0.38–0.44 ms a layer a verify step from 2,050 positions on (~4.4 ms a step over 11 layers): the 24 → 31 ms step at long context; ready to build with 018's shape
+**Status:** Built 2026-10-18 with 018 (bench: 380–430 → 226 µs a layer a two-token step, 1.7–1.9×); the node's integration and gate next
 **Area:** decode, long context
 **Gain:** measured ceiling ~4 ms a verify step at any context past 2,050 positions
 
@@ -22,7 +22,12 @@ bit-identical to today's single-workgroup order.
   walking 2,048 latent rows), not the position count. ×11 layers ≈ 4.4 ms a step; the served step
   reads 24 ms short and 31 at 18k.
 
+- 2026-10-18 13:30, built as 018's chunked form: a verify step's token is 4 head tiles × 9 chunks of
+  256 positions (72 workgroups for two tokens), each chunk's (m, l, O) to a partials buffer,
+  `mla_attend_merge` (all heads' weights in parallel, the chunk count a constant) into the mix,
+  then the scalar `mla_uv` (a row a wave). **226 µs a layer** = q_abs 39 + attend 119 + merge 32 +
+  W_uv 37, against the scalar's 380–430. Smaller chunks lost (the per-workgroup fixed cost), the
+  scalar q_abs (39) is the next item: it wants a transposed `W_uk` copy or the rows shape.
+
 ## Next
-Build with 018: the same WMMA scoring/mix kernel, positions split across workgroups for a one- or
-two-token step, partial softmaxes merged in a fixed order (not bit-identical to today's single
-workgroup; gated numerically like the prefill pairs).
+With 018's integration. Expected served: ~2 ms a verify step at long context (31 → ~29 ms at 18k).

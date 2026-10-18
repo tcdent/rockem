@@ -19,6 +19,13 @@ its first reader. Our launch-fusion notes left "a second queue" open (2026-09-19
 ## History
 - 2026-10-18: proposed from #61868.
 
+- 2026-10-18 (060's research): on gfx1100, HIP streams overlap poorly (ROCm #10836); Redline's
+  best case on a 7900 XTX was two queues, with three or four timing out and VM faults from queue
+  churn (TheRock #9241); llama.cpp's concurrent streams measured −3 % on RDNA2. Overlap within one
+  queue — independent packets with the barrier bit clear, which our launcher already has — is the
+  safer first form.
+
 ## Next
 List the decode step's independent pieces from a timeline (what each launch reads and when its
-output is first read), then a second queue on one card for the largest.
+output is first read), then free launches within the one queue for them; a second queue only if that falls short, with
+a soak against the reported instability.
