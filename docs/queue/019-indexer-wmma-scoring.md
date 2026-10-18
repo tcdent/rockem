@@ -1,6 +1,6 @@
 # 019 — Indexer scoring on WMMA
 
-**Status:** Deployed 2026-10-18 13:21 (`ix_score_w`: 27–34× the scalar at a 512-step, 2.6–5.3× at a two-token step past 18k; selections within 0.03–0.3 %; SCORE vs the attend-only build: NLL 0.04365 → 0.04362, mean |Δ| 5e-5); the decode selection's split still open
+**Status:** Done 2026-10-18 — the scorer on WMMA (27–34× at a 512-step, 2.6–5.3× at two tokens past 18k) and the selection across workgroups (a two-token step 182 → 92 µs a layer at 262k, flat to 1M, exact against the host); deploying
 **Area:** long context (prefill and decode)
 **Gain:** measured — the whole scoring cost above, ~10× on WMMA; the selection needs its own split (below)
 
@@ -51,7 +51,21 @@ launch); our 1M arithmetic (~13 GMAC and ~1.6 GB of f32 pool keys read a decode 
   small (0.3 ms a prompt token, 0.1 a step); its gain is the long tail (65k–1M). SCORE vs the attend-only
   build: NLL 0.04365 → 0.04362, 42 % of positions moved by a mean 5e-5 (the selection's near-tie flips).
 
+- 2026-10-18 14:05, the selection: one cooperative `ix_select` — a workgroup per (token, slice of its
+  pools); each radix pass histograms the slice into the token's 256 global bins, the last workgroup to
+  arrive picks the digit and publishes it (`await_word` on a sequence word), the slices then share their
+  counts above and at the threshold and each writes its takes at their global ranks; the last to finish
+  resets the token's state. Exact against a host reference at every width (the bench's check). One
+  slice below 8,192 pools (32k positions) and for a step of many tokens — the round trips through global
+  memory cost ~70 µs, so the single workgroup wins there. A two-token step, µs a layer: 18k 61 → 69,
+  65k 127 → 90, 262k 182 → 92 — flat with position, so ~95 at 1M against ~700 (8 ms → 1 ms a step over
+  11 layers). A two-stage form (each slice its top-K, then the candidates) was exact too but no faster:
+  the final stage re-walked K × slices candidates in one workgroup.
+
 ## Next
-The selection at decode: `ix_select` is one workgroup a token over every pool (182 µs a layer at 262k,
+None. The selection's remaining cost at a verify step is the kernel's round trips (~70 µs a layer),
+on the shelf: **Quantified — ~0.7 ms a step at long context** if the four digit rounds collapse to
+two (16-bit digits over 65k bins) or the whole select moves to a single pass over a sampled threshold.
+Formerly: the selection at decode: `ix_select` is one workgroup a token over every pool (182 µs a layer at 262k,
 ~0.7 ms at 1M — 8 ms a step over 11 layers): a split-row select. Build after 018 shares its WMMA staging: scores as `[32 × 128] · [128 × pools]` a token (rows of 16
 queries at prefill), ReLU and the head weights in the epilogue, f32 scores; then a split-row select.

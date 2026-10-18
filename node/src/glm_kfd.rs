@@ -42,7 +42,7 @@ use glm_5_3_flash::kda::gfx11_consts as g;
 use common::gemv::ROWS;
 use glm_5_3_flash::ffn::gfx11_consts::ROWS_GU;
 use glm_5_3_flash::layout::{KDA_MEMORY, KDA_WINDOW};
-use glm_5_3_flash::mla::gfx11_consts::{aw_chunk, aw_chunks, aw_grid, ixw_grid, AW_DECODE_CHUNKS, AW_HEAD_TILES, AW_LDS, AW_MERGE_LDS, AW_PART, AW_WG, IXW_LDS, IX_ROWS, O_IN, ROWS_QB, SELECT_LDS};
+use glm_5_3_flash::mla::gfx11_consts::{aw_chunk, aw_chunks, aw_grid, ixw_grid, select_slices, select_state_init, AW_DECODE_CHUNKS, AW_HEAD_TILES, AW_LDS, AW_MERGE_LDS, AW_PART, AW_WG, IXW_LDS, IX_ROWS, O_IN, ROWS_QB, SELECT_LDS, SELECT_STATE};
 use glm_5_3_flash::expert::gfx11_consts::{DOWN_WGS as XPT_DOWN_WGS, SLOT_BYTES, UP_WGS as XPT_UP_WGS, XPT_LDS};
 use glm_5_3_flash::DENSE_BELOW;
 use glm_5_3_flash::TOP_K;
@@ -189,6 +189,7 @@ struct Card {
     mqabs: Mem,  // [STEP][MLA_HEADS][KV_LORA_RANK] bf16: q_abs, the attend's A operand (`mla_qabs`)
     molat: Mem,  // [STEP][MLA_HEADS][KV_LORA_RANK] f32: the normalized mixes, W_uv's input
     mpart: Mem,  // [SPEC_TOKENS][AW_HEAD_TILES][AW_DECODE_CHUNKS][AW_PART] f32: a verify step's attend partials
+    mselst: Mem, // [STEP][SELECT_STATE] u32: the selection's cross-workgroup state, left as a launch expects it
 }
 /// The draft layer's own pieces on the head's card (its MLA attention is `mlas[MTP_LAYER]`, its
 /// routed experts the host's as layer `MTP_LAYER`): `eh_proj`, the norms, the shared expert, and
@@ -421,6 +422,15 @@ impl Cards {
                     mqabs: k.vram(STEP * MLA_HEADS * KV_LORA_RANK * 2),
                     molat: k.vram(STEP * MLA_HEADS * KV_LORA_RANK * 4),
                     mpart: k.vram(SPEC_TOKENS * AW_HEAD_TILES * AW_DECODE_CHUNKS * AW_PART * 4),
+                    mselst: {
+                        let m = k.vram_visible(STEP * SELECT_STATE * 4);
+                        let mut v = vec![0u32; STEP * SELECT_STATE];
+                        for i in 0..STEP {
+                            select_state_init(&mut v[i * SELECT_STATE..(i + 1) * SELECT_STATE]);
+                        }
+                        k.upload(&m, 0, raw(&v));
+                        m
+                    },
                     k,
                 }
             })
@@ -1273,9 +1283,11 @@ impl Placed for Cards {
             a.ptr(c.miq.va).ptr(c.mproj.at(MIX * 4)).ptr(m.pools.va).ptr(c.mscore.va).u32(n as u32).u32(visible as u32).u32(stride as u32).f32(scale).f32(wscale);
             c.k.launch(&c.ix_score_w, ixw_grid(n, visible), 256, IXW_LDS as u32, &a);
         }
+        // the selection across slices of the pools at a verify step past 32k positions (docs/queue/019)
+        let slices = select_slices(n, (pos + n) / INDEX_KPOOL);
         let mut a = Args::new();
-        a.ptr(c.mscore.va).u32(stride as u32).u32(pos as u32).ptr(c.msel.va).ptr(c.mseln.va);
-        c.k.launch(&c.ix_select, n as u32, g::WG, SELECT_LDS as u32, &a);
+        a.ptr(c.mscore.va).u32(stride as u32).u32(pos as u32).u32(slices as u32).ptr(c.mselst.va).ptr(c.msel.va).ptr(c.mseln.va);
+        c.k.launch(&c.ix_select, (n * slices) as u32, g::WG, SELECT_LDS as u32, &a);
         if let Some(count) = count {
             c.k.sync();
             let mut w = [0u32; 1];

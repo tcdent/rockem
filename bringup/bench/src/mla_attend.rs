@@ -10,7 +10,8 @@
 mod kfd;
 
 use glm_5_3_flash::kda::gfx11_consts as g;
-use glm_5_3_flash::mla::gfx11_consts::{aw_chunk, aw_chunks, ixw_grid, AW_HEAD_TILES, AW_LDS, AW_MERGE_LDS, AW_PART, AW_WG, IXW_LDS, IX_ROWS, SELECT_LDS};
+use glm_5_3_flash::mla::gfx11_consts::{aw_chunk, aw_chunks, ixw_grid, select_slices, select_state_init, AW_HEAD_TILES, AW_LDS, AW_MERGE_LDS, AW_PART, AW_WG, IXW_LDS, IX_ROWS, SELECT_LDS, SELECT_STATE};
+use glm_5_3_flash::mla::KEEP;
 use glm_5_3_flash::{DENSE_BELOW, INDEX_HEAD_DIM, INDEX_KPOOL, INDEX_N_HEADS, KVB_HEAD, KV_LORA_RANK, MLA_HEADS, Q_HEAD, V_HEAD_DIM};
 use harness::arg;
 
@@ -64,7 +65,15 @@ fn main() {
     upload_f32(&ix, &(0..maxn * IX_ROWS).map(|_| rng.unit().abs()).collect::<Vec<f32>>());
     let pools = k.vram_visible(npools * INDEX_HEAD_DIM * 2);
     upload_u16(&pools, &(0..npools * INDEX_HEAD_DIM).map(|_| (rng.unit().to_bits() >> 16) as u16).collect::<Vec<u16>>());
-    let score = k.vram(maxn * npools * 4);
+    let score = k.vram_visible(maxn * npools * 4);
+    let sel_state = k.vram_visible(maxn * SELECT_STATE * 4);
+    {
+        let mut v = vec![0u32; maxn * SELECT_STATE];
+        for i in 0..maxn {
+            select_state_init(&mut v[i * SELECT_STATE..(i + 1) * SELECT_STATE]);
+        }
+        k.upload(&sel_state, 0, unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) });
+    }
     let (scale, wscale) = glm_5_3_flash::mla::score_scales();
     let (k_score, k_select, k_attend) = (k.kernel("ix_score"), k.kernel("ix_select"), k.kernel("mla_attend"));
     let (k_attend_w, k_merge, k_qabs, k_uv, k_uv_s) = (k.kernel("mla_attend_w"), k.kernel("mla_attend_merge"), k.kernel("mla_qabs"), k.kernel("mla_uv_w"), k.kernel("mla_uv"));
@@ -99,20 +108,20 @@ fn main() {
                 a.ptr(iq.va).ptr(ix.va).ptr(pools.va).ptr(score.va).u32(n as u32).u32(((pos + n) / INDEX_KPOOL) as u32).u32(npools as u32).f32(scale).f32(wscale);
                 k.launch(&k_score_w, ixw_grid(n, (pos + n) / INDEX_KPOOL), 256, IXW_LDS as u32, &a);
             });
-            let select = || {
+            let slices = select_slices(n, (pos + n) / INDEX_KPOOL);
+            let select_launch = || {
                 let mut a = kfd::Args::new();
-                a.ptr(score.va).u32(npools as u32).u32(pos as u32).ptr(sel.va).ptr(counts.va);
-                k.launch(&k_select, n as u32, g::WG, SELECT_LDS as u32, &a);
+                a.ptr(score.va).u32(npools as u32).u32(pos as u32).u32(slices as u32).ptr(sel_state.va).ptr(sel.va).ptr(counts.va);
+                k.launch(&k_select, (n * slices) as u32, g::WG, SELECT_LDS as u32, &a);
+            };
+            let select = || {
+                select_launch();
                 k.sync();
             };
             select();
             let sel_w: Vec<u32> = unsafe { std::slice::from_raw_parts(sel.ptr() as *const u32, n * DENSE_BELOW) }.to_vec();
             let cnt_w: Vec<u32> = unsafe { std::slice::from_raw_parts(counts.ptr() as *const u32, n) }.to_vec();
-            let t_select = time(&|| {
-                let mut a = kfd::Args::new();
-                a.ptr(score.va).u32(npools as u32).u32(pos as u32).ptr(sel.va).ptr(counts.va);
-                k.launch(&k_select, n as u32, g::WG, SELECT_LDS as u32, &a);
-            });
+            let t_select = time(&select_launch);
             // the scalar scorer's selection (the one the attends below use)
             {
                 let mut a = kfd::Args::new();
@@ -122,6 +131,26 @@ fn main() {
             }
             let sel_s = unsafe { std::slice::from_raw_parts(sel.ptr() as *const u32, n * DENSE_BELOW) };
             let cnt_s = unsafe { std::slice::from_raw_parts(counts.ptr() as *const u32, n) };
+            // the card's selection of the last token against the host's over the same scores: exact
+            let host_ok = {
+                let i = n - 1;
+                let p = pos + i;
+                let visible = (p + 1) / INDEX_KPOOL;
+                let sc = unsafe { std::slice::from_raw_parts((score.ptr() as *const f32).add(i * npools), visible) };
+                let key = |v: f32| -> u32 { let b = v.to_bits(); if b & 0x8000_0000 != 0 { !b } else { b | 0x8000_0000 } };
+                let mut order: Vec<usize> = (0..visible).collect();
+                order.sort_by(|&a, &b| key(sc[b]).cmp(&key(sc[a])).then(a.cmp(&b)));
+                let mut want: Vec<u32> = if visible <= KEEP { (0..=p as u32).collect() } else {
+                    let mut top: Vec<usize> = order[..KEEP].to_vec();
+                    top.sort();
+                    let mut v: Vec<u32> = top.iter().flat_map(|&j| (0..INDEX_KPOOL).map(move |q| (j * INDEX_KPOOL + q) as u32)).collect();
+                    v.extend((visible * INDEX_KPOOL) as u32..=p as u32);
+                    v
+                };
+                let got = &sel_s[i * DENSE_BELOW..i * DENSE_BELOW + cnt_s[i] as usize];
+                want.truncate(want.len());
+                got == &want[..]
+            };
             let mut sel_diff = 0usize;
             for i in 0..n {
                 let (a, b) = (&sel_s[i * DENSE_BELOW..i * DENSE_BELOW + cnt_s[i] as usize], &sel_w[i * DENSE_BELOW..i * DENSE_BELOW + cnt_w[i] as usize]);
@@ -210,7 +239,7 @@ fn main() {
             }
             let mut c = vec![0u32; n];
             unsafe { std::ptr::copy_nonoverlapping(counts.ptr() as *const u32, c.as_mut_ptr(), n) };
-            println!("    ix_score_w {t_score_w:.1} µs ({:.2} a token); selection vs scalar: {sel_diff} positions differ of {}", t_score_w / n as f64, cnt_s.iter().map(|&c| c as usize).sum::<usize>());
+            println!("    ix_score_w {t_score_w:.1} µs ({:.2} a token); selection vs scalar: {sel_diff} positions differ of {}; select {t_select:.1} µs ×{slices} slices, last token's set == host's: {host_ok}", t_score_w / n as f64, cnt_s.iter().map(|&c| c as usize).sum::<usize>());
             println!("{pos:>9} {n:>6} {t_score:>12.1} ({:>7.2}) {t_select:>12.1} ({:>7.2}) {t_attend:>12.1} ({:>7.2}) {t_w:>12.1} ({:>7.2}) ×{chunks:<2} = qabs {t_qabs:.0} + attend {t_aw:.0} + merge {t_merge:.0} + uv {t_uv:.0}  selected {}; |Δ|max {dmax:.2e} of {vmax:.2e}, non-finite {nans}", t_score / n as f64, t_select / n as f64, t_attend / n as f64, t_w / n as f64, c[n - 1]);
         }
     }

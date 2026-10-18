@@ -413,7 +413,43 @@ pub mod gfx11_consts {
     pub const ATTEND_LDS: usize = 4 * (AT_RED + ATTEND_H * 8);
     const _: () = assert!(MLA_HEADS % ATTEND_H == 0 && ATTEND_LDS <= 60 * 1024);
     /// `ix_select`'s LDS: a 256-bin histogram and the scan's eight wave totals, u32.
-    pub const SELECT_LDS: usize = 4 * (256 + 8);
+    pub const SELECT_LDS: usize = 4 * (256 + 8 + 1);
+    /// The selection across workgroups (docs/queue/019): a token's pools in slices of `SELECT_SLICE`,
+    /// a workgroup each; every pass of the radix select histograms its slice into the token's global
+    /// 256 bins, the last workgroup to arrive picks the digit and publishes it, the rest wait on it;
+    /// then each slice counts its takes, the counts are shared the same way, and each slice writes
+    /// its takes at their global ranks. One workgroup walking every pool took 182 µs a layer at 262k
+    /// positions, ~0.7 ms at 1M. The workgroups of a launch spin on each other, so they must all be
+    /// resident: a verify step's tokens × ≤ SELECT_MAX_SLICES; a step of many tokens takes one slice
+    /// a token (no waiting). The token's state in global memory: SELECT_STATE u32 (`select_state_*`).
+    pub const SELECT_SLICE: usize = 4096;
+    pub const SELECT_MAX_SLICES: usize = 64;
+    /// Below this many pools (32k positions) one workgroup a token is faster than the slices' round
+    /// trips through global memory (61 against 89 µs a layer at 18k, 2026-10-18).
+    pub const SELECT_SINGLE: usize = 8192;
+    pub const fn select_slices(n: usize, pools: usize) -> usize {
+        if n > SPEC_TOKENS || pools <= SELECT_SINGLE { 1 } else { let s = pools.div_ceil(SELECT_SLICE); if s > SELECT_MAX_SLICES { SELECT_MAX_SLICES } else { s } }
+    }
+    pub const SS_HIST: usize = 0;
+    pub const SS_ARRIVE: usize = 256;
+    pub const SS_SEQ: usize = 257;
+    pub const SS_PREFIX: usize = 258;
+    pub const SS_ABOVE: usize = 259;
+    pub const SS_WANT: usize = 260;
+    pub const SS_ARRIVE2: usize = 261;
+    pub const SS_READY2: usize = 262;
+    pub const SS_DONE: usize = 263;
+    pub const SS_GT: usize = 264;
+    pub const SS_EQ: usize = SS_GT + SELECT_MAX_SLICES;
+    pub const SELECT_STATE: usize = SS_EQ + SELECT_MAX_SLICES;
+    /// A token's state as a launch expects it (and as the last workgroup leaves it): zeros but `want = KEEP`.
+    pub fn select_state_init(state: &mut [u32]) {
+        for w in state.iter_mut() {
+            *w = 0;
+        }
+        state[SS_WANT] = super::KEEP as u32;
+    }
+    const _: () = assert!(SELECT_SLICE % 256 == 0 && SPEC_TOKENS * SELECT_MAX_SLICES <= 256);
     /// `ix_score_w` (docs/queue/019): a workgroup scores a tile of 16 tokens against 128 pools (a pool
     /// tile a wave), the heads in rounds of `IXW_HEADS`; LDS: the round's queries as bf16 rows padded
     /// off the bank width, and the tokens' head weights.
@@ -1277,56 +1313,70 @@ pub mod gfx11 {
             }
         }
     }
-    /// The indexer's selection on the card: a workgroup a token, `pick`'s result — below `KEEP`
-    /// complete pools every position; past it the `KEEP` best pools by score, lower index first on
-    /// a tie, in index order, then the incomplete tail — into `sel[i]` and `counts[i]`, what
-    /// `mla_attend` reads. The `KEEP`th largest score is found by a radix select over the scores'
-    /// order-preserving bits (four passes of 256 bins in LDS); then a pool is taken if its score is
-    /// greater, or equal and among the first of the equals by index (a scan over the pools in index
-    /// order, chunks of 256). The host's pick and this agree on the set exactly. Grid: tokens;
-    /// LDS: SELECT_LDS. `score: [tokens][stride]`.
+    /// A score's bits as an order-preserving unsigned key (finite scores never map to 0).
+    #[inline(always)]
+    fn score_key(v: f32) -> u32 {
+        let b = v.to_bits();
+        if b & 0x8000_0000 != 0 { !b } else { b | 0x8000_0000 }
+    }
+    /// The indexer's selection on the card, `pick`'s result — below `KEEP` complete pools every
+    /// position; past it the `KEEP` best pools by score, lower index first on a tie, in index order,
+    /// then the incomplete tail — into `sel[i]` and `counts[i]`, what the attend reads. A workgroup per
+    /// (token, slice of its pools): the `KEEP`th largest key by a radix select over the keys'
+    /// bytes, each pass's 256-bin histogram the slices' sum in `state` (the last workgroup to arrive
+    /// picks the digit, the rest wait for it); then a pool is taken if its key is above the threshold,
+    /// or equal and among the first of the equals by index, the slices' counts shared the same way for
+    /// the ranks. The host's `pick` and this agree on the set exactly. Grid: tokens × select_slices(n,
+    /// pools); LDS: SELECT_LDS. `score: [tokens][stride]`, `state: [tokens][SELECT_STATE]`.
     #[no_mangle]
-    pub extern "gpu-kernel" fn ix_select(score: *const f32, stride: u32, pos0: u32, sel: *mut u32, counts: *mut u32) {
+    pub extern "gpu-kernel" fn ix_select(score: *const f32, stride: u32, pos0: u32, slices: u32, state: *mut u32, sel: *mut u32, counts: *mut u32) {
         unsafe {
-            use common::gfx11::{lds, workgroup_scan_excl, workgroup_sync};
+            use common::gfx11::{await_word, lds, workgroup_scan_excl, workgroup_sync};
             use core::arch::amdgpu::workgroup_id_x;
-            use core::sync::atomic::{AtomicU32, Ordering};
-            let i = workgroup_id_x() as usize;
+            use core::sync::atomic::{fence, AtomicU32, Ordering};
+            let wg = workgroup_id_x() as usize;
+            let slices = slices as usize;
+            let (i, sl) = (wg / slices, wg % slices);
             let pos = pos0 as usize + i;
             let visible = (pos + 1) / INDEX_KPOOL;
             let tid = workitem_id_x();
             let t = tid as usize;
             let (sel, score) = (sel.add(i * DENSE_BELOW), score.add(i * stride as usize));
             if visible <= super::KEEP {
-                // every position
-                let mut p = t;
-                while p <= pos {
-                    *sel.add(p) = p as u32;
-                    p += 256;
-                }
-                if t == 0 {
-                    *counts.add(i) = (pos + 1) as u32;
+                // every position (slice 0 writes; no state is touched)
+                if sl == 0 {
+                    let mut p = t;
+                    while p <= pos {
+                        *sel.add(p) = p as u32;
+                        p += 256;
+                    }
+                    if t == 0 {
+                        *counts.add(i) = (pos + 1) as u32;
+                    }
                 }
                 return;
             }
+            let st = state.add(i * SELECT_STATE);
+            let word = |w: usize| AtomicU32::from_ptr(st.add(w));
             let l: *mut u32 = lds();
             let (hist, red) = (l, l.add(256));
-            // a score's bits in an order-preserving unsigned key
-            let key = |j: usize| -> u32 {
-                let b = (*score.add(j)).to_bits();
-                if b & 0x8000_0000 != 0 { !b } else { b | 0x8000_0000 }
-            };
-            // the KEEPth largest key: four radix passes from the top byte
+            let flag = l.add(256 + 8); // the "last to arrive" word
+            // the token's pools split evenly over its slices (one slice: all of them)
+            let span = visible.div_ceil(slices);
+            let j0 = sl * span;
+            let count = if visible > j0 { (visible - j0).min(span) } else { 0 };
+            let key = |j: usize| score_key(*score.add(j0 + j));
+            let last_wg = slices == 1;
+            // the KEEPth largest key: four radix passes from the top byte, the digit decided once a pass
             let mut prefix = 0u32;
             let mut mask = 0u32;
-            let mut want = super::KEEP as u32; // of the keys matching the prefix, how many the top KEEP still take
-            let mut above = 0u32; // keys strictly greater than the final threshold
             let mut shift = 24;
+            let mut pass = 0u32;
             loop {
                 *hist.add(t) = 0;
                 workgroup_sync();
                 let mut j = t;
-                while j < visible {
+                while j < count {
                     let k = key(j);
                     if k & mask == prefix {
                         AtomicU32::from_ptr(hist.add(((k >> shift) & 255) as usize)).fetch_add(1, Ordering::Relaxed);
@@ -1334,49 +1384,140 @@ pub mod gfx11 {
                     j += 256;
                 }
                 workgroup_sync();
-                // every thread walks the bins from the top to the same answer
-                let mut cum = 0u32;
-                let mut b = 256usize;
-                let mut digit = 0u32;
-                while b > 0 {
-                    b -= 1;
-                    let c = *hist.add(b);
-                    if cum + c >= want {
-                        digit = b as u32;
-                        break;
+                if !last_wg {
+                    // this slice's bins into the token's, then arrive
+                    let c = *hist.add(t);
+                    if c != 0 {
+                        word(SS_HIST + t).fetch_add(c, Ordering::Relaxed);
                     }
-                    cum += c;
+                    fence(Ordering::Release);
+                    workgroup_sync();
+                    if t == 0 {
+                        *flag = (word(SS_ARRIVE).fetch_add(1, Ordering::AcqRel) == slices as u32 - 1) as u32;
+                    }
+                    workgroup_sync();
                 }
-                prefix |= digit << shift;
+                let last = last_wg || *flag != 0;
+                if last {
+                    // the last workgroup (or the only one): the digit from the token's bins (this slice's own when alone)
+                    if !last_wg {
+                        fence(Ordering::Acquire);
+                        *hist.add(t) = word(SS_HIST + t).load(Ordering::Relaxed);
+                        workgroup_sync();
+                    }
+                    if t == 0 {
+                        let want = if last_wg && pass == 0 { super::KEEP as u32 } else if last_wg { *red } else { word(SS_WANT).load(Ordering::Relaxed) };
+                        let above0 = if last_wg && pass == 0 { 0 } else if last_wg { *red.add(1) } else { word(SS_ABOVE).load(Ordering::Relaxed) };
+                        let mut cum = 0u32;
+                        let mut b = 256usize;
+                        let mut digit = 0u32;
+                        while b > 0 {
+                            b -= 1;
+                            let c = *hist.add(b);
+                            if cum + c >= want {
+                                digit = b as u32;
+                                break;
+                            }
+                            cum += c;
+                        }
+                        let np = prefix | (digit << shift);
+                        if last_wg {
+                            *red = want - cum;
+                            *red.add(1) = above0 + cum;
+                            *red.add(2) = np;
+                        } else {
+                            word(SS_WANT).store(want - cum, Ordering::Relaxed);
+                            word(SS_ABOVE).store(above0 + cum, Ordering::Relaxed);
+                            word(SS_PREFIX).store(np, Ordering::Relaxed);
+                            word(SS_ARRIVE).store(0, Ordering::Relaxed);
+                        }
+                    }
+                    workgroup_sync();
+                    if !last_wg {
+                        word(SS_HIST + t).store(0, Ordering::Relaxed);
+                        fence(Ordering::Release);
+                        workgroup_sync();
+                        if t == 0 {
+                            word(SS_SEQ).store(pass + 1, Ordering::Release);
+                        }
+                    }
+                }
+                if !last_wg {
+                    if t == 0 {
+                        await_word(st.add(SS_SEQ), pass + 1);
+                    }
+                    workgroup_sync();
+                    fence(Ordering::Acquire);
+                    prefix = word(SS_PREFIX).load(Ordering::Relaxed);
+                } else {
+                    prefix = *red.add(2);
+                }
                 mask |= 255 << shift;
-                above += cum;
-                want -= cum;
                 workgroup_sync();
                 if shift == 0 {
                     break;
                 }
                 shift -= 8;
+                pass += 1;
             }
             let thr = prefix;
-            let need = super::KEEP as u32 - above; // of the keys equal to the threshold, the first by index
-            // the pools in index order, chunks of 256: taken if greater than the threshold, or equal and
-            // among the first `need` equals; each taken pool's four positions at its rank
+            let need = super::KEEP as u32 - if last_wg { *red.add(1) } else { word(SS_ABOVE).load(Ordering::Relaxed) };
+            // this slice's counts above and at the threshold, shared for the ranks (one slice needs none)
+            let (mut gt_n, mut eq_n) = (0u32, 0u32);
+            if !last_wg {
+                let mut base = 0;
+                while base < count {
+                    let j = base + t;
+                    let k = if j < count { key(j) } else { 0 };
+                    let (_, g) = workgroup_scan_excl(tid, (j < count && k > thr) as u32, red);
+                    let (_, e) = workgroup_scan_excl(tid, (j < count && k == thr) as u32, red);
+                    gt_n += g;
+                    eq_n += e;
+                    base += 256;
+                }
+            }
+            let (mut rank0, mut need_s) = (0u32, need);
+            if !last_wg {
+                if t == 0 {
+                    word(SS_GT + sl).store(gt_n, Ordering::Relaxed);
+                    word(SS_EQ + sl).store(eq_n, Ordering::Relaxed);
+                    fence(Ordering::Release);
+                    if word(SS_ARRIVE2).fetch_add(1, Ordering::AcqRel) == slices as u32 - 1 {
+                        word(SS_READY2).store(1, Ordering::Release);
+                    }
+                    await_word(st.add(SS_READY2), 1);
+                }
+                workgroup_sync();
+                fence(Ordering::Acquire);
+                // the ranks before this slice: every earlier slice's takes above, and its share of the equals
+                let mut eq_before = 0u32;
+                let mut s2 = 0;
+                while s2 < sl {
+                    let (g, e) = (word(SS_GT + s2).load(Ordering::Relaxed), word(SS_EQ + s2).load(Ordering::Relaxed));
+                    let budget = if need > eq_before { need - eq_before } else { 0 };
+                    rank0 += g + if e < budget { e } else { budget };
+                    eq_before += e;
+                    s2 += 1;
+                }
+                need_s = if need > eq_before { need - eq_before } else { 0 };
+            }
+            // this slice's pools in index order: taken if above, or equal and within the slice's share of equals
             let mut carry_eq = 0u32;
-            let mut carry_sel = 0u32;
+            let mut carry_sel = rank0;
             let mut base = 0;
-            while base < visible {
+            while base < count {
                 let j = base + t;
-                let k = if j < visible { key(j) } else { 0 };
-                let gt = j < visible && k > thr;
-                let eq = j < visible && k == thr;
+                let k = if j < count { key(j) } else { 0 };
+                let gt = j < count && k > thr;
+                let eq = j < count && k == thr;
                 let (eq_before, eq_total) = workgroup_scan_excl(tid, eq as u32, red);
-                let take = gt || (eq && carry_eq + eq_before < need);
+                let take = gt || (eq && carry_eq + eq_before < need_s);
                 let (rank, taken) = workgroup_scan_excl(tid, take as u32, red);
                 if take {
                     let r = (carry_sel + rank) as usize * INDEX_KPOOL;
                     let mut q = 0;
                     while q < INDEX_KPOOL {
-                        *sel.add(r + q) = (j * INDEX_KPOOL + q) as u32;
+                        *sel.add(r + q) = ((j0 + j) * INDEX_KPOOL + q) as u32;
                         q += 1;
                     }
                 }
@@ -1384,15 +1525,30 @@ pub mod gfx11 {
                 carry_sel += taken;
                 base += 256;
             }
-            // the incomplete tail's positions
-            let tail0 = visible * INDEX_KPOOL;
-            let mut p = tail0 + t;
-            while p <= pos {
-                *sel.add(super::KEEP * INDEX_KPOOL + p - tail0) = p as u32;
-                p += 256;
+            // the incomplete tail's positions and the count: the first slice's
+            if sl == 0 {
+                let tail0 = visible * INDEX_KPOOL;
+                let mut p = tail0 + t;
+                while p <= pos {
+                    *sel.add(super::KEEP * INDEX_KPOOL + p - tail0) = p as u32;
+                    p += 256;
+                }
+                if t == 0 {
+                    *counts.add(i) = (super::KEEP * INDEX_KPOOL + pos + 1 - tail0) as u32;
+                }
             }
-            if t == 0 {
-                *counts.add(i) = (super::KEEP * INDEX_KPOOL + pos + 1 - tail0) as u32;
+            // the last slice to finish leaves the token's state as the next launch expects it
+            if !last_wg {
+                workgroup_sync();
+                if t == 0 && word(SS_DONE).fetch_add(1, Ordering::AcqRel) == slices as u32 - 1 {
+                    word(SS_SEQ).store(0, Ordering::Relaxed);
+                    word(SS_PREFIX).store(0, Ordering::Relaxed);
+                    word(SS_ABOVE).store(0, Ordering::Relaxed);
+                    word(SS_WANT).store(super::KEEP as u32, Ordering::Relaxed);
+                    word(SS_ARRIVE2).store(0, Ordering::Relaxed);
+                    word(SS_READY2).store(0, Ordering::Relaxed);
+                    word(SS_DONE).store(0, Ordering::Release);
+                }
             }
         }
     }
