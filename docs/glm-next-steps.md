@@ -411,7 +411,11 @@ the bundle's seeded rows; the buffers, kernels and mirrors unchanged, so the ari
 still f32), the pool keys formed as the reference forms them (weights cast to bf16, the sum at
 bf16), the KDA state f32. Measured against the f32 build on the long SCORE text (3632 ids,
 `bringup/gates/score_diff.py`): mean |Δ logprob| 9.1e-3 nats, 99.4 % of positions moved, one
-position by 5.8 nats (a near-tie), **NLL 0.0414 → 0.0446**. Decode step cost unchanged; acceptance
+position by 5.8 nats (a near-tie), **NLL 0.0414 → 0.0446**. **How much that gate resolves
+(2026-10-18):** an ulp-level change elsewhere (the router's weight sum taken in ranked instead of
+id order, caught and reverted) moved the same text's NLL by 0.003 the other way; the text's
+near-ties make ±0.003 the gate's noise, so the bf16 state's cost is below what this text can
+show. A longer, higher-perplexity text (or the evals) is the gate for costs this small. Decode step cost unchanged; acceptance
 on the short text 0.88–1.00 across runs (0.92 before). The second phase — bf16 buffers for the
 latents and pools (half the bytes the attend and scorer read, the 1M arithmetic) — is layout work on
 the host cache, the cards' mirrors, `mla_attend`, `ix_score` and the host's `heads`, gated by the same
