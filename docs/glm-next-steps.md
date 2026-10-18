@@ -313,7 +313,15 @@ expert prefetch (the early router for n ≤ SPEC_TOKENS, then layer-ahead) and t
 sampler); served, a three-token step cost 75–78 ms for 2.45 tokens — 30.6–31.8 ms an emitted
 token against 30.2, and a loss at 0.84 acceptance. The loop stays generic (`DRAFT_DEPTH = 1`);
 depth 2 pays once a three-token step is cheaper than ~65 ms, which the expert union bounds (§3).
-Persistent per-layer kernels, DFloat11, FP8 KDA projections: unchanged.
+**Persistent per-layer kernels, re-costed from our own timeline (2026-10-17):** a two-token verify
+step posts ~430 launches a card with ~2.3 ms of gaps between launches (card 1, `rockem.timeline`),
+and the CP's per-launch dispatch inside the busy time is another ~5–8 µs each (~2–3 ms). A
+persistent per-layer kernel can recover at most that ~5 ms a step, and pays gfx1100's 6–8 µs
+device-wide barriers at every dependency it replaces (several a layer × 45 layers ≈ 2 ms), so the
+net is ≤ ~3 ms a step, ~1.5 ms an emitted token, for a rewrite of the layer's launch structure.
+Behind the card-phase kernels (§5) in gain per effort; not built. DFloat11 for the KDA projections
+(lossless, ~11 bits a weight): ~30 % of the KDA bytes (4.6 ms a token a card at bf16) if its decode
+rides free under the stream — a kernel to write and measure; not built. FP8 KDA projections: tcdent's.
 
 ## 7. Precision decisions, with their measurements
 
