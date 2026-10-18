@@ -23,6 +23,9 @@ struct DebugTrace {
     topk: Vec<u32>,   // [STEP][NUM_HIDDEN_LAYERS][TOP_K], 0 for the dense layers
 }
 impl Trace for DebugTrace {
+    fn wants_edges(&self) -> bool {
+        true
+    }
     fn edge(&mut self, layer: usize, name: &str, data: &[f32]) {
         if layer != NONE && name == "out" {
             let at = (self.tok * NUM_HIDDEN_LAYERS + layer) * H;

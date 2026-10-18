@@ -85,8 +85,9 @@ struct Resident {
 const NONE: u32 = u32::MAX;
 const PENDING: u32 = u32::MAX - 1;
 const LOADS_IN_FLIGHT: usize = 1;
-/// The loader's core: a housekeeping core (the pool's are isolated).
-const LOADER_CORE: usize = 0;
+/// The loader's core: a housekeeping core on the cards' socket other than the main thread's (core 0): a slow
+/// 13 MB write over a degraded link held the main thread's core for a step at a time (2026-10-17).
+const LOADER_CORE: usize = 24;
 /// Replace a resident expert of the layer only when the newcomer has been picked this many more times.
 const RESIDENT_MARGIN: u32 = 4;
 /// VRAM a card may spend on resident experts at most (the node); what is free past a reserve decides.
@@ -270,6 +271,8 @@ pub struct Cards {
     head: (usize, Mem, Mem),
     mtp: Option<MtpOn>,
     resident: Resident,
+    /// Built with the launches stamped (`rockem.timeline`): the bring-up checks run too.
+    instrument: bool,
     /// The handoff sequence: a value a half of a layer's words carry, and each layer's (attention, FFN) values this token.
     seq: u32,
     half_seq: Vec<[u32; 2]>,
@@ -636,7 +639,7 @@ impl Cards {
             }
             Resident { table: std::sync::Arc::new((0..moe * glm_5_3_flash::E).map(|_| AtomicU32::new(NONE)).collect()), loader: None, inflight: Default::default(), ticks: Default::default(), count: vec![0; moe * glm_5_3_flash::E], owner: counts.iter().map(|&k| vec![(NONE, NONE); k]).collect(), free: counts.iter().map(|&k| (0..k as u32).rev().collect()).collect(), held: (0..n).map(|_| vec![0; moe]).collect(), per_layer, slots, jobs: (0..n).map(|_| Vec::new()).collect(), uploads: 0 }
         };
-        Cards { cards, shared, layers, ffns, mlas, head, mtp, resident, seq: 0, half_seq: vec![[0; 2]; NUM_HIDDEN_LAYERS], token_from: vec![0; n], last_n: 1, npools: max_ctx.div_ceil(INDEX_KPOOL), tokens: 0 }
+        Cards { cards, shared, layers, ffns, mlas, head, mtp, resident, instrument, seq: 0, half_seq: vec![[0; 2]; NUM_HIDDEN_LAYERS], token_from: vec![0; n], last_n: 1, npools: max_ctx.div_ceil(INDEX_KPOOL), tokens: 0 }
     }
 
     /// With the launches stamped, every 16 tokens: a line per card of the last token's time by
@@ -913,6 +916,9 @@ impl Placed for Cards {
             read(&c.lg, 0, &mut out[p0 * H..(p0 + np) * H]);
             p0 += np;
         }
+    }
+    fn checks(&self) -> bool {
+        self.instrument
     }
     fn resident(&self, l: usize, e: usize) -> bool {
         let at = self.resident.table[(l - glm_5_3_flash::FIRST_K_DENSE_REPLACE) * glm_5_3_flash::E + e].load(std::sync::atomic::Ordering::Relaxed);

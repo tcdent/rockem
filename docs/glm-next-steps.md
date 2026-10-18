@@ -317,20 +317,86 @@ Persistent per-layer kernels, DFloat11, FP8 KDA projections: unchanged.
 
 ## 7. Precision decisions, with their measurements
 
-- **bf16 MLA latents.** Half the latent bytes (64 MB a layer at 32k). Not "native" to the
-  checkpoint — the latents are activations, and our oracle and gates are f32 — but every
+**Decided (tcdent, 2026-10-17): the attention state follows the reference.**
+
+> Lets follow the reference and consider any deviations to be additional experiments.
+>
+> bf16 latents, f32 kda, bf16 indexer scored in 32
+
+The reference is `modeling_glm5_next.py` (transformers v5) at the config's default dtype:
+
+- **MLA latents in bf16:** the `kv_a_layernorm` output stored as bf16 (l.1189–1196).
+- **KDA recurrent state in f32:** forced to f32 whatever the model dtype is (l.762).
+- **Indexer in bf16, scored in f32:** the per-token keys stored in bf16 (l.846). The pools are
+  formed in bf16, the softmax weights cast to the keys' dtype (l.856–866). The scores are
+  `q.float() @ pool_keys.float()`, ReLU, then the f32 head weights (l.999–1003).
+
+To match it exactly, the pool's arithmetic follows the reference too, not only the storage: the
+weighted sum of a pool's four keys runs at bf16, as the reference does it.
+
+Anything off this line is an experiment, gated like the approximate menu (§8): KL and top-1
+against the oracle, the indexer's selection overlap at long positions, the evals. Candidates: fp8
+latents (DeepSeek-V3.2's deployment, vLLM on SM100); fp8 pool keys after a Hadamard rotation (vLLM,
+SGLang); a bf16 KDA state (vLLM PR #59147 reports it neutral on this model).
+
+The gate's reference point: our oracle and goldens run the reference code in f32 throughout,
+while the reference at its default dtype runs everything in bf16, weights and activations alike.
+We follow it for the stored attention state, not for activations. So the new state is measured
+against the f32 goldens as a numeric distance, and the goldens stay what they are.
+
+- **bf16 MLA latents: decided (tcdent, 2026-10-17)** — the latent cache takes the checkpoint's
+  default dtype (`config.json`: `"dtype": "bfloat16"`), and the KDA state stays f32 as the more
+  sensitive state. Half the latent bytes (64 MB a layer at 32k; ~13 GB of VRAM at 1M). Our oracle
+  and gates are f32, so the change is gated numerically, not bit-identically. Every
   production stack serves this model from bf16 or fp8 latents, fp8 measures at noise on
   GSM8K and LongBench-v2 for GLM-5.3-Flash, and GLM's MLA has no RoPE dimensions (the part of an
   MLA cache found most sensitive). The documented failures at long context are selection and
   accumulation bugs, not storage. Measurement: KL and top-1 against the f32 oracle, and the
   overlap of the indexer's top-2048 selection at 16k–100k positions — a number nobody has
   published. **Status: Unimplemented.**
+
+  **Grounding (read 2026-10-17):**
+  - *The reference runs the latents in bf16.* transformers v5 made `dtype="auto"` the
+    `from_pretrained` default (v5.0.0 release notes; `modeling_utils.py` ~l.4106, 829), which
+    takes `config.dtype` (bfloat16); `modeling_glm5_next.py` l.1189–1196 writes the normed latent
+    into the cache, whose dtype is the incoming tensor's (`cache_utils.py` l.113). The indexer's
+    per-token keys go in the same way (l.846). Upstream deployments go lower still: DeepSeek-V3.2's
+    reference uses an fp8 latent cache ("we use fp8 kv cache in actual deployment",
+    `inference/model.py` l.569–571), and vLLM switches GLM-5.3-Flash to fp8 KV on SM100
+    (`Glm5NextModelConfig`, `config.py` l.118–134). bf16 is the conservative end.
+  - *The reference keeps the KDA state in f32 regardless of the model dtype.*
+    `modeling_glm5_next.py` l.762 (`last_recurrent_state.to(torch.float32)`); FLA's KDA kernels
+    accumulate and return an f32 state (`fla/ops/kda/fused_recurrent.py` l.125–150, 279–281);
+    vLLM's `kda_state_dtype` maps `auto` to float32 (`mamba_utils.py` l.133–148); SGLang defaults
+    the SSM state to float32. "More sensitive" is the field's default, not a measured GLM loss:
+    vLLM PR #59147 reports bf16 state on GLM-5.3-Flash with long-context NLL unchanged within
+    noise, and Kimi-Linear GSM8K is at parity (#61245, 0.8961 f32 vs 0.8976 bf16). Keeping f32
+    costs nothing in capacity — the state is per sequence (~136 MB), not per position, so it
+    does not grow with the 1M context.
+  - *The 1M arithmetic:* 12 MLA layers on the cards (the draft layer's included; 5 on card 0,
+    7 on card 1 by `card_of`) × 1,048,576 positions × 512 × 2 bytes = 12.9 GB at bf16, 25.8 GB at
+    f32 — f32 does not fit beside the rest of the cards' state.
+- **The indexer's pool keys: decided above (bf16, scored in f32).** Today `[max_ctx/4][128]` f32 a layer (`glm_kfd.rs:567`),
+  1.6 GB across 12 layers at 1M, and every decode token reads all of them (~2 ms of streaming at
+  1M, plus ~13 GMAC of scoring). The reference pools in bf16 and scores in f32
+  (`modeling_glm5_next.py` l.856–866); vLLM and SGLang store the pooled keys in fp8 with an f32
+  scale after a Hadamard rotation (`glm5next/nvidia/sparse_indexer.py` l.61–101,
+  `dsa_indexer_kpool.py` l.284–322); tinygrad in half. Every stack accumulates scores in f32. No
+  published measurement ties key precision to selection flips at long context; the selection
+  overlap above is the measurement that would.
 - **FP8 KDA projections:** **Unimplemented; tcdent's decision** (§6).
 
-**Status 2026-10-17: neither measured.** bf16 latents need a bf16 cache variant to measure KL
-and the indexer's selection overlap; FP8 KDA projections wait on tcdent's dense-precision
-decision. Both are behind §3 in expected gain (the KDA projections are ~4.6 ms a token a card at
-bf16 — real, but the expert phase is 21 ms a step).
+**Status 2026-10-17 evening: decided above, not yet built.** What the decision changes in the
+tree: the MLA cache row keeps its latent in bf16 (host `cache: [max_ctx][MLA_ROW]`, the cards'
+`lat` mirror, `finish_row` writes it, `mla_attend` and the host's `heads` read it); the indexer's
+per-token keys in bf16 with the pool's four-key sum at bf16 (`pool_key`, the cards' `pools`
+mirror) and the scores in f32 as now (`ix_score`, `score_pools`); the KDA state untouched. The
+gates for it are numeric: KL and top-1 of the gate text's logits against the f32 build (the
+step gate's bit-identity is kept within the build: one token vs steps), and the indexer's
+top-2048 selection overlap at 18k (the Cody transcript) between the two builds. What it buys
+now: half the latent and pool bytes the attend and the scorer read (at 18k the attend is ~2.3 ms
+a two-token step on the head's card, the scorer ~0.3), and the 1M context's VRAM arithmetic; it
+does not move the 24 ms figure, which §3 owns. FP8 KDA projections: unchanged, tcdent's.
 
 ## 8. Approximate menu (each needs its eval cost)
 
@@ -364,7 +430,9 @@ before it can be weighed, and all are behind §3. Which ones get a run is tcdent
 ## Decisions open for tcdent
 
 - §4: resolve routing ties exactly, or exploit them for placement.
-- §6–§7: the KDA projections' precision (DFloat11 or FP8); bf16 latents (after the measurement).
+- §6: the KDA projections' precision (DFloat11 or FP8). §7's attention state is decided: it
+  follows the reference (bf16 latents, f32 KDA state, bf16 indexer scored in f32), and any
+  deviation is an experiment.
 - §8: which approximate methods are worth an eval run.
 
 ## Considered and set aside

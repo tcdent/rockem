@@ -185,7 +185,11 @@ impl<'a> Weights<'a> {
         (&it[h * w..(h + 1) * w], f32s(&it[layout::DOWN_W + h * sc..layout::DOWN_W + (h + 1) * sc]))
     }
     /// The expert as a card slot holds it: its gate/up items, then its down items (`gfx11_consts::SLOT_BYTES`).
+    /// Under the stream's regions lock: `migrate` moves items and flips their addresses under it, and a
+    /// gather from another thread must see one placement (a slot filled during a move served wrong
+    /// bytes for good, 2026-10-17).
     pub fn slot_bytes(&self, out: &mut [u8]) {
+        let _placement = self.stream.regions.lock().unwrap();
         let mut at = 0;
         for c in 0..GU_ITEMS {
             let b = self.gu_bytes(c);

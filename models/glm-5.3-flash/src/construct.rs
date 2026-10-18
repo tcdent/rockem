@@ -848,6 +848,8 @@ pub trait Placed {
     fn xpt_join(&mut self, l: usize, out: &mut [f32]);
     /// Whether expert `e` of layer `l` is resident on a card (the prefetch leaves those to the cards).
     fn resident(&self, l: usize, e: usize) -> bool;
+    /// Whether the bring-up checks run this boot (the cards instrumented).
+    fn checks(&self) -> bool;
     fn mtp_begin(&mut self, cat: &[f32], n: usize);
     /// its output projection and residual, the blocks' states out (`[n][H]`) for the host's routing;
     fn mtp_attn_out(&mut self, hidden: &mut [f32], n: usize);
@@ -1572,6 +1574,23 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 s.routed.run_batch(l, &picks[..n], &s.b_xn[..n * H], &mut s.b_out[..n * TOP_K * H]);
                 if jobs > 0 {
                     pl.xpt_join(l, &mut s.b_out[..n * TOP_K * H]);
+                    // bring-up (a traced run): every resident pick's output against the host's on the same bytes
+                    if tr.wants_edges() || pl.checks() {
+                        let mut host = vec![0f32; TOP_K * H];
+                        for i in 0..n {
+                            for k in 0..TOP_K {
+                                if picks[i][k] == E {
+                                    let e = routed_picks[i][k];
+                                    s.routed.run(l, &[e; TOP_K], &s.b_xn[i * H..(i + 1) * H], &mut host);
+                                    let card = &s.b_out[(i * TOP_K + k) * H..(i * TOP_K + k + 1) * H];
+                                    if let Some(d) = (0..H).find(|&d| card[d].to_bits() != host[d].to_bits()) {
+                                        let worst = (0..H).map(|d| (card[d] - host[d]).abs()).fold(0f32, f32::max);
+                                        eprintln!("xpt mismatch: layer {l} expert {e} token {i} pick {k}: first at {d} card {:e} host {:e}, max |Δ| {worst:e}", card[d], host[d]);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 // each token's weighted sum of its experts' outputs, likewise
                 {
