@@ -1,8 +1,8 @@
 # 063 — Residency filled during prefill, from the prompt's own routing
 
-**Status:** Open — the largest exact decode lever at long context
+**Status:** Resolved (built and measured 2026-10-18; tuning left — see Next)
 **Area:** decode (at long context), prefill
-**Gain:** est. experts 19.1 → ~13 ms a two-token verify step at 18k (−6 ms a step, ~−3 ms an emitted token)
+**Gain:** measured — expert lap 9.5 → 7.3 ms a step token at 18k after a cold 18k prompt (32 % of picks resident from the first decode step, against 2 %); a verify step 56 → 51.5 ms; 29.3–30.0 → 27.9–28.7 ms an emitted token from the steps, 33–40 → 32–38 wall; prefill +3 % (5.0 → 5.2 ms a prompt token)
 
 ## Proposal
 The resident experts (003, 004) fill one slot a decode step and never during prefill. In a world where
@@ -26,8 +26,26 @@ warm-up measurements; tcdent's long-context rule.
 ## History
 - 2026-10-18: proposed from the baseline's `experts` rows.
 
+## History
+- 2026-10-18 23:41 (run of `d64336c-dirty`, kernels aw3): built. `xpt_train` on every prefill step's picks a
+  layer: the counts (now aged by steps — `RESIDENT_HALF_LIFE` 16 steps, the same 32 positions at draft depth 1,
+  8k positions in prefill) and claims for the layer's most-picked non-residents, free slots first then up to
+  4 replacements a layer a step; the loader's pacing became a budget (`allowed` against `issued`): one load a
+  decode step, unbounded inside a prefill step. The slots filled within the first three 512-token steps
+  (675 / 1347 / 1680 of 1754 after steps 1–3) and churned on through the prompt (9,174 loads by its end,
+  ~250 a step). Decode at 18k then read 32 % of picks resident from its first step, the expert lap 7.28
+  against 9.54 a step token (baseline e03735b6), the verify step 51.5 against 56.2 ms; the route lap grew
+  1.35 → 1.87 and the join 0.02 → 0.47 (the dispatch's uploads and the wait for the cards' jobs, as 003
+  saw), so the net is −2.3 a step token rather than the −3 estimated. Prefill 5.0 → 5.16–5.2 ms a prompt
+  token: the replacement churn's BAR writes during the card phases. Long SCORE bit-identical (prefill runs
+  no resident); zero PCIe records.
+
 ## Next
-1. The loader's schedule in prefill: loads flat out inside the expert phase, paused for the card
+1. The churn: fewer replacements a step once the slots are full (the margin in prefill units), or loads
+   paused through the card phases — recovers the 3 % of prefill.
+2. The join and route growth (064 territory): the dispatch's three uploads a layer and the wait for the
+   cards' jobs.
+3. The loader's schedule in prefill: loads flat out inside the expert phase, paused for the card
    phases; the aged counts' half-life against an 18k prompt's picks.
 2. Measure: resident share and the expert lap of the first 100 decode steps after an 18k cold prompt,
    against the baseline's 2 % and 9.5 ms a step token.

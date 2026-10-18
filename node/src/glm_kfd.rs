@@ -64,14 +64,18 @@ struct Resident {
     loader: Option<std::sync::mpsc::Sender<(usize, u32, usize, usize)>>,
     /// Loads queued and not yet landed; at most `LOADS_IN_FLIGHT` (the rest stay on the host this step).
     inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    /// Steps begun (the first MoE layer's dispatch): the loader paces itself to one load a step — a loader
-    /// streaming flat out doubled every card lap (its BAR writes share the link with the handoffs) and the
-    /// expert phase (its core and its DRAM reads come out of the pool's), 2026-10-17.
-    ticks: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// Picks seen, `[MOE_LAYERS][E]`, halved every `RESIDENT_HALF_LIFE` positions (`seen` counts them).
+    /// Loads the loader may make, against `issued` (the loads it has made): raised by one a decode step —
+    /// a loader streaming flat out doubled every card lap (its BAR writes share the link with the handoffs)
+    /// and the expert phase (its core and its DRAM reads come out of the pool's), 2026-10-17 — and without
+    /// bound inside a prefill step, where the cards idle through the CPU's expert phase and decode begins
+    /// with the slots the prompt's own routing chose (063, 2026-10-18).
+    allowed: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    issued: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Steps begun (the first MoE layer's): the counts' aging and the layer turn run on it.
+    steps: u64,
+    /// Picks seen, `[MOE_LAYERS][E]`, halved every `RESIDENT_HALF_LIFE` steps.
     count: Vec<u32>,
-    seen: usize,
-    /// The layer whose misses claim first this step (`ticks % MOE_LAYERS`): the one load a step goes to the
+    /// The layer whose misses claim first this step (`steps % MOE_LAYERS`): the one load a step goes to the
     /// earliest layer with a miss, so without a turn the first layers took every load and the rest stayed
     /// empty — 3–4 % of picks resident after 2,600 steps (2026-10-18 10:05).
     turn: usize,
@@ -90,6 +94,10 @@ struct Resident {
 const NONE: u32 = u32::MAX;
 const PENDING: u32 = u32::MAX - 1;
 const LOADS_IN_FLIGHT: usize = 1;
+/// A prefill step's claims a MoE layer: the layer's most-picked experts not resident, free slots first, then
+/// up to `PREFILL_REPLACES` of the layer's least-picked residents replaced past the margin (063).
+const PREFILL_CLAIMS: usize = 16;
+const PREFILL_REPLACES: usize = 4;
 /// The loader's core: a core on the cards' socket (the KFD topology puts the cards on NUMA nodes 2 and 3;
 /// `bench-p2p` 2026-10-18: a 13 MB BAR write runs at 21.6 GB/s from nodes 2 / 3 and at 10–17 from nodes
 /// 0 / 1), other than the main thread's (core 0): a slow 13 MB write over a degraded link held the main
@@ -100,13 +108,13 @@ const LOADS_IN_FLIGHT: usize = 1;
 /// slow the pool's slowest node, which bounds the phase. Core 24 it stays.
 const LOADER_CORE: usize = 24;
 /// Replace a resident expert of the layer only when the newcomer has been picked this many more times.
-/// The counts age: halved every `RESIDENT_HALF_LIFE` positions. The routing replay (2026-10-18,
+/// The counts age: halved every `RESIDENT_HALF_LIFE` steps (16 steps are the 32 positions measured below at draft depth 1; a prefill of 512-token steps ages over 8k positions). The routing replay (2026-10-18,
 /// `bringup/gates/routing_replay.py` on the code and chat traces, 21 / 18 slots a layer): lifetime counts
 /// with a margin of 4 hit 0.406 / 0.285 (code / chat) and 0.374 / 0.260; a half-life of 32 and a margin
 /// of 2 hit 0.438 / 0.364 and 0.405 / 0.335 — the chat text is the one where recency counts (LRU 0.348,
 /// ARC 0.366 there, but 0.294 / 0.345 on code). Belady's ceiling: 0.552 / 0.577.
 const RESIDENT_MARGIN: u32 = 2;
-const RESIDENT_HALF_LIFE: usize = 32;
+const RESIDENT_HALF_LIFE: u64 = 16;
 /// VRAM a card may spend on resident experts at most (the node); what is free past a reserve decides.
 pub const RESIDENT_BYTES: usize = 12 << 30;
 /// VRAM left unallocated on a card: the driver's and the queue's own, and room for a bring-up gate's buffers.
@@ -696,46 +704,25 @@ impl Cards {
                 per_layer.push(count / moe);
                 counts.push(count);
             }
-            Resident { table: std::sync::Arc::new((0..moe * glm_5_3_flash::E).map(|_| AtomicU32::new(NONE)).collect()), loader: None, inflight: Default::default(), ticks: Default::default(), count: vec![0; moe * glm_5_3_flash::E], seen: 0, turn: 0, owner: counts.iter().map(|&k| vec![(NONE, NONE); k]).collect(), free: counts.iter().map(|&k| (0..k as u32).rev().collect()).collect(), held: (0..n).map(|_| vec![0; moe]).collect(), per_layer, slots, jobs: (0..n).map(|_| Vec::new()).collect(), uploads: 0 }
+            Resident { table: std::sync::Arc::new((0..moe * glm_5_3_flash::E).map(|_| AtomicU32::new(NONE)).collect()), loader: None, inflight: Default::default(), allowed: Default::default(), issued: Default::default(), steps: 0, count: vec![0; moe * glm_5_3_flash::E], turn: 0, owner: counts.iter().map(|&k| vec![(NONE, NONE); k]).collect(), free: counts.iter().map(|&k| (0..k as u32).rev().collect()).collect(), held: (0..n).map(|_| vec![0; moe]).collect(), per_layer, slots, jobs: (0..n).map(|_| Vec::new()).collect(), uploads: 0 }
         };
-        Cards { cards, shared, layers, ffns, mlas, head, mtp, resident, instrument, seq: 0, half_seq: vec![[0; 2]; NUM_HIDDEN_LAYERS], token_from: vec![0; n], last_n: 1, npools: max_ctx.div_ceil(INDEX_KPOOL), tokens: 0 }
+        Cards { cards, shared, layers, ffns, mlas, head, mtp, resident, instrument, seq: 0, half_seq: vec![[0; 2]; NUM_HIDDEN_LAYERS], token_from: vec![0; n], npools: max_ctx.div_ceil(INDEX_KPOOL) }
     }
 
-    /// With the launches stamped, every 16 tokens: a line per card of the last token's time by
-    /// kernel (busy µs and count, most first) and the gaps between launches — where a token's
-    /// card time goes.
-    /// With `rockem.timeline`: every step of more than one token, and every sixteenth single token.
-    fn timeline_report(&mut self, n: usize) {
+    /// With the launches stamped (`track-launches`): the step's launches on every card as zones on
+    /// lanes `card0`, `card1`, …, their completion stamps in UTC through the card's clock. A step of
+    /// more launches than the ring holds keeps its last `RING_PACKETS`.
+    fn timeline_report(&self) {
         if !self.cards[0].k.instrumented() {
             return;
         }
-        self.tokens += 1;
-        if n == 1 && self.tokens % 16 != 0 {
-            return;
-        }
         for (i, c) in self.cards.iter().enumerate() {
-            let tl = c.k.timeline_from(self.token_from[i]);
-            let mut by: std::collections::BTreeMap<&str, (f64, usize)> = std::collections::BTreeMap::new();
-            let (mut busy, mut gaps, mut prev_end) = (0f64, 0f64, 0u64);
-            for &(name, s, e) in &tl {
-                if e <= s {
-                    continue;
+            let lane = format!("card{}", c.k.index);
+            for &(name, s, e) in &c.k.timeline_from(self.token_from[i]) {
+                if e > s {
+                    prow::zone_at!("track-launches", if name.is_empty() { "barrier" } else { name }, lane.as_str(), c.k.utc(s), c.k.utc(e));
                 }
-                let us = (e - s) as f64 / 100.0;
-                if prev_end != 0 && s > prev_end {
-                    gaps += (s - prev_end) as f64 / 100.0;
-                }
-                prev_end = e;
-                busy += us;
-                let ent = by.entry(if name.is_empty() { "barrier" } else { name }).or_insert((0.0, 0));
-                ent.0 += us;
-                ent.1 += 1;
             }
-            let span = tl.last().map_or(0, |l| l.2).saturating_sub(tl.first().map_or(0, |f| f.1)) as f64 / 100.0;
-            let mut v: Vec<_> = by.into_iter().collect();
-            v.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
-            let parts: Vec<String> = v.iter().map(|(n, (us, cnt))| format!("{n} {us:.0}/{cnt}")).collect();
-            println!("timeline : card {i}, {n} tokens: {} launches{} over {span:.0} µs, {busy:.0} busy, {gaps:.0} between; by kernel (µs/count): {}", tl.len(), if c.k.posted() - self.token_from[i] > tl.len() as u64 { " (the ring's last)" } else { "" }, parts.join(", "));
         }
     }
 
@@ -924,9 +911,74 @@ impl Cards {
     }
 }
 
+impl Cards {
+    /// A step begins at its first MoE layer: the layer turn advances, the counts age at the half-life, and
+    /// the loader's budget is set — one more load for a decode step, no bound for a prefill step (063).
+    fn begin_step(&mut self, prefill: bool) {
+        use std::sync::atomic::Ordering;
+        let r = &mut self.resident;
+        r.steps += 1;
+        r.turn = (r.steps % r.held[0].len() as u64) as usize;
+        if r.steps % RESIDENT_HALF_LIFE == 0 {
+            for c in r.count.iter_mut() {
+                *c >>= 1;
+            }
+        }
+        let issued = r.issued.load(Ordering::Acquire);
+        r.allowed.store(if prefill { u64::MAX } else { issued + 1 }, Ordering::Release);
+    }
+    /// Expert `e` of MoE layer `ml` claims a slot and its load is queued: a free slot on the card holding fewer
+    /// of the layer, else — with `replace` — the layer's least-picked resident not in use when `e` leads it
+    /// by the margin. `Some(true)` when a resident was replaced, `Some(false)` for a free slot, `None` for no slot.
+    fn claim(&mut self, ml: usize, e: usize, in_use: &[bool], replace: bool) -> Option<bool> {
+        use std::sync::atomic::Ordering;
+        let e_n = glm_5_3_flash::E;
+        let r = &mut self.resident;
+        let mut pick_card = None;
+        for c in (0..self.cards.len()).rev() {
+            if (r.held[c][ml] as usize) < r.per_layer[c] && !r.free[c].is_empty() && pick_card.is_none_or(|p: usize| r.held[c][ml] < r.held[p][ml]) {
+                pick_card = Some(c);
+            }
+        }
+        let (c, sl, by_replacement) = match pick_card {
+            Some(c) => (c, r.free[c].pop().unwrap(), false),
+            None if replace => {
+                let mut victim: Option<(usize, u32, u32)> = None; // (card, slot, count)
+                for c in 0..self.cards.len() {
+                    for (sl, &(ol, oe)) in r.owner[c].iter().enumerate() {
+                        if ol as usize != ml || in_use[oe as usize] || r.table[ml * e_n + oe as usize].load(Ordering::Relaxed) == PENDING {
+                            continue;
+                        }
+                        let cnt = r.count[ml * e_n + oe as usize];
+                        if victim.is_none_or(|v| cnt < v.2) {
+                            victim = Some((c, sl as u32, cnt));
+                        }
+                    }
+                }
+                match victim {
+                    Some((c, sl, cnt)) if r.count[ml * e_n + e] >= cnt + RESIDENT_MARGIN => {
+                        let (_, oe) = r.owner[c][sl as usize];
+                        r.table[ml * e_n + oe as usize].store(NONE, Ordering::Release);
+                        r.held[c][ml] -= 1;
+                        (c, sl, true)
+                    }
+                    _ => return None,
+                }
+            }
+            None => return None,
+        };
+        r.owner[c][sl as usize] = (ml as u32, e as u32);
+        r.held[c][ml] += 1;
+        r.uploads += 1;
+        r.table[ml * e_n + e].store(PENDING, Ordering::Release);
+        r.inflight.fetch_add(1, Ordering::AcqRel);
+        r.loader.as_ref().expect("the residency's loader is set before the first step").send((c, sl, ml, e)).unwrap();
+        Some(by_replacement)
+    }
+}
+
 impl Placed for Cards {
     fn begin(&mut self, rows: &[f32], n: usize) {
-        self.last_n = n;
         // every card: the step's handoffs restart, each token's embedding into each of its streams
         let mut streams = Vec::with_capacity(n * HC * H);
         for i in 0..n {
@@ -1044,7 +1096,8 @@ impl Placed for Cards {
         let (tx, rx) = std::sync::mpsc::channel::<(usize, u32, usize, usize)>();
         let table = self.resident.table.clone();
         let inflight = self.resident.inflight.clone();
-        let ticks = self.resident.ticks.clone();
+        let allowed = self.resident.allowed.clone();
+        let issued = self.resident.issued.clone();
         let bases: Vec<usize> = self.resident.slots.iter().map(|m| m.ptr() as usize).collect();
         std::thread::Builder::new().name("xpt-loader".into()).spawn(move || {
             extern "C" {
@@ -1054,46 +1107,63 @@ impl Placed for Cards {
             mask[LOADER_CORE / 64] |= 1 << (LOADER_CORE % 64);
             unsafe { sched_setaffinity(0, 128, mask.as_ptr()) };
             let mut scratch = vec![0u8; SLOT_BYTES];
-            let mut served = 0u64;
             for (card, slot, ml, e) in rx {
-                // one load a step: wait for a step the last load did not see
-                loop {
-                    let t = ticks.load(std::sync::atomic::Ordering::Acquire);
-                    if t > served {
-                        served = t;
-                        break;
-                    }
+                // paced by the main thread: one load a decode step, free inside a prefill step
+                while issued.load(std::sync::atomic::Ordering::Acquire) >= allowed.load(std::sync::atomic::Ordering::Acquire) {
                     std::thread::park_timeout(std::time::Duration::from_micros(200));
                 }
                 fetch(ml + glm_5_3_flash::FIRST_K_DENSE_REPLACE, e, &mut scratch);
                 let dst = unsafe { std::slice::from_raw_parts_mut((bases[card] + slot as usize * SLOT_BYTES) as *mut u8, SLOT_BYTES) };
                 common::copy::stream(dst, &scratch);
                 table[ml * glm_5_3_flash::E + e].store((card as u32) << 24 | slot, std::sync::atomic::Ordering::Release);
+                issued.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                 inflight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
             }
         }).unwrap();
         self.resident.loader = Some(tx);
     }
+    /// A prefill step's picks for MoE layer `l` train the counts, and the layer's most-picked experts not
+    /// resident claim slots — free ones first, then up to `PREFILL_REPLACES` replacements — loaded while
+    /// the step runs, so decode begins with the residency the prompt's routing chose (063). No pick runs
+    /// on the cards here (038).
+    fn xpt_train(&mut self, l: usize, picks: &[[usize; TOP_K]]) {
+        use std::sync::atomic::Ordering;
+        let ml = l - glm_5_3_flash::FIRST_K_DENSE_REPLACE;
+        let e_n = glm_5_3_flash::E;
+        if ml == 0 {
+            self.begin_step(true);
+        }
+        let r = &mut self.resident;
+        for p in picks {
+            for &e in p {
+                if e < e_n {
+                    r.count[ml * e_n + e] += 1;
+                }
+            }
+        }
+        let mut order: Vec<usize> = (0..e_n).filter(|&e| r.count[ml * e_n + e] > 0 && r.table[ml * e_n + e].load(Ordering::Relaxed) == NONE).collect();
+        order.sort_by_key(|&e| std::cmp::Reverse(r.count[ml * e_n + e]));
+        let in_use = [false; glm_5_3_flash::E];
+        let mut replaced = 0;
+        for &e in order.iter().take(PREFILL_CLAIMS) {
+            match self.claim(ml, e, &in_use, replaced < PREFILL_REPLACES) {
+                Some(true) => replaced += 1,
+                Some(false) => {}
+                None => break, // the rest are picked less: no slot for them either
+            }
+        }
+    }
+
     fn xpt_dispatch(&mut self, l: usize, n: usize, picks: &mut [[usize; TOP_K]], xq: &[i8], xs: &[f32], xg: &[i32]) -> usize {
         use std::sync::atomic::Ordering;
         let ml = l - glm_5_3_flash::FIRST_K_DENSE_REPLACE;
         let e_n = glm_5_3_flash::E;
+        if ml == 0 {
+            self.begin_step(false);
+        }
         let r = &mut self.resident;
-        let loader = r.loader.as_ref().expect("the residency's loader is set before the first step");
         for j in r.jobs.iter_mut() {
             j.clear();
-        }
-        if ml == 0 {
-            let t = r.ticks.fetch_add(1, Ordering::AcqRel);
-            r.turn = t as usize % r.held[0].len();
-            // the counts age with the positions: halved at every half-life this step crosses
-            let crossed = (r.seen + n) / RESIDENT_HALF_LIFE - r.seen / RESIDENT_HALF_LIFE;
-            r.seen += n;
-            if crossed > 0 {
-                for c in r.count.iter_mut() {
-                    *c = if crossed >= 32 { 0 } else { *c >> crossed };
-                }
-            }
         }
         // the resident picks become jobs; the experts with a job this step are never a victim
         let mut in_use = [false; glm_5_3_flash::E];
@@ -1115,56 +1185,18 @@ impl Placed for Cards {
                 }
             }
         }
-        // the misses claim slots for the steps to come: a free one on the card holding fewer of this layer,
-        // else the layer's least-picked resident when the miss leads it by the margin (one a layer a step)
+        // the misses claim slots for the steps to come (one load a step, the layer turn first; one replacement a layer)
         let mut replaced = false;
         for &e in &misses {
+            let r = &self.resident;
             if ml < r.turn || r.inflight.load(Ordering::Acquire) >= LOADS_IN_FLIGHT {
                 break;
             }
-            let mut pick_card = None;
-            for c in (0..self.cards.len()).rev() {
-                if (r.held[c][ml] as usize) < r.per_layer[c] && !r.free[c].is_empty() && pick_card.is_none_or(|p: usize| r.held[c][ml] < r.held[p][ml]) {
-                    pick_card = Some(c);
-                }
-            }
-            let slot = match pick_card {
-                Some(c) => Some((c, r.free[c].pop().unwrap())),
-                None if !replaced => {
-                    let mut victim: Option<(usize, u32, u32)> = None; // (card, slot, count)
-                    for c in 0..self.cards.len() {
-                        for (sl, &(ol, oe)) in r.owner[c].iter().enumerate() {
-                            if ol as usize != ml || in_use[oe as usize] || r.table[ml * e_n + oe as usize].load(Ordering::Relaxed) == PENDING {
-                                continue;
-                            }
-                            let cnt = r.count[ml * e_n + oe as usize];
-                            if victim.is_none_or(|v| cnt < v.2) {
-                                victim = Some((c, sl as u32, cnt));
-                            }
-                        }
-                    }
-                    match victim {
-                        Some((c, sl, cnt)) if r.count[ml * e_n + e] >= cnt + RESIDENT_MARGIN => {
-                            let (_, oe) = r.owner[c][sl as usize];
-                            r.table[ml * e_n + oe as usize].store(NONE, Ordering::Release);
-                            r.held[c][ml] -= 1;
-                            replaced = true;
-                            Some((c, sl))
-                        }
-                        _ => None,
-                    }
-                }
-                None => None,
-            };
-            if let Some((c, sl)) = slot {
-                r.owner[c][sl as usize] = (ml as u32, e as u32);
-                r.held[c][ml] += 1;
-                r.uploads += 1;
-                r.table[ml * e_n + e].store(PENDING, Ordering::Release);
-                r.inflight.fetch_add(1, Ordering::AcqRel);
-                loader.send((c, sl, ml, e)).unwrap();
+            if self.claim(ml, e, &in_use, !replaced) == Some(true) {
+                replaced = true;
             }
         }
+        let r = &mut self.resident;
         let mut total = 0;
         for c in 0..self.cards.len() {
             let jobs = &r.jobs[c];

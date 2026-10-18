@@ -840,6 +840,10 @@ pub trait Placed {
     /// marked `E` in `picks` so the host's run skips it; a pick not resident may claim a slot (a free one,
     /// or a less-used resident's past a margin), which the loader fills for the steps to come. Returns the jobs.
     fn xpt_dispatch(&mut self, l: usize, n: usize, picks: &mut [[usize; TOP_K]], xq: &[i8], xs: &[f32], xg: &[i32]) -> usize;
+    /// A prefill step's picks for MoE layer `l`: they train the residency's counts and the layer's most-picked
+    /// experts not resident claim slots, loaded while the step runs — decode then begins with the residency the
+    /// prompt's own routing chose rather than filling it a slot a step (063). The picks all run on the host.
+    fn xpt_train(&mut self, l: usize, picks: &[[usize; TOP_K]]);
     /// The loader the residency fills slots with, off the step: `fetch(l, e, out)` gathers expert `e` of
     /// layer `l` as a slot holds it (`expert::Weights::slot_bytes`). Set once before the first step.
     fn xpt_loader(&mut self, fetch: Box<dyn Fn(usize, usize, &mut [u8]) + Send + 'static>);
@@ -1605,6 +1609,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     }
                     pl.xpt_dispatch(l, n, &mut picks[..n], &s.b_xq[..n * H], &s.b_xs[..n * HG], &s.b_xg[..n * HG])
                 } else {
+                    pl.xpt_train(l, &picks[..n]);
                     0
                 };
                 pl.ffn_post(l, n);
