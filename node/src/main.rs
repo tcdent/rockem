@@ -22,6 +22,7 @@
 //!   rockem.debug=<dir>         dev: write every position's logits as <dir>/pos<N>.f32 and print the top-2 margin
 //!   rockem.profile=N           GLM: a line of the token's time by phase every N tokens
 //!   rockem.timeline=1          GLM, with rockem.gpu: each card's launches stamped; every 16 tokens a line per card
+//!   rockem.resident=<GB>       GLM, with rockem.gpu: VRAM a card may spend on resident routed experts (default: what is free past a reserve, up to 12); 0 leaves the cards to a gate or bench beside the node
 //!                              of the token's time by kernel and the gaps between launches
 //!   rockem.probe=1             measure this box (DRAM, GEMV rates, each card's VRAM, link and BAR) with
 //!                              the bundle's code object if there is one, report, and idle: the baseline
@@ -760,7 +761,7 @@ fn main() {
     let (gpu, experts_host) = (config("rockem.gpu").is_some(), config("rockem.experts").as_deref() == Some("host"));
     let e: Box<dyn Engine> = match name.as_str() {
         "deepseek-v2-lite" => v2lite::V2Lite::open(bundle, mem, max_ctx, gpu, experts_host),
-        "glm-5.3-flash" => glm::Glm::open(bundle, mem, max_ctx, gpu, config("rockem.profile").and_then(|v| v.parse().ok()).unwrap_or(0), config("rockem.timeline").is_some()),
+        "glm-5.3-flash" => glm::Glm::open(bundle, mem, max_ctx, gpu, config("rockem.profile").and_then(|v| v.parse().ok()).unwrap_or(0), config("rockem.timeline").is_some(), config("rockem.resident").and_then(|v| v.parse::<usize>().ok()).map_or(glm_kfd::RESIDENT_BYTES, |gb| gb << 30)),
         other => halt(&format!("the manifest names model {other:?}, which this node does not carry")),
     };
     assert!(max_ctx > e.first_pos(), "rockem.ctx must leave room after the prefix");

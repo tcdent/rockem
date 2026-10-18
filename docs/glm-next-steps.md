@@ -453,9 +453,13 @@ the same sentinel the resident experts use, so nothing else changes. Measured on
 build: the expert phase 6.0 → 3.9 ms a step token warmed, **a verify step ~40 ms, ~21 ms an emitted
 token** (24–25 at k = 8); the long SCORE text's NLL **0.0426** against 0.0446 at k = 8 (the f32 build
 0.0414) — on that low-perplexity text the cost is not visible; acceptance on the short decode text
-0.78–0.85 (0.88–0.92). A full GSM8K at k = 4 is running on the box (22:15), the k = 8 baseline to
-follow; the pair is the eval cost the entry asks for. Adopting it is tcdent's call; the source
-stays at `TOP_K`. Expert deferral, intra-expert sparsity, bit-plane storage: not evaluated — each
+0.78–0.85 (0.88–0.92). **Rejected (2026-10-18):** GSM8K under our harness on the same 408
+problems, k = 4 **83.3 %** against k = 8 **91.2 %** — 64 problems came out differently, 48 of them
+k = 8's (z ≈ 4), and k = 4 ran out of the 320-token budget on 22 against 8 (it reasons longer
+before an answer). Eight points for 3 ms an emitted token; `TOP_K` stays the model's 8. The
+runs' absolute numbers are ours only (the 320-token cap, our prompt format), not a leaderboard's;
+the pair needed 400 paired problems, not 1319 — the two full runs were stopped. The harness's
+cap is wrong for a thinking model and should rise before any absolute GSM8K is read. Expert deferral, intra-expert sparsity, bit-plane storage: not evaluated — each
 is a storage or scheduling change before any run.
 
 ## Order

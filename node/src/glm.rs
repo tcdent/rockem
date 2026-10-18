@@ -63,7 +63,7 @@ pub struct Glm {
 }
 
 impl Glm {
-    pub fn open(bundle: &std::path::Path, mem: loader::Mem, max_ctx: usize, gpu: bool, profile_every: usize, timeline: bool) -> Box<dyn Engine> {
+    pub fn open(bundle: &std::path::Path, mem: loader::Mem, max_ctx: usize, gpu: bool, profile_every: usize, timeline: bool, resident_bytes: usize) -> Box<dyn Engine> {
         let t0 = std::time::Instant::now();
         let dense = loader::load(&bundle.join(layout::DENSE_FILE), mem);
         // the experts, placed equally first; the pool then measures where each node ends its runs
@@ -99,7 +99,7 @@ impl Glm {
         if gpu {
             // the KDA layers on the cards, split by layer order between them; everything else here
             let elf = loader::load(&bundle.join(layout::KERNELS_FILE), loader::Mem::Anon);
-            model.placed = Some(Box::new(crate::glm_kfd::Cards::new(elf, &w, max_ctx, timeline, crate::glm_kfd::RESIDENT_BYTES)));
+            model.placed = Some(Box::new(crate::glm_kfd::Cards::new(elf, &w, max_ctx, timeline, resident_bytes)));
             model.placed.as_mut().unwrap().xpt_loader(Box::new(move |l, e, out| glm_5_3_flash::expert::Weights::at(experts, l, e).slot_bytes(out)));
         }
         // the prefix from nothing: its logits, and the realization against the bundle's state
