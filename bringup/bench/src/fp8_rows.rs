@@ -38,6 +38,11 @@ fn main() {
     let (gu_w, gu_s) = fp8(SHARED_GU_ROWS, H);
     let (dn_w, dn_s) = fp8(H, kd);
     let out = k.vram_visible(TOKENS * SHARED_GU_ROWS.max(H) * 4);
+    let bf_w = k.vram_visible(H * H * 2);
+    {
+        let w: Vec<u16> = (0..H * H).map(|_| (rng.unit().to_bits() >> 16) as u16).collect();
+        k.upload(&bf_w, 0, unsafe { std::slice::from_raw_parts(w.as_ptr() as *const u8, w.len() * 2) });
+    }
     println!("bench-fp8-rows: ffn_gu {SHARED_GU_ROWS} × {H} ({:.1} MB), ffn_down_shared {H} × {kd} ({:.1} MB)", (SHARED_GU_ROWS * H) as f64 / 1e6, (H * kd) as f64 / 1e6);
     println!("{:>8} {:>22} {:>22}", "tokens", "ffn_gu µs (a token)", "ffn_down_shared µs (a token)");
     for n in [1usize, 2, 4, 8, 16, 32] {
@@ -63,6 +68,24 @@ fn main() {
         };
         let gu = time(&k.kernel("ffn_gu"), true, &gu_w, &gu_s, SHARED_GU_ROWS, H, ROWS_GU);
         let dn = time(&k.kernel("ffn_down_shared"), false, &dn_w, &dn_s, H, kd, common::gemv::ROWS);
-        println!("{n:>8} {gu:>12.1} ({:>6.1}) {dn:>14.1} ({:>6.1})", gu / n as f64, dn / n as f64);
+        // the bf16 reference at the same bytes: rows_h over 4096 × 4096 bf16 (33.6 MB)
+        let bf = {
+            let kern = k.kernel("rows_h");
+            let run = || {
+                let mut a = kfd::Args::new();
+                a.ptr(bx.va).ptr(bln.va).ptr(bf_w.va).ptr(out.va).u32(H as u32).u32(n as u32);
+                k.launch(&kern, g::rows_grid(H, n, common::gemv::ROWS), g::WG, g::normed_rows_lds(H, n) as u32, &a);
+                k.sync();
+            };
+            run();
+            let mut us: Vec<f64> = (0..iters).map(|_| {
+                let t = std::time::Instant::now();
+                run();
+                t.elapsed().as_secs_f64() * 1e6
+            }).collect();
+            us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            us[iters / 2]
+        };
+        println!("{n:>8} {gu:>12.1} ({:>6.1}) {dn:>14.1} ({:>6.1})   rows_h bf16 {H}×{H}: {bf:>7.1} ({:.0} GB/s)", gu / n as f64, dn / n as f64, (H * H * 2) as f64 / bf / 1e3);
     }
 }
