@@ -910,6 +910,9 @@ pub struct Profile {
     /// Over the MoE layers: how many of a layer's eight experts were also the previous token's at that layer
     /// (the ceiling of a same-layer prefetch), and the layers counted.
     pub reuse: usize,
+    /// Picks run on the cards' resident experts, and picks in all, over the steps profiled (verify-sized steps).
+    pub resident: usize,
+    pub picks: usize,
     pub moe_layers: usize,
     /// Expert items (gate/up and down) that ran on their preferred CCD, and all of them.
     pub local_items: usize,
@@ -956,7 +959,7 @@ impl Profile {
         let mla = self.mla_proj + self.mla_attn + self.mla_out;
         let rs = self.route + self.shared;
         let sum = self.hc + self.slot + self.kda_card + self.kda_cpu + mla + self.dense_ffn + rs + self.experts + self.head + self.draft;
-        format!("{} tokens: hc {:.1}  slot {:.1}  kda card {:.1}  kda cpu {:.1}  mla {:.1} (proj {:.1} attn {:.1} out {:.1})  dense ffn {:.1}  router+shared {:.1} (route {:.1} shared {:.1})  experts {:.1} (reused {:.2} of {} from the previous token, {:.2} named on the attention input; {:.0}% of the predicted slices pulled; {:.0}% of items on their CCD)  head {:.1}  draft {:.1}  join {:.2}  = {:.1} ms a token{}", self.tokens, self.hc / n, self.slot / n, self.kda_card / n, self.kda_cpu / n, mla / n, self.mla_proj / n, self.mla_attn / n, self.mla_out / n, self.dense_ffn / n, rs / n, self.route / n, self.shared / n, self.experts / n, self.reuse as f64 / self.moe_layers.max(1) as f64, TOP_K, self.pre_agree as f64 / self.moe_layers.max(1) as f64, 100.0 * self.prefetched as f64 / self.prefetch_items.max(1) as f64, 100.0 * self.local_items as f64 / self.items.max(1) as f64, self.head / n, self.draft / n, self.join / n, sum / n, self.nodes())
+        format!("{} tokens: hc {:.1}  slot {:.1}  kda card {:.1}  kda cpu {:.1}  mla {:.1} (proj {:.1} attn {:.1} out {:.1})  dense ffn {:.1}  router+shared {:.1} (route {:.1} shared {:.1})  experts {:.1} (reused {:.2} of {} from the previous token, {:.2} named on the attention input; {:.0}% of the predicted slices pulled; {:.0}% of items on their CCD; {:.0}% of picks resident)  head {:.1}  draft {:.1}  join {:.2}  = {:.1} ms a token{}", self.tokens, self.hc / n, self.slot / n, self.kda_card / n, self.kda_cpu / n, mla / n, self.mla_proj / n, self.mla_attn / n, self.mla_out / n, self.dense_ffn / n, rs / n, self.route / n, self.shared / n, self.experts / n, self.reuse as f64 / self.moe_layers.max(1) as f64, TOP_K, self.pre_agree as f64 / self.moe_layers.max(1) as f64, 100.0 * self.prefetched as f64 / self.prefetch_items.max(1) as f64, 100.0 * self.local_items as f64 / self.items.max(1) as f64, 100.0 * self.resident as f64 / self.picks.max(1) as f64, self.head / n, self.draft / n, self.join / n, sum / n, self.nodes())
     }
 }
 
@@ -1593,6 +1596,10 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     0
                 };
                 pl.ffn_post(l, n);
+                if n <= SPEC_TOKENS {
+                    p.resident += jobs;
+                    p.picks += n * TOP_K;
+                }
                 s.routed.run_batch(l, &picks[..n], &s.b_xn[..n * H], &mut s.b_out[..n * TOP_K * H]);
                 if jobs > 0 {
                     let t_join = std::time::Instant::now();

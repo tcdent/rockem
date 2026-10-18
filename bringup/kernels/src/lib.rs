@@ -128,3 +128,56 @@ pub extern "gpu-kernel" fn wmma_layout(a: *const u16, b: *const u16, out: *mut f
         }
     }
 }
+
+/// Ping-pong over a link (docs/queue/001): one wave. `rounds` times, the opener (`first` = 1) writes
+/// `words` payload words (`r ^ i`) into the peer's buffer, then the round number into the peer's word;
+/// the other side spins on its own word, checks the payload it finds (mismatches counted into
+/// `errors`: the visibility test), and answers the same way. The words and buffers may be the peer's
+/// VRAM (peer writes), host memory (today's handoffs) or, with the host as the other side, a host word.
+/// Grid 1 × 32.
+#[no_mangle]
+pub extern "gpu-kernel" fn pingpong(mine: *mut u32, theirs: *mut u32, my_data: *mut u32, their_data: *mut u32, words: u32, rounds: u32, first: u32, errors: *mut u32) {
+    use core::sync::atomic::{fence, AtomicU32, Ordering};
+    let t = workitem_id_x() as usize;
+    let mut bad = 0u32;
+    unsafe {
+        let send = |r: u32| {
+            let mut i = t;
+            while i < words as usize {
+                *their_data.add(i) = r ^ i as u32;
+                i += 32;
+            }
+            fence(Ordering::Release);
+            if t == 0 {
+                AtomicU32::from_ptr(theirs).store(r, Ordering::Release);
+            }
+        };
+        let recv = |r: u32, bad: &mut u32| {
+            if t == 0 {
+                while AtomicU32::from_ptr(mine).load(Ordering::Acquire) != r {}
+            }
+            fence(Ordering::Acquire);
+            let mut i = t;
+            while i < words as usize {
+                if AtomicU32::from_ptr(my_data.add(i)).load(Ordering::Relaxed) != r ^ i as u32 {
+                    *bad += 1;
+                }
+                i += 32;
+            }
+        };
+        let mut r = 1;
+        while r <= rounds {
+            if first != 0 {
+                send(r);
+                recv(r, &mut bad);
+            } else {
+                recv(r, &mut bad);
+                send(r);
+            }
+            r += 1;
+        }
+        if bad != 0 {
+            AtomicU32::from_ptr(errors).fetch_add(bad, Ordering::Relaxed);
+        }
+    }
+}

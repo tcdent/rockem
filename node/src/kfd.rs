@@ -551,6 +551,19 @@ impl Kfd {
     pub fn host_coherent(&self, size: usize) -> Mem {
         self.alloc(size, MEM_GTT | MEM_COHERENT | MEM_WRITABLE, true, size)
     }
+    /// VRAM of this card every card of `others` sees too (their writes come over the link as peer
+    /// writes): the receiver's side of a card-to-card handoff (docs/queue/001). Fine-grained
+    /// (`MEM_COHERENT`: gfx11 maps it MTYPE UC), so this card's loads of what a peer wrote bypass its
+    /// L2; host-visible, so the host seeds and reads it. The peer map failing is the test of peer access.
+    pub fn vram_shared(&self, size: usize, others: &[&Kfd]) -> Mem {
+        let m = self.alloc(size, MEM_VRAM | MEM_COHERENT | MEM_WRITABLE | MEM_PUBLIC, true, size);
+        for o in others {
+            let ids = [o.gpu_id];
+            let mut a = MapArgs { handle: m.handle, device_ids_array_ptr: ids.as_ptr() as u64, n_devices: 1, n_success: 0 };
+            Self::call(&self.kfd, IOC_MAP, &mut a, "map vram to the other gpu");
+        }
+        m
+    }
     /// `host_coherent` memory every card of `others` sees too, at the same address: the
     /// cards' handoffs (block outputs a card produces and another consumes, and the words
     /// that say they are there). One process holds every card, so KFD maps one handle on each.

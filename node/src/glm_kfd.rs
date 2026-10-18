@@ -68,8 +68,9 @@ struct Resident {
     /// streaming flat out doubled every card lap (its BAR writes share the link with the handoffs) and the
     /// expert phase (its core and its DRAM reads come out of the pool's), 2026-10-17.
     ticks: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// Picks seen, `[MOE_LAYERS][E]`.
+    /// Picks seen, `[MOE_LAYERS][E]`, halved every `RESIDENT_HALF_LIFE` positions (`seen` counts them).
     count: Vec<u32>,
+    seen: usize,
     /// Per card: each slot's (layer, expert), or `NONE`; the free slots; the slots a layer holds.
     owner: Vec<Vec<(u32, u32)>>,
     free: Vec<Vec<u32>>,
@@ -85,11 +86,23 @@ struct Resident {
 const NONE: u32 = u32::MAX;
 const PENDING: u32 = u32::MAX - 1;
 const LOADS_IN_FLIGHT: usize = 1;
-/// The loader's core: a housekeeping core on the cards' socket other than the main thread's (core 0): a slow
-/// 13 MB write over a degraded link held the main thread's core for a step at a time (2026-10-17).
+/// The loader's core: a core on the cards' socket (the KFD topology puts the cards on NUMA nodes 2 and 3;
+/// `bench-p2p` 2026-10-18: a 13 MB BAR write runs at 21.6 GB/s from nodes 2 / 3 and at 10–17 from nodes
+/// 0 / 1), other than the main thread's (core 0): a slow 13 MB write over a degraded link held the main
+/// thread's core for a step at a time (2026-10-17). The pool takes every physical core, so the loader
+/// shares this one with a worker whichever it is — and the socket matters more than the BAR rate: on core
+/// 48 (node 2, the cards' socket, the slower memory) the expert lap read 9.9–10.5 ms a step token and the
+/// route lap 2.0 against 9.2–9.8 and 1.3 on core 24 (2026-10-18 09:50, three boots): the loader's reads
+/// slow the pool's slowest node, which bounds the phase. Core 24 it stays.
 const LOADER_CORE: usize = 24;
 /// Replace a resident expert of the layer only when the newcomer has been picked this many more times.
-const RESIDENT_MARGIN: u32 = 4;
+/// The counts age: halved every `RESIDENT_HALF_LIFE` positions. The routing replay (2026-10-18,
+/// `bringup/gates/routing_replay.py` on the code and chat traces, 21 / 18 slots a layer): lifetime counts
+/// with a margin of 4 hit 0.406 / 0.285 (code / chat) and 0.374 / 0.260; a half-life of 32 and a margin
+/// of 2 hit 0.438 / 0.364 and 0.405 / 0.335 — the chat text is the one where recency counts (LRU 0.348,
+/// ARC 0.366 there, but 0.294 / 0.345 on code). Belady's ceiling: 0.552 / 0.577.
+const RESIDENT_MARGIN: u32 = 2;
+const RESIDENT_HALF_LIFE: usize = 32;
 /// VRAM a card may spend on resident experts at most (the node); what is free past a reserve decides.
 pub const RESIDENT_BYTES: usize = 12 << 30;
 /// VRAM left unallocated on a card: the driver's and the queue's own, and room for a bring-up gate's buffers.
@@ -650,12 +663,12 @@ impl Cards {
             for c in &cards {
                 let bytes = resident_bytes.min(c.k.vram_free().saturating_sub(RESIDENT_RESERVE)) / SLOT_BYTES * SLOT_BYTES;
                 let count = bytes / SLOT_BYTES;
-                println!("gpu      : card {}: {:.1} GB allocated, {count} routed experts resident ({:.1} GB), {} a layer, filled on use and replaced least-used past a margin of {RESIDENT_MARGIN}", c.k.index, c.k.allocated.get() as f64 / 1e9, bytes as f64 / 1e9, count / moe);
+                println!("gpu      : card {}: {:.1} GB allocated, {count} routed experts resident ({:.1} GB), {} a layer, filled on use and replaced least-picked past a margin of {RESIDENT_MARGIN} (counts halved every {RESIDENT_HALF_LIFE} positions)", c.k.index, c.k.allocated.get() as f64 / 1e9, bytes as f64 / 1e9, count / moe);
                 slots.push(c.k.vram_visible(bytes.max(SLOT_BYTES)));
                 per_layer.push(count / moe);
                 counts.push(count);
             }
-            Resident { table: std::sync::Arc::new((0..moe * glm_5_3_flash::E).map(|_| AtomicU32::new(NONE)).collect()), loader: None, inflight: Default::default(), ticks: Default::default(), count: vec![0; moe * glm_5_3_flash::E], owner: counts.iter().map(|&k| vec![(NONE, NONE); k]).collect(), free: counts.iter().map(|&k| (0..k as u32).rev().collect()).collect(), held: (0..n).map(|_| vec![0; moe]).collect(), per_layer, slots, jobs: (0..n).map(|_| Vec::new()).collect(), uploads: 0 }
+            Resident { table: std::sync::Arc::new((0..moe * glm_5_3_flash::E).map(|_| AtomicU32::new(NONE)).collect()), loader: None, inflight: Default::default(), ticks: Default::default(), count: vec![0; moe * glm_5_3_flash::E], seen: 0, owner: counts.iter().map(|&k| vec![(NONE, NONE); k]).collect(), free: counts.iter().map(|&k| (0..k as u32).rev().collect()).collect(), held: (0..n).map(|_| vec![0; moe]).collect(), per_layer, slots, jobs: (0..n).map(|_| Vec::new()).collect(), uploads: 0 }
         };
         Cards { cards, shared, layers, ffns, mlas, head, mtp, resident, instrument, seq: 0, half_seq: vec![[0; 2]; NUM_HIDDEN_LAYERS], token_from: vec![0; n], last_n: 1, npools: max_ctx.div_ceil(INDEX_KPOOL), tokens: 0 }
     }
@@ -1038,6 +1051,14 @@ impl Placed for Cards {
         }
         if ml == 0 {
             r.ticks.fetch_add(1, Ordering::AcqRel);
+            // the counts age with the positions: halved at every half-life this step crosses
+            let crossed = (r.seen + n) / RESIDENT_HALF_LIFE - r.seen / RESIDENT_HALF_LIFE;
+            r.seen += n;
+            if crossed > 0 {
+                for c in r.count.iter_mut() {
+                    *c = if crossed >= 32 { 0 } else { *c >> crossed };
+                }
+            }
         }
         // the resident picks become jobs; the experts with a job this step are never a victim
         let mut in_use = [false; glm_5_3_flash::E];
