@@ -1,6 +1,6 @@
 # 019 — Indexer scoring on WMMA
 
-**Status:** Done 2026-10-18 — the scorer on WMMA (27–34× at a 512-step, 2.6–5.3× at two tokens past 18k) and the selection across workgroups (a two-token step 182 → 92 µs a layer at 262k, flat to 1M, exact against the host); deploying
+**Status:** Done 2026-10-18 — the scorer on WMMA (27–34× at a 512-step, 2.6–5.3× at two tokens past 18k) and the selection across workgroups (a two-token step 182 → 92 µs a layer at 262k, flat to 1M, exact against the host); deployed 14:09, the long SCORE bit-identical to the build before it
 **Area:** long context (prefill and decode)
 **Gain:** measured — the whole scoring cost above, ~10× on WMMA; the selection needs its own split (below)
 
@@ -61,6 +61,9 @@ launch); our 1M arithmetic (~13 GMAC and ~1.6 GB of f32 pool keys read a decode 
   65k 127 → 90, 262k 182 → 92 — flat with position, so ~95 at 1M against ~700 (8 ms → 1 ms a step over
   11 layers). A two-stage form (each slice its top-K, then the candidates) was exact too but no faster:
   the final stage re-walked K × slices candidates in one workgroup.
+- 2026-10-18 14:09, deployed: the long SCORE is bit-identical to the build before it (the selection is
+  the same set, as the host check says); served numbers at 18k are unchanged by design (one slice below
+  32k positions). The boot logged 57 PCIe error records, so no new timing was taken.
 
 ## Next
 None. The selection's remaining cost at a verify step is the kernel's round trips (~70 µs a layer),
