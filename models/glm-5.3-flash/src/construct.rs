@@ -690,10 +690,14 @@ impl Routed for CpuExperts<'_> {
         }
         // the experts picked, each with the (token, slot) pairs that picked it: a counting sort into one
         // list, `first[e]..first[e + 1]` an expert's pairs (no allocation an expert)
+        // a pick of `E` is resident on a card and runs there (`Placed::xpt_dispatch`): skipped here, its
+        // output slot filled by the join
         let mut first = [0usize; E + 1];
         for picks in idx {
             for &e in picks {
-                first[e + 1] += 1;
+                if e < E {
+                    first[e + 1] += 1;
+                }
             }
         }
         for e in 0..E {
@@ -703,8 +707,10 @@ impl Routed for CpuExperts<'_> {
         let mut pairs = vec![(0u16, 0u8); n * TOP_K];
         for (i, picks) in idx.iter().enumerate() {
             for (k, &e) in picks.iter().enumerate() {
-                pairs[fill[e]] = (i as u16, k as u8);
-                fill[e] += 1;
+                if e < E {
+                    pairs[fill[e]] = (i as u16, k as u8);
+                    fill[e] += 1;
+                }
             }
         }
         let experts: Vec<usize> = (0..E).filter(|&e| first[e + 1] > first[e]).collect();
@@ -827,6 +833,21 @@ pub trait Placed {
     /// The draft layer (`layout::MTP_LAYER`): its input `[2·H]` (the next token's normed embedding, the
     /// normed hidden state) through `eh_proj` and the attention's projections (then `mla_wait`,
     /// `ix_pools`, `ix_select`, `mla_attend` as for any MLA layer);
+    /// A MoE layer's routed experts resident on the cards: every pick `(token i, slot k)` whose expert is
+    /// resident becomes a job on its card over the token's quantized activation, launched at once, and is
+    /// marked `E` in `picks` so the host's run skips it; a pick not resident may claim a slot (a free one,
+    /// or a less-used resident's past a margin), which the loader fills for the steps to come. Returns the jobs.
+    fn xpt_dispatch(&mut self, l: usize, n: usize, picks: &mut [[usize; TOP_K]], xq: &[i8], xs: &[f32], xg: &[i32]) -> usize;
+    /// The loader the residency fills slots with, off the step: `fetch(l, e, out)` gathers expert `e` of
+    /// layer `l` as a slot holds it (`expert::Weights::slot_bytes`). Set once before the first step.
+    fn xpt_loader(&mut self, fetch: Box<dyn Fn(usize, usize, &mut [u8]) + Send + 'static>);
+    /// A MoE layer's FFN output half (`hc_post`, which waits for the host's experts), posted after the resident
+    /// experts' launches so they are not queued behind it.
+    fn ffn_post(&mut self, l: usize, n: usize);
+    /// The cards' expert outputs of `xpt_dispatch`'s jobs into `out[(i · TOP_K + k) · H..]`, waiting for them.
+    fn xpt_join(&mut self, l: usize, out: &mut [f32]);
+    /// Whether expert `e` of layer `l` is resident on a card (the prefetch leaves those to the cards).
+    fn resident(&self, l: usize, e: usize) -> bool;
     fn mtp_begin(&mut self, cat: &[f32], n: usize);
     /// its output projection and residual, the blocks' states out (`[n][H]`) for the host's routing;
     fn mtp_attn_out(&mut self, hidden: &mut [f32], n: usize);
@@ -955,6 +976,10 @@ pub struct CpuModel<'p, R: Routed> {
     d_cats: Vec<f32>,
     /// The draft layer's output at the last position it drafted, `[H]`: the next depth's hidden input.
     d_hid: Vec<f32>,
+    /// A few tokens' FFN inputs quantized for the cards' resident experts (`[SPEC_TOKENS][H]` i8, the scales and Σq).
+    b_xq: Vec<i8>,
+    b_xs: Vec<f32>,
+    b_xg: Vec<i32>,
     d_x: Vec<f32>,
     d_xn: Vec<f32>,
     d_y: Vec<f32>,
@@ -1026,6 +1051,9 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             d_cat: vec![0.0; 2 * H],
             d_cats: vec![0.0; STEP * 2 * H],
             d_hid: vec![0.0; H],
+            b_xq: vec![0; SPEC_TOKENS * H],
+            b_xs: vec![0.0; SPEC_TOKENS * (H / common::q4::GROUP)],
+            b_xg: vec![0; SPEC_TOKENS * (H / common::q4::GROUP)],
             d_x: vec![0.0; H],
             d_xn: vec![0.0; H],
             d_y: vec![0.0; H],
@@ -1525,7 +1553,26 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     tr.edge(l, "ffn_in", &s.b_xn[..H]);
                     tr.topk(l, &picks[0], &wts[0]);
                 }
+                // a step of a few tokens: the picks resident on the cards run there, concurrently with the host's;
+                // the picks as routed are kept for the accounting (the dispatch marks the resident ones)
+                let mut routed_picks = [[E; TOP_K]; SPEC_TOKENS];
+                if n <= SPEC_TOKENS {
+                    routed_picks[..n].copy_from_slice(&picks[..n]);
+                }
+                let jobs = if n <= SPEC_TOKENS {
+                    const HG: usize = H / common::q4::GROUP;
+                    for i in 0..n {
+                        common::q4::QAct { q: &mut s.b_xq[i * H..(i + 1) * H], scale: &mut s.b_xs[i * HG..(i + 1) * HG], gsum: &mut s.b_xg[i * HG..(i + 1) * HG] }.quantize(&s.b_xn[i * H..(i + 1) * H]);
+                    }
+                    pl.xpt_dispatch(l, n, &mut picks[..n], &s.b_xq[..n * H], &s.b_xs[..n * HG], &s.b_xg[..n * HG])
+                } else {
+                    0
+                };
+                pl.ffn_post(l, n);
                 s.routed.run_batch(l, &picks[..n], &s.b_xn[..n * H], &mut s.b_out[..n * TOP_K * H]);
+                if jobs > 0 {
+                    pl.xpt_join(l, &mut s.b_out[..n * TOP_K * H]);
+                }
                 // each token's weighted sum of its experts' outputs, likewise
                 {
                     let (y_p, out, wts_r) = (s.b_y.as_mut_ptr() as usize, &s.b_out, &wts);
@@ -1549,7 +1596,8 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 }
                 pl.ffn_routed(l, n, &s.b_y[..n * H]);
                 for i in 0..n {
-                    account(p, &mut s.last_picks, &mut s.freq, s.pool, l, picks[i], if n <= SPEC_TOKENS { pre_picks[i] } else { [E; TOP_K] });
+                    let as_routed = if n <= SPEC_TOKENS { routed_picks[i] } else { picks[i] };
+                    account(p, &mut s.last_picks, &mut s.freq, s.pool, l, as_routed, if n <= SPEC_TOKENS { pre_picks[i] } else { [E; TOP_K] });
                 }
                 let e = s.routed.elapsed();
                 p.experts += e;
@@ -1564,7 +1612,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     for i in 0..n {
                         pre_next[i] = ffn::picks(m2, &mut s.b_score[i * ROUTE_ROWS + E..(i + 1) * ROUTE_ROWS]);
                         for &e in &pre_next[i] {
-                            if !union[..nu].contains(&e) {
+                            if !union[..nu].contains(&e) && !pl.resident(l + 1, e) {
                                 union[nu] = e;
                                 nu += 1;
                             }

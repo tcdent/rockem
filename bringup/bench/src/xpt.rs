@@ -50,13 +50,16 @@ fn main() {
     let bdir = arg_required("--bundle");
     let elf = std::fs::read(arg_required("--elf")).unwrap();
     let (l, e0, jobs, iters) = (num("--layer", 10), num("--expert", 0), num("--jobs", 8), num("--iters", 20));
+    // --slots N: the slot buffer sized for N experts (the node's residency: one host-visible allocation of ~10 GB)
+    let nslots = num("--slots", jobs).max(jobs);
     let f = std::fs::File::open(bdir.join(glm_5_3_flash::layout::EXPERTS_FILE)).unwrap();
     let mm = unsafe { memmap2::Mmap::map(&f).unwrap() };
     let stream = Stream::file(&mm[..]);
     let k = kfd::Kfd::open(&elf, false, 0);
     let (kgu, kdown) = (k.kernel("xpt_gu"), k.kernel("xpt_down"));
     // `jobs` experts e0.. in slots 0.., each a job on its own token (the same activation shifted)
-    let slots = k.vram_visible(jobs * SLOT_BYTES);
+    let slots = k.vram_visible(nslots * SLOT_BYTES);
+    println!("slots: {nslots} ({:.1} GB host-visible), {:.1} GB allocated on the card", (nslots * SLOT_BYTES) as f64 / 1e9, k.allocated.get() as f64 / 1e9);
     for j in 0..jobs {
         let w = Weights::at(&stream, l, e0 + j);
         let mut bytes = Vec::with_capacity(SLOT_BYTES);

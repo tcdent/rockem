@@ -43,15 +43,68 @@ use common::gemv::ROWS;
 use glm_5_3_flash::ffn::gfx11_consts::ROWS_GU;
 use glm_5_3_flash::layout::{KDA_MEMORY, KDA_WINDOW};
 use glm_5_3_flash::mla::gfx11_consts::{ATTEND_GRID, ATTEND_LDS, IX_ROWS, O_IN, ROWS_QB, SELECT_LDS};
+use glm_5_3_flash::expert::gfx11_consts::{DOWN_WGS as XPT_DOWN_WGS, SLOT_BYTES, UP_WGS as XPT_UP_WGS, XPT_LDS};
 use glm_5_3_flash::DENSE_BELOW;
+use glm_5_3_flash::TOP_K;
 use glm_5_3_flash::{INDEX_HEAD_DIM, INDEX_N_HEADS, KV_LORA_RANK, Q_LORA_RANK};
 use glm_5_3_flash::weights::{Attn, Ffn, Fp8, Weights};
 use glm_5_3_flash::{CONV_DIM, CONV_TAPS, D_FF, H, HC, INDEX_KPOOL, INTERMEDIATE_SIZE, SPEC_TOKENS, KDA_DIM, KDA_HEADS, KDA_QKV, LINEAR_ATTENTION, MLA_HEADS, NUM_HIDDEN_LAYERS, N_SHARED_EXPERTS, Q_HEAD, STEP, TOKENS, VOCAB_SIZE};
 use std::sync::atomic::AtomicU32;
 use std::rc::Rc;
 
+/// The routed experts resident on the cards: a slot a card holds one expert's bytes (`SLOT_BYTES`);
+/// a layer may hold `per_layer` slots a card, filled on first use and then replaced least-frequently-used
+/// with a margin, so the set tracks the conversation (a static hotlist does not travel between texts:
+/// 0.19 of picks, 2026-10-17). An expert's bits are the same on either tier (`expert::gfx11`), so the
+/// placement never changes a result. Sized for the VRAM free at the configured context.
+struct Resident {
+    /// `[MOE_LAYERS][E]`: the card and slot an expert sits in (`card << 24 | slot`), `PENDING` while its slot
+    /// is being filled, or `NONE`. Shared with the loader, which writes the slot once the bytes are there.
+    table: std::sync::Arc<Vec<AtomicU32>>,
+    loader: Option<std::sync::mpsc::Sender<(usize, u32, usize, usize)>>,
+    /// Loads queued and not yet landed; at most `LOADS_IN_FLIGHT` (the rest stay on the host this step).
+    inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Steps begun (the first MoE layer's dispatch): the loader paces itself to one load a step — a loader
+    /// streaming flat out doubled every card lap (its BAR writes share the link with the handoffs) and the
+    /// expert phase (its core and its DRAM reads come out of the pool's), 2026-10-17.
+    ticks: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Picks seen, `[MOE_LAYERS][E]`.
+    count: Vec<u32>,
+    /// Per card: each slot's (layer, expert), or `NONE`; the free slots; the slots a layer holds.
+    owner: Vec<Vec<(u32, u32)>>,
+    free: Vec<Vec<u32>>,
+    held: Vec<Vec<u32>>,
+    per_layer: Vec<usize>,
+    /// Per card: the slots' bytes.
+    slots: Vec<Mem>,
+    /// The jobs in flight a card for the layer being joined: (slot, token, k).
+    jobs: Vec<Vec<(u32, u32, u8)>>,
+    /// Uploads made (bring-up: the warm-up's cost).
+    uploads: usize,
+}
+const NONE: u32 = u32::MAX;
+const PENDING: u32 = u32::MAX - 1;
+const LOADS_IN_FLIGHT: usize = 1;
+/// The loader's core: a housekeeping core (the pool's are isolated).
+const LOADER_CORE: usize = 0;
+/// Replace a resident expert of the layer only when the newcomer has been picked this many more times.
+const RESIDENT_MARGIN: u32 = 4;
+/// VRAM a card may spend on resident experts at most (the node); what is free past a reserve decides.
+pub const RESIDENT_BYTES: usize = 12 << 30;
+/// VRAM left unallocated on a card: the driver's and the queue's own, and room for a bring-up gate's buffers.
+const RESIDENT_RESERVE: usize = 1 << 30;
+
 struct Card {
     k: Rc<Kfd>,
+    xpt_gu: crate::kfd::Kernel,
+    xpt_down: crate::kfd::Kernel,
+    /// The resident experts' quantized activations and jobs (host-visible), the gate/up state, the outputs to the host.
+    xq: Mem,
+    xs: Mem,
+    xg: Mem,
+    xjobs: Mem,
+    xgu: Mem,
+    xout: Mem,
     rows_h: crate::kfd::Kernel,
     rows_d2: crate::kfd::Kernel,
     rows_part: crate::kfd::Kernel,
@@ -216,6 +269,7 @@ pub struct Cards {
     /// The head's card, the final norm (bf16) and lm_head.
     head: (usize, Mem, Mem),
     mtp: Option<MtpOn>,
+    resident: Resident,
     /// The handoff sequence: a value a half of a layer's words carry, and each layer's (attention, FFN) values this token.
     seq: u32,
     half_seq: Vec<[u32; 2]>,
@@ -228,6 +282,9 @@ pub struct Cards {
     tokens: u32,
 }
 
+fn raw_i8(v: &[i8]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()) }
+}
 fn raw<T>(v: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
@@ -241,7 +298,7 @@ impl Cards {
     /// Open every gfx1100 card, load the code object on each, and place the
     /// blocks on them in order: the KDA layers an equal share each, every
     /// layer's FFN half with the KDA layer at or before it, the head last.
-    pub fn new(elf: &[u8], w: &Weights, max_ctx: usize, instrument: bool) -> Self {
+    pub fn new(elf: &[u8], w: &Weights, max_ctx: usize, instrument: bool, resident_bytes: usize) -> Self {
         let n = Kfd::cards().len();
         assert!(n > 0, "rockem.gpu: no gfx1100 card");
         let t0 = std::time::Instant::now();
@@ -255,6 +312,14 @@ impl Cards {
                     rows_part: k.kernel("rows_part"),
                     step: k.kernel("kda_step"),
                     copy: k.kernel("copy_f32"),
+                    xpt_gu: k.kernel("xpt_gu"),
+                    xpt_down: k.kernel("xpt_down"),
+                    xq: k.vram_visible(SPEC_TOKENS * H),
+                    xs: k.vram_visible(SPEC_TOKENS * (H / common::q4::GROUP) * 4),
+                    xg: k.vram_visible(SPEC_TOKENS * (H / common::q4::GROUP) * 4),
+                    xjobs: k.vram_visible(SPEC_TOKENS * TOP_K * 8),
+                    xgu: k.vram(SPEC_TOKENS * TOP_K * 2 * D_FF * 4),
+                    xout: k.host(SPEC_TOKENS * TOP_K * H * 4),
                     ffn_gu: k.kernel("ffn_gu"),
                     ffn_down_shared: k.kernel("ffn_down_shared"),
                     ffn_down_dense: k.kernel("ffn_down_dense"),
@@ -555,7 +620,23 @@ impl Cards {
             println!("gpu      : the draft layer on card {card}: its attention, shared expert and eh_proj ({:.2} GB)", (mt.eh_proj.len() * 2 + gu_w.size + down_w.size) as f64 / 1e9);
             MtpOn { card, eh: up(raw(mt.eh_proj)), post_ln: up(raw(&bf16_of(mt.post_ln))), head_norm: up(raw(&bf16_of(mt.head_norm))), gu_w, gu_s, down_w, down_s, dx: k.vram_visible(STEP * 2 * H * 4) }
         });
-        Cards { cards, shared, layers, ffns, mlas, head, mtp, seq: 0, half_seq: vec![[0; 2]; NUM_HIDDEN_LAYERS], token_from: vec![0; n], last_n: 1, npools: max_ctx.div_ceil(INDEX_KPOOL), tokens: 0 }
+        // the resident experts' slots last: what each card has free past the reserve, up to the budget
+        let resident = {
+            let moe = glm_5_3_flash::layout::MOE_LAYERS;
+            let mut slots = Vec::with_capacity(n);
+            let mut per_layer = Vec::with_capacity(n);
+            let mut counts = Vec::with_capacity(n);
+            for c in &cards {
+                let bytes = resident_bytes.min(c.k.vram_free().saturating_sub(RESIDENT_RESERVE)) / SLOT_BYTES * SLOT_BYTES;
+                let count = bytes / SLOT_BYTES;
+                println!("gpu      : card {}: {:.1} GB allocated, {count} routed experts resident ({:.1} GB), {} a layer, filled on use and replaced least-used past a margin of {RESIDENT_MARGIN}", c.k.index, c.k.allocated.get() as f64 / 1e9, bytes as f64 / 1e9, count / moe);
+                slots.push(c.k.vram_visible(bytes.max(SLOT_BYTES)));
+                per_layer.push(count / moe);
+                counts.push(count);
+            }
+            Resident { table: std::sync::Arc::new((0..moe * glm_5_3_flash::E).map(|_| AtomicU32::new(NONE)).collect()), loader: None, inflight: Default::default(), ticks: Default::default(), count: vec![0; moe * glm_5_3_flash::E], owner: counts.iter().map(|&k| vec![(NONE, NONE); k]).collect(), free: counts.iter().map(|&k| (0..k as u32).rev().collect()).collect(), held: (0..n).map(|_| vec![0; moe]).collect(), per_layer, slots, jobs: (0..n).map(|_| Vec::new()).collect(), uploads: 0 }
+        };
+        Cards { cards, shared, layers, ffns, mlas, head, mtp, resident, seq: 0, half_seq: vec![[0; 2]; NUM_HIDDEN_LAYERS], token_from: vec![0; n], last_n: 1, npools: max_ctx.div_ceil(INDEX_KPOOL), tokens: 0 }
     }
 
     /// With the launches stamped, every 16 tokens: a line per card of the last token's time by
@@ -833,6 +914,163 @@ impl Placed for Cards {
             p0 += np;
         }
     }
+    fn resident(&self, l: usize, e: usize) -> bool {
+        let at = self.resident.table[(l - glm_5_3_flash::FIRST_K_DENSE_REPLACE) * glm_5_3_flash::E + e].load(std::sync::atomic::Ordering::Relaxed);
+        at != NONE && at != PENDING
+    }
+    fn xpt_loader(&mut self, fetch: Box<dyn Fn(usize, usize, &mut [u8]) + Send + 'static>) {
+        // the loader: gathers an expert from the stream and streams it into its slot (write-combining
+        // stores over the BAR), then publishes the slot in the table; the main thread keeps the bookkeeping
+        let (tx, rx) = std::sync::mpsc::channel::<(usize, u32, usize, usize)>();
+        let table = self.resident.table.clone();
+        let inflight = self.resident.inflight.clone();
+        let ticks = self.resident.ticks.clone();
+        let bases: Vec<usize> = self.resident.slots.iter().map(|m| m.ptr() as usize).collect();
+        std::thread::Builder::new().name("xpt-loader".into()).spawn(move || {
+            extern "C" {
+                fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
+            }
+            let mut mask = [0u64; 16];
+            mask[LOADER_CORE / 64] |= 1 << (LOADER_CORE % 64);
+            unsafe { sched_setaffinity(0, 128, mask.as_ptr()) };
+            let mut scratch = vec![0u8; SLOT_BYTES];
+            let mut served = 0u64;
+            for (card, slot, ml, e) in rx {
+                // one load a step: wait for a step the last load did not see
+                loop {
+                    let t = ticks.load(std::sync::atomic::Ordering::Acquire);
+                    if t > served {
+                        served = t;
+                        break;
+                    }
+                    std::thread::park_timeout(std::time::Duration::from_micros(200));
+                }
+                fetch(ml + glm_5_3_flash::FIRST_K_DENSE_REPLACE, e, &mut scratch);
+                let dst = unsafe { std::slice::from_raw_parts_mut((bases[card] + slot as usize * SLOT_BYTES) as *mut u8, SLOT_BYTES) };
+                common::copy::stream(dst, &scratch);
+                table[ml * glm_5_3_flash::E + e].store((card as u32) << 24 | slot, std::sync::atomic::Ordering::Release);
+                inflight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            }
+        }).unwrap();
+        self.resident.loader = Some(tx);
+    }
+    fn xpt_dispatch(&mut self, l: usize, n: usize, picks: &mut [[usize; TOP_K]], xq: &[i8], xs: &[f32], xg: &[i32]) -> usize {
+        use std::sync::atomic::Ordering;
+        let ml = l - glm_5_3_flash::FIRST_K_DENSE_REPLACE;
+        let e_n = glm_5_3_flash::E;
+        let r = &mut self.resident;
+        let loader = r.loader.as_ref().expect("the residency's loader is set before the first step");
+        for j in r.jobs.iter_mut() {
+            j.clear();
+        }
+        if ml == 0 {
+            r.ticks.fetch_add(1, Ordering::AcqRel);
+        }
+        // the resident picks become jobs; the experts with a job this step are never a victim
+        let mut in_use = [false; glm_5_3_flash::E];
+        let mut misses: Vec<usize> = Vec::new();
+        for i in 0..n {
+            for k in 0..TOP_K {
+                let e = picks[i][k];
+                r.count[ml * e_n + e] += 1;
+                let at = r.table[ml * e_n + e].load(Ordering::Acquire);
+                if at != NONE && at != PENDING {
+                    r.jobs[(at >> 24) as usize].push((at & 0xff_ffff, i as u32, k as u8));
+                    picks[i][k] = e_n;
+                    in_use[e] = true;
+                } else if at == NONE && !misses.contains(&e) {
+                    misses.push(e);
+                }
+            }
+        }
+        // the misses claim slots for the steps to come: a free one on the card holding fewer of this layer,
+        // else the layer's least-picked resident when the miss leads it by the margin (one a layer a step)
+        let mut replaced = false;
+        for &e in &misses {
+            if r.inflight.load(Ordering::Acquire) >= LOADS_IN_FLIGHT {
+                break;
+            }
+            let mut pick_card = None;
+            for c in (0..self.cards.len()).rev() {
+                if (r.held[c][ml] as usize) < r.per_layer[c] && !r.free[c].is_empty() && pick_card.is_none_or(|p: usize| r.held[c][ml] < r.held[p][ml]) {
+                    pick_card = Some(c);
+                }
+            }
+            let slot = match pick_card {
+                Some(c) => Some((c, r.free[c].pop().unwrap())),
+                None if !replaced => {
+                    let mut victim: Option<(usize, u32, u32)> = None; // (card, slot, count)
+                    for c in 0..self.cards.len() {
+                        for (sl, &(ol, oe)) in r.owner[c].iter().enumerate() {
+                            if ol as usize != ml || in_use[oe as usize] || r.table[ml * e_n + oe as usize].load(Ordering::Relaxed) == PENDING {
+                                continue;
+                            }
+                            let cnt = r.count[ml * e_n + oe as usize];
+                            if victim.is_none_or(|v| cnt < v.2) {
+                                victim = Some((c, sl as u32, cnt));
+                            }
+                        }
+                    }
+                    match victim {
+                        Some((c, sl, cnt)) if r.count[ml * e_n + e] >= cnt + RESIDENT_MARGIN => {
+                            let (_, oe) = r.owner[c][sl as usize];
+                            r.table[ml * e_n + oe as usize].store(NONE, Ordering::Release);
+                            r.held[c][ml] -= 1;
+                            replaced = true;
+                            Some((c, sl))
+                        }
+                        _ => None,
+                    }
+                }
+                None => None,
+            };
+            if let Some((c, sl)) = slot {
+                r.owner[c][sl as usize] = (ml as u32, e as u32);
+                r.held[c][ml] += 1;
+                r.uploads += 1;
+                r.table[ml * e_n + e].store(PENDING, Ordering::Release);
+                r.inflight.fetch_add(1, Ordering::AcqRel);
+                loader.send((c, sl, ml, e)).unwrap();
+            }
+        }
+        let mut total = 0;
+        for c in 0..self.cards.len() {
+            let jobs = &r.jobs[c];
+            if jobs.is_empty() {
+                continue;
+            }
+            total += jobs.len();
+            let card = &self.cards[c];
+            card.k.upload(&card.xq, 0, raw_i8(xq));
+            card.k.upload(&card.xs, 0, raw(xs));
+            card.k.upload(&card.xg, 0, raw(xg));
+            let list: Vec<u32> = jobs.iter().flat_map(|&(sl, tok, _)| [sl, tok]).collect();
+            card.k.upload(&card.xjobs, 0, raw(&list));
+            let mut a = Args::new();
+            a.ptr(r.slots[c].va).ptr(card.xjobs.va).ptr(card.xq.va).ptr(card.xs.va).ptr(card.xg.va).ptr(card.xgu.va);
+            card.k.launch(&card.xpt_gu, (jobs.len() * XPT_UP_WGS) as u32, g::WG, XPT_LDS as u32, &a);
+            let mut b = Args::new();
+            b.ptr(r.slots[c].va).ptr(card.xjobs.va).ptr(card.xgu.va).ptr(card.xout.va);
+            card.k.launch(&card.xpt_down, (jobs.len() * XPT_DOWN_WGS) as u32, g::WG, XPT_LDS as u32, &b);
+            card.k.fence();
+        }
+        total
+    }
+    fn xpt_join(&mut self, _l: usize, out: &mut [f32]) {
+        for c in 0..self.cards.len() {
+            let jobs = &self.resident.jobs[c];
+            if jobs.is_empty() {
+                continue;
+            }
+            let card = &self.cards[c];
+            card.k.wait();
+            let y = unsafe { std::slice::from_raw_parts(card.xout.ptr() as *const f32, jobs.len() * H) };
+            for (j, &(_, tok, k)) in jobs.iter().enumerate() {
+                let at = (tok as usize * TOP_K + k as usize) * H;
+                out[at..at + H].copy_from_slice(&y[j * H..(j + 1) * H]);
+            }
+        }
+    }
     fn mtp_begin(&mut self, cat: &[f32], n: usize) {
         let t = self.mtp.as_ref().expect("no draft layer on the cards");
         let c = &self.cards[t.card];
@@ -938,7 +1176,6 @@ impl Placed for Cards {
         let value = self.next_seq();
         self.half_seq[l][1] = value;
         let f = self.ffns[l].as_ref().unwrap();
-        let parity = l % 2;
         for c in &self.cards {
             // the FFN card's collapse goes to the host too when the routed experts need it, with the router's logits and the word
             let to_host = (!f.dense && c.k.index == f.card).then_some(self.shared.xh.va);
@@ -947,9 +1184,19 @@ impl Placed for Cards {
         }
         let c = &self.cards[f.card];
         let (rows, down, k_width) = if f.dense { (DENSE_GU_ROWS, &c.ffn_down_dense, INTERMEDIATE_SIZE) } else { (SHARED_GU_ROWS, &c.ffn_down_shared, N_SHARED_EXPERTS * D_FF) };
-        let fy = self.shared.fy[parity].va;
         self.rows8(c, &c.ffn_gu, c.x.va, Some(f.ln.va), f.gu_w.va, f.gu_s.va, c.gu.va, rows, H, n, ROWS_GU);
         self.rows8_at(c, down, c.gu.va, 2 * k_width, None, f.down_w.va, f.down_s.va, c.fyv.va, H, k_width, n, ROWS, true);
+        // a dense layer's output half now; a MoE layer's waits for the host's experts and is posted after the
+        // resident experts' launches (`ffn_post`): a queue is in order, and the output half spins on the word
+        if f.dense {
+            self.ffn_post(l, n);
+        }
+    }
+    fn ffn_post(&mut self, l: usize, n: usize) {
+        let value = self.half_seq[l][1];
+        let f = self.ffns[l].as_ref().unwrap();
+        let parity = l % 2;
+        let fy = self.shared.fy[parity].va;
         for o in &self.cards {
             let producer = o.k.index == f.card;
             let copy = producer.then_some((o.fyv.va, fy, n * H));

@@ -222,7 +222,8 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
         // the bundle's code object, or one under test (`--elf`); `--timeline` prints the cards' kernel laps a step
         let elf_path = arg("--elf").unwrap_or_else(|| bundle.join(layout::KERNELS_FILE));
         let elf = std::fs::read(&elf_path).unwrap_or_else(|e| panic!("{}: {e}", elf_path.display()));
-        model.placed = Some(Box::new(glm_kfd::Cards::new(&elf, &w, ctx, harness::flag("--timeline"))));
+        model.placed = Some(Box::new(glm_kfd::Cards::new(&elf, &w, ctx, harness::flag("--timeline"), 1 << 30)));
+        model.placed.as_mut().unwrap().xpt_loader(Box::new(move |l, e, out| glm_5_3_flash::expert::Weights::at(stream, l, e).slot_bytes(out)));
     }
     model.seed_prefix(&w, &prefix);
     for (t, &id) in ids.iter().enumerate().take(FIRST_POS) {

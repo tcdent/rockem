@@ -184,6 +184,21 @@ impl<'a> Weights<'a> {
         let (h, w, sc) = (c % SUB, layout::DOWN_W / SUB, 4 * layout::DOWN_S / SUB);
         (&it[h * w..(h + 1) * w], f32s(&it[layout::DOWN_W + h * sc..layout::DOWN_W + (h + 1) * sc]))
     }
+    /// The expert as a card slot holds it: its gate/up items, then its down items (`gfx11_consts::SLOT_BYTES`).
+    pub fn slot_bytes(&self, out: &mut [u8]) {
+        let mut at = 0;
+        for c in 0..GU_ITEMS {
+            let b = self.gu_bytes(c);
+            out[at..at + b.len()].copy_from_slice(b);
+            at += b.len();
+        }
+        for c in 0..DOWN_ITEMS {
+            let b = self.down_bytes(c);
+            out[at..at + b.len()].copy_from_slice(b);
+            at += b.len();
+        }
+        assert_eq!(at, out.len());
+    }
     /// The item's bytes, for a core to pull through its caches.
     #[inline(always)]
     pub fn gu_bytes(&self, c: usize) -> &'a [u8] {

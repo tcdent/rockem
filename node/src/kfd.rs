@@ -288,6 +288,8 @@ impl Args {
 
 /// One process, one card, one queue.
 pub struct Kfd {
+    /// VRAM allocated through this handle so far (bytes, page-rounded): what a late allocation may still take.
+    pub allocated: std::cell::Cell<usize>,
     kfd: std::fs::File,
     drm: std::fs::File,
     gpu_id: u32,
@@ -377,6 +379,7 @@ impl Kfd {
         assert!(mwaitx_supported(), "the wait is MWAITX; this CPU has none");
 
         let mut k = Kfd {
+            allocated: std::cell::Cell::new(0),
             kfd,
             drm,
             gpu_id,
@@ -504,6 +507,9 @@ impl Kfd {
     fn alloc(&self, size: usize, flags: u32, host: bool, host_bytes: usize) -> Mem {
         const ALIGN: usize = 2 << 20;
         let size = (size + 4095) & !4095;
+        if flags & MEM_VRAM != 0 {
+            self.allocated.set(self.allocated.get() + size);
+        }
         if flags & MEM_PUBLIC != 0 {
             assert!(size <= self.visible_vram, "{} MiB host-visible VRAM requested, {} MiB visible: enable resizable BAR", size >> 20, self.visible_vram >> 20);
         }
@@ -523,6 +529,10 @@ impl Kfd {
         Mem { va, size, handle: a.handle }
     }
     /// VRAM the host writes (weights, cache, tables): through the BAR.
+    /// VRAM not yet allocated through this handle (bytes).
+    pub fn vram_free(&self) -> usize {
+        self.visible_vram.saturating_sub(self.allocated.get())
+    }
     pub fn vram_visible(&self, size: usize) -> Mem {
         self.alloc(size, MEM_VRAM | MEM_WRITABLE | MEM_PUBLIC, true, size)
     }
