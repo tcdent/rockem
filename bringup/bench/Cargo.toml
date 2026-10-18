@@ -77,3 +77,7 @@ path = "src/hc.rs"
 [[bin]]
 name = "bench-wmma"
 path = "src/wmma.rs"
+
+[[bin]]
+name = "bench-xpt"
+path = "src/xpt.rs"

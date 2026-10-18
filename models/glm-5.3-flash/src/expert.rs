@@ -435,9 +435,185 @@ pub mod gfx11_consts {
         let e = if n * crate::TOP_K < N_ROUTED_EXPERTS { n * crate::TOP_K } else { N_ROUTED_EXPERTS };
         (e * DOWN_WGS) as u32
     }
+    /// An expert's bytes in a card slot: its gate/up items, then its down items, each as the stream holds it.
+    pub const SLOT_BYTES: usize = super::GU_ITEMS * crate::layout::GU_ITEM + super::DOWN_ITEMS * crate::layout::DOWN_ITEM;
+    /// LDS a (token, pick) job's workgroup stages a round into: `FLIGHT` steps of one token.
+    pub const XPT_LDS: usize = common::gemv::FLIGHT * STEP_BYTES;
     // a workgroup's eight tiles must belong to one expert for the shared staging
-    const _: () = assert!(UP_TILES % 8 == 0 && DOWN_TILES % 8 == 0);
+    const _: () = assert!(UP_TILES % 8 == 0 && DOWN_TILES % 8 == 0 && SLOT_BYTES == crate::layout::RECORD);
 }
 
-// The GPU realization of the experts is not this copy of V2-Lite's: GLM-5.3-Flash's
-// 288 experts, eight a token, get their own kernel when experts move to the card.
+/// The card realization of a routed expert: a (token, pick) job over an expert resident in a card
+/// slot. `xpt_gu` runs the gate/up tiles against the token's quantized activation
+/// (`gu[job][2·D_FF]`, gate rows then up rows); `xpt_down` applies the clamped SwiGLU, quantizes
+/// each group as `QAct::quantize` does (absmax/127, the shared `round`, Σq) and runs the down tiles
+/// (`out[job][H]`). Every (row, group) is the same integer sum and the same flush in the same group
+/// order as `q4::gemv` on the CPU, the SwiGLU the shared `silu`: an expert's bits are the same
+/// whichever tier ran it, so a refreshed residency stays reproducible. The twin of
+/// `deepseek_v2_lite::expert::gfx11` over this stream's item layout, a token a job.
+#[cfg(target_arch = "amdgpu")]
+pub mod gfx11 {
+    use super::gfx11_consts::*;
+    use super::*;
+    use common::gemv::gfx11::round;
+    use common::q4::gfx11::{gemv_tile_step, STEP_BYTES};
+    use common::q4::{GROUP, TILE};
+    use common::swiglu::silu;
+    use core::arch::amdgpu::{wave_reduce_add, wave_reduce_umax, workgroup_id_x, workitem_id_x};
+    const HG: usize = H / GROUP;
+
+    /// `gu[j][2·D_FF] = [gate; up] · xq[tok]` for job `j = (slot, tok)` of `jobs` (`[jobs][2]` u32).
+    /// `slots`: the resident experts, `SLOT_BYTES` each; `xq`/`xs`/`xg`: `[tokens][H]`, `[tokens][H/GROUP]` ×2.
+    /// Grid: jobs × UP_WGS, 256 threads, XPT_LDS.
+    #[no_mangle]
+    pub extern "gpu-kernel" fn xpt_gu(slots: *const u8, jobs: *const u32, xq: *const i8, xs: *const f32, xg: *const i32, gu: *mut f32) {
+        unsafe {
+            let wg = workgroup_id_x() as usize;
+            let (j, blk) = (wg / UP_WGS, wg % UP_WGS);
+            let (slot, tok) = (*jobs.add(2 * j) as usize, *jobs.add(2 * j + 1) as usize);
+            let tid = workitem_id_x();
+            let (wave, lane) = ((tid / 32) as usize, tid % 32);
+            let tile = blk * 8 + wave; // 0..2·D_FF/TILE: the gate's tiles, then the up's
+            let (half, t) = (tile / (D_FF / TILE), tile % (D_FF / TILE));
+            let (c, ti) = (t * TILE / GU_CHUNK, t % (GU_CHUNK / TILE));
+            let item = slots.add(slot * SLOT_BYTES + c * layout::GU_ITEM);
+            let w_tile = item.add(half * layout::GU_W + ti * TILE * H / 2);
+            let ws_tile = item.add(2 * layout::GU_W + half * 4 * layout::GU_S + ti * TILE * HG * 4) as *const f32;
+            let slab: *mut u8 = common::gfx11::lds();
+            let (q, sc, g) = (xq.add(tok * H), xs.add(tok * HG), xg.add(tok * HG));
+            let stage = |s0: usize, r: usize, _stride: usize, dst: *mut u8| {
+                let mut cch = tid as usize;
+                while cch < r * 32 {
+                    let (k, part) = (cch / 32, cch % 32);
+                    stage_one::<H>(part, q, sc, g, s0 + k, dst.add(k * STEP_BYTES));
+                    cch += 256;
+                }
+            };
+            let mut y = [0f32; common::q4::gfx11::PASS];
+            tile_pass::<H>(lane, w_tile, ws_tile, slab, &stage, &mut y);
+            if lane < 16 && lane % 4 == 0 {
+                *gu.add(j * 2 * D_FF + tile * TILE + lane as usize / 4) = y[0];
+            }
+        }
+    }
+
+    /// `out[j][H] = down · quant(swiglu_clamped(gu[j]))` for job `j`. Grid: jobs × DOWN_WGS, 256 threads, XPT_LDS.
+    #[no_mangle]
+    pub extern "gpu-kernel" fn xpt_down(slots: *const u8, jobs: *const u32, gu: *const f32, out: *mut f32) {
+        unsafe {
+            let wg = workgroup_id_x() as usize;
+            let (j, blk) = (wg / DOWN_WGS, wg % DOWN_WGS);
+            let slot = *jobs.add(2 * j) as usize;
+            let tid = workitem_id_x();
+            let (wave, lane) = ((tid / 32) as usize, tid % 32);
+            let tile = blk * 8 + wave; // 0..H/TILE
+            let (c, ti) = (tile * TILE / layout::DOWN_CHUNK, tile % (layout::DOWN_CHUNK / TILE));
+            let item = slots.add(slot * SLOT_BYTES + GU_ITEMS * layout::GU_ITEM + c * layout::DOWN_ITEM);
+            let w_tile = item.add(ti * TILE * D_FF / 2);
+            let ws_tile = item.add(layout::DOWN_W + ti * TILE * (D_FF / GROUP) * 4) as *const f32;
+            let slab: *mut u8 = common::gfx11::lds();
+            let g = gu.add(j * 2 * D_FF);
+            let ng = D_FF / GROUP;
+            let limit = crate::SWIGLU_LIMIT;
+            // a wave quantizes a group of the round: the clamped SwiGLU (the CPU's `swiglu_clamped`), then
+            // `QAct::quantize`'s absmax/127, the shared round, the clamp and Σq
+            let stage = |s0: usize, r: usize, _stride: usize, dst: *mut u8| {
+                let g0 = 2 * s0;
+                let g1 = if 2 * (s0 + r) < ng { 2 * (s0 + r) } else { ng };
+                let mut gi = wave;
+                while gi < g1 - g0 {
+                    let (k, gp) = (gi / 2, gi % 2);
+                    let k0 = (g0 + gi) * GROUP + lane as usize * 4;
+                    let mut v = [0f32; 4];
+                    let mut amax = 0f32;
+                    let mut jj = 0;
+                    while jj < 4 {
+                        let gate = *g.add(k0 + jj);
+                        let up = *g.add(D_FF + k0 + jj);
+                        let gc = if gate > limit { limit } else { gate };
+                        let uc = if up > limit { limit } else if up < -limit { -limit } else { up };
+                        v[jj] = silu(gc) * uc;
+                        let a = if v[jj] < 0.0 { -v[jj] } else { v[jj] };
+                        if a > amax {
+                            amax = a;
+                        }
+                        jj += 1;
+                    }
+                    let amax = f32::from_bits(wave_reduce_umax::<0>(amax.to_bits()));
+                    let s = amax / 127.0;
+                    let inv = if s > 0.0 { 1.0 / s } else { 0.0 };
+                    let mut packed = 0u32;
+                    let mut sum = 0i32;
+                    let mut jj = 0;
+                    while jj < 4 {
+                        let rd = common::math::round(v[jj] * inv);
+                        let rd = if rd > 127.0 { 127.0 } else if rd < -127.0 { -127.0 } else { rd };
+                        let qv = rd as i8;
+                        packed |= ((qv as u8) as u32) << (8 * jj);
+                        sum += qv as i32;
+                        jj += 1;
+                    }
+                    let sum = wave_reduce_add::<0>(sum as u32) as i32;
+                    let d = dst.add(k * STEP_BYTES);
+                    *(d.add(gp * GROUP + lane as usize * 4) as *mut u32) = packed;
+                    if lane == 0 {
+                        *(d.add(2 * GROUP) as *mut f32).add(gp) = s;
+                        *(d.add(2 * GROUP + 8) as *mut i32).add(gp) = sum;
+                    }
+                    gi += 8;
+                }
+            };
+            let mut y = [0f32; common::q4::gfx11::PASS];
+            tile_pass::<D_FF>(lane, w_tile, ws_tile, slab, &stage, &mut y);
+            if lane < 16 && lane % 4 == 0 {
+                *out.add(j * H + tile * TILE + lane as usize / 4) = y[0];
+            }
+        }
+    }
+
+    /// One token's pass over the wave's tile: rounds of `round(1, steps)` steps, each round staged whole by
+    /// `stage(s0, r, 1, slab)` as `[r][STEP_BYTES]`, then the tile's sums. (`deepseek_v2_lite::expert::gfx11::tile_pass` at width one.)
+    #[inline(always)]
+    unsafe fn tile_pass<const K: usize>(lane: u32, w_tile: *const u8, ws_tile: *const f32, slab: *mut u8, stage: &impl Fn(usize, usize, usize, *mut u8), y: &mut [f32; common::q4::gfx11::PASS]) {
+        let steps = (K / GROUP).div_ceil(2);
+        let r = round(1, steps);
+        let mut s0 = 0;
+        while s0 + r <= steps {
+            stage(s0, r, 1, slab);
+            common::gfx11::workgroup_sync();
+            let mut k = 0;
+            while k < r {
+                gemv_tile_step::<K, 1>(lane, w_tile, ws_tile, s0 + k, slab.add(k * STEP_BYTES), y);
+                k += 1;
+            }
+            common::gfx11::workgroup_sync();
+            s0 += r;
+        }
+        let tail = steps - s0;
+        if tail > 0 {
+            stage(s0, tail, 1, slab);
+            common::gfx11::workgroup_sync();
+            let mut k = 0;
+            while k < tail {
+                gemv_tile_step::<K, 1>(lane, w_tile, ws_tile, s0 + k, slab.add(k * STEP_BYTES), y);
+                k += 1;
+            }
+            common::gfx11::workgroup_sync();
+        }
+    }
+
+    /// Step `st` (two groups) of a quantized activation into `dst` in `q4::gfx11`'s step layout, by the 32 threads `part`.
+    #[inline(always)]
+    unsafe fn stage_one<const K: usize>(part: usize, q: *const i8, ascale: *const f32, gsum: *const i32, st: usize, dst: *mut u8) {
+        let ng = K / GROUP;
+        let g = 2 * st;
+        let b = g * GROUP + part * 8;
+        if b < K {
+            core::ptr::write_unaligned(dst.add(part * 8) as *mut u64, core::ptr::read_unaligned(q.add(b) as *const u64));
+        }
+        if part < 2 && g + part < ng {
+            *(dst.add(2 * GROUP) as *mut f32).add(part) = *ascale.add(g + part);
+            *(dst.add(2 * GROUP + 8) as *mut i32).add(part) = *gsum.add(g + part);
+        }
+    }
+}

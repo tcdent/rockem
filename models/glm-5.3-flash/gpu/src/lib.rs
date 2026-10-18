@@ -3,6 +3,7 @@
 //! the linker turns into an ELF.
 #![no_std]
 
+pub use glm_5_3_flash::expert::gfx11 as xpt;
 pub use glm_5_3_flash::ffn::gfx11 as ffn;
 pub use glm_5_3_flash::hc::gfx11 as hc;
 pub use glm_5_3_flash::kda::gfx11 as kda;
