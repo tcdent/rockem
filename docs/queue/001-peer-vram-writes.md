@@ -23,6 +23,10 @@ Our own design discussion, 2026-10-17. The KFD topology (read 2026-10-18) puts t
 - 2026-10-17: evidence the link matters — the residency loader's BAR writes, flat out,
   doubled every card lap (003).
 
+- 2026-10-18: vLLM PR #61868 stores a GEMM epilogue straight into the next boundary kernel's
+  mailbox (−41 µs, a copy kernel removed). With peer mapping our producing kernels could do the
+  same into the receiver's VRAM, instead of writing VRAM and copying out with `hc_handoff`.
+
 ## Next
 1. ~~On the box: each card's `p2p_links`~~ — read 2026-10-18 over the console shell: gpu 50288 (node 4, io link to CPU node 2) ↔ gpu 60504 (node 5, io link to CPU node 3), p2p weight 52 flags 3; the link exists and crosses the socket's fabric between quadrants, not a shared switch. Note the c0 root port's card throws corrected PCIe replay errors under load (memory `metatron-pcie-link-errors`): the ping-pong bench should count them.
 2. The helper, then three benches beside the serving node: card-to-card ping-pong against the

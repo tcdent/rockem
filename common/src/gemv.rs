@@ -542,8 +542,8 @@ pub mod gfx11 {
     }
     /// FP8 e4m3 rows with an f32 scale per `FP8_BLOCK`-square block (`super::fp8`'s
     /// layout): a row is its bytes and its block row of scales. The decode is a
-    /// 256-entry table in LDS (`FP8_LDS` floats): decoding in registers ran the rows
-    /// at 210–290 GB/s against bf16's 700 (2026-10-15).
+    /// an f16 bit transplant in registers (`fp8_row_step`; the 256-entry LDS table of 2026-10-15
+    /// is set up still and unused — removed with its LDS when the next kernel change lands).
     #[derive(Clone, Copy)]
     pub struct Fp8 {
         pub w: *const u8,
@@ -568,6 +568,10 @@ pub mod gfx11 {
         }
     }
 
+    unsafe extern "C" {
+        #[link_name = "llvm.convert.from.fp16.f32"]
+        fn f16_to_f32(h: i16) -> f32;
+    }
     /// `bf16_row_step` for FP8 rows: the lane's eight bytes of step `s` decoded
     /// through the table at `lut` and scaled by their block's scale once, then
     /// the same products in the same order per token. A lane's eight elements
@@ -588,17 +592,30 @@ pub mod gfx11 {
                 scale[r] = *w[r].1.add(base / super::FP8_BLOCK);
                 r += 1;
             }
-            // four weights at a time: eight decoded at once spilled a register (2026-10-15)
+            // four weights at a time: eight decoded at once spilled a register (2026-10-15).
+            // The decode transplants each byte's bits into an f16 (sign to bit 15, the seven
+            // magnitude bits one place down, Marlin's form): the f16 is the e4m3 value × 2⁻⁸ exactly,
+            // normals and subnormals alike (both formats are linear below their first binade and the
+            // mantissa lands top-aligned), so the block scale carries the 2⁸ and `w · scale` rounds as
+            // it did through the table (`e4m3`) — bit-identical except at the NaN codes 0x7f/0xff,
+            // which weights never hold. The table (`lut`, an LDS load a weight) ran `ffn_gu` at one
+            // token in 59.9 µs, this in 48.8 (2026-10-18, bench-fp8-rows); sixteen bytes a lane over a
+            // step pair measured 42.9 at one token but slower at two to thirty-two, and is not kept.
+            let _ = lut;
             let mut h = 0;
             while h < 2 {
                 let mut wv = [[0f32; 4]; R];
                 let mut r = 0;
                 while r < R {
-                    let mut j = 0;
-                    while j < 4 {
-                        wv[r][j] = *lut.add(((q[r] >> (8 * (4 * h + j))) & 0xff) as usize) * scale[r];
-                        j += 1;
-                    }
+                    let word = (q[r] >> (32 * h)) as u32;
+                    let odd = (word & 0x8000_8000) | ((word & 0x7f00_7f00) >> 1); // bytes 1 and 3
+                    let sh = word << 8;
+                    let even = (sh & 0x8000_8000) | ((sh & 0x7f00_7f00) >> 1); // bytes 0 and 2
+                    let sc = scale[r] * 256.0;
+                    wv[r][0] = f16_to_f32((even & 0xffff) as i16) * sc;
+                    wv[r][1] = f16_to_f32((odd & 0xffff) as i16) * sc;
+                    wv[r][2] = f16_to_f32((even >> 16) as i16) * sc;
+                    wv[r][3] = f16_to_f32((odd >> 16) as i16) * sc;
                     r += 1;
                 }
                 let mut i = 0;
