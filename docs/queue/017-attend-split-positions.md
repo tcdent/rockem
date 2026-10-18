@@ -1,6 +1,6 @@
 # 017 — Attend: positions split across workgroups (decode at long context)
 
-**Status:** Built 2026-10-18 with 018 (bench: 380–430 → 226 µs a layer a two-token step, 1.7–1.9×); the node's integration and gate next
+**Status:** Deployed 2026-10-18 13:06 with 018 — the 18k decode step 31.2 → 28.7 ms a step token
 **Area:** decode, long context
 **Gain:** measured ceiling ~4 ms a verify step at any context past 2,050 positions
 
@@ -29,5 +29,7 @@ bit-identical to today's single-workgroup order.
   W_uv 37, against the scalar's 380–430. Smaller chunks lost (the per-workgroup fixed cost), the
   scalar q_abs (39) is the next item: it wants a transposed `W_uk` copy or the rows shape.
 
+- 2026-10-18 13:10, served: the warm 18k decode step **31.2 → 28.7 ms a step token** (the short-context step 24–26: the long-context cliff is 4.4 → ~2.5 ms a step).
+
 ## Next
-With 018's integration. Expected served: ~2 ms a verify step at long context (31 → ~29 ms at 18k).
+The scalar q_abs at a verify step (39 µs a layer, 0.4 ms a step) wants the rows shape or a transposed `W_uk`; the attend's 119 µs a layer is the tile loop's ~5 µs a tile (018's shelf).

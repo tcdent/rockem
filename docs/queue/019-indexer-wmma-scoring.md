@@ -1,6 +1,6 @@
 # 019 — Indexer scoring on WMMA
 
-**Status:** Quantified (bench, 2026-10-18) — `ix_score` is 1.6 µs a token per 1k positions a layer, linear: 0.3 ms a prompt token at 18k, 4.7 at 262k, ~18 at 1M; a decode step at 262k 14 ms of scoring, at 1M ~56; `ix_select` at decode 0.07 ms a layer at 65k, ~0.7 at 1M
+**Status:** Built 2026-10-18 (`ix_score_w`: 27–34× the scalar at a 512-step, 2.6–5.3× at a two-token step past 18k; selections agree to 0.03–0.3 %); the node's integration deploying; the decode selection's split still open
 **Area:** long context (prefill and decode)
 **Gain:** measured — the whole scoring cost above, ~10× on WMMA; the selection needs its own split (below)
 
@@ -27,6 +27,27 @@ launch); our 1M arithmetic (~13 GMAC and ~1.6 GB of f32 pool keys read a decode 
   decode step, 8 ms a step over 11 layers, so the selection needs a split-row form as well
   (SGLang #43775 / vLLM #60618).
 
+- 2026-10-18 13:15, built (`ix_score_w`: a workgroup scores 16 tokens against 128 pools, a pool tile
+  a wave with its eight key fragments in registers for the whole kernel, the queries staged as bf16 a
+  round of 8 heads at a time, ReLU and the head weight on each head's tile, summed in registers).
+  `bench-mla-attend`, µs a token a layer, scalar → WMMA:
+
+  | positions | 512-step | two-token step |
+  |---|---|---|
+  | 2k | 1.25 → 0.22 | 9.5 → 24 |
+  | 18k | 27.6 → 1.0 | 31.5 → 24 |
+  | 65k | 109 → 3.3 | 141 → 49 |
+  | 262k | 435 → 12.8 | 652 → 123 |
+
+  At 1M, extrapolated: ~0.6 ms a prompt token over 11 layers (18 before) and ~5 ms a decode step (56).
+  Selections against the scalar scorer's: 276–2,048 of 1.05 M positions differ at a 512-step
+  (0.03–0.2 %), 0–12 of 4,099 at two tokens — near-tie flips from the bf16 queries (the reference's
+  dtype). The two-token form pads 2 tokens to a 16-row tile and is 5 µs a layer slower than the scalar
+  below ~4k positions (**Quantified, on the shelf — 0.05 ms a step token at short context**: a
+  position-derived twin). One kernel serves both.
+
 ## Next
-Build after 018 shares its WMMA staging: scores as `[32 × 128] · [128 × pools]` a token (rows of 16
+Deploying in the node (`ix_select` launches it over the pools the step's last token sees). Then the
+selection at decode: `ix_select` is one workgroup a token over every pool (182 µs a layer at 262k,
+~0.7 ms at 1M — 8 ms a step over 11 layers): a split-row select. Build after 018 shares its WMMA staging: scores as `[32 × 128] · [128 × pools]` a token (rows of 16
 queries at prefill), ReLU and the head weights in the epilogue, f32 scores; then a split-row select.

@@ -10,7 +10,7 @@
 mod kfd;
 
 use glm_5_3_flash::kda::gfx11_consts as g;
-use glm_5_3_flash::mla::gfx11_consts::{aw_chunk, aw_chunks, AW_HEAD_TILES, AW_LDS, AW_MERGE_LDS, AW_PART, AW_WG, IX_ROWS, SELECT_LDS};
+use glm_5_3_flash::mla::gfx11_consts::{aw_chunk, aw_chunks, ixw_grid, AW_HEAD_TILES, AW_LDS, AW_MERGE_LDS, AW_PART, AW_WG, IXW_LDS, IX_ROWS, SELECT_LDS};
 use glm_5_3_flash::{DENSE_BELOW, INDEX_HEAD_DIM, INDEX_KPOOL, INDEX_N_HEADS, KVB_HEAD, KV_LORA_RANK, MLA_HEADS, Q_HEAD, V_HEAD_DIM};
 use harness::arg;
 
@@ -45,7 +45,8 @@ fn main() {
         let v: Vec<u16> = (0..(maxpos + maxn) * KV_LORA_RANK).map(|_| (rng.unit().to_bits() >> 16) as u16).collect();
         upload_u16(&lat, &v);
     }
-    let sel = k.vram(maxn * DENSE_BELOW * 4);
+    let sel = k.vram_visible(maxn * DENSE_BELOW * 4);
+    let k_score_w = k.kernel("ix_score_w");
     let counts = k.vram_visible(maxn * 4);
     let heads = k.vram_visible(maxn * MLA_HEADS * V_HEAD_DIM * 4);
     let heads_w = k.vram_visible(maxn * MLA_HEADS * V_HEAD_DIM * 4);
@@ -92,11 +93,41 @@ fn main() {
                 a.ptr(iq.va).ptr(ix.va).ptr(pools.va).ptr(score.va).u32(pos as u32).u32(nb as u32).u32(npools as u32).f32(scale).f32(wscale);
                 k.launch(&k_score, (n * nb) as u32, g::WG, 0, &a);
             });
+            // the WMMA scorer: its time, then the selection it leads to against the scalar scorer's
+            let t_score_w = time(&|| {
+                let mut a = kfd::Args::new();
+                a.ptr(iq.va).ptr(ix.va).ptr(pools.va).ptr(score.va).u32(n as u32).u32(((pos + n) / INDEX_KPOOL) as u32).u32(npools as u32).f32(scale).f32(wscale);
+                k.launch(&k_score_w, ixw_grid(n, (pos + n) / INDEX_KPOOL), 256, IXW_LDS as u32, &a);
+            });
+            let select = || {
+                let mut a = kfd::Args::new();
+                a.ptr(score.va).u32(npools as u32).u32(pos as u32).ptr(sel.va).ptr(counts.va);
+                k.launch(&k_select, n as u32, g::WG, SELECT_LDS as u32, &a);
+                k.sync();
+            };
+            select();
+            let sel_w: Vec<u32> = unsafe { std::slice::from_raw_parts(sel.ptr() as *const u32, n * DENSE_BELOW) }.to_vec();
+            let cnt_w: Vec<u32> = unsafe { std::slice::from_raw_parts(counts.ptr() as *const u32, n) }.to_vec();
             let t_select = time(&|| {
                 let mut a = kfd::Args::new();
                 a.ptr(score.va).u32(npools as u32).u32(pos as u32).ptr(sel.va).ptr(counts.va);
                 k.launch(&k_select, n as u32, g::WG, SELECT_LDS as u32, &a);
             });
+            // the scalar scorer's selection (the one the attends below use)
+            {
+                let mut a = kfd::Args::new();
+                a.ptr(iq.va).ptr(ix.va).ptr(pools.va).ptr(score.va).u32(pos as u32).u32(nb as u32).u32(npools as u32).f32(scale).f32(wscale);
+                k.launch(&k_score, (n * nb) as u32, g::WG, 0, &a);
+                select();
+            }
+            let sel_s = unsafe { std::slice::from_raw_parts(sel.ptr() as *const u32, n * DENSE_BELOW) };
+            let cnt_s = unsafe { std::slice::from_raw_parts(counts.ptr() as *const u32, n) };
+            let mut sel_diff = 0usize;
+            for i in 0..n {
+                let (a, b) = (&sel_s[i * DENSE_BELOW..i * DENSE_BELOW + cnt_s[i] as usize], &sel_w[i * DENSE_BELOW..i * DENSE_BELOW + cnt_w[i] as usize]);
+                let bs: std::collections::HashSet<u32> = b.iter().copied().collect();
+                sel_diff += a.iter().filter(|p| !bs.contains(p)).count();
+            }
             let t_attend = time(&|| {
                 let mut a = kfd::Args::new();
                 a.ptr(q.va).ptr(kvb.va).ptr(lat.va).ptr(sel.va).ptr(counts.va).ptr(heads.va);
@@ -179,6 +210,7 @@ fn main() {
             }
             let mut c = vec![0u32; n];
             unsafe { std::ptr::copy_nonoverlapping(counts.ptr() as *const u32, c.as_mut_ptr(), n) };
+            println!("    ix_score_w {t_score_w:.1} µs ({:.2} a token); selection vs scalar: {sel_diff} positions differ of {}", t_score_w / n as f64, cnt_s.iter().map(|&c| c as usize).sum::<usize>());
             println!("{pos:>9} {n:>6} {t_score:>12.1} ({:>7.2}) {t_select:>12.1} ({:>7.2}) {t_attend:>12.1} ({:>7.2}) {t_w:>12.1} ({:>7.2}) ×{chunks:<2} = qabs {t_qabs:.0} + attend {t_aw:.0} + merge {t_merge:.0} + uv {t_uv:.0}  selected {}; |Δ|max {dmax:.2e} of {vmax:.2e}, non-finite {nans}", t_score / n as f64, t_select / n as f64, t_attend / n as f64, t_w / n as f64, c[n - 1]);
         }
     }

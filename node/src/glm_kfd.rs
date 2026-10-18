@@ -42,11 +42,11 @@ use glm_5_3_flash::kda::gfx11_consts as g;
 use common::gemv::ROWS;
 use glm_5_3_flash::ffn::gfx11_consts::ROWS_GU;
 use glm_5_3_flash::layout::{KDA_MEMORY, KDA_WINDOW};
-use glm_5_3_flash::mla::gfx11_consts::{ATTEND_GRID, ATTEND_LDS, IX_ROWS, O_IN, ROWS_QB, SELECT_LDS};
+use glm_5_3_flash::mla::gfx11_consts::{aw_chunk, aw_chunks, aw_grid, ixw_grid, AW_DECODE_CHUNKS, AW_HEAD_TILES, AW_LDS, AW_MERGE_LDS, AW_PART, AW_WG, IXW_LDS, IX_ROWS, O_IN, ROWS_QB, SELECT_LDS};
 use glm_5_3_flash::expert::gfx11_consts::{DOWN_WGS as XPT_DOWN_WGS, SLOT_BYTES, UP_WGS as XPT_UP_WGS, XPT_LDS};
 use glm_5_3_flash::DENSE_BELOW;
 use glm_5_3_flash::TOP_K;
-use glm_5_3_flash::{INDEX_HEAD_DIM, INDEX_N_HEADS, KV_LORA_RANK, Q_LORA_RANK};
+use glm_5_3_flash::{INDEX_HEAD_DIM, INDEX_N_HEADS, KV_LORA_RANK, Q_LORA_RANK, V_HEAD_DIM};
 use glm_5_3_flash::weights::{Attn, Ffn, Fp8, Weights};
 use glm_5_3_flash::{CONV_DIM, CONV_TAPS, D_FF, H, HC, INDEX_KPOOL, INTERMEDIATE_SIZE, SPEC_TOKENS, KDA_DIM, KDA_HEADS, KDA_QKV, LINEAR_ATTENTION, MLA_HEADS, NUM_HIDDEN_LAYERS, N_SHARED_EXPERTS, Q_HEAD, STEP, TOKENS, VOCAB_SIZE};
 use std::sync::atomic::AtomicU32;
@@ -142,8 +142,13 @@ struct Card {
     ffn_down_dense: crate::kfd::Kernel,
     mla_qb: crate::kfd::Kernel,
     mla_iq: crate::kfd::Kernel,
-    mla_attend: crate::kfd::Kernel,
-    ix_score: crate::kfd::Kernel,
+    mla_qabs: crate::kfd::Kernel,
+    mla_qabs_w: crate::kfd::Kernel,
+    mla_attend_w: crate::kfd::Kernel,
+    mla_attend_merge: crate::kfd::Kernel,
+    mla_uv: crate::kfd::Kernel,
+    mla_uv_w: crate::kfd::Kernel,
+    ix_score_w: crate::kfd::Kernel,
     ix_select: crate::kfd::Kernel,
     add2: crate::kfd::Kernel,
     mtp_eh: crate::kfd::Kernel,
@@ -181,6 +186,9 @@ struct Card {
     miq: Mem,    // [STEP][INDEX_N_HEADS·INDEX_HEAD_DIM] f32: the indexer's query, the card's scorer's input
     mscore: Mem, // [STEP][pools] f32: the indexer's scores, the card's selection's input
     mheads: Mem, // [STEP][O_IN] f32: the heads' outputs, the output projection's input
+    mqabs: Mem,  // [STEP][MLA_HEADS][KV_LORA_RANK] bf16: q_abs, the attend's A operand (`mla_qabs`)
+    molat: Mem,  // [STEP][MLA_HEADS][KV_LORA_RANK] f32: the normalized mixes, W_uv's input
+    mpart: Mem,  // [SPEC_TOKENS][AW_HEAD_TILES][AW_DECODE_CHUNKS][AW_PART] f32: a verify step's attend partials
 }
 /// The draft layer's own pieces on the head's card (its MLA attention is `mlas[MTP_LAYER]`, its
 /// routed experts the host's as layer `MTP_LAYER`): `eh_proj`, the norms, the shared expert, and
@@ -363,8 +371,13 @@ impl Cards {
                     ffn_down_dense: k.kernel("ffn_down_dense"),
                     mla_qb: k.kernel("mla_qb"),
                     mla_iq: k.kernel("mla_iq"),
-                    mla_attend: k.kernel("mla_attend"),
-                    ix_score: k.kernel("ix_score"),
+                    mla_qabs: k.kernel("mla_qabs"),
+                    mla_qabs_w: k.kernel("mla_qabs_w"),
+                    mla_attend_w: k.kernel("mla_attend_w"),
+                    mla_attend_merge: k.kernel("mla_attend_merge"),
+                    mla_uv: k.kernel("mla_uv"),
+                    mla_uv_w: k.kernel("mla_uv_w"),
+                    ix_score_w: k.kernel("ix_score_w"),
                     ix_select: k.kernel("ix_select"),
                     add2: k.kernel("add2"),
                     mtp_eh: k.kernel("mtp_eh"),
@@ -405,6 +418,9 @@ impl Cards {
                     miq: alloc(STEP * INDEX_N_HEADS * INDEX_HEAD_DIM),
                     mscore: alloc(STEP * max_ctx.div_ceil(INDEX_KPOOL)),
                     mheads: alloc(STEP * O_IN),
+                    mqabs: k.vram(STEP * MLA_HEADS * KV_LORA_RANK * 2),
+                    molat: k.vram(STEP * MLA_HEADS * KV_LORA_RANK * 4),
+                    mpart: k.vram(SPEC_TOKENS * AW_HEAD_TILES * AW_DECODE_CHUNKS * AW_PART * 4),
                     k,
                 }
             })
@@ -1249,11 +1265,13 @@ impl Placed for Cards {
         // nothing comes back to the host but a count asked for (bring-up)
         let stride = self.npools;
         if glm_5_3_flash::mla::selects(pos + n - 1) {
-            let nb = ((pos + n) / INDEX_KPOOL).div_ceil(256);
+            // the scores on the matrix path (docs/queue/019): a tile of 16 tokens against 128 pools a
+            // workgroup, over the pools the step's last token sees
+            let visible = (pos + n) / INDEX_KPOOL;
             let (scale, wscale) = glm_5_3_flash::mla::score_scales();
             let mut a = Args::new();
-            a.ptr(c.miq.va).ptr(c.mproj.at(MIX * 4)).ptr(m.pools.va).ptr(c.mscore.va).u32(pos as u32).u32(nb as u32).u32(stride as u32).f32(scale).f32(wscale);
-            c.k.launch(&c.ix_score, (n * nb) as u32, g::WG, 0, &a);
+            a.ptr(c.miq.va).ptr(c.mproj.at(MIX * 4)).ptr(m.pools.va).ptr(c.mscore.va).u32(n as u32).u32(visible as u32).u32(stride as u32).f32(scale).f32(wscale);
+            c.k.launch(&c.ix_score_w, ixw_grid(n, visible), 256, IXW_LDS as u32, &a);
         }
         let mut a = Args::new();
         a.ptr(c.mscore.va).u32(stride as u32).u32(pos as u32).ptr(c.msel.va).ptr(c.mseln.va);
@@ -1268,11 +1286,36 @@ impl Placed for Cards {
     fn mla_attend(&mut self, l: usize, n: usize, pos: usize, latents: &[u16]) {
         let m = self.mlas[l].as_ref().unwrap();
         let c = &self.cards[m.card];
-        // the step's latents into the mirror; the selections are the card's (`ix_select`); one launch over (token, heads)
+        // the step's latents into the mirror; the selections are the card's (`ix_select`). The attend on the
+        // matrix path (docs/queue/018, 017): q_abs for every head, the attend over (token, 16 heads) — a
+        // verify step's token in chunks of positions merged after — and W_uv over the step; the few-token
+        // twins of q_abs and W_uv below SPEC_TOKENS, like the rows kernels'
         c.k.upload(&m.lat, pos * KV_LORA_RANK * 2, raw(&latents[..n * KV_LORA_RANK]));
         let mut a = Args::new();
-        a.ptr(c.mq.va).ptr(m.kv_b.va).ptr(m.lat.va).ptr(c.msel.va).ptr(c.mseln.va).ptr(c.mheads.va);
-        c.k.launch(&c.mla_attend, ATTEND_GRID * n as u32, g::WG, ATTEND_LDS as u32, &a);
+        a.ptr(c.mq.va).ptr(m.kv_b.va).ptr(c.mqabs.va);
+        if n > SPEC_TOKENS {
+            a.u32(n as u32);
+            c.k.launch(&c.mla_qabs_w, MLA_HEADS as u32 * g::wmma_grid(KV_LORA_RANK, n), g::WG, g::WMMA_LDS, &a);
+        } else {
+            c.k.launch(&c.mla_qabs, (n * MLA_HEADS) as u32, 256, 0, &a);
+        }
+        let (chunk, chunks) = (aw_chunk(n), aw_chunks(n));
+        let mut a = Args::new();
+        a.ptr(c.mqabs.va).ptr(m.lat.va).ptr(c.msel.va).ptr(c.mseln.va).ptr(c.molat.va).ptr(c.mpart.va).u32(chunks as u32).u32(chunk as u32);
+        c.k.launch(&c.mla_attend_w, aw_grid(n), AW_WG, AW_LDS as u32, &a);
+        if chunks > 1 {
+            let mut a = Args::new();
+            a.ptr(c.mpart.va).ptr(c.molat.va);
+            c.k.launch(&c.mla_attend_merge, (n * AW_HEAD_TILES) as u32, AW_WG, AW_MERGE_LDS as u32, &a);
+        }
+        let mut a = Args::new();
+        a.ptr(c.molat.va).ptr(m.kv_b.va).ptr(c.mheads.va);
+        if n > SPEC_TOKENS {
+            a.u32(n as u32);
+            c.k.launch(&c.mla_uv_w, MLA_HEADS as u32 * g::wmma_grid(V_HEAD_DIM, n), g::WG, g::WMMA_LDS, &a);
+        } else {
+            c.k.launch(&c.mla_uv, (n * MLA_HEADS) as u32, 256, (KV_LORA_RANK * 4) as u32, &a);
+        }
     }
     fn mla_out(&mut self, l: usize, n: usize) {
         let m = self.mlas[l].as_ref().unwrap();

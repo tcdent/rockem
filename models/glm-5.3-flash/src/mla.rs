@@ -414,6 +414,19 @@ pub mod gfx11_consts {
     const _: () = assert!(MLA_HEADS % ATTEND_H == 0 && ATTEND_LDS <= 60 * 1024);
     /// `ix_select`'s LDS: a 256-bin histogram and the scan's eight wave totals, u32.
     pub const SELECT_LDS: usize = 4 * (256 + 8);
+    /// `ix_score_w` (docs/queue/019): a workgroup scores a tile of 16 tokens against 128 pools (a pool
+    /// tile a wave), the heads in rounds of `IXW_HEADS`; LDS: the round's queries as bf16 rows padded
+    /// off the bank width, and the tokens' head weights.
+    pub const IXW_HEADS: usize = 8;
+    pub const IXW_POOLS: usize = 8 * 16;
+    pub const IXW_QS: usize = INDEX_HEAD_DIM + 8;
+    pub const IXW_Q: usize = 0;
+    pub const IXW_W: usize = IXW_Q + IXW_HEADS * 16 * IXW_QS * 2;
+    pub const IXW_LDS: usize = IXW_W + 16 * INDEX_N_HEADS * 4;
+    pub const fn ixw_grid(n: usize, pools: usize) -> u32 {
+        (n.div_ceil(16) * pools.div_ceil(IXW_POOLS)) as u32
+    }
+    const _: () = assert!(INDEX_N_HEADS % IXW_HEADS == 0 && INDEX_HEAD_DIM % 16 == 0 && IXW_LDS <= 60 * 1024);
 
     /// `mla_attend_w` (docs/queue/018, 017): a workgroup takes a WMMA tile of 16 heads of one token
     /// over a chunk of its selected positions, 256 threads (eight waves). LDS in bytes: `q_abs` as
@@ -1151,6 +1164,117 @@ pub mod gfx11 {
                 h += 1;
             }
             *score.add(i * stride as usize + j) = sc;
+        }
+    }
+    /// The indexer's scoring on the matrix path (docs/queue/019): `score[i][j] = Σ_h w[i][h]·wscale ·
+    /// relu(scale · q[i][h] · pool[j])` for a tile of 16 tokens against 128 pools a workgroup — a pool
+    /// tile a wave, its eight B fragments (the pools' bf16 keys, 16 × 16 channels) held in registers
+    /// for the whole kernel, the queries staged as bf16 (the reference's dtype) a round of 8 heads at
+    /// a time, one WMMA tile `[16 tokens × 128] · [128 × 16 pools]` a head, ReLU and the head's
+    /// weight on the tile, summed over the heads in registers. The scalar `ix_score` ran a thread a
+    /// (token, pool) at 1.6 µs a token per 1k positions a layer. Grid: ixw_grid(n, pools), 256 threads, LDS IXW_LDS.
+    /// Tokens past `n` compute and are not stored; pools past `pools` are not stored.
+    #[no_mangle]
+    pub extern "gpu-kernel" fn ix_score_w(iq: *const f32, ix: *const f32, pools: *const u16, score: *mut f32, n: u32, npools: u32, stride: u32, scale: f32, wscale: f32) {
+        unsafe {
+            use common::gemv::gfx11::{to_bf16, v16i16, v8f32, wmma};
+            use common::gfx11::{lds, workgroup_sync};
+            use core::arch::amdgpu::workgroup_id_x;
+            const C: usize = INDEX_HEAD_DIM;
+            const QS: usize = IXW_QS;
+            let (n, npools, stride) = (n as usize, npools as usize, stride as usize);
+            let blocks = npools.div_ceil(IXW_POOLS);
+            let wg = workgroup_id_x() as usize;
+            let (tt, pb) = (wg / blocks, wg % blocks);
+            let t = workitem_id_x() as usize;
+            let (lane, wave) = (t % 32, t / 32);
+            let base: *mut u8 = lds();
+            let qs = base.add(IXW_Q) as *mut u16;
+            let ws = base.add(IXW_W) as *mut f32;
+            // this wave's pool tile: pool pb·128 + wave·16 + lane % 16, its eight k fragments (a pool past the
+            // allocated keys reads the last one; its scores are not stored)
+            let mut pj = pb * IXW_POOLS + wave * 16 + lane % 16;
+            if pj >= npools {
+                pj = npools - 1;
+            }
+            let key = pools.add(pj * C);
+            let mut bf = [v16i16([0; 16]); C / 16];
+            let mut k = 0;
+            while k < C / 16 {
+                bf[k] = core::ptr::read_unaligned(key.add(k * 16) as *const v16i16);
+                k += 1;
+            }
+            // the tile's head weights: [16 tokens][INDEX_N_HEADS] (a token past n reads token n - 1)
+            {
+                let mut e = t;
+                while e < 16 * INDEX_N_HEADS {
+                    let (tok, h) = (e / INDEX_N_HEADS, e % INDEX_N_HEADS);
+                    let ti = tt * 16 + tok;
+                    let ti = if ti < n { ti } else { n - 1 };
+                    *ws.add(e) = *ix.add(ti * IX_ROWS + 2 * C + h) * wscale;
+                    e += 256;
+                }
+            }
+            let mut acc = v8f32([0.0; 8]);
+            let mut h0 = 0;
+            while h0 < INDEX_N_HEADS {
+                // stage the round's queries: 8 heads × 16 tokens × 128 channels, eight channels a thread a store
+                {
+                    let mut v = t;
+                    while v < IXW_HEADS * 16 * (C / 8) {
+                        let (hh, rest) = (v / (16 * (C / 8)), v % (16 * (C / 8)));
+                        let (tok, c8) = (rest / (C / 8), rest % (C / 8));
+                        let ti = tt * 16 + tok;
+                        let ti = if ti < n { ti } else { n - 1 };
+                        let src = iq.add((ti * INDEX_N_HEADS + h0 + hh) * C + c8 * 8);
+                        let mut packed = [0u16; 8];
+                        let mut u = 0;
+                        while u < 8 {
+                            packed[u] = to_bf16(*src.add(u));
+                            u += 1;
+                        }
+                        *(qs.add((hh * 16 + tok) * QS + c8 * 8) as *mut [u16; 8]) = packed;
+                        v += 256;
+                    }
+                }
+                workgroup_sync();
+                let mut hh = 0;
+                while hh < IXW_HEADS {
+                    let mut d = v8f32([0.0; 8]);
+                    let mut k = 0;
+                    while k < C / 16 {
+                        let a: v16i16 = core::ptr::read_unaligned(qs.add((hh * 16 + lane % 16) * QS + k * 16) as *const v16i16);
+                        d = wmma(a, bf[k], d);
+                        k += 1;
+                    }
+                    // D[token 2r + lane/16][pool lane % 16]: ReLU, the token's weight for this head, summed
+                    let dv: [f32; 8] = core::mem::transmute(d);
+                    let mut av: [f32; 8] = core::mem::transmute(acc);
+                    let mut r = 0;
+                    while r < 8 {
+                        let x = dv[r] * scale;
+                        let x = if x > 0.0 { x } else { 0.0 };
+                        av[r] += *ws.add((2 * r + lane / 16) * INDEX_N_HEADS + h0 + hh) * x;
+                        r += 1;
+                    }
+                    acc = core::mem::transmute(av);
+                    hh += 1;
+                }
+                workgroup_sync();
+                h0 += IXW_HEADS;
+            }
+            let av: [f32; 8] = core::mem::transmute(acc);
+            let pool = pb * IXW_POOLS + wave * 16 + lane % 16;
+            if pool < npools && pool < stride {
+                let mut r = 0;
+                while r < 8 {
+                    let ti = tt * 16 + 2 * r + lane / 16;
+                    if ti < n {
+                        *score.add(ti * stride + pool) = av[r];
+                    }
+                    r += 1;
+                }
+            }
         }
     }
     /// The indexer's selection on the card: a workgroup a token, `pick`'s result — below `KEEP`

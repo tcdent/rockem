@@ -1,6 +1,6 @@
 # 018 — Sparse attend on WMMA for prefill (heads as rows)
 
-**Status:** Built 2026-10-18 (bench: 151 → 36 µs a token a layer at a 512-step, 4.2×); the node's integration and gate next
+**Status:** Deployed 2026-10-18 13:06 — prefill at 18k positions 6.7 → 5.0–5.4 ms a prompt token, the 18k prompt 127 → 100 s; SCORE NLL +0.003 (the text's noise floor); the step gate at long positions pending a lab boot
 **Area:** prefill, long context
 **Gain:** measured ceiling ~1.7 ms a prompt token at any context past 2,050 positions (the kernel runs at ~1.8 TFLOP/s; WMMA takes the same work ~10× down)
 
@@ -43,8 +43,16 @@ experiments 014–016 (every scalar shape tried; this one untried).
   (a deadlock, the card reset, the node lost). Expected served: ~1.3 ms a prompt token at any context
   past 2,050 positions.
 
+- 2026-10-18 13:06, deployed (`971f5df`…): the node's `mla_attend` is q_abs → attend → W_uv by the
+  step. Served: the 512-step at 18k positions **6.7–6.8 → 5.0–5.4 ms a prompt token**, and the card
+  wait no longer grows with position (1.9 → 2.1 ms across the prompt against 2.3 → 3.7); the 18k cold
+  prompt **127 → 100 s** (no hardware errors in either boot). Long SCORE: NLL 0.0407 → 0.0437, mean |Δ
+  logprob| 9.6e-3, 99 % moved, max 4.9 at a near-tie — the same size as the bf16-state step and the
+  text's ±0.003 floor. Decode acceptance on the short text 0.85 (0.88).
+
 ## Next
-The node: `mla_attend` → the three launches by the step (q_abs and W_uv twins by `SPEC_TOKENS`, the
+The step gate (top-1/KL) at long positions needs the gate binary beside the node: a `rockem.resident=0`
+lab boot, batched with the next lab run. Then: `mla_attend` → the three launches by the step (q_abs and W_uv twins by `SPEC_TOKENS`, the
 chunked form with its merge below it); the gate (step gate top-1/KL at long positions, long SCORE);
 deploy; the scalar `mla_attend` kernel stays as the bench's reference. On the shelf after: the attend
 at 34 µs a token is ~5 µs a tile where its WMMA, LDS and VALU add to ~1.5 — two tiles an iteration
