@@ -13,7 +13,8 @@
 //! (latent | indexer key | indexer gate) and `pools` `[max_ctx / INDEX_KPOOL]
 //! [INDEX_HEAD_DIM]`, both filled through position `pos` by this step.
 
-use crate::layout::MLA_ROW;
+use crate::layout::{MLA_ROW, MLA_ROW_U16};
+use common::gemv::widen;
 use crate::weights;
 use crate::*;
 use common::gemv;
@@ -44,12 +45,12 @@ pub const HEAD_SCRATCH: usize = 2 * KV_LORA_RANK + DENSE_BELOW;
 /// The complete pool `j`'s key from its positions' indexer keys and gates (`cache` rows):
 /// a per-channel softmax over the four gates plus the learned offset per slot.
 #[inline(always)]
-pub fn pool_key(w: &weights::Mla, cache: &[f32], j: usize, out: &mut [f32]) {
+pub fn pool_key(w: &weights::Mla, cache: &[u16], j: usize, out: &mut [u16]) {
     for c in 0..INDEX_HEAD_DIM {
         let mut logit = [0f32; INDEX_KPOOL];
         let mut mx = f32::NEG_INFINITY;
         for i in 0..INDEX_KPOOL {
-            logit[i] = cache[(j * INDEX_KPOOL + i) * MLA_ROW + KV_LORA_RANK + INDEX_HEAD_DIM + c] + w.ix_ape[i * INDEX_HEAD_DIM + c];
+            logit[i] = gate(cache, j * INDEX_KPOOL + i)[c] + w.ix_ape[i * INDEX_HEAD_DIM + c];
             if logit[i] > mx {
                 mx = logit[i];
             }
@@ -63,10 +64,46 @@ pub fn pool_key(w: &weights::Mla, cache: &[f32], j: usize, out: &mut [f32]) {
         // weighted sum accumulated in f32 and stored at bf16 precision
         let mut acc = 0f32;
         for i in 0..INDEX_KPOOL {
-            acc += bf16_round(logit[i] / sum) * cache[(j * INDEX_KPOOL + i) * MLA_ROW + KV_LORA_RANK + c];
+            acc += bf16_round(logit[i] / sum) * widen(key(cache, j * INDEX_KPOOL + i)[c]);
         }
-        out[c] = bf16_round(acc);
+        out[c] = bits(bf16_round(acc));
     }
+}
+/// The 16 bits of a value already at bf16 precision.
+#[inline(always)]
+fn bits(v: f32) -> u16 {
+    (v.to_bits() >> 16) as u16
+}
+/// Position `pos`'s latent (bf16), indexer key (bf16) and indexer gate (f32) in the packed cache.
+#[inline(always)]
+pub fn latent(cache: &[u16], pos: usize) -> &[u16] {
+    &cache[pos * MLA_ROW_U16..pos * MLA_ROW_U16 + KV_LORA_RANK]
+}
+#[inline(always)]
+pub fn key(cache: &[u16], pos: usize) -> &[u16] {
+    &cache[pos * MLA_ROW_U16 + KV_LORA_RANK..pos * MLA_ROW_U16 + KV_LORA_RANK + INDEX_HEAD_DIM]
+}
+#[inline(always)]
+pub fn gate(cache: &[u16], pos: usize) -> &[f32] {
+    let g = &cache[pos * MLA_ROW_U16 + KV_LORA_RANK + INDEX_HEAD_DIM..(pos + 1) * MLA_ROW_U16];
+    let (a, f, b) = unsafe { g.align_to::<f32>() };
+    assert!(a.is_empty() && b.is_empty());
+    f
+}
+/// A bundle row (`[MLA_ROW]` f32) into the packed form, and back (the latent and key at bf16 precision).
+pub fn pack_row(src: &[f32], dst: &mut [u16]) {
+    for c in 0..KV_LORA_RANK + INDEX_HEAD_DIM {
+        dst[c] = bits(bf16_round(src[c]));
+    }
+    let g = &mut dst[KV_LORA_RANK + INDEX_HEAD_DIM..MLA_ROW_U16];
+    let (_, f, _) = unsafe { g.align_to_mut::<f32>() };
+    f.copy_from_slice(&src[KV_LORA_RANK + INDEX_HEAD_DIM..MLA_ROW]);
+}
+pub fn unpack_row(src: &[u16], dst: &mut [f32]) {
+    for c in 0..KV_LORA_RANK + INDEX_HEAD_DIM {
+        dst[c] = widen(src[c]);
+    }
+    dst[KV_LORA_RANK + INDEX_HEAD_DIM..MLA_ROW].copy_from_slice(gate(src, 0));
 }
 
 /// Pools one scoring item takes (`score_pools` over the thread pool).
@@ -78,7 +115,7 @@ pub const KEEP: usize = INDEX_TOPK / INDEX_KPOOL;
 /// `head_scale`): per pool, the heads' ReLU'd dots with the pool key, weighted. One token's pools
 /// go in blocks over the thread pool; the dot's order is the definition's whichever block runs it.
 #[inline(always)]
-pub fn score_pools(iq: &[f32], iw: &[f32], pools: &[f32], j0: usize, j1: usize, pscore: &mut [f32]) {
+pub fn score_pools(iq: &[f32], iw: &[f32], pools: &[u16], j0: usize, j1: usize, pscore: &mut [f32]) {
     let scale = 1.0 / sqrt(INDEX_HEAD_DIM as f32);
     for j in j0..j1 {
         let key = &pools[j * INDEX_HEAD_DIM..(j + 1) * INDEX_HEAD_DIM];
@@ -87,7 +124,7 @@ pub fn score_pools(iq: &[f32], iw: &[f32], pools: &[f32], j0: usize, j1: usize, 
             let qh = &iq[h * INDEX_HEAD_DIM..(h + 1) * INDEX_HEAD_DIM];
             let mut d = 0f32;
             for c in 0..INDEX_HEAD_DIM {
-                d += qh[c] * key[c];
+                d += qh[c] * widen(key[c]);
             }
             let d = d * scale;
             sc += iw[h] * if d > 0.0 { d } else { 0.0 };
@@ -148,7 +185,7 @@ pub fn pick(pos: usize, pscore: &[f32], pidx: &mut [u32], sel: &mut [usize]) -> 
 }
 /// `score_pools` over every complete pool when the query selects, then `pick`.
 #[inline(always)]
-fn select(pos: usize, iq: &[f32], iw: &[f32], pools: &[f32], pscore: &mut [f32], pidx: &mut [u32], sel: &mut [usize]) -> usize {
+fn select(pos: usize, iq: &[f32], iw: &[f32], pools: &[u16], pscore: &mut [f32], pidx: &mut [u32], sel: &mut [usize]) -> usize {
     if selects(pos) {
         score_pools(iq, iw, pools, 0, (pos + 1) / INDEX_KPOOL, pscore);
     }
@@ -161,10 +198,11 @@ fn select(pos: usize, iq: &[f32], iw: &[f32], pools: &[f32], pscore: &mut [f32],
 
 /// Position `pos`'s cache row: the latent, the indexer's key, the indexer's gate.
 #[inline(always)]
-pub fn row(cache: &mut [f32], pos: usize) -> (&mut [f32], &mut [f32], &mut [f32]) {
-    let row = &mut cache[pos * MLA_ROW..(pos + 1) * MLA_ROW];
+pub fn row(cache: &mut [u16], pos: usize) -> (&mut [u16], &mut [u16], &mut [f32]) {
+    let row = &mut cache[pos * MLA_ROW_U16..(pos + 1) * MLA_ROW_U16];
     let (latent, rest) = row.split_at_mut(KV_LORA_RANK);
     let (ikey, igate) = rest.split_at_mut(INDEX_HEAD_DIM);
+    let (_, igate, _) = unsafe { igate.align_to_mut::<f32>() };
     (latent, ikey, igate)
 }
 
@@ -186,12 +224,13 @@ pub fn project(w: &weights::Mla, xn: &[f32], s: &mut Scratch, igate: &mut [f32],
 
 /// The cache row's normed latent and the indexer's key (LayerNorm, eps 1e-6) from the projections.
 #[inline(always)]
-pub fn finish_row(w: &weights::Mla, kva: &[f32], ik: &[f32], latent: &mut [f32], ikey: &mut [f32]) {
+pub fn finish_row(w: &weights::Mla, kva: &[f32], ik: &[f32], latent: &mut [u16], ikey: &mut [u16]) {
     // the stored attention state follows the reference's dtype (tcdent, 2026-10-17): the latent
-    // and the indexer's key at bf16 precision (the arithmetic on them stays f32), the KDA state f32
-    rmsnorm::<KV_LORA_RANK>(kva, &w.kv_a_ln, RMS_NORM_EPS, latent);
-    for v in latent.iter_mut() {
-        *v = bf16_round(*v);
+    // and the indexer's key in bf16 (the arithmetic on them stays f32), the KDA state f32
+    let mut lat = [0f32; KV_LORA_RANK];
+    rmsnorm::<KV_LORA_RANK>(kva, &w.kv_a_ln, RMS_NORM_EPS, &mut lat);
+    for c in 0..KV_LORA_RANK {
+        latent[c] = bits(bf16_round(lat[c]));
     }
     let mut mean = 0f32;
     for &v in ik.iter() {
@@ -204,12 +243,12 @@ pub fn finish_row(w: &weights::Mla, kva: &[f32], ik: &[f32], latent: &mut [f32],
     }
     let rs = 1.0 / sqrt(var / INDEX_HEAD_DIM as f32 + 1e-6);
     for c in 0..INDEX_HEAD_DIM {
-        ikey[c] = bf16_round((ik[c] - mean) * rs * w.ix_k_norm_w[c] + w.ix_k_norm_b[c]);
+        ikey[c] = bits(bf16_round((ik[c] - mean) * rs * w.ix_k_norm_w[c] + w.ix_k_norm_b[c]));
     }
 }
 /// The pool position `pos` completes, if any, gains its key (`pool_key`).
 #[inline(always)]
-pub fn pool_done(w: &weights::Mla, cache: &[f32], pools: &mut [f32], pos: usize) {
+pub fn pool_done(w: &weights::Mla, cache: &[u16], pools: &mut [u16], pos: usize) {
     if (pos + 1) % INDEX_KPOOL == 0 {
         let j = (pos + 1) / INDEX_KPOOL - 1;
         pool_key(w, cache, j, &mut pools[j * INDEX_HEAD_DIM..(j + 1) * INDEX_HEAD_DIM]);
@@ -219,7 +258,7 @@ pub fn pool_done(w: &weights::Mla, cache: &[f32], pools: &mut [f32], pos: usize)
 /// The pool key a completed pool gains, and the selection: `s.sel[..n]`, the
 /// positions attended, ascending.
 #[inline(always)]
-pub fn select_at(l: usize, w: &weights::Mla, cache: &[f32], pools: &mut [f32], pos: usize, s: &mut Scratch, tr: &mut impl Trace) -> usize {
+pub fn select_at(l: usize, w: &weights::Mla, cache: &[u16], pools: &mut [u16], pos: usize, s: &mut Scratch, tr: &mut impl Trace) -> usize {
     pool_done(w, cache, pools, pos);
     head_scale(s.iw);
     let n = select(pos, s.iq, s.iw, pools, s.pscore, s.pidx, s.sel);
@@ -229,7 +268,7 @@ pub fn select_at(l: usize, w: &weights::Mla, cache: &[f32], pools: &mut [f32], p
 
 /// Absorbed MLA over the `n` selected positions, a head per item on its own scratch, into `s.heads`.
 #[inline(always)]
-pub fn heads(l: usize, w: &weights::Mla, cache: &[f32], s: &mut Scratch, n: usize, pool: &dyn Pool, tr: &mut impl Trace) {
+pub fn heads(l: usize, w: &weights::Mla, cache: &[u16], s: &mut Scratch, n: usize, pool: &dyn Pool, tr: &mut impl Trace) {
     let (q, sel) = (&*s.q, &s.sel[..n]);
     let (heads_p, hs_p) = (s.heads.as_mut_ptr() as usize, s.hs.as_mut_ptr() as usize);
     // a head's item streams its W_uk and W_uv: on their node
@@ -253,7 +292,7 @@ pub fn output(w: &weights::Mla, heads: &[f32], out: &mut [f32], pool: &dyn Pool)
 /// latents, softmax, the latent mix, back through `W_uv`.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn head(w: &weights::Mla, h: usize, q: &[f32], sel: &[usize], cache: &[f32], q_abs: &mut [f32], o_lat: &mut [f32], att: &mut [f32], oh: &mut [f32]) {
+fn head(w: &weights::Mla, h: usize, q: &[f32], sel: &[usize], cache: &[u16], q_abs: &mut [f32], o_lat: &mut [f32], att: &mut [f32], oh: &mut [f32]) {
     let scale = 1.0 / sqrt(Q_HEAD as f32);
     let qh = &q[h * Q_HEAD..(h + 1) * Q_HEAD];
     let w_uk = &w.kv_b[h * KVB_HEAD * KV_LORA_RANK..(h * KVB_HEAD + QK_NOPE_HEAD_DIM) * KV_LORA_RANK];
@@ -267,16 +306,14 @@ fn head(w: &weights::Mla, h: usize, q: &[f32], sel: &[usize], cache: &[f32], q_a
     }
     let n = sel.len();
     for (i, &t) in sel.iter().enumerate() {
-        let lat = &cache[t * MLA_ROW..t * MLA_ROW + KV_LORA_RANK];
-        att[i] = lat_ops::dot(q_abs, lat) * scale;
+        att[i] = lat_ops::dot_bf16(q_abs, latent(cache, t)) * scale;
     }
     softmax(&mut att[..n]);
     for j in 0..KV_LORA_RANK {
         o_lat[j] = 0.0;
     }
     for (i, &t) in sel.iter().enumerate() {
-        let lat = &cache[t * MLA_ROW..t * MLA_ROW + KV_LORA_RANK];
-        lat_ops::axpy(lat, att[i], o_lat);
+        lat_ops::axpy_bf16(latent(cache, t), att[i], o_lat);
     }
     gemv::bf16::<V_HEAD_DIM, KV_LORA_RANK>(w_uv, o_lat, oh);
 }
@@ -300,30 +337,20 @@ mod lat_ops {
             acc[j] += widen(w[j]) * a;
         }
     }
+    /// `Σ a·widen(b)`: the dot against a bf16 latent, in `dot`'s order.
     #[inline(always)]
-    pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+    pub fn dot_bf16(a: &[f32], b: &[u16]) -> f32 {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            avx2::dot(a.as_ptr(), b.as_ptr())
+            avx2::dot_bf16(a.as_ptr(), b.as_ptr())
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
             let mut acc = 0f32;
             for j in 0..N {
-                acc += a[j] * b[j];
+                acc += a[j] * widen(b[j]);
             }
             acc
-        }
-    }
-    #[inline(always)]
-    pub fn axpy(x: &[f32], p: f32, acc: &mut [f32]) {
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            avx2::axpy(x.as_ptr(), p, acc.as_mut_ptr())
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        for j in 0..N {
-            acc[j] += p * x[j];
         }
     }
 
@@ -348,25 +375,15 @@ mod lat_ops {
             }
         }
         #[target_feature(enable = "avx2,fma")]
-        pub unsafe fn dot(a: *const f32, b: *const f32) -> f32 {
+        pub unsafe fn dot_bf16(a: *const f32, b: *const u16) -> f32 {
             let (mut s0, mut s1) = (_mm256_setzero_ps(), _mm256_setzero_ps());
             let mut j = 0;
             while j < N {
-                s0 = _mm256_add_ps(s0, _mm256_mul_ps(_mm256_loadu_ps(a.add(j)), _mm256_loadu_ps(b.add(j))));
-                s1 = _mm256_add_ps(s1, _mm256_mul_ps(_mm256_loadu_ps(a.add(j + 8)), _mm256_loadu_ps(b.add(j + 8))));
+                s0 = _mm256_add_ps(s0, _mm256_mul_ps(_mm256_loadu_ps(a.add(j)), widen8(b.add(j))));
+                s1 = _mm256_add_ps(s1, _mm256_mul_ps(_mm256_loadu_ps(a.add(j + 8)), widen8(b.add(j + 8))));
                 j += 16;
             }
             common::gemv::avx2::hsum(_mm256_add_ps(s0, s1))
-        }
-        #[target_feature(enable = "avx2,fma")]
-        pub unsafe fn axpy(x: *const f32, p: f32, acc: *mut f32) {
-            let pv = _mm256_set1_ps(p);
-            let mut j = 0;
-            while j < N {
-                _mm256_storeu_ps(acc.add(j), _mm256_add_ps(_mm256_loadu_ps(acc.add(j)), _mm256_mul_ps(pv, _mm256_loadu_ps(x.add(j)))));
-                _mm256_storeu_ps(acc.add(j + 8), _mm256_add_ps(_mm256_loadu_ps(acc.add(j + 8)), _mm256_mul_ps(pv, _mm256_loadu_ps(x.add(j + 8)))));
-                j += 16;
-            }
         }
     }
 }
@@ -460,7 +477,7 @@ pub mod gfx11 {
     /// `q: [tokens][MLA_HEADS][Q_HEAD]`, `kvb` the layer's `[MLA_HEADS][KVB_HEAD][KV_LORA_RANK]` bf16,
     /// `sel: [tokens][DENSE_BELOW]`, `heads: [tokens][MLA_HEADS][V_HEAD_DIM]`.
     #[no_mangle]
-    pub extern "gpu-kernel" fn mla_attend(q: *const f32, kvb: *const u16, lat: *const f32, sel: *const u32, counts: *const u32, heads: *mut f32) {
+    pub extern "gpu-kernel" fn mla_attend(q: *const f32, kvb: *const u16, lat: *const u16, sel: *const u32, counts: *const u32, heads: *mut f32) {
         unsafe {
             use common::gemv::gfx11::bf16_row;
             use common::gfx11::{lds, wave_max, wave_sum, workgroup_sync};
@@ -516,8 +533,13 @@ pub mod gfx11 {
                     let mut acc = 0f32;
                     let mut j = 0;
                     while j < D {
-                        acc += *qa.add(j) * *row.add(j);
-                        j += 1;
+                        let r = common::gemv::gfx11::widen8_at(row.add(j));
+                        let mut u = 0;
+                        while u < 8 {
+                            acc += *qa.add(j + u) * r[u];
+                            u += 1;
+                        }
+                        j += 8;
                     }
                     let sc = acc * scale;
                     *att.add(h * ATT_SLOTS + p) = sc;
@@ -585,7 +607,7 @@ pub mod gfx11 {
                 let mut acc = [0f32; AH];
                 let mut p = 0;
                 while p < n {
-                    let v = *lat.add(*sel.add(p) as usize * D + j);
+                    let v = widen(*lat.add(*sel.add(p) as usize * D + j));
                     let mut h = 0;
                     while h < AH {
                         acc[h] += *att.add(h * ATT_SLOTS + p) * v;
@@ -664,7 +686,7 @@ pub mod gfx11 {
     /// pools when it selects among them. Grid: tokens × `nb` (256 pools a workgroup). One host
     /// thread scored a token's 5.4k pools at 21k positions in 6 ms (2026-10-17).
     #[no_mangle]
-    pub extern "gpu-kernel" fn ix_score(iq: *const f32, ix: *const f32, pools: *const f32, score: *mut f32, pos0: u32, nb: u32, stride: u32, scale: f32, wscale: f32) {
+    pub extern "gpu-kernel" fn ix_score(iq: *const f32, ix: *const f32, pools: *const u16, score: *mut f32, pos0: u32, nb: u32, stride: u32, scale: f32, wscale: f32) {
         unsafe {
             use core::arch::amdgpu::workgroup_id_x;
             let wg = workgroup_id_x();
@@ -685,8 +707,13 @@ pub mod gfx11 {
                 let mut d = 0f32;
                 let mut c = 0;
                 while c < INDEX_HEAD_DIM {
-                    d += *qh.add(c) * *key.add(c);
-                    c += 1;
+                    let k = common::gemv::gfx11::widen8_at(key.add(c));
+                    let mut u = 0;
+                    while u < 8 {
+                        d += *qh.add(c + u) * k[u];
+                        u += 1;
+                    }
+                    c += 8;
                 }
                 let d = d * scale;
                 sc += (*iw.add(h) * wscale) * if d > 0.0 { d } else { 0.0 };

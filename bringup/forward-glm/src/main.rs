@@ -289,7 +289,7 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
             }
             None => (ids, n),
         };
-        let position = glm_5_3_flash::layout::POSITION;
+        let position = glm_5_3_flash::layout::POSITION_W;
         let snap_len = glm_5_3_flash::layout::SNAPSHOT;
         // every position's logits (what SCORE reads), every position's rows, the recurrent state
         let run = |model: &mut CpuModel<_>, step: usize| -> (Vec<f32>, Vec<f32>, Vec<f32>) {

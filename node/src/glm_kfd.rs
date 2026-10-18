@@ -583,7 +583,7 @@ impl Cards {
                 k.upload(&m, (mw.ix_wk.len() + mw.ix_gate.len()) * 2, raw(mw.ix_weights));
                 m
             };
-            let on = MlaOn { card, input_ln: up(raw(&bf16_of(w.layers[l].input_ln))), qa_ln: up(raw(&bf16_of(mw.q_a_ln))), q_a: one(mw.q_a), kv_a: one(mw.kv_a), ix, q_b: one(mw.q_b), ix_wq_b: up(raw(mw.ix_wq_b)), kv_b: up(raw(mw.kv_b)), lat: k.vram_visible(max_ctx * KV_LORA_RANK * 4), pools: k.vram_visible(max_ctx.div_ceil(INDEX_KPOOL) * INDEX_HEAD_DIM * 4), o: one(mw.o) };
+            let on = MlaOn { card, input_ln: up(raw(&bf16_of(w.layers[l].input_ln))), qa_ln: up(raw(&bf16_of(mw.q_a_ln))), q_a: one(mw.q_a), kv_a: one(mw.kv_a), ix, q_b: one(mw.q_b), ix_wq_b: up(raw(mw.ix_wq_b)), kv_b: up(raw(mw.kv_b)), lat: k.vram_visible(max_ctx * KV_LORA_RANK * 2), pools: k.vram_visible(max_ctx.div_ceil(INDEX_KPOOL) * INDEX_HEAD_DIM * 2), o: one(mw.o) };
             bytes += on.q_a.0.size + on.q_a.1.size + on.kv_a.0.size + on.kv_a.1.size + on.ix.size + on.q_b.0.size + on.q_b.1.size + on.ix_wq_b.size + on.kv_b.size + on.lat.size + on.o.0.size + on.o.1.size;
             mlas[l] = Some(on);
             mla_n += 1;
@@ -625,7 +625,7 @@ impl Cards {
                 k.upload(&m, (mw.ix_wk.len() + mw.ix_gate.len()) * 2, raw(mw.ix_weights));
                 m
             };
-            mlas.push(Some(MlaOn { card, input_ln: up(raw(&bf16_of(mt.input_ln))), qa_ln: up(raw(&bf16_of(mw.q_a_ln))), q_a: one(mw.q_a), kv_a: one(mw.kv_a), ix, q_b: one(mw.q_b), ix_wq_b: up(raw(mw.ix_wq_b)), kv_b: up(raw(mw.kv_b)), lat: k.vram_visible(max_ctx * KV_LORA_RANK * 4), pools: k.vram_visible(max_ctx.div_ceil(INDEX_KPOOL) * INDEX_HEAD_DIM * 4), o: one(mw.o) }));
+            mlas.push(Some(MlaOn { card, input_ln: up(raw(&bf16_of(mt.input_ln))), qa_ln: up(raw(&bf16_of(mw.q_a_ln))), q_a: one(mw.q_a), kv_a: one(mw.kv_a), ix, q_b: one(mw.q_b), ix_wq_b: up(raw(mw.ix_wq_b)), kv_b: up(raw(mw.kv_b)), lat: k.vram_visible(max_ctx * KV_LORA_RANK * 2), pools: k.vram_visible(max_ctx.div_ceil(INDEX_KPOOL) * INDEX_HEAD_DIM * 2), o: one(mw.o) }));
             let (gu_w, gu_s) = {
                 let (g, u) = (mt.ffn.shared_gate, mt.ffn.shared_up);
                 let wm = k.vram_visible(g.w.len() + u.w.len());
@@ -1204,10 +1204,10 @@ impl Placed for Cards {
         read(&c.mproj, ix * 4, &mut ik[..INDEX_HEAD_DIM]);
         read(&c.mproj, (ix + INDEX_HEAD_DIM) * 4, &mut igate[..INDEX_HEAD_DIM]);
     }
-    fn ix_pools(&mut self, l: usize, pools: &[f32], from: usize, to: usize) {
+    fn ix_pools(&mut self, l: usize, pools: &[u16], from: usize, to: usize) {
         let m = self.mlas[l].as_ref().unwrap();
         if to > from {
-            self.cards[m.card].k.upload(&m.pools, from * INDEX_HEAD_DIM * 4, raw(&pools[from * INDEX_HEAD_DIM..to * INDEX_HEAD_DIM]));
+            self.cards[m.card].k.upload(&m.pools, from * INDEX_HEAD_DIM * 2, raw(&pools[from * INDEX_HEAD_DIM..to * INDEX_HEAD_DIM]));
         }
     }
     fn ix_select(&mut self, l: usize, pos: usize, n: usize, count: Option<&mut usize>) {
@@ -1233,11 +1233,11 @@ impl Placed for Cards {
             *count = w[0] as usize;
         }
     }
-    fn mla_attend(&mut self, l: usize, n: usize, pos: usize, latents: &[f32]) {
+    fn mla_attend(&mut self, l: usize, n: usize, pos: usize, latents: &[u16]) {
         let m = self.mlas[l].as_ref().unwrap();
         let c = &self.cards[m.card];
         // the step's latents into the mirror; the selections are the card's (`ix_select`); one launch over (token, heads)
-        c.k.upload(&m.lat, pos * KV_LORA_RANK * 4, raw(&latents[..n * KV_LORA_RANK]));
+        c.k.upload(&m.lat, pos * KV_LORA_RANK * 2, raw(&latents[..n * KV_LORA_RANK]));
         let mut a = Args::new();
         a.ptr(c.mq.va).ptr(m.kv_b.va).ptr(m.lat.va).ptr(c.msel.va).ptr(c.mseln.va).ptr(c.mheads.va);
         c.k.launch(&c.mla_attend, ATTEND_GRID * n as u32, g::WG, ATTEND_LDS as u32, &a);
@@ -1254,9 +1254,9 @@ impl Placed for Cards {
         }
         self.hc_post(c, Some((c.myv.va, my, n * H)), Some((W_Y, m.card)), None, None, self.half_seq[l][0], my, None, n);
     }
-    fn mla_seed(&mut self, l: usize, pos: usize, latent: &[f32]) {
+    fn mla_seed(&mut self, l: usize, pos: usize, latent: &[u16]) {
         let m = self.mlas[l].as_ref().unwrap();
-        self.cards[m.card].k.upload(&m.lat, pos * KV_LORA_RANK * 4, raw(&latent[..KV_LORA_RANK]));
+        self.cards[m.card].k.upload(&m.lat, pos * KV_LORA_RANK * 2, raw(&latent[..KV_LORA_RANK]));
     }
     fn ffn(&mut self, l: usize, n: usize) {
         let value = self.next_seq();

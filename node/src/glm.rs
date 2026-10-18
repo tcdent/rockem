@@ -12,7 +12,7 @@ use crate::engine::{Engine, Sampling};
 use crate::loader;
 use common::trace::{NoTrace, Trace, NONE};
 use glm_5_3_flash::construct::{Logits, physical_cores, CpuExperts, CpuModel, Threads};
-use glm_5_3_flash::layout::{self, POSITION, SNAPSHOT};
+use glm_5_3_flash::layout::{self, MLA_ROW, MLA_ROW_U16, POSITION, POSITION_W, SNAPSHOT};
 use glm_5_3_flash::weights::Weights;
 use glm_5_3_flash::{EOS_TOKENS, FIRST_POS, H, NUM_HIDDEN_LAYERS, PREFIX_IDS, SAMPLING, SEED, STEP, TOP_K, VOCAB_SIZE};
 
@@ -54,6 +54,8 @@ pub struct Glm {
     w: Weights<'static>,
     model: CpuModel<'static, CpuExperts<'static>>,
     prefix: &'static [f32],
+    /// The prefix's rows in the node's packed form, what the store seeds positions `0..FIRST_POS` from.
+    prefix_rows: Vec<f32>,
     prefix_logits: Vec<f32>,
     /// A step's hidden states for the draft, `[STEP][H]`.
     hiddens: Vec<f32>,
@@ -110,9 +112,15 @@ impl Glm {
         let prefix_logits = model.logits[..VOCAB_SIZE].to_vec();
         let mut snap = vec![0f32; SNAPSHOT];
         model.snapshot(&mut snap);
+        // the realization's rows, unpacked to the bundle's f32 form for the comparison
         let mut rows = vec![0f32; FIRST_POS * POSITION];
+        let mut packed = vec![0f32; POSITION_W];
         for pos in 0..FIRST_POS {
-            model.rows(pos, &mut rows[pos * POSITION..(pos + 1) * POSITION]);
+            model.rows(pos, &mut packed);
+            let words: &[u16] = unsafe { std::slice::from_raw_parts(packed.as_ptr() as *const u16, packed.len() * 2) };
+            for mi in 0..layout::MLA_LAYERS {
+                glm_5_3_flash::mla::unpack_row(&words[mi * MLA_ROW_U16..(mi + 1) * MLA_ROW_U16], &mut rows[pos * POSITION + mi * MLA_ROW..pos * POSITION + (mi + 1) * MLA_ROW]);
+            }
         }
         let (prows, psnap) = prefix.split_at(FIRST_POS * POSITION);
         let dev = |a: &[f32], b: &[f32]| a.iter().zip(b).fold((0f32, 0f32), |(d, m), (x, y)| (d.max((x - y).abs()), m.max(y.abs())));
@@ -132,6 +140,7 @@ impl Glm {
             w,
             model,
             prefix,
+            prefix_rows: glm_5_3_flash::construct::pack_rows(&prefix[..FIRST_POS * POSITION]),
             prefix_logits,
             hiddens: vec![0.0; STEP * H],
             last_pos: 0,
@@ -187,7 +196,7 @@ impl Engine for Glm {
         &PREFIX_IDS
     }
     fn position(&self) -> usize {
-        POSITION
+        POSITION_W
     }
     fn snapshot_len(&self) -> usize {
         SNAPSHOT
@@ -196,7 +205,7 @@ impl Engine for Glm {
         SEED
     }
     fn prefix(&self) -> (&[f32], &[f32]) {
-        self.prefix.split_at(FIRST_POS * POSITION)
+        (&self.prefix_rows, &self.prefix[FIRST_POS * POSITION..FIRST_POS * POSITION + SNAPSHOT])
     }
     fn seed_prefix(&mut self) {
         self.model.seed_prefix(&self.w, self.prefix)

@@ -419,6 +419,27 @@ against the f32 goldens as a numeric distance, and the goldens stay what they ar
   overlap above is the measurement that would.
 - **FP8 KDA projections:** **Unimplemented; tcdent's decision** (§6).
 
+**Status 2026-10-18 09:00: the second phase built, gated and deployed — the attention state is
+stored in bf16.** The cache row is packed (`layout::MLA_ROW_U16`: the latent and the indexer's key as
+bf16 bits, the gate f32; 1792 bytes a layer against 3072), on the host, in the cards' `lat` and
+`pools` mirrors, and in the context store (`POSITION_W` words a position: 19 KB against 33); the
+bundle's `prefix.f32` stays f32 and is packed once at open (`construct::pack_rows`). The host's
+`heads` reads the latents through `lat_ops::dot_bf16`/`axpy_bf16`, `mla_attend` and `ix_score` widen
+on the card. Gate: the long SCORE (3632 ids) is **bit-identical** to the WMMA build's (the values were
+already bf16-rounded in phase 1; `score_diff.py`: 0 moved); decode text and acceptance (0.88 on the
+short text) unchanged; 18k decode step unchanged (31.2 ms a token). Prefill at 18k positions
+**7.0 → 6.7–6.8 ms a prompt token**: the card wait that grows with position (the attend and the
+scorer) went 2.6 → 3.7 at 18k. Two lessons from the build: (1) a `u16` inner loop compiles to
+halfword loads on gfx1100 — the first code object read the rows a halfword at a time and the same
+wait grew to 4.8 (8.0 ms a prompt token, the 18k prompt 143 s against 129); `gemv::gfx11::widen8_at`
+(two u64 loads, eight bf16) restored wide loads, 2 × b128 a 16-element chunk against the f32 build's 4.
+(2) The store seeds positions `0..FIRST_POS` from the engine's `prefix()`, so that must hand out the
+packed form too — the first deploy handed the f32 rows, a cache resume seeded garbage, the forward
+went NaN and the sampler panicked (`sample.rs:190`, zero candidates). VRAM: the latents' mirror at
+32k positions 11 layers 360 → 180 MB; at 1M, 12.9 GB. Still open: the selection overlap at 18k, and
+the attend/scorer at long positions as the next long-context cost (the wait above grows 0.08 ms a
+prompt token per 1k positions → ~80 ms a prompt token at 1M).
+
 **Status 2026-10-17 21:40: the first phase built and deployed; the numbers below.** The latent
 and the indexer's key are stored at bf16 precision (rounded to nearest even at `finish_row` and on
 the bundle's seeded rows; the buffers, kernels and mirrors unchanged, so the arithmetic on them is
@@ -430,10 +451,8 @@ position by 5.8 nats (a near-tie), **NLL 0.0414 → 0.0446**. **How much that ga
 id order, caught and reverted) moved the same text's NLL by 0.003 the other way; the text's
 near-ties make ±0.003 the gate's noise, so the bf16 state's cost is below what this text can
 show. A longer, higher-perplexity text (or the evals) is the gate for costs this small. Decode step cost unchanged; acceptance
-on the short text 0.88–1.00 across runs (0.92 before). The second phase — bf16 buffers for the
-latents and pools (half the bytes the attend and scorer read, the 1M arithmetic) — is layout work on
-the host cache, the cards' mirrors, `mla_attend`, `ix_score` and the host's `heads`, gated by the same
-comparison. The selection-overlap measurement at 18k is still to be made.
+on the short text 0.88–1.00 across runs (0.92 before). The second phase (bf16 buffers) is
+built: the status above.
 
 **Status 2026-10-17 evening (before the build):** What the decision changes in the
 tree: the MLA cache row keeps its latent in bf16 (host `cache: [max_ctx][MLA_ROW]`, the cards'

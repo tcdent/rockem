@@ -426,6 +426,13 @@ pub const MLA_LAYERS: usize = count(&LINEAR_ATTENTION, false);
 pub const MLA_ROW: usize = KV_LORA_RANK + INDEX_HEAD_DIM + INDEX_HEAD_DIM;
 /// One position's rows, every MLA layer's in layer order: `[MLA_LAYERS][MLA_ROW]`.
 pub const POSITION: usize = MLA_LAYERS * MLA_ROW;
+/// The row as the node keeps it (tcdent 2026-10-17: the stored attention state follows the reference):
+/// the latent and the indexer's key in bf16, the indexer's gate in f32 — `MLA_ROW_U16` halfwords, 1792
+/// bytes against the f32 row's 3072; `POSITION_W` f32-sized words a position in the context store. The
+/// bundle's prefix keeps the f32 `POSITION` form and is packed when seeded.
+pub const MLA_ROW_U16: usize = KV_LORA_RANK + INDEX_HEAD_DIM + 2 * INDEX_HEAD_DIM;
+pub const POSITION_W: usize = MLA_LAYERS * MLA_ROW_U16 / 2;
+const _: () = assert!(MLA_ROW_U16 % 2 == 0 && (KV_LORA_RANK + INDEX_HEAD_DIM) % 2 == 0);
 /// One KDA layer's state: the convolution's last `CONV_TAPS - 1` inputs, then the `[head][k][v]` memory.
 pub const KDA_WINDOW: usize = (CONV_TAPS - 1) * CONV_DIM;
 pub const KDA_MEMORY: usize = KDA_HEADS * KDA_DIM * KDA_DIM;

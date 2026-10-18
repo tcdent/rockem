@@ -377,6 +377,23 @@ pub mod gfx11 {
     /// `y = Σ_k W[k] · x[k]` for one `K`-wide bf16 row (`K % 8 == 0`; a
     /// last partial step is masked per lane); every lane returns the sum.
     #[inline(always)]
+    /// Eight consecutive bf16 at `p` (16-byte aligned) widened, in one wide load: a u16 loop the
+    /// compiler would read a halfword at a time (2026-10-18: the attend's and scorer's rows).
+    #[inline(always)]
+    pub unsafe fn widen8_at(p: *const u16) -> [f32; 8] {
+        let q = p as *const u64;
+        let (a, b) = (*q, *q.add(1));
+        [
+            super::widen(a as u16),
+            super::widen((a >> 16) as u16),
+            super::widen((a >> 32) as u16),
+            super::widen((a >> 48) as u16),
+            super::widen(b as u16),
+            super::widen((b >> 16) as u16),
+            super::widen((b >> 32) as u16),
+            super::widen((b >> 48) as u16),
+        ]
+    }
     pub unsafe fn bf16_row<const K: usize>(lane: u32, w: *const u16, x: *const f32) -> f32 {
         const { assert!(K % 8 == 0) };
         let l = lane as usize;
