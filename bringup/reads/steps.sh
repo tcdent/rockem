@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # The profile line, from the step rows: `steps.sh [run] [since]`. Milliseconds a step token by phase,
 # grouped by kind (prefill: steps wider than a verify step; score: such steps that emit every token's
-# logits, the SCORE verb; verify: the rest, decode's steps of a token and its drafts) and
+# logits, the SCORE verb; verify: a token and its drafts; token: a single one with no draft) and
 # by 10k bands of position (band_10k 10 = positions 10,000–19,999). `since` is a UTC timestamp ('2026-10-18 22:10:00') to read one window.
 # `run` is a prefix of the run id; none means the newest run on metatron (PROW_HOST).
 set -u; . "$(dirname "$0")/_run.sh"
 RUN=$(pick_run "${1:-}"); [ -n "$RUN" ] || { echo "no run" >&2; exit 1; }
 SINCE=${2:-1970-01-01}
-q "WITH s AS (SELECT *, CASE WHEN width > 4 AND scoring THEN 'score' WHEN width > 4 THEN 'prefill' ELSE 'verify' END AS kind,
+q "WITH s AS (SELECT *, CASE WHEN width > 4 AND scoring THEN 'score' WHEN width > 4 THEN 'prefill' WHEN width = 1 THEN 'token' ELSE 'verify' END AS kind,
                       (pos // 10000) * 10 AS band_k,
                       hc_ms+slot_ms+kda_card_ms+kda_cpu_ms+mla_proj_ms+mla_attn_ms+mla_out_ms+dense_ffn_ms+route_ms+shared_ms+experts_ms+head_ms+draft_ms+join_ms AS total_ms
              FROM step WHERE run = '$RUN' AND ts >= TIMESTAMPTZ '$SINCE')
