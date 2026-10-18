@@ -1,6 +1,6 @@
 # 001 — Peer VRAM writes for the handoffs
 
-**Status:** Deferred (measured 2026-10-18) — the helper and the benches exist; the handoffs' ceiling is ≤ 0.1 ms a step token
+**Status:** Quantified, on the shelf — ≤ 0.1 ms a step token (decode), ~0.04 ms a prompt token (prefill); the helper and the benches exist, the handoff refactor is the work left
 **Area:** decode, prefill
 **Gain:** measured — a flag round trip 2.67 µs through peer VRAM against 3.47 through host memory (0.4 µs a one-way message); a single wave's 64 KB payload 2.7× faster
 

@@ -65,4 +65,7 @@ table, the block scale) at one to four tokens, ~2.5 ms a step token.** Reopened 
 ## Next
 `ffn_down_shared` at 8.4 MB in 36 µs: not the decode — find what holds it (its SwiGLU staging, the
 emit, the short K = 2048 rows) with the bench; the same question for the other FP8 shapes (mla_qb,
-mla_o). The ceiling on the table stays ~2 ms a step token.
+mla_o). The ceiling on the table stays ~2 ms a step token. **Quantified, on the shelf — the step
+pair at one token:** 48.8 → 42.9 µs on `ffn_gu` (−12 %) when the step is a single token (plain
+decode, no draft); it loses at two to thirty-two, so it waits for a width-conditional step that the
+no-toggles rule allows (derived from `NP`, a const).

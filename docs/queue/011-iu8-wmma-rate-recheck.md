@@ -1,6 +1,6 @@
 # 011 — iu8 WMMA rate recheck
 
-**Status:** Deferred — small gain (a measurement)
+**Status:** Quantified, on the shelf — a measurement (eight chains in `rate_wmma_iu8`), minutes of work; sizes 038
 **Area:** prefill
 **Gain:** informs 038; RDNA3 lists int8 at twice fp16
 

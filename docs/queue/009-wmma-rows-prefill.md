@@ -32,6 +32,7 @@ tcdent's license for prefill kernel pairs (2026-10-17).
   card time (0.3 of 6.7 ms a prompt token) — the KDA scan (023) holds the rest.
 
 ## Next
-Small: accumulate the rms in the staging loop (the sum of squares falls out of the values staged;
-apply 1/rms at the end) to bring `rows_h_w` to `rows_part_w`'s rate — ~30 ms a 512-step, 0.06 ms a
-prompt token. The card lap at 512 is the scan's: 023.
+**Quantified, on the shelf — 0.06 ms a prompt token:** accumulate the rms in the staging loop (the
+sum of squares falls out of the values staged; apply 1/rms at the end) to bring `rows_h_w` to
+`rows_part_w`'s rate, ~30 ms a 512-step. Bit-identical to the pair as it stands. The card lap at
+512 is the scan's: 023.

@@ -1,6 +1,6 @@
 # 002 — The expert phase controlled by a card
 
-**Status:** Rejected (measured) — revisit with a placement where the cards hold most of a layer's picks
+**Status:** Quantified, on the shelf — ≤ 0.01–0.02 ms a step token as the cards' share stands; grows with the cards' share of a layer's picks (039)
 **Area:** decode
 **Gain:** measured ceiling 0.01–0.02 ms a step token
 

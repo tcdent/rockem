@@ -1,6 +1,6 @@
 # 016 — Attend: four heads a workgroup
 
-**Status:** Rejected (measured) for decode; Deferred — small gain for prefill
+**Status:** Rejected (measured) for decode; Quantified, on the shelf for prefill — ~0.1 ms a prompt token at 3k as a prefill-only pair at four heads
 **Area:** decode, prefill
 **Gain:** measured — decode at 18k worse (kda card 14.5 → 20.3); 3k prefill 4.4 → 4.3
 
