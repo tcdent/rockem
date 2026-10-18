@@ -1,6 +1,6 @@
 # 019 — Indexer scoring on WMMA
 
-**Status:** Built 2026-10-18 (`ix_score_w`: 27–34× the scalar at a 512-step, 2.6–5.3× at a two-token step past 18k; selections agree to 0.03–0.3 %); the node's integration deploying; the decode selection's split still open
+**Status:** Deployed 2026-10-18 13:21 (`ix_score_w`: 27–34× the scalar at a 512-step, 2.6–5.3× at a two-token step past 18k; selections within 0.03–0.3 %; SCORE vs the attend-only build: NLL 0.04365 → 0.04362, mean |Δ| 5e-5); the decode selection's split still open
 **Area:** long context (prefill and decode)
 **Gain:** measured — the whole scoring cost above, ~10× on WMMA; the selection needs its own split (below)
 
@@ -46,8 +46,12 @@ launch); our 1M arithmetic (~13 GMAC and ~1.6 GB of f32 pool keys read a decode 
   below ~4k positions (**Quantified, on the shelf — 0.05 ms a step token at short context**: a
   position-derived twin). One kernel serves both.
 
+- 2026-10-18 13:21, deployed: `ix_select` launches it over the pools the step's last token sees. Served
+  at 18k: the 512-step 5.2 ms a prompt token steady, the decode step 28.9 — the scorer's share at 18k is
+  small (0.3 ms a prompt token, 0.1 a step); its gain is the long tail (65k–1M). SCORE vs the attend-only
+  build: NLL 0.04365 → 0.04362, 42 % of positions moved by a mean 5e-5 (the selection's near-tie flips).
+
 ## Next
-Deploying in the node (`ix_select` launches it over the pools the step's last token sees). Then the
-selection at decode: `ix_select` is one workgroup a token over every pool (182 µs a layer at 262k,
+The selection at decode: `ix_select` is one workgroup a token over every pool (182 µs a layer at 262k,
 ~0.7 ms at 1M — 8 ms a step over 11 layers): a split-row select. Build after 018 shares its WMMA staging: scores as `[32 × 128] · [128 × pools]` a token (rows of 16
 queries at prefill), ReLU and the head weights in the epilogue, f32 scores; then a split-row select.
