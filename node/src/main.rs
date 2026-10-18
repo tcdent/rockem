@@ -131,10 +131,17 @@ struct Context {
     marks: Vec<(usize, Vec<f32>, Vec<f32>)>,
     used: u64,
 }
+/// Marks a transcript keeps (the newest): a mark is a whole sequence state (~150 MB for GLM-5.3-Flash);
+/// a long chat would keep one a turn, and only the recent ones are ever resumed from.
+const MARKS_KEPT: usize = 8;
 struct Store {
     contexts: Vec<Option<Context>>,
     index: std::collections::HashMap<u64, (usize, usize)>, // prefix key → (context, positions)
     budget: usize, // positions
+    /// What one kept sequence state (a mark, or a closed context's snapshot, with its logits) costs in
+    /// positions of rows: the budget counts both, so a thousand short transcripts cannot keep a thousand
+    /// states (the box went out of memory on a GSM8K run, 2026-10-18: 913 contexts × 153 MB).
+    state_cost: usize,
     held: usize,
     clock: u64,
     max_ctx: usize,
@@ -149,8 +156,13 @@ impl Store {
     fn close(&mut self, ctx: usize, snap: Vec<f32>, logits: Vec<f32>) {
         if let Some(c) = self.contexts[ctx].as_mut() {
             c.rows = Box::new(Dram(std::mem::take(&mut self.active)));
+            let kept = !snap.is_empty() && c.snap.is_empty();
             c.snap = snap;
             c.snap_logits = logits;
+            if kept {
+                self.held += self.state_cost;
+                self.trim(ctx);
+            }
         }
     }
     /// A new context, the active one, holding `n` positions read from `from`, or the prefix (its ids and rows) when `from` is none.
@@ -174,7 +186,7 @@ impl Store {
                 self.active[..prefix_rows.len()].copy_from_slice(prefix_rows);
             }
         }
-        self.held += c.ids.len();
+        self.held += self.cost(&c);
         self.clock += 1;
         c.used = self.clock;
         let slot = self.contexts.iter().position(|c| c.is_none()).unwrap_or_else(|| {
@@ -192,15 +204,23 @@ impl Store {
         let key = self.contexts[ctx].as_ref().unwrap().keys[n];
         self.index.entry(key).or_insert((ctx, n + 1));
         self.held += 1;
+        self.trim(ctx);
+    }
+    /// A context's share of the budget: its positions, and its kept states as positions.
+    fn cost(&self, c: &Context) -> usize {
+        c.ids.len() + (c.marks.len() + usize::from(!c.snap.is_empty())) * self.state_cost
+    }
+    /// Evict least-recently-used contexts, never `keep`, until the budget holds.
+    fn trim(&mut self, keep: usize) {
         while self.held > self.budget {
-            let Some(victim) = self.contexts.iter().enumerate().filter(|(i, c)| *i != ctx && c.is_some()).min_by_key(|(_, c)| c.as_ref().unwrap().used).map(|(i, _)| i) else { break };
+            let Some(victim) = self.contexts.iter().enumerate().filter(|(i, c)| *i != keep && c.is_some()).min_by_key(|(_, c)| c.as_ref().unwrap().used).map(|(i, _)| i) else { break };
             let c = self.contexts[victim].take().unwrap();
             for (n, k) in c.keys.iter().enumerate() {
                 if self.index.get(k) == Some(&(victim, n + 1)) {
                     self.index.remove(k);
                 }
             }
-            self.held -= c.ids.len();
+            self.held -= self.cost(&c);
         }
     }
     fn touch(&mut self, ctx: usize) {
@@ -333,7 +353,8 @@ impl Session {
         let old = self.active;
         let (rows, _) = self.e.prefix();
         self.active = self.store.open(Some((src, at)), self.e.prefix_ids(), rows);
-        self.store.held -= self.store.contexts[old].take().unwrap().ids.len();
+        let gone = self.store.contexts[old].take().unwrap();
+        self.store.held -= self.store.cost(&gone);
         let mut drawn = false;
         if at == first {
             self.e.seed_prefix();
@@ -378,6 +399,12 @@ impl Session {
         let logits = self.e.logits_row(self.last_row).to_vec();
         println!("context  : state at {} positions kept ({:.0} MB in {:.0} ms)", self.pos, 4.0 * len as f64 / 1e6, t0.elapsed().as_secs_f64() * 1e3);
         c.marks.push((self.pos, snap, logits));
+        // the newest MARKS_KEPT stay; every kept state is charged to the budget, which evicts other contexts
+        let dropped = c.marks.len().saturating_sub(MARKS_KEPT);
+        c.marks.drain(..dropped);
+        self.store.held += self.store.state_cost;
+        self.store.held -= dropped * self.store.state_cost;
+        self.store.trim(self.active);
     }
     /// `ids` through the model at the next positions, as few steps as they
     /// allow (`tokens()` per step): the prefix's remaining ids are checked and
@@ -747,8 +774,9 @@ fn main() {
     let avail_kb: usize = std::fs::read_to_string("/proc/meminfo").unwrap_or_default().lines().find_map(|l| l.strip_prefix("MemAvailable:")).and_then(|v| v.trim().split(' ').next()).and_then(|v| v.parse().ok()).unwrap_or(0);
     let budget_bytes = config("rockem.cache").and_then(|v| v.parse::<usize>().ok()).map(|gb| gb << 30).unwrap_or(avail_kb << 9);
     let position = e.position();
-    let store = Store { contexts: Vec::new(), index: std::collections::HashMap::new(), budget: (budget_bytes / (position * 4)).max(max_ctx), held: 0, clock: 0, max_ctx, position, active: Vec::new() };
-    println!("cache    : {} cached positions ({:.1} GB of host memory), {} KB each{}, for {}", store.budget, budget_bytes as f64 / 1e9, position * 4 / 1024, if e.snapshot_len() > 0 { format!(", {} MB of state a transcript", e.snapshot_len() * 4 >> 20) } else { String::new() }, e.name());
+    let state_cost = ((e.snapshot_len() + e.vocab_size()) * 4).div_ceil(position * 4);
+    let store = Store { contexts: Vec::new(), index: std::collections::HashMap::new(), budget: (budget_bytes / (position * 4)).max(max_ctx), state_cost, held: 0, clock: 0, max_ctx, position, active: Vec::new() };
+    println!("cache    : {} cached positions ({:.1} GB of host memory), {} KB each{}, for {}", store.budget, budget_bytes as f64 / 1e9, position * 4 / 1024, if e.snapshot_len() > 0 { format!(", {} MB a kept state ({} positions' worth; the newest {MARKS_KEPT} marks a transcript)", e.snapshot_len() * 4 >> 20, state_cost) } else { String::new() }, e.name());
     let (bos, first) = (e.bos(), e.first_pos());
     let spec = e.drafts() && debug.is_none();
     let e_depth = if spec { e.draft_depth() } else { 0 };
