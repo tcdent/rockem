@@ -270,10 +270,24 @@ boundary: unchanged, tcdent's call.
 **Status 2026-10-17.**
 
 - WMMA rate measured (`bench-wmma`, `bringup/kernels`): iu8 WMMA **87 TOP/s**, bf16 WMMA 85
-  TFLOP/s, scalar f32 FMA 17.5 TFLOP/s at four chains — against the rows kernels' ~1.4 TFLOPS,
-  so an Ozaki-form pair has 10× or more rate headroom after the slice products; its bound is
-  staging operands, not the matrix unit. iu8 measured no faster than bf16 (RDNA3 lists 2×): try
-  eight chains before trusting the ratio. The pair itself is not built.
+  TFLOP/s, scalar f32 FMA 17.5 TFLOP/s at four chains. iu8 measured no faster than bf16 (RDNA3
+  lists 2×): try eight chains before trusting the ratio.
+- **The rows pair, built and deployed (2026-10-18, `rows_wmma` / `rows_wmma_with`):** plain bf16
+  WMMA, not Ozaki — the reference runs these projections in bf16, so bf16 activations (rounded as
+  they are staged) and FP8 weights dequantized as the reference does (fp8 × block scale → bf16)
+  *are* the reference's arithmetic; the Ozaki form (exact int32, order-independent) is **rejected**
+  for this pair as 9–16 iu8 products for a bit-identity the step gate no longer asks of prefill.
+  A step past SPEC_TOKENS takes the twins of every rows kernel (KDA sq rows and output projection,
+  the FP8 gate|up and down projections, the MLA q_a/kv_a/q_b/iq/o, the indexer rows, the
+  all-positions head, the draft's eh_proj). Two lessons: the fragment layout measured first
+  (bench-wmma-layout); the staged rows padded off the 128-byte LDS bank width (a 16-way conflict
+  made the first version 3.5× slower than it is). At 512 tokens the KDA sq rows 2.8 ms a launch,
+  the output projection 0.8 (~10 TFLOPS). **Prefill: 6.2 → 5.5 ms a prompt token at short
+  positions, 8.2 → 7.0 at 18k; the 18k prompt 153 → 129 s; the long SCORE 33 → 30 s.** The
+  numeric gate: step path vs token path top-1 agreement 0.9954, mean KL 2.3e-3 a position (bf16
+  kernels); the long SCORE text's NLL 0.0446 → 0.0407 (within what that text resolves). What is
+  left in prefill: hc_pre (0.35 ms a prompt token at 512, a per-launch cost), kda_step, the attend
+  at long positions, and the experts' compute-bound gemm.
 - The rows kernels at a few tokens: a third pass width `FEW = 4` with four-step rounds (for the
   verify step's 2–4 tokens) — the card's two-token step 21.7 → 17.6 ms of kernels; bf16 launches
   1.18× one token's, FP8 still 1.7–2×. **Rejected:** one or two rows a wave for that width (a
