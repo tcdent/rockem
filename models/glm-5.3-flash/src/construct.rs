@@ -681,7 +681,6 @@ impl Routed for CpuExperts<'_> {
         use common::q4::{self, Act, QAct, GEMM_TOKENS, GROUP};
         use common::swiglu::swiglu_clamped;
         use expert::{DOWN_PARTS, DOWN_ROWS, GU_PARTS, GU_ROWS, SUB};
-        prow::zone!("track-zones", "experts");
         let t0 = std::time::Instant::now();
         let n = idx.len();
         assert!(n <= STEP);
@@ -1617,14 +1616,15 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     p.resident += jobs;
                     p.picks += n * TOP_K;
                 }
+                // the host's FFN phase as laps: the route (the picks, the residents' dispatch), the experts' run,
+                // the join of the cards' jobs, the sum and the handoff back — each a zone of its own
+                lap(&mut p.route, "route");
                 s.routed.run_batch(l, &picks[..n], &s.b_xn[..n * H], &mut s.b_out[..n * TOP_K * H]);
+                lap(&mut p.experts, "experts");
+                s.routed.elapsed(); // the pool's own timer, taken so it does not accumulate (the lap is the measure here)
                 if jobs > 0 {
-                    let t_join = std::time::Instant::now();
-                    {
-                        prow::zone!("track-zones", "join");
-                        pl.xpt_join(l, &mut s.b_out[..n * TOP_K * H]);
-                    }
-                    p.join += t_join.elapsed().as_secs_f64();
+                    pl.xpt_join(l, &mut s.b_out[..n * TOP_K * H]);
+                    lap(&mut p.join, "join");
                     // bring-up (a traced run): every resident pick's output against the host's on the same bytes
                     if tr.wants_edges() || pl.checks() {
                         let mut host = vec![0f32; TOP_K * H];
@@ -1643,7 +1643,8 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                         }
                     }
                 }
-                // each token's weighted sum of its experts' outputs, likewise
+                // each token's weighted sum of its experts' outputs, likewise (on the pool for any width: a few
+                // tokens summed on this thread instead measured 25 against 22 µs a layer, 2026-10-19)
                 {
                     let (y_p, out, wts_r) = (s.b_y.as_mut_ptr() as usize, &s.b_out, &wts);
                     s.pool.run(n, &move |i| {
@@ -1669,10 +1670,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     let as_routed = if n <= SPEC_TOKENS { routed_picks[i] } else { picks[i] };
                     account(p, &mut s.last_picks, &mut s.freq, s.pool, l, as_routed, if n <= SPEC_TOKENS { pre_picks[i] } else { [E; TOP_K] });
                 }
-                let e = s.routed.elapsed();
-                p.experts += e;
-                lap(&mut p.route, "route");
-                p.route -= e;
+                lap(&mut p.route, "sum");
                 // the next MoE layer's picks, predicted by its router over this layer's FFN input (the second
                 // half of each token's scores), prefetched now that this layer's run is done (a run abandons
                 // the prefetches in flight); a step of many tokens names most experts and runs none

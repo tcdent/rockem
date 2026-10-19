@@ -150,9 +150,10 @@ pub mod gfx11_consts {
     /// (`common::gemv::rows_per_wg`).
     /// The matrix-path rows kernels (`rows_wmma`): their grid and LDS.
     pub const WMMA_TOKENS: usize = 128;
+    pub const WMMA_ROWS: usize = 128;
     pub const WMMA_LDS: u32 = (WMMA_TOKENS * (64 + 8) * 2 + WMMA_TOKENS * 4) as u32;
     pub const fn wmma_grid(m: usize, n: usize) -> u32 {
-        (m.div_ceil(128) * n.div_ceil(WMMA_TOKENS)) as u32
+        (m.div_ceil(WMMA_ROWS) * n.div_ceil(WMMA_TOKENS)) as u32
     }
     pub const fn rows_grid(m: usize, n: usize, r: usize) -> u32 {
         m.div_ceil(common::gemv::rows_per_wg(n, r)) as u32

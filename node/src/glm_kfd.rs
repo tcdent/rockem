@@ -206,7 +206,7 @@ struct MtpOn {
     card: usize,
     eh: Mem,        // [H][2·H] bf16
     post_ln: Mem,   // bf16
-    head_norm: Mem, // bf16
+    head_norm: Vec<Mem>, // bf16, on every card: the shared head's rows are split across them (040)
     gu_w: Mem,
     gu_s: Mem,
     down_w: Mem,
@@ -310,8 +310,11 @@ pub struct Cards {
     layers: Vec<Option<Layer>>,
     ffns: Vec<Option<FfnOn>>,
     mlas: Vec<Option<MlaOn>>,
-    /// The head's card, the final norm (bf16) and lm_head.
-    head: (usize, Mem, Mem),
+    /// The head on every card: the final norm (bf16) and this card's rows of lm_head — the vocabulary split
+    /// across the cards (`head_rows`), each card's part over its own copy of the streams (040).
+    head: Vec<(Mem, Mem)>,
+    /// The last layer's card: the traces read the streams' means there.
+    head_card: usize,
     mtp: Option<MtpOn>,
     resident: Resident,
     /// Built with the launches stamped (`track-launches`): the bring-up checks run too.
@@ -637,22 +640,25 @@ impl Cards {
             mla_n += 1;
         }
         // the head with the last layer
-        let head = {
-            let card = card_of(NUM_HIDDEN_LAYERS - 1);
-            let k = &cards[card].k;
-            let norm = k.vram_visible(H * 2);
-            k.upload(&norm, 0, raw(&bf16_of(w.norm)));
-            let lm = k.vram_visible(w.lm_head.len() * 2);
-            k.upload(&lm, 0, raw(w.lm_head));
-            bytes += norm.size + lm.size;
-            (card, norm, lm)
-        };
+        let head_card = card_of(NUM_HIDDEN_LAYERS - 1);
+        let head: Vec<(Mem, Mem)> = (0..cards.len())
+            .map(|c| {
+                let k = &cards[c].k;
+                let norm = k.vram_visible(H * 2);
+                k.upload(&norm, 0, raw(&bf16_of(w.norm)));
+                let (r0, rows) = head_rows(c, cards.len());
+                let lm = k.vram_visible(rows * H * 2);
+                k.upload(&lm, 0, raw(&w.lm_head[r0 * H..(r0 + rows) * H]));
+                bytes += norm.size + lm.size;
+                (norm, lm)
+            })
+            .collect();
         prow::row!("track-boot", "boot", { "what" => "cards", "s" => t0.elapsed().as_secs_f64(), "gb" => bytes as f64 / 1e9 });
         println!("gpu      : {} KDA layers, {mla_n} MLA layers (their latents to {max_ctx} positions), {dense} dense FFNs, {shared_n} shared experts, the hyper-connections, the streams and the head on {} card{} ({:.1} GB with their state) in {:.1}s", kda_layers.len(), n, if n == 1 { "" } else { "s" }, bytes as f64 / 1e9, t0.elapsed().as_secs_f32());
         // the draft layer: its MLA attention as layer MTP_LAYER on the head's card (the shared lm_head is
         // there), its own pieces beside it
         let mtp = w.mtp.as_ref().map(|mt| {
-            let card = head.0;
+            let card = head_card;
             let k = &cards[card].k;
             let one = |a: Fp8| -> (Mem, Mem) {
                 let wm = k.vram_visible(a.w.len());
@@ -688,7 +694,7 @@ impl Cards {
             };
             let (down_w, down_s) = one(mt.ffn.shared_down);
             println!("gpu      : the draft layer on card {card}: its attention, shared expert and eh_proj ({:.2} GB)", (mt.eh_proj.len() * 2 + gu_w.size + down_w.size) as f64 / 1e9);
-            MtpOn { card, eh: up(raw(mt.eh_proj)), post_ln: up(raw(&bf16_of(mt.post_ln))), head_norm: up(raw(&bf16_of(mt.head_norm))), gu_w, gu_s, down_w, down_s, dx: k.vram_visible(STEP * 2 * H * 4) }
+            MtpOn { card, eh: up(raw(mt.eh_proj)), post_ln: up(raw(&bf16_of(mt.post_ln))), head_norm: cards.iter().map(|cd| { let m = cd.k.vram_visible(H * 2); cd.k.upload(&m, 0, raw(&bf16_of(mt.head_norm))); m }).collect(), gu_w, gu_s, down_w, down_s, dx: k.vram_visible(STEP * 2 * H * 4) }
         });
         // the resident experts' slots last: what each card has free past the reserve, up to the budget
         let resident = {
@@ -706,7 +712,7 @@ impl Cards {
             }
             Resident { table: std::sync::Arc::new((0..moe * glm_5_3_flash::E).map(|_| AtomicU32::new(NONE)).collect()), loader: None, inflight: Default::default(), allowed: Default::default(), issued: Default::default(), steps: 0, count: vec![0; moe * glm_5_3_flash::E], turn: 0, owner: counts.iter().map(|&k| vec![(NONE, NONE); k]).collect(), free: counts.iter().map(|&k| (0..k as u32).rev().collect()).collect(), held: (0..n).map(|_| vec![0; moe]).collect(), per_layer, slots, jobs: (0..n).map(|_| Vec::new()).collect(), uploads: 0 }
         };
-        Cards { cards, shared, layers, ffns, mlas, head, mtp, resident, instrument, seq: 0, half_seq: vec![[0; 2]; NUM_HIDDEN_LAYERS], token_from: vec![0; n], npools: max_ctx.div_ceil(INDEX_KPOOL) }
+        Cards { cards, shared, layers, ffns, mlas, head, head_card, mtp, resident, instrument, seq: 0, half_seq: vec![[0; 2]; NUM_HIDDEN_LAYERS], token_from: vec![0; n], npools: max_ctx.div_ceil(INDEX_KPOOL) }
     }
 
     /// With the launches stamped (`track-launches`): the step's launches on every card as zones on
@@ -911,6 +917,15 @@ impl Cards {
     }
 }
 
+/// Card `c`'s rows of lm_head among `cards`: the vocabulary in parts of whole WMMA row groups (which the
+/// scalar rows kernel's groups divide), the last card taking the remainder. The head and the draft's head
+/// stream 1.27 GB a step each on one card otherwise (040).
+fn head_rows(c: usize, cards: usize) -> (usize, usize) {
+    let part = VOCAB_SIZE.div_ceil(cards).next_multiple_of(g::WMMA_ROWS);
+    let r0 = (c * part).min(VOCAB_SIZE);
+    (r0, (VOCAB_SIZE - r0).min(part))
+}
+
 impl Cards {
     /// A step begins at its first MoE layer: the layer turn advances, the counts age at the half-life, and
     /// the loader's budget is set — one more load for a decode step, no bound for a prefill step (063).
@@ -1062,7 +1077,7 @@ impl Placed for Cards {
     }
     fn hidden_all(&mut self, n: usize, out: &mut [f32]) {
         // the streams' means a pass of TOKENS at a time, through the head card's logits buffer (host memory)
-        let c = &self.cards[self.head.0];
+        let c = &self.cards[self.head_card];
         let mut p0 = 0;
         while p0 < n {
             let np = (n - p0).min(TOKENS);
@@ -1156,6 +1171,7 @@ impl Placed for Cards {
 
     fn xpt_dispatch(&mut self, l: usize, n: usize, picks: &mut [[usize; TOP_K]], xq: &[i8], xs: &[f32], xg: &[i32]) -> usize {
         use std::sync::atomic::Ordering;
+        prow::zone!("track-zones", "dispatch");
         let ml = l - glm_5_3_flash::FIRST_K_DENSE_REPLACE;
         let e_n = glm_5_3_flash::E;
         if ml == 0 {
@@ -1276,11 +1292,26 @@ impl Placed for Cards {
     }
     fn mtp_head(&mut self, i: usize, logits: &mut [f32]) {
         let t = self.mtp.as_ref().unwrap();
-        let c = &self.cards[t.card];
-        let (_, _, lm) = &self.head;
-        self.rows(c, &c.rows_h, c.x.at(i * H * 4), Some(t.head_norm.va), lm.va, c.lg.va, VOCAB_SIZE, H, 1, ROWS);
-        c.k.sync();
-        read(&c.lg, 0, &mut logits[..VOCAB_SIZE]);
+        // every card's rows of the shared head over the draft's hidden state: in the draft card's `x`, and
+        // for the other cards in host memory since `mtp_ffn` (the same bytes, so the parts are one head)
+        for (ci, c) in self.cards.iter().enumerate() {
+            let (_, lm) = &self.head[ci];
+            let (_, rows) = head_rows(ci, self.cards.len());
+            let x = if ci == t.card {
+                c.x.at(i * H * 4)
+            } else {
+                // into this card's head input first: the rows kernel's workgroups each read the whole
+                // activation, which over the BAR cost the draft 1.8 ms (2026-10-19 00:15)
+                self.copy_out(c, self.shared.xh.at(i * H * 4), c.fx.va, 1);
+                c.fx.va
+            };
+            self.rows(c, &c.rows_h, x, Some(t.head_norm[ci].va), lm.va, c.lg.va, rows, H, 1, ROWS);
+        }
+        for (ci, c) in self.cards.iter().enumerate() {
+            let (r0, rows) = head_rows(ci, self.cards.len());
+            c.k.sync();
+            read(&c.lg, 0, &mut logits[r0..r0 + rows]);
+        }
     }
     fn mla_wait(&mut self, l: usize, i: usize, kva: &mut [f32], ik: &mut [f32], igate: &mut [f32]) {
         let c = &self.cards[self.mlas[l].as_ref().unwrap().card];
@@ -1429,7 +1460,7 @@ impl Placed for Cards {
         unsafe { &*self.word_ptr(W_EXPERTS, 0) }.store(self.half_seq[l][1], std::sync::atomic::Ordering::Release);
     }
     fn layer_out(&mut self, _l: usize, i: usize, mean: &mut [f32]) {
-        let c = &self.cards[self.head.0];
+        let c = &self.cards[self.head_card];
         let mut a = Args::new();
         a.ptr(c.streams.at(i * HC * H * 4)).ptr(c.mean.va).u32(1);
         c.k.launch(&c.hc_mean, CHANNEL_GRID, g::WG, 0, &a);
@@ -1437,24 +1468,32 @@ impl Placed for Cards {
         read(&c.mean, 0, &mut mean[..H]);
     }
     fn logits(&mut self, from: usize, n: usize, logits: &mut [f32]) {
-        let (card, norm, lm) = &self.head;
-        let c = &self.cards[*card];
-        // a pass of TOKENS at a time: the streams' means, the norm and lm_head over them, the pass read back
+        // a pass of TOKENS at a time, on every card at once: the streams' means (every card holds the streams),
+        // the norm and this card's rows of lm_head over them; the parts read back a token into the one vector
         let mut p0 = 0;
         while p0 < n {
             let np = (n - p0).min(TOKENS);
-            let mut a = Args::new();
-            a.ptr(c.streams.at((from + p0) * HC * H * 4)).ptr(c.fx.va).u32(np as u32);
-            c.k.launch(&c.hc_mean, CHANNEL_GRID, g::WG, 0, &a);
-            if np > SPEC_TOKENS {
+            for (ci, c) in self.cards.iter().enumerate() {
+                let (norm, lm) = &self.head[ci];
+                let (_, rows) = head_rows(ci, self.cards.len());
                 let mut a = Args::new();
-                a.ptr(c.fx.va).ptr(norm.va).ptr(lm.va).ptr(c.lg.va).u32(VOCAB_SIZE as u32).u32(np as u32);
-                c.k.launch(&c.rows_h_w, g::wmma_grid(VOCAB_SIZE, np), g::WG, g::WMMA_LDS, &a);
-            } else {
-                self.rows(c, &c.rows_h, c.fx.va, Some(norm.va), lm.va, c.lg.va, VOCAB_SIZE, H, np, ROWS);
+                a.ptr(c.streams.at((from + p0) * HC * H * 4)).ptr(c.fx.va).u32(np as u32);
+                c.k.launch(&c.hc_mean, CHANNEL_GRID, g::WG, 0, &a);
+                if np > SPEC_TOKENS {
+                    let mut a = Args::new();
+                    a.ptr(c.fx.va).ptr(norm.va).ptr(lm.va).ptr(c.lg.va).u32(rows as u32).u32(np as u32);
+                    c.k.launch(&c.rows_h_w, g::wmma_grid(rows, np), g::WG, g::WMMA_LDS, &a);
+                } else {
+                    self.rows(c, &c.rows_h, c.fx.va, Some(norm.va), lm.va, c.lg.va, rows, H, np, ROWS);
+                }
             }
-            c.k.sync();
-            read(&c.lg, 0, &mut logits[p0 * VOCAB_SIZE..(p0 + np) * VOCAB_SIZE]);
+            for (ci, c) in self.cards.iter().enumerate() {
+                let (r0, rows) = head_rows(ci, self.cards.len());
+                c.k.sync();
+                for i in 0..np {
+                    read(&c.lg, i * rows * 4, &mut logits[(p0 + i) * VOCAB_SIZE + r0..(p0 + i) * VOCAB_SIZE + r0 + rows]);
+                }
+            }
             p0 += np;
         }
         // the step ends when every card is done with its streams: the next begins by overwriting them
