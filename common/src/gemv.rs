@@ -873,6 +873,26 @@ pub mod gfx11 {
     pub unsafe fn wmma(a: v16i16, b: v16i16, c: v8f32) -> v8f32 {
         wmma_f32_bf16(a, b, c)
     }
+    #[repr(simd)]
+    #[derive(Clone, Copy)]
+    #[allow(non_camel_case_types)]
+    pub struct v4i32(pub [i32; 4]);
+    #[repr(simd)]
+    #[derive(Clone, Copy)]
+    #[allow(non_camel_case_types)]
+    pub struct v8i32(pub [i32; 8]);
+    unsafe extern "C" {
+        #[link_name = "llvm.amdgcn.wmma.i32.16x16x16.iu8.v8i32.v4i32"]
+        fn wmma_i32_iu8(sa: bool, a: v4i32, sb: bool, b: v4i32, c: v8i32, clamp: bool) -> v8i32;
+    }
+    /// One integer WMMA step, the same fragment layout: A sixteen unsigned bytes a lane (q4 nibbles
+    /// widened, 0..16), B sixteen signed bytes (an int8 activation), i32 accumulators — exact, so a
+    /// group's sum is the CPU kernel's whatever the order (87 TOP/s measured, queue 011).
+    #[inline(always)]
+    pub unsafe fn wmma_u8i8(a: v4i32, b: v4i32, c: v8i32) -> v8i32 {
+        wmma_i32_iu8(false, a, true, b, c, false)
+    }
+    pub const ZERO_I32: v8i32 = v8i32([0; 8]);
     /// `x` rounded to bf16 (ties to even), as the 16 bits.
     #[inline(always)]
     pub fn to_bf16(x: f32) -> u16 {

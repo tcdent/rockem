@@ -839,10 +839,10 @@ pub trait Placed {
     /// marked `E` in `picks` so the host's run skips it; a pick not resident may claim a slot (a free one,
     /// or a less-used resident's past a margin), which the loader fills for the steps to come. Returns the jobs.
     fn xpt_dispatch(&mut self, l: usize, n: usize, picks: &mut [[usize; TOP_K]], xq: &[i8], xs: &[f32], xg: &[i32]) -> usize;
-    /// A prefill step's picks for MoE layer `l`: they train the residency's counts and the layer's most-picked
-    /// experts not resident claim slots, loaded while the step runs — decode then begins with the residency the
-    /// prompt's own routing chose rather than filling it a slot a step (063). The picks all run on the host.
-    fn xpt_train(&mut self, l: usize, picks: &[[usize; TOP_K]]);
+    /// The routed experts' outputs, `[STEP · TOP_K][H]` f32 in host memory every card sees: the cards' jobs
+    /// land in their (token, pick) rows directly and the host's experts write theirs beside them, so the
+    /// join is a wait and no copy (038). Null without cards.
+    fn expert_out(&self) -> *mut f32;
     /// The loader the residency fills slots with, off the step: `fetch(l, e, out)` gathers expert `e` of
     /// layer `l` as a slot holds it (`expert::Weights::slot_bytes`). Set once before the first step.
     fn xpt_loader(&mut self, fetch: Box<dyn Fn(usize, usize, &mut [u8]) + Send + 'static>);
@@ -971,6 +971,8 @@ pub struct CpuModel<'p, R: Routed> {
     b_xq: Vec<i8>,
     b_xs: Vec<f32>,
     b_xg: Vec<i32>,
+    /// A step's picks as routed, kept beside `picks` (which the dispatch marks) for the accounting and the checks.
+    b_routed: Vec<[usize; TOP_K]>,
     d_x: Vec<f32>,
     d_xn: Vec<f32>,
     d_y: Vec<f32>,
@@ -1042,9 +1044,10 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             d_cat: vec![0.0; 2 * H],
             d_cats: vec![0.0; STEP * 2 * H],
             d_hid: vec![0.0; H],
-            b_xq: vec![0; SPEC_TOKENS * H],
-            b_xs: vec![0.0; SPEC_TOKENS * (H / common::q4::GROUP)],
-            b_xg: vec![0; SPEC_TOKENS * (H / common::q4::GROUP)],
+            b_xq: vec![0; STEP * H],
+            b_xs: vec![0.0; STEP * (H / common::q4::GROUP)],
+            b_xg: vec![0; STEP * (H / common::q4::GROUP)],
+            b_routed: vec![[E; TOP_K]; STEP],
             d_x: vec![0.0; H],
             d_xn: vec![0.0; H],
             d_y: vec![0.0; H],
@@ -1506,6 +1509,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             tr.edge(NONE, "embed", &s.b_x[..H]);
         }
         let pl = s.placed.as_mut().unwrap();
+        let xout = pl.expert_out();
         pl.begin(&s.b_x[..n * H], n);
         let mut t = std::time::Instant::now();
         // a lap is a phase from the previous lap to now: its time goes to the profile and, with
@@ -1595,35 +1599,38 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     tr.edge(l, "ffn_in", &s.b_xn[..H]);
                     tr.topk(l, &picks[0], &wts[0]);
                 }
-                // a step of a few tokens: the picks resident on the cards run there, concurrently with the host's;
-                // the picks as routed are kept for the accounting (the dispatch marks the resident ones)
-                let mut routed_picks = [[E; TOP_K]; SPEC_TOKENS];
-                if n <= SPEC_TOKENS {
-                    routed_picks[..n].copy_from_slice(&picks[..n]);
-                }
-                let jobs = if n <= SPEC_TOKENS {
-                    const HG: usize = H / common::q4::GROUP;
-                    for i in 0..n {
-                        common::q4::QAct { q: &mut s.b_xq[i * H..(i + 1) * H], scale: &mut s.b_xs[i * HG..(i + 1) * HG], gsum: &mut s.b_xg[i * HG..(i + 1) * HG] }.quantize(&s.b_xn[i * H..(i + 1) * H]);
+                // the picks resident on the cards run there, concurrently with the host's (the dispatch marks them
+                // `E` in `picks`); the picks as routed are kept for the accounting
+                s.b_routed[..n].copy_from_slice(&picks[..n]);
+                const HG: usize = H / common::q4::GROUP;
+                {
+                    let (xq_p, xs_p, xg_p, xn) = (s.b_xq.as_mut_ptr() as usize, s.b_xs.as_mut_ptr() as usize, s.b_xg.as_mut_ptr() as usize, &s.b_xn);
+                    let quantize = move |i: usize| {
+                        let (q, sc, g) = unsafe { (std::slice::from_raw_parts_mut((xq_p as *mut i8).add(i * H), H), std::slice::from_raw_parts_mut((xs_p as *mut f32).add(i * HG), HG), std::slice::from_raw_parts_mut((xg_p as *mut i32).add(i * HG), HG)) };
+                        common::q4::QAct { q, scale: sc, gsum: g }.quantize(&xn[i * H..(i + 1) * H]);
+                    };
+                    if n <= 16 {
+                        for i in 0..n {
+                            quantize(i);
+                        }
+                    } else {
+                        s.pool.run(n, &quantize);
                     }
-                    pl.xpt_dispatch(l, n, &mut picks[..n], &s.b_xq[..n * H], &s.b_xs[..n * HG], &s.b_xg[..n * HG])
-                } else {
-                    pl.xpt_train(l, &picks[..n]);
-                    0
-                };
-                pl.ffn_post(l, n);
-                if n <= SPEC_TOKENS {
-                    p.resident += jobs;
-                    p.picks += n * TOP_K;
                 }
+                let jobs = pl.xpt_dispatch(l, n, &mut picks[..n], &s.b_xq[..n * H], &s.b_xs[..n * HG], &s.b_xg[..n * HG]);
+                pl.ffn_post(l, n);
+                p.resident += jobs;
+                p.picks += n * TOP_K;
+                // the outputs: the cards' host-memory rows when there are cards (their jobs land there), else the model's own
+                let out: &mut [f32] = if xout.is_null() { &mut s.b_out[..n * TOP_K * H] } else { unsafe { std::slice::from_raw_parts_mut(xout, n * TOP_K * H) } };
                 // the host's FFN phase as laps: the route (the picks, the residents' dispatch), the experts' run,
                 // the join of the cards' jobs, the sum and the handoff back — each a zone of its own
                 lap(&mut p.route, "route");
-                s.routed.run_batch(l, &picks[..n], &s.b_xn[..n * H], &mut s.b_out[..n * TOP_K * H]);
+                s.routed.run_batch(l, &picks[..n], &s.b_xn[..n * H], out);
                 lap(&mut p.experts, "experts");
                 s.routed.elapsed(); // the pool's own timer, taken so it does not accumulate (the lap is the measure here)
-                if jobs > 0 {
-                    pl.xpt_join(l, &mut s.b_out[..n * TOP_K * H]);
+                if jobs > 0 || n > SPEC_TOKENS {
+                    pl.xpt_join(l, out);
                     lap(&mut p.join, "join");
                     // bring-up (a traced run): every resident pick's output against the host's on the same bytes
                     if tr.wants_edges() || pl.checks() {
@@ -1631,9 +1638,9 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                         for i in 0..n {
                             for k in 0..TOP_K {
                                 if picks[i][k] == E {
-                                    let e = routed_picks[i][k];
+                                    let e = s.b_routed[i][k];
                                     s.routed.run(l, &[e; TOP_K], &s.b_xn[i * H..(i + 1) * H], &mut host);
-                                    let card = &s.b_out[(i * TOP_K + k) * H..(i * TOP_K + k + 1) * H];
+                                    let card = &out[(i * TOP_K + k) * H..(i * TOP_K + k + 1) * H];
                                     if let Some(d) = (0..H).find(|&d| card[d].to_bits() != host[d].to_bits()) {
                                         let worst = (0..H).map(|d| (card[d] - host[d]).abs()).fold(0f32, f32::max);
                                         eprintln!("xpt mismatch: layer {l} expert {e} token {i} pick {k}: first at {d} card {:e} host {:e}, max |Δ| {worst:e}", card[d], host[d]);
@@ -1646,7 +1653,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 // each token's weighted sum of its experts' outputs, likewise (on the pool for any width: a few
                 // tokens summed on this thread instead measured 25 against 22 µs a layer, 2026-10-19)
                 {
-                    let (y_p, out, wts_r) = (s.b_y.as_mut_ptr() as usize, &s.b_out, &wts);
+                    let (y_p, out, wts_r) = (s.b_y.as_mut_ptr() as usize, &*out, &wts);
                     s.pool.run(n, &move |i| {
                         let y = unsafe { std::slice::from_raw_parts_mut((y_p as *mut f32).add(i * H), H) };
                         y.fill(0.0);
@@ -1661,14 +1668,13 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 if n == 1 {
                     tr.edge(l, "ffn_in", &s.b_xn[..H]);
                     for k in 0..TOP_K {
-                        tr.routed(l, k, &s.b_out[k * H..(k + 1) * H]);
+                        tr.routed(l, k, &out[k * H..(k + 1) * H]);
                     }
                     tr.edge(l, "routed", &s.b_y[..H]);
                 }
                 pl.ffn_routed(l, n, &s.b_y[..n * H]);
                 for i in 0..n {
-                    let as_routed = if n <= SPEC_TOKENS { routed_picks[i] } else { picks[i] };
-                    account(p, &mut s.last_picks, &mut s.freq, s.pool, l, as_routed, if n <= SPEC_TOKENS { pre_picks[i] } else { [E; TOP_K] });
+                    account(p, &mut s.last_picks, &mut s.freq, s.pool, l, s.b_routed[i], if n <= SPEC_TOKENS { pre_picks[i] } else { [E; TOP_K] });
                 }
                 lap(&mut p.route, "sum");
                 // the next MoE layer's picks, predicted by its router over this layer's FFN input (the second

@@ -460,6 +460,19 @@ pub mod gfx11_consts {
     pub const XPT_LDS: usize = common::gemv::FLIGHT * STEP_BYTES;
     // a workgroup's eight tiles must belong to one expert for the shared staging
     const _: () = assert!(UP_TILES % 8 == 0 && DOWN_TILES % 8 == 0 && SLOT_BYTES == crate::layout::RECORD);
+    /// The grouped kernels (038): a workgroup is `XG_ROWS` rows of one resident expert (eight waves, a
+    /// 16-row WMMA tile each) over every token that picked it, sixteen tokens a tile. The dispatch's
+    /// group table is `[groups][4]` u32 (slot, first job, jobs, 0), its jobs `[jobs][2]` u32 (token, the
+    /// output row `token · TOP_K + pick`); `gu` is `[jobs][2·D_FF]` f32, the quantized hidden state
+    /// `[jobs][D_FF]` i8 with `[jobs][XQ_GROUPS]` scales and Σq.
+    pub const XG_ROWS: usize = 128;
+    pub const XG_GU_WGS: usize = 2 * D_FF / XG_ROWS;
+    pub const XG_DOWN_WGS: usize = H / XG_ROWS;
+    pub const XQ_GROUPS: usize = D_FF / common::q4::GROUP;
+    pub const XQ_WGS: usize = XQ_GROUPS / 8;
+    /// Jobs a layer the cards take at most; the rest of a step's resident picks run on the host.
+    pub const XG_MAX_JOBS: usize = crate::STEP * crate::TOP_K / 2;
+    const _: () = assert!(XG_ROWS % 16 == 0 && (2 * D_FF) % XG_ROWS == 0 && H % XG_ROWS == 0 && XQ_GROUPS % 8 == 0 && crate::layout::GU_CHUNK % 16 == 0 && crate::layout::DOWN_CHUNK % 16 == 0);
 }
 
 /// The card realization of a routed expert: a (token, pick) job over an expert resident in a card
@@ -481,15 +494,16 @@ pub mod gfx11 {
     use core::arch::amdgpu::{wave_reduce_add, wave_reduce_umax, workgroup_id_x, workitem_id_x};
     const HG: usize = H / GROUP;
 
-    /// `gu[j][2·D_FF] = [gate; up] · xq[tok]` for job `j = (slot, tok)` of `jobs` (`[jobs][2]` u32).
+    /// `gu[j][2·D_FF] = [gate; up] · xq[tok]` for job `j = (slot, tok, output row)` of `jobs` (`[jobs][3]` u32).
     /// `slots`: the resident experts, `SLOT_BYTES` each; `xq`/`xs`/`xg`: `[tokens][H]`, `[tokens][H/GROUP]` ×2.
-    /// Grid: jobs × UP_WGS, 256 threads, XPT_LDS.
+    /// A step of a few tokens (a verify step's) runs its jobs here, a token a job; a prefill step's run grouped
+    /// by expert (`xpt_gemm_gu`), as the rows kernels split by `SPEC_TOKENS`. Grid: jobs × UP_WGS, 256 threads, XPT_LDS.
     #[no_mangle]
     pub extern "gpu-kernel" fn xpt_gu(slots: *const u8, jobs: *const u32, xq: *const i8, xs: *const f32, xg: *const i32, gu: *mut f32) {
         unsafe {
             let wg = workgroup_id_x() as usize;
             let (j, blk) = (wg / UP_WGS, wg % UP_WGS);
-            let (slot, tok) = (*jobs.add(2 * j) as usize, *jobs.add(2 * j + 1) as usize);
+            let (slot, tok) = (*jobs.add(3 * j) as usize, *jobs.add(3 * j + 1) as usize);
             let tid = workitem_id_x();
             let (wave, lane) = ((tid / 32) as usize, tid % 32);
             let tile = blk * 8 + wave; // 0..2·D_FF/TILE: the gate's tiles, then the up's
@@ -516,13 +530,14 @@ pub mod gfx11 {
         }
     }
 
-    /// `out[j][H] = down · quant(swiglu_clamped(gu[j]))` for job `j`. Grid: jobs × DOWN_WGS, 256 threads, XPT_LDS.
+    /// `out[row(j)][H] = down · quant(swiglu_clamped(gu[j]))` for job `j`, `out` the `[STEP · TOP_K][H]` rows by
+    /// (token, pick). Grid: jobs × DOWN_WGS, 256 threads, XPT_LDS.
     #[no_mangle]
     pub extern "gpu-kernel" fn xpt_down(slots: *const u8, jobs: *const u32, gu: *const f32, out: *mut f32) {
         unsafe {
             let wg = workgroup_id_x() as usize;
             let (j, blk) = (wg / DOWN_WGS, wg % DOWN_WGS);
-            let slot = *jobs.add(2 * j) as usize;
+            let (slot, orow) = (*jobs.add(3 * j) as usize, *jobs.add(3 * j + 2) as usize);
             let tid = workitem_id_x();
             let (wave, lane) = ((tid / 32) as usize, tid % 32);
             let tile = blk * 8 + wave; // 0..H/TILE
@@ -585,7 +600,7 @@ pub mod gfx11 {
             let mut y = [0f32; common::q4::gfx11::PASS];
             tile_pass::<D_FF>(lane, w_tile, ws_tile, slab, &stage, &mut y);
             if lane < 16 && lane % 4 == 0 {
-                *out.add(j * H + tile * TILE + lane as usize / 4) = y[0];
+                *out.add(orow * H + tile * TILE + lane as usize / 4) = y[0];
             }
         }
     }
@@ -633,6 +648,203 @@ pub mod gfx11 {
         if part < 2 && g + part < ng {
             *(dst.add(2 * GROUP) as *mut f32).add(part) = *ascale.add(g + part);
             *(dst.add(2 * GROUP + 8) as *mut i32).add(part) = *gsum.add(g + part);
+        }
+    }
+
+    // ---- the grouped kernels (038): one expert's rows against every token that picked it ----
+
+    /// `y[r] += (Σ a·b − 8·Σb) · (ws · xs)` a group over `K`, for the lane's eight accumulating rows
+    /// (`2r + lane / 16` of the wave's 16-row tile) and its token (`lane % 16`): `a_row` is the row the
+    /// lane supplies (row `lane % 16`), its group-0 bytes in the q4 tile layout (64 bytes a row a group,
+    /// `TILE` rows a group block of 256); `ws_rows[r]` the accumulating rows' scales at group 0 (`TILE`
+    /// apart a group); `b`, `bs`, `bg` the token's activation. The integer sum is exact, the flush the
+    /// CPU's expression in the CPU's group order: the same bits as `q4::gemm`.
+    #[inline(always)]
+    unsafe fn tile16<const K: usize>(lane: u32, a_row: *const u8, ws_rows: &[*const f32; 8], b: *const i8, bs: *const f32, bg: *const i32, y: &mut [f32; 8]) {
+        use common::gemv::gfx11::{v4i32, v8i32, wmma_u8i8, ZERO_I32};
+        let ng = K / GROUP;
+        let mut g = 0;
+        while g < ng {
+            let mut acc: v8i32 = ZERO_I32;
+            let ab = a_row.add(g * TILE * (GROUP / 2));
+            let bb = b.add(g * GROUP);
+            // the group's eight k-steps in two halves of four, each half's loads issued before its WMMAs
+            // (a step's load alone would wait a memory latency before each 16-cycle multiply): bytes
+            // c·32 + q·16.. of the row hold k c·64 + q·16.. in their low nibbles and k + 32 in the high
+            let mut c = 0;
+            while c < 2 {
+                let raw0: [u32; 4] = core::ptr::read_unaligned(ab.add(c * 32) as *const [u32; 4]);
+                let raw1: [u32; 4] = core::ptr::read_unaligned(ab.add(c * 32 + 16) as *const [u32; 4]);
+                let b0: [i32; 4] = core::ptr::read_unaligned(bb.add(c * 64) as *const [i32; 4]);
+                let b1: [i32; 4] = core::ptr::read_unaligned(bb.add(c * 64 + 16) as *const [i32; 4]);
+                let b2: [i32; 4] = core::ptr::read_unaligned(bb.add(c * 64 + 32) as *const [i32; 4]);
+                let b3: [i32; 4] = core::ptr::read_unaligned(bb.add(c * 64 + 48) as *const [i32; 4]);
+                let (mut lo0, mut lo1, mut hi0, mut hi1) = ([0i32; 4], [0i32; 4], [0i32; 4], [0i32; 4]);
+                let mut i = 0;
+                while i < 4 {
+                    lo0[i] = (raw0[i] & 0x0F0F_0F0F) as i32;
+                    lo1[i] = (raw1[i] & 0x0F0F_0F0F) as i32;
+                    hi0[i] = ((raw0[i] >> 4) & 0x0F0F_0F0F) as i32;
+                    hi1[i] = ((raw1[i] >> 4) & 0x0F0F_0F0F) as i32;
+                    i += 1;
+                }
+                acc = wmma_u8i8(v4i32(lo0), v4i32(b0), acc);
+                acc = wmma_u8i8(v4i32(lo1), v4i32(b1), acc);
+                acc = wmma_u8i8(v4i32(hi0), v4i32(b2), acc);
+                acc = wmma_u8i8(v4i32(hi1), v4i32(b3), acc);
+                c += 1;
+            }
+            let (xs, xg) = (*bs.add(g), *bg.add(g));
+            let d: [i32; 8] = core::mem::transmute(acc);
+            let mut r = 0;
+            while r < 8 {
+                let sum = d[r] - 8 * xg;
+                y[r] += sum as f32 * (*ws_rows[r].add(g * TILE) * xs);
+                r += 1;
+            }
+            g += 1;
+        }
+        let _ = lane;
+    }
+
+    /// `gu[j][2·D_FF] = [gate; up] · xq[tok]` for every job of every group: workgroup (group, block) takes
+    /// rows `block · XG_ROWS..` of the expert (gate rows then up rows), wave `w` its 16-row tile, over the
+    /// group's tokens sixteen a tile (a short tile repeats the last job: the same values written twice).
+    /// Grid: groups × XG_GU_WGS, 256 threads, no LDS.
+    #[no_mangle]
+    pub extern "gpu-kernel" fn xpt_gemm_gu(slots: *const u8, groups: *const u32, jobs: *const u32, xq: *const i8, xs: *const f32, xg: *const i32, gu: *mut f32) {
+        unsafe {
+            let wg = workgroup_id_x() as usize;
+            let (grp, blk) = (wg / XG_GU_WGS, wg % XG_GU_WGS);
+            let (slot, first, count) = (*groups.add(4 * grp) as usize, *groups.add(4 * grp + 1) as usize, *groups.add(4 * grp + 2) as usize);
+            let tid = workitem_id_x();
+            let (wave, lane) = ((tid / 32) as usize, tid % 32);
+            let row0 = blk * XG_ROWS + wave * 16; // 0..2·D_FF
+            let (half, rr) = (row0 / D_FF, row0 % D_FF);
+            let (c, t0) = (rr / GU_CHUNK, (rr % GU_CHUNK) / TILE);
+            let item = slots.add(slot * SLOT_BYTES + c * layout::GU_ITEM);
+            let w_base = item.add(half * layout::GU_W);
+            let ws_base = item.add(2 * layout::GU_W + half * 4 * layout::GU_S) as *const f32;
+            let lr = lane as usize % 16;
+            let a_row = w_base.add((t0 + lr / 4) * TILE * H / 2 + (lr % 4) * (GROUP / 2));
+            let mut ws_rows = [ws_base; 8];
+            let mut r = 0;
+            while r < 8 {
+                let row = 2 * r + lane as usize / 16;
+                ws_rows[r] = ws_base.add((t0 + row / 4) * TILE * HG + row % 4);
+                r += 1;
+            }
+            let mut tt = 0;
+            while tt * 16 < count {
+                let mut jj = first + tt * 16 + lr;
+                if jj >= first + count {
+                    jj = first + count - 1;
+                }
+                let tok = *jobs.add(2 * jj) as usize;
+                let mut y = [0f32; 8];
+                tile16::<H>(lane, a_row, &ws_rows, xq.add(tok * H), xs.add(tok * HG), xg.add(tok * HG), &mut y);
+                let mut r = 0;
+                while r < 8 {
+                    *gu.add(jj * 2 * D_FF + row0 + 2 * r + lane as usize / 16) = y[r];
+                    r += 1;
+                }
+                tt += 1;
+            }
+        }
+    }
+
+    /// Every job's hidden state quantized: the clamped SwiGLU over `gu[j]` (the CPU's `swiglu_clamped`),
+    /// then `QAct::quantize`'s absmax/127, the shared round, the clamp and Σq, a wave a group. Grid:
+    /// jobs × XQ_WGS, 256 threads, no LDS.
+    #[no_mangle]
+    pub extern "gpu-kernel" fn xpt_quant(gu: *const f32, hq: *mut i8, hs: *mut f32, hg: *mut i32) {
+        unsafe {
+            let wg = workgroup_id_x() as usize;
+            let (j, blk) = (wg / XQ_WGS, wg % XQ_WGS);
+            let tid = workitem_id_x();
+            let (wave, lane) = ((tid / 32) as usize, tid % 32);
+            let gi = blk * 8 + wave; // the job's group
+            let g = gu.add(j * 2 * D_FF);
+            let limit = crate::SWIGLU_LIMIT;
+            let k0 = gi * GROUP + lane as usize * 4;
+            let mut v = [0f32; 4];
+            let mut amax = 0f32;
+            let mut jj = 0;
+            while jj < 4 {
+                let gate = *g.add(k0 + jj);
+                let up = *g.add(D_FF + k0 + jj);
+                let gc = if gate > limit { limit } else { gate };
+                let uc = if up > limit { limit } else if up < -limit { -limit } else { up };
+                v[jj] = silu(gc) * uc;
+                let a = if v[jj] < 0.0 { -v[jj] } else { v[jj] };
+                if a > amax {
+                    amax = a;
+                }
+                jj += 1;
+            }
+            let amax = f32::from_bits(wave_reduce_umax::<0>(amax.to_bits()));
+            let s = amax / 127.0;
+            let inv = if s > 0.0 { 1.0 / s } else { 0.0 };
+            let mut packed = 0u32;
+            let mut sum = 0i32;
+            let mut jj = 0;
+            while jj < 4 {
+                let rd = common::math::round(v[jj] * inv);
+                let rd = if rd > 127.0 { 127.0 } else if rd < -127.0 { -127.0 } else { rd };
+                let qv = rd as i8;
+                packed |= ((qv as u8) as u32) << (8 * jj);
+                sum += qv as i32;
+                jj += 1;
+            }
+            let sum = wave_reduce_add::<0>(sum as u32) as i32;
+            *(hq.add(j * D_FF + k0) as *mut u32) = packed;
+            if lane == 0 {
+                *hs.add(j * XQ_GROUPS + gi) = s;
+                *hg.add(j * XQ_GROUPS + gi) = sum;
+            }
+        }
+    }
+
+    /// `out[row(j)][H] = down · hq[j]` for every job of every group, as `xpt_gemm_gu` over the down rows;
+    /// `out` is `[STEP · TOP_K][H]`, the row a job's `token · TOP_K + pick`. Grid: groups × XG_DOWN_WGS,
+    /// 256 threads, no LDS.
+    #[no_mangle]
+    pub extern "gpu-kernel" fn xpt_gemm_down(slots: *const u8, groups: *const u32, jobs: *const u32, hq: *const i8, hs: *const f32, hg: *const i32, out: *mut f32) {
+        unsafe {
+            let wg = workgroup_id_x() as usize;
+            let (grp, blk) = (wg / XG_DOWN_WGS, wg % XG_DOWN_WGS);
+            let (slot, first, count) = (*groups.add(4 * grp) as usize, *groups.add(4 * grp + 1) as usize, *groups.add(4 * grp + 2) as usize);
+            let tid = workitem_id_x();
+            let (wave, lane) = ((tid / 32) as usize, tid % 32);
+            let row0 = blk * XG_ROWS + wave * 16; // 0..H
+            let (c, t0) = (row0 / layout::DOWN_CHUNK, (row0 % layout::DOWN_CHUNK) / TILE);
+            let item = slots.add(slot * SLOT_BYTES + GU_ITEMS * layout::GU_ITEM + c * layout::DOWN_ITEM);
+            let ws_base = item.add(layout::DOWN_W) as *const f32;
+            let lr = lane as usize % 16;
+            let a_row = item.add((t0 + lr / 4) * TILE * D_FF / 2 + (lr % 4) * (GROUP / 2));
+            let mut ws_rows = [ws_base; 8];
+            let mut r = 0;
+            while r < 8 {
+                let row = 2 * r + lane as usize / 16;
+                ws_rows[r] = ws_base.add((t0 + row / 4) * TILE * XQ_GROUPS + row % 4);
+                r += 1;
+            }
+            let mut tt = 0;
+            while tt * 16 < count {
+                let mut jj = first + tt * 16 + lr;
+                if jj >= first + count {
+                    jj = first + count - 1;
+                }
+                let orow = *jobs.add(2 * jj + 1) as usize;
+                let mut y = [0f32; 8];
+                tile16::<D_FF>(lane, a_row, &ws_rows, hq.add(jj * D_FF), hs.add(jj * XQ_GROUPS), hg.add(jj * XQ_GROUPS), &mut y);
+                let mut r = 0;
+                while r < 8 {
+                    *out.add(orow * H + row0 + 2 * r + lane as usize / 16) = y[r];
+                    r += 1;
+                }
+                tt += 1;
+            }
         }
     }
 }

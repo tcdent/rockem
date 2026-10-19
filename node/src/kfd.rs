@@ -135,6 +135,7 @@ const MEM_PUBLIC: u32 = 1 << 29;
 const MEM_AQL_QUEUE: u32 = 1 << 27;
 const MEM_COHERENT: u32 = 1 << 26;
 const MEM_UNCACHED: u32 = 1 << 25;
+const MEM_USERPTR: u32 = 1 << 2;
 
 // --- what the command processor expects in memory (ROCR amd_hsa_queue.h, amd_hsa_signal.h, hsa.h) ---
 /// `amd_queue_t`: the CP is told where `write_dispatch_id` and `read_dispatch_id` live.
@@ -579,6 +580,28 @@ impl Kfd {
             Self::call(&self.kfd, IOC_MAP, &mut a, "map to the other gpu");
         }
         m
+    }
+    /// Memory the host owns — anonymous pages, cached for the CPU like any of its own — mapped for this
+    /// card and `others` at the host's own address (a KFD userptr registration). GTT allocations are
+    /// write-combining on the CPU side (a 160 KB read of one took 0.86 ms, 2026-10-19), so what the
+    /// CPU reads and writes in bulk and the cards only write — the routed experts' outputs (038) —
+    /// lives here: the cards' writes reach it over the link, the CPU's caches stay coherent by PCIe. Not
+    /// `MEM_COHERENT`: that maps it uncached on the card, and a kernel's scattered 4-byte stores then each
+    /// cross the link alone (the per-token expert kernel's join went 0.9 → 12 ms a step, 2026-10-19);
+    /// cached, the card's L2 gathers them and the fence flushes whole lines, as `host()` relies on.
+    pub fn host_owned(&self, size: usize, others: &[&Kfd]) -> Mem {
+        let size = (size + 4095) & !4095;
+        let p = unsafe { mmap(std::ptr::null_mut(), size, PROT_RW, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) };
+        assert!(p != MAP_FAILED, "host_owned: {}", std::io::Error::last_os_error());
+        populate(p as usize, size);
+        let mut a = AllocArgs { va_addr: p as u64, size: size as u64, mmap_offset: p as u64, gpu_id: self.gpu_id, flags: MEM_USERPTR | MEM_WRITABLE, ..Default::default() };
+        Self::call(&self.kfd, IOC_ALLOC, &mut a, "register host memory");
+        for k in std::iter::once(self).chain(others.iter().copied()) {
+            let ids = [k.gpu_id];
+            let mut m = MapArgs { handle: a.handle, device_ids_array_ptr: ids.as_ptr() as u64, n_devices: 1, n_success: 0 };
+            Self::call(&self.kfd, IOC_MAP, &mut m, "map host memory to a gpu");
+        }
+        Mem { va: p as usize, size, handle: a.handle }
     }
     /// Host → card through the BAR, streamed (`common::copy`): a weight
     /// upload, a context swap-in.

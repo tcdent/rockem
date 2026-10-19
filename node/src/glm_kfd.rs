@@ -43,7 +43,7 @@ use common::gemv::ROWS;
 use glm_5_3_flash::ffn::gfx11_consts::ROWS_GU;
 use glm_5_3_flash::layout::{KDA_MEMORY, KDA_WINDOW};
 use glm_5_3_flash::mla::gfx11_consts::{aw_chunk, aw_chunks, aw_grid, ixw_grid, select_slices, select_state_init, AW_DECODE_CHUNKS, AW_HEAD_TILES, AW_LDS, AW_MERGE_LDS, AW_PART, AW_WG, IXW_LDS, IX_ROWS, O_IN, ROWS_QB, SELECT_LDS, SELECT_STATE};
-use glm_5_3_flash::expert::gfx11_consts::{DOWN_WGS as XPT_DOWN_WGS, SLOT_BYTES, UP_WGS as XPT_UP_WGS, XPT_LDS};
+use glm_5_3_flash::expert::gfx11_consts::{DOWN_WGS as XPT_DOWN_WGS, SLOT_BYTES, UP_WGS as XPT_UP_WGS, XG_DOWN_WGS, XG_GU_WGS, XG_MAX_JOBS, XPT_LDS, XQ_GROUPS, XQ_WGS};
 use glm_5_3_flash::DENSE_BELOW;
 use glm_5_3_flash::TOP_K;
 use glm_5_3_flash::{INDEX_HEAD_DIM, INDEX_N_HEADS, KV_LORA_RANK, Q_LORA_RANK, V_HEAD_DIM};
@@ -73,6 +73,9 @@ struct Resident {
     issued: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Steps begun (the first MoE layer's): the counts' aging and the layer turn run on it.
     steps: u64,
+    /// Whether this step is a prefill step (wider than a verify step): its claims come after each layer's
+    /// join, when no job of the layer is reading a slot, so a resident in use this step can still be replaced.
+    prefill: bool,
     /// Picks seen, `[MOE_LAYERS][E]`, halved every `RESIDENT_HALF_LIFE` steps.
     count: Vec<u32>,
     /// The layer whose misses claim first this step (`steps % MOE_LAYERS`): the one load a step goes to the
@@ -124,13 +127,20 @@ struct Card {
     k: Rc<Kfd>,
     xpt_gu: crate::kfd::Kernel,
     xpt_down: crate::kfd::Kernel,
-    /// The resident experts' quantized activations and jobs (host-visible), the gate/up state, the outputs to the host.
+    xpt_gemm_gu: crate::kfd::Kernel,
+    xpt_quant: crate::kfd::Kernel,
+    xpt_gemm_down: crate::kfd::Kernel,
+    /// The resident experts' work (038): the step's quantized activations and the group/job tables
+    /// (host-visible), the jobs' gate/up state and quantized hidden states (VRAM); the outputs go to
+    /// `Shared::xout`.
     xq: Mem,
     xs: Mem,
     xg: Mem,
     xjobs: Mem,
     xgu: Mem,
-    xout: Mem,
+    xhq: Mem,
+    xhs: Mem,
+    xhg: Mem,
     rows_h: crate::kfd::Kernel,
     rows_h_w: crate::kfd::Kernel,
     rows_d2: crate::kfd::Kernel,
@@ -223,6 +233,7 @@ struct Shared {
     my: [Mem; 2],  // [STEP][H] f32: the MLA card's output projection
     yexp: [Mem; 2], // [STEP][H] f32: the host's routed experts
     xh: Mem,       // [STEP][H] f32: a MoE layer's FFN input for the host
+    xout: Mem,     // [STEP·TOP_K][H] f32, the host's own pages mapped for the cards: the routed experts' outputs by (token, pick) — the cards' jobs and the host's experts (038)
     scores_ffn: Mem, // [STEP][ROUTE_ROWS] f32: the FFN half's router over its input (this layer's rows, then the next layer's: the prefetch's predictor), for the host's picks
     words: Mem,    // the handoff words, a cache line each: `word()`
 }
@@ -369,12 +380,17 @@ impl Cards {
                     copy: k.kernel("copy_f32"),
                     xpt_gu: k.kernel("xpt_gu"),
                     xpt_down: k.kernel("xpt_down"),
-                    xq: k.vram_visible(SPEC_TOKENS * H),
-                    xs: k.vram_visible(SPEC_TOKENS * (H / common::q4::GROUP) * 4),
-                    xg: k.vram_visible(SPEC_TOKENS * (H / common::q4::GROUP) * 4),
-                    xjobs: k.vram_visible(SPEC_TOKENS * TOP_K * 8),
-                    xgu: k.vram(SPEC_TOKENS * TOP_K * 2 * D_FF * 4),
-                    xout: k.host(SPEC_TOKENS * TOP_K * H * 4),
+                    xpt_gemm_gu: k.kernel("xpt_gemm_gu"),
+                    xpt_quant: k.kernel("xpt_quant"),
+                    xpt_gemm_down: k.kernel("xpt_gemm_down"),
+                    xq: k.vram_visible(STEP * H),
+                    xs: k.vram_visible(STEP * (H / common::q4::GROUP) * 4),
+                    xg: k.vram_visible(STEP * (H / common::q4::GROUP) * 4),
+                    xjobs: k.vram_visible((glm_5_3_flash::E * 4 + XG_MAX_JOBS * 3) * 4),
+                    xgu: k.vram(XG_MAX_JOBS * 2 * D_FF * 4),
+                    xhq: k.vram(XG_MAX_JOBS * D_FF),
+                    xhs: k.vram(XG_MAX_JOBS * XQ_GROUPS * 4),
+                    xhg: k.vram(XG_MAX_JOBS * XQ_GROUPS * 4),
                     ffn_gu: k.kernel("ffn_gu"),
                     ffn_down_shared: k.kernel("ffn_down_shared"),
                     ffn_down_dense: k.kernel("ffn_down_dense"),
@@ -461,6 +477,7 @@ impl Cards {
                 my: [buf(), buf()],
                 yexp: [buf(), buf()],
                 xh: buf(),
+                xout: k0.host_owned(STEP * TOP_K * H * 4, &others),
                 scores_ffn: k0.host_shared(STEP * ROUTE_ROWS * 4, &others),
                 words: {
                     let m = k0.host_shared(word(W_KINDS, 0), &others);
@@ -710,7 +727,7 @@ impl Cards {
                 per_layer.push(count / moe);
                 counts.push(count);
             }
-            Resident { table: std::sync::Arc::new((0..moe * glm_5_3_flash::E).map(|_| AtomicU32::new(NONE)).collect()), loader: None, inflight: Default::default(), allowed: Default::default(), issued: Default::default(), steps: 0, count: vec![0; moe * glm_5_3_flash::E], turn: 0, owner: counts.iter().map(|&k| vec![(NONE, NONE); k]).collect(), free: counts.iter().map(|&k| (0..k as u32).rev().collect()).collect(), held: (0..n).map(|_| vec![0; moe]).collect(), per_layer, slots, jobs: (0..n).map(|_| Vec::new()).collect(), uploads: 0 }
+            Resident { table: std::sync::Arc::new((0..moe * glm_5_3_flash::E).map(|_| AtomicU32::new(NONE)).collect()), loader: None, inflight: Default::default(), allowed: Default::default(), issued: Default::default(), steps: 0, prefill: false, count: vec![0; moe * glm_5_3_flash::E], turn: 0, owner: counts.iter().map(|&k| vec![(NONE, NONE); k]).collect(), free: counts.iter().map(|&k| (0..k as u32).rev().collect()).collect(), held: (0..n).map(|_| vec![0; moe]).collect(), per_layer, slots, jobs: (0..n).map(|_| Vec::new()).collect(), uploads: 0 }
         };
         Cards { cards, shared, layers, ffns, mlas, head, head_card, mtp, resident, instrument, seq: 0, half_seq: vec![[0; 2]; NUM_HIDDEN_LAYERS], token_from: vec![0; n], npools: max_ctx.div_ceil(INDEX_KPOOL) }
     }
@@ -933,6 +950,7 @@ impl Cards {
         use std::sync::atomic::Ordering;
         let r = &mut self.resident;
         r.steps += 1;
+        r.prefill = prefill;
         r.turn = (r.steps % r.held[0].len() as u64) as usize;
         if r.steps % RESIDENT_HALF_LIFE == 0 {
             for c in r.count.iter_mut() {
@@ -990,6 +1008,25 @@ impl Cards {
         r.loader.as_ref().expect("the residency's loader is set before the first step").send((c, sl, ml, e)).unwrap();
         Some(by_replacement)
     }
+    /// A prefill step's claims for MoE layer `ml`: the layer's most-picked experts not resident claim slots —
+    /// free ones first, then up to `PREFILL_REPLACES` replacements — loaded while the step runs, so decode
+    /// begins with the residency the prompt's routing chose (063). `in_use`: the experts with a job this step.
+    fn claim_prefill(&mut self, ml: usize, in_use: &[bool]) {
+        use std::sync::atomic::Ordering;
+        let e_n = glm_5_3_flash::E;
+        let r = &self.resident;
+        let mut order: Vec<usize> = (0..e_n).filter(|&e| r.count[ml * e_n + e] > 0 && r.table[ml * e_n + e].load(Ordering::Relaxed) == NONE).collect();
+        order.sort_by_key(|&e| std::cmp::Reverse(r.count[ml * e_n + e]));
+        let mut replaced = 0;
+        for &e in order.iter().take(PREFILL_CLAIMS) {
+            match self.claim(ml, e, in_use, replaced < PREFILL_REPLACES) {
+                Some(true) => replaced += 1,
+                Some(false) => {}
+                None => break, // the rest are picked less: no slot for them either
+            }
+        }
+    }
+
 }
 
 impl Placed for Cards {
@@ -1137,51 +1174,21 @@ impl Placed for Cards {
         }).unwrap();
         self.resident.loader = Some(tx);
     }
-    /// A prefill step's picks for MoE layer `l` train the counts, and the layer's most-picked experts not
-    /// resident claim slots — free ones first, then up to `PREFILL_REPLACES` replacements — loaded while
-    /// the step runs, so decode begins with the residency the prompt's routing chose (063). No pick runs
-    /// on the cards here (038).
-    fn xpt_train(&mut self, l: usize, picks: &[[usize; TOP_K]]) {
-        use std::sync::atomic::Ordering;
-        let ml = l - glm_5_3_flash::FIRST_K_DENSE_REPLACE;
-        let e_n = glm_5_3_flash::E;
-        if ml == 0 {
-            self.begin_step(true);
-        }
-        let r = &mut self.resident;
-        for p in picks {
-            for &e in p {
-                if e < e_n {
-                    r.count[ml * e_n + e] += 1;
-                }
-            }
-        }
-        let mut order: Vec<usize> = (0..e_n).filter(|&e| r.count[ml * e_n + e] > 0 && r.table[ml * e_n + e].load(Ordering::Relaxed) == NONE).collect();
-        order.sort_by_key(|&e| std::cmp::Reverse(r.count[ml * e_n + e]));
-        let in_use = [false; glm_5_3_flash::E];
-        let mut replaced = 0;
-        for &e in order.iter().take(PREFILL_CLAIMS) {
-            match self.claim(ml, e, &in_use, replaced < PREFILL_REPLACES) {
-                Some(true) => replaced += 1,
-                Some(false) => {}
-                None => break, // the rest are picked less: no slot for them either
-            }
-        }
-    }
-
     fn xpt_dispatch(&mut self, l: usize, n: usize, picks: &mut [[usize; TOP_K]], xq: &[i8], xs: &[f32], xg: &[i32]) -> usize {
         use std::sync::atomic::Ordering;
         prow::zone!("track-zones", "dispatch");
         let ml = l - glm_5_3_flash::FIRST_K_DENSE_REPLACE;
         let e_n = glm_5_3_flash::E;
+        let prefill = n > SPEC_TOKENS;
         if ml == 0 {
-            self.begin_step(false);
+            self.begin_step(prefill);
         }
         let r = &mut self.resident;
         for j in r.jobs.iter_mut() {
             j.clear();
         }
-        // the resident picks become jobs; the experts with a job this step are never a victim
+        // the resident picks become jobs, up to a card's XG_MAX_JOBS (the rest stay on the host); the experts
+        // with a job this step are never a victim
         let mut in_use = [false; glm_5_3_flash::E];
         let mut misses: Vec<usize> = Vec::new();
         for i in 0..n {
@@ -1193,29 +1200,38 @@ impl Placed for Cards {
                 r.count[ml * e_n + e] += 1;
                 let at = r.table[ml * e_n + e].load(Ordering::Acquire);
                 if at != NONE && at != PENDING {
-                    r.jobs[(at >> 24) as usize].push((at & 0xff_ffff, i as u32, k as u8));
-                    picks[i][k] = e_n;
-                    in_use[e] = true;
-                } else if at == NONE && !misses.contains(&e) {
+                    let card = (at >> 24) as usize;
+                    if r.jobs[card].len() < XG_MAX_JOBS {
+                        r.jobs[card].push((at & 0xff_ffff, i as u32, k as u8));
+                        picks[i][k] = e_n;
+                        in_use[e] = true;
+                    }
+                } else if at == NONE && !prefill && !misses.contains(&e) {
                     misses.push(e);
                 }
             }
         }
-        // the misses claim slots for the steps to come (one load a step, the layer turn first; one replacement a layer)
-        let mut replaced = false;
-        for &e in &misses {
-            let r = &self.resident;
-            if ml < r.turn || r.inflight.load(Ordering::Acquire) >= LOADS_IN_FLIGHT {
-                break;
-            }
-            if self.claim(ml, e, &in_use, !replaced) == Some(true) {
-                replaced = true;
+        if !prefill {
+            // the misses claim slots for the steps to come (one load a step, the layer turn first; one replacement a layer)
+            let mut replaced = false;
+            for &e in &misses {
+                let r = &self.resident;
+                if ml < r.turn || r.inflight.load(Ordering::Acquire) >= LOADS_IN_FLIGHT {
+                    break;
+                }
+                if self.claim(ml, e, &in_use, !replaced) == Some(true) {
+                    replaced = true;
+                }
             }
         }
+        // the launches: a step of a few tokens runs a token a job (`xpt_gu`, `xpt_down` over `[jobs][3]`: slot,
+        // token, output row); a prefill step's jobs grouped by slot — a group table (slot, first job, jobs, 0)
+        // and the jobs (token, output row) — through gate/up over every group, the hidden states quantized,
+        // down into the shared output rows. The same split as the rows kernels', at SPEC_TOKENS.
         let r = &mut self.resident;
         let mut total = 0;
         for c in 0..self.cards.len() {
-            let jobs = &r.jobs[c];
+            let jobs = &mut r.jobs[c];
             if jobs.is_empty() {
                 continue;
             }
@@ -1224,32 +1240,67 @@ impl Placed for Cards {
             card.k.upload(&card.xq, 0, raw_i8(xq));
             card.k.upload(&card.xs, 0, raw(xs));
             card.k.upload(&card.xg, 0, raw(xg));
-            let list: Vec<u32> = jobs.iter().flat_map(|&(sl, tok, _)| [sl, tok]).collect();
-            card.k.upload(&card.xjobs, 0, raw(&list));
+            if !prefill {
+                let list: Vec<u32> = jobs.iter().flat_map(|&(sl, tok, k)| [sl, tok, tok * TOP_K as u32 + k as u32]).collect();
+                card.k.upload(&card.xjobs, 0, raw(&list));
+                let mut a = Args::new();
+                a.ptr(r.slots[c].va).ptr(card.xjobs.va).ptr(card.xq.va).ptr(card.xs.va).ptr(card.xg.va).ptr(card.xgu.va);
+                card.k.launch(&card.xpt_gu, (jobs.len() * XPT_UP_WGS) as u32, g::WG, XPT_LDS as u32, &a);
+                let mut b = Args::new();
+                b.ptr(r.slots[c].va).ptr(card.xjobs.va).ptr(card.xgu.va).ptr(self.shared.xout.va);
+                card.k.launch(&card.xpt_down, (jobs.len() * XPT_DOWN_WGS) as u32, g::WG, XPT_LDS as u32, &b);
+                card.k.fence();
+                continue;
+            }
+            jobs.sort_unstable_by_key(|&(slot, tok, k)| (slot, tok, k));
+            let mut table: Vec<u32> = Vec::with_capacity(e_n * 4 + jobs.len() * 2);
+            let mut groups = 0u32;
+            let mut j0 = 0;
+            while j0 < jobs.len() {
+                let slot = jobs[j0].0;
+                let mut j1 = j0;
+                while j1 < jobs.len() && jobs[j1].0 == slot {
+                    j1 += 1;
+                }
+                table.extend_from_slice(&[slot, j0 as u32, (j1 - j0) as u32, 0]);
+                groups += 1;
+                j0 = j1;
+            }
+            let jobs_at = e_n * 4;
+            table.resize(jobs_at, 0);
+            for &(_, tok, k) in jobs.iter() {
+                table.extend_from_slice(&[tok, tok * TOP_K as u32 + k as u32]);
+            }
+            card.k.upload(&card.xjobs, 0, raw(&table));
+            let jobs_va = card.xjobs.at(jobs_at * 4);
             let mut a = Args::new();
-            a.ptr(r.slots[c].va).ptr(card.xjobs.va).ptr(card.xq.va).ptr(card.xs.va).ptr(card.xg.va).ptr(card.xgu.va);
-            card.k.launch(&card.xpt_gu, (jobs.len() * XPT_UP_WGS) as u32, g::WG, XPT_LDS as u32, &a);
+            a.ptr(r.slots[c].va).ptr(card.xjobs.va).ptr(jobs_va).ptr(card.xq.va).ptr(card.xs.va).ptr(card.xg.va).ptr(card.xgu.va);
+            card.k.launch(&card.xpt_gemm_gu, groups * XG_GU_WGS as u32, g::WG, 0, &a);
+            let mut q = Args::new();
+            q.ptr(card.xgu.va).ptr(card.xhq.va).ptr(card.xhs.va).ptr(card.xhg.va);
+            card.k.launch(&card.xpt_quant, (jobs.len() * XQ_WGS) as u32, g::WG, 0, &q);
             let mut b = Args::new();
-            b.ptr(r.slots[c].va).ptr(card.xjobs.va).ptr(card.xgu.va).ptr(card.xout.va);
-            card.k.launch(&card.xpt_down, (jobs.len() * XPT_DOWN_WGS) as u32, g::WG, XPT_LDS as u32, &b);
+            b.ptr(r.slots[c].va).ptr(card.xjobs.va).ptr(jobs_va).ptr(card.xhq.va).ptr(card.xhs.va).ptr(card.xhg.va).ptr(self.shared.xout.va);
+            card.k.launch(&card.xpt_gemm_down, groups * XG_DOWN_WGS as u32, g::WG, 0, &b);
             card.k.fence();
         }
         total
     }
-    fn xpt_join(&mut self, _l: usize, out: &mut [f32]) {
+    fn xpt_join(&mut self, l: usize, _out: &mut [f32]) {
+        // the jobs' rows are in the shared output already; the wait is all
         for c in 0..self.cards.len() {
-            let jobs = &self.resident.jobs[c];
-            if jobs.is_empty() {
-                continue;
-            }
-            let card = &self.cards[c];
-            card.k.wait();
-            let y = unsafe { std::slice::from_raw_parts(card.xout.ptr() as *const f32, jobs.len() * H) };
-            for (j, &(_, tok, k)) in jobs.iter().enumerate() {
-                let at = (tok as usize * TOP_K + k as usize) * H;
-                out[at..at + H].copy_from_slice(&y[j * H..(j + 1) * H]);
+            if !self.resident.jobs[c].is_empty() {
+                self.cards[c].k.wait();
             }
         }
+        // a prefill step's claims, now that no job of the layer reads a slot (063)
+        if self.resident.prefill {
+            let none = [false; glm_5_3_flash::E];
+            self.claim_prefill(l - glm_5_3_flash::FIRST_K_DENSE_REPLACE, &none);
+        }
+    }
+    fn expert_out(&self) -> *mut f32 {
+        self.shared.xout.ptr() as *mut f32
     }
     fn mtp_begin(&mut self, cat: &[f32], n: usize) {
         let t = self.mtp.as_ref().expect("no draft layer on the cards");
