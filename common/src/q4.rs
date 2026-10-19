@@ -675,21 +675,26 @@ mod tests {
         let pw: Vec<u8> = (0..SLABS).flat_map(|_| pw1.iter().copied()).collect();
         let ps: Vec<f32> = (0..SLABS).flat_map(|_| ps1.iter().copied()).collect();
         std::println!("{SLABS} slabs of {M} rows x {K} ({:.1} MB), each applied to n tokens then the next:", pw.len() as f64 / 1e6);
-        for &n in &[16usize, 64] {
-            let (mut q, mut s, mut g) = (vec![0i8; n * K], vec![0f32; n * K / GROUP], vec![0i32; n * K / GROUP]);
-            for i in 0..n {
-                let x: Vec<f32> = (0..K).map(|_| rng.unit()).collect();
-                QAct { q: &mut q[i * K..(i + 1) * K], scale: &mut s[i * (K / GROUP)..(i + 1) * (K / GROUP)], gsum: &mut g[i * (K / GROUP)..(i + 1) * (K / GROUP)] }.quantize(&x);
-            }
-            let act = |i: usize| Act { q: &q[i * K..(i + 1) * K], scale: &s[i * (K / GROUP)..(i + 1) * (K / GROUP)], gsum: &g[i * (K / GROUP)..(i + 1) * (K / GROUP)] };
+        // one activation set reused by every slab, then a prefill step's shape: each slab's n tokens drawn from a
+        // pool of 1024 quantized activations (4 MB: L3, not L1), every slab a different set
+        const POOL: usize = 1024;
+        let (mut q, mut s, mut g) = (vec![0i8; POOL * K], vec![0f32; POOL * K / GROUP], vec![0i32; POOL * K / GROUP]);
+        for i in 0..POOL {
+            let x: Vec<f32> = (0..K).map(|_| rng.unit()).collect();
+            QAct { q: &mut q[i * K..(i + 1) * K], scale: &mut s[i * (K / GROUP)..(i + 1) * (K / GROUP)], gsum: &mut g[i * (K / GROUP)..(i + 1) * (K / GROUP)] }.quantize(&x);
+        }
+        let act_at = |t: usize| Act { q: &q[t * K..(t + 1) * K], scale: &s[t * (K / GROUP)..(t + 1) * (K / GROUP)], gsum: &g[t * (K / GROUP)..(t + 1) * (K / GROUP)] };
+        for &(n, spread) in &[(16usize, false), (64, false), (16, true), (32, true), (64, true)] {
             let mut out = vec![0f32; n * M];
             let op = out.as_mut_ptr() as usize;
             let t0 = std::time::Instant::now();
             for sl in 0..SLABS {
+                let base = if spread { (sl * 37 * n) % (POOL - n) } else { 0 };
+                let act = |i: usize| act_at(base + i);
                 gemm::<K>(M, &pw[sl * pw1.len()..(sl + 1) * pw1.len()], &ps[sl * ps1.len()..(sl + 1) * ps1.len()], n, act, |i| unsafe { (op as *mut f32).add(i * M) });
             }
             let b = t0.elapsed().as_secs_f64() / (SLABS * n) as f64;
-            std::println!("n {n:>2}: gemm {:.2} µs a token a slab ({:.1} GMAC/s, {:.1} GB/s of weights)", b * 1e6, (M * K) as f64 / b / 1e9, pw1.len() as f64 / (b * n as f64) / 1e9);
+            std::println!("n {n:>2}{}: gemm {:.2} µs a token a slab ({:.1} GMAC/s, {:.1} GB/s of weights)", if spread { " spread" } else { "       " }, b * 1e6, (M * K) as f64 / b / 1e9, pw1.len() as f64 / (b * n as f64) / 1e9);
         }
     }
     fn gemm_rate_rows<const M: usize>(reps_at_one: usize) {

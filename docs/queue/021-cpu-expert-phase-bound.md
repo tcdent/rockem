@@ -78,10 +78,19 @@ Our analysis, 2026-10-18; the 512-step profile (run ends 1.72–1.78 ms a token,
   (one or two tokens an expert) run at 12–24 GMAC/s a core, the bandwidth floor, with the pool 62–73 % busy
   over the runs' wall: the host's expert phase at a verify step has a quarter of idle in it (059/064).
 
+- 2026-10-19 14:40 (`gemm-rate3`, the slab bench with each slab's n tokens drawn from a 4 MB pool of
+  activations, as a prefill item sees them): one core 68.7 / 74.3 / 76.3 GMAC/s at 16 / 32 / 64 tokens
+  (71.4 / 78.7 with one activation set reused); all 92 cores 58.6 / 58.3 / 65.9 against 65.7 / 71.8. The
+  phase's measured 56–61 is this: the activations' traffic out of the core complex's L3 — each of an expert's
+  64 gate/up parts runs on a different core and pulls the expert's tokens' activations into its own L2
+  again — costs 10 % of the rate when every core does it at once, 3–4 % alone. That is the whole gap between
+  the phase and the microbench; the kernel's arithmetic is at its rate.
+
 ## Next
-1. The kernel's rate on real items against the bench's (58 vs 69): the per-tile re-read of the item's
-   activations (eight 4-row tiles each walk every token's groups) and the scattered SwiGLU writes — a tile
-   order that keeps a token's activation in registers across the rows, or wider tiles.
-2. More picks on the cards: 038 takes 27 % at the residency the VRAM allows; the latent mirror's size (031)
-   decides the rest.
-3. The decode runs' 27–38 % idle: the items' tail and the post (059).
+Closed. On the shelf, quantified:
+- **The activation re-read a part, ≤ 0.13 ms a prompt token** (10 % of the host's 1.28 ms of items): fewer,
+  larger parts (`expert::SUB` 2 → 1 doubles a part's rows with no bundle change, half the re-reads, ~0.06 ms
+  est.; `GU_CHUNK` is the bundle's item layout and costs a repack) or a token-block-stationary order that
+  keeps a block's activations in L2 across an expert's parts on one core.
+- **The quantize run and the posting, ~0.13 ms a prompt token** (the lap's 1.41 against the items' 1.28).
+- More picks on the cards is 031's (the latent mirror's size), the decode runs' idle 059's.
