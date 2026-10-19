@@ -670,7 +670,9 @@ impl Kfd {
         // a code object built with stats has the slab pointer as a symbol: fill it in
         if let Some(va) = self.symbol("ROCKEM_STATS") {
             use common::stats::{STAT_RING, STAT_SLOTS, STAT_WAVES};
-            let slab = self.host(STAT_RING * STAT_SLOTS * STAT_WAVES * 4);
+            // in the card's VRAM: a kernel's stamps must not cross the link (host memory would add the very
+            // PCIe writes a phase is being timed against); the host reads it back streamed
+            let slab = self.vram_visible(STAT_RING * STAT_SLOTS * STAT_WAVES * 4);
             unsafe { *(self.code.at(va) as *mut u64) = slab.va as u64 };
             self.stats = Some(slab);
             println!("gpu      : kernel statistics on ({} MB slab)", slab.size >> 20);
@@ -847,6 +849,30 @@ impl Kfd {
                 let waves = ((grids[slot] * STAT_WAVES_PER_WG) as usize).min(STAT_WAVES);
                 let read = |s: usize| unsafe { std::slice::from_raw_parts(slab.at(((block * STAT_SLOTS + s) * STAT_WAVES) * 4) as *const f32, waves).to_vec() };
                 (names[slot], [read(0), read(1), read(2), read(3)])
+            })
+            .collect()
+    }
+    /// The statistics of the launches from packet `from` to the last posted whose kernel is in `kernels`: the
+    /// packet index, the kernel's name, and per slot the values every wave wrote. Empty without a stats
+    /// code object. Valid after `sync`, until the ring wraps.
+    pub fn stats_from(&self, from: u64, kernels: &[&str]) -> Vec<(u64, &'static str, [Vec<f32>; 4])> {
+        use common::stats::{STAT_RING, STAT_SLOTS, STAT_WAVES, STAT_WAVES_PER_WG};
+        let Some(slab) = &self.stats else { return Vec::new() };
+        let to = self.write_index.get();
+        let from = from.max(to.saturating_sub(STAT_RING.min(RING_PACKETS) as u64));
+        let (names, grids) = (self.names.borrow(), self.grids.borrow());
+        (from..to)
+            .filter(|&i| kernels.contains(&names[(i as usize) % RING_PACKETS]))
+            .map(|i| {
+                let slot = (i as usize) % RING_PACKETS;
+                let block = (i as usize) % STAT_RING;
+                let waves = ((grids[slot] * STAT_WAVES_PER_WG) as usize).min(STAT_WAVES);
+                let rd = |s: usize| {
+                    let mut v = vec![0f32; waves];
+                    read(slab, ((block * STAT_SLOTS + s) * STAT_WAVES) * 4, &mut v);
+                    v
+                };
+                (i, names[slot], [rd(0), rd(1), rd(2), rd(3)])
             })
             .collect()
     }

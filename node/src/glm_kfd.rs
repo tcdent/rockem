@@ -239,6 +239,8 @@ struct Shared {
     words: Mem,    // the handoff words, a cache line each: `word()`
 }
 /// A handoff word's byte offset in `Shared::words`: the kind, and the card for a block output.
+/// The kernels a stats code object stamps (`common::stats`), reported by `timeline_report`.
+const STAT_KERNELS: &[&str] = &["ffn_act", "hc_pre"];
 /// `Shared::xact`'s regions, in bytes.
 const HG: usize = H / common::q4::GROUP;
 const XA_Q: usize = 0;
@@ -790,10 +792,24 @@ impl Cards {
         }
         for (i, c) in self.cards.iter().enumerate() {
             let lane = format!("card{}", c.k.index);
-            for &(name, s, e) in &c.k.timeline_from(self.token_from[i]) {
+            let tl = c.k.timeline_from(self.token_from[i]);
+            for &(name, s, e) in &tl {
                 if e > s {
                     prow::zone_at!("track-launches", if name.is_empty() { "barrier" } else { name }, lane.as_str(), c.k.utc(s), c.k.utc(e));
                 }
+            }
+            // a stats code object: the stamped kernels' phases in shader cycles, a row a launch — wave 0's value, the
+            // mean and the max over the waves a slot (what each slot times is the kernel's own comment)
+            let first = self.token_from[i].max(c.k.posted().saturating_sub(tl.len() as u64));
+            for (idx, name, slots) in c.k.stats_from(first, STAT_KERNELS) {
+                let at = (idx - first) as usize;
+                let dur_us = tl.get(at).map_or(0.0, |&(_, s, e)| (e.saturating_sub(s)) as f64 / 100.0);
+                let w0 = |k: usize| slots[k].first().copied().unwrap_or(0.0) as f64;
+                let mean = |k: usize| if slots[k].is_empty() { 0.0 } else { slots[k].iter().map(|&v| v as f64).sum::<f64>() / slots[k].len() as f64 };
+                let max = |k: usize| slots[k].iter().copied().fold(0f32, f32::max) as f64;
+                prow::row!("track-launches", "kernel_stats", { "lane" => lane.as_str(), "kernel" => name, "dur_us" => dur_us, "waves" => slots[0].len(),
+                    "s0_w0" => w0(0), "s0_mean" => mean(0), "s0_max" => max(0), "s1_w0" => w0(1), "s1_mean" => mean(1), "s1_max" => max(1),
+                    "s2_w0" => w0(2), "s2_mean" => mean(2), "s2_max" => max(2), "s3_w0" => w0(3), "s3_mean" => mean(3), "s3_max" => max(3) });
             }
         }
     }

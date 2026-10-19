@@ -246,7 +246,11 @@ pub mod gfx11 {
         use common::q4::GROUP;
         use core::arch::amdgpu::{wave_reduce_add, wave_reduce_umax, workgroup_id_x};
         use core::sync::atomic::{fence, AtomicU32, Ordering};
+        // stats (a stats code object only): slot 0 the loads to the first barrier (the row, the sigmoids over the
+        // host-memory scores, the bias), 1 the norm's sum (wave 0; the others wait), 2 the wave's quantize (its
+        // stores to VRAM and host memory issued), 3 the top-k (wave 0) and the release fence's drain of the stores
         unsafe {
+            let k0 = common::stat_clock!();
             let t = workgroup_id_x() as usize;
             let tid = workitem_id_x();
             let (wave, lane) = ((tid / 32) as usize, tid as usize % 32);
@@ -273,6 +277,8 @@ pub mod gfx11 {
                 e += 256;
             }
             common::gfx11::workgroup_sync();
+            let k1 = common::stat_clock!();
+            common::stat!(0, k1.wrapping_sub(k0) & common::stats::CLOCK_MASK);
             // the norm's scale as `rmsnorm8`: lane j of wave 0 sums the squares of x[8i + j] in order, lane 0 adds the
             // eight in order — the host's `sumsq8` exactly, on eight chains
             if wave == 0 && lane < 8 {
@@ -294,6 +300,8 @@ pub mod gfx11 {
                 }
             }
             common::gfx11::workgroup_sync();
+            let k2 = common::stat_clock!();
+            common::stat!(1, k2.wrapping_sub(k1) & common::stats::CLOCK_MASK);
             let r = *rr;
             // the groups: wave w takes groups w, w + 8, ...: `ln[i] · (x[i] · r)`, then absmax/127, the shared round, the clamp, Σq
             let mut g = wave;
@@ -335,6 +343,8 @@ pub mod gfx11 {
                 }
                 g += 8;
             }
+            let k3 = common::stat_clock!();
+            common::stat!(2, k3.wrapping_sub(k2) & common::stats::CLOCK_MASK);
             // the router's picks, `route_scores`'s arithmetic on wave 0: expert e sits on lane e % 32, slot e / 32,
             // its key `score + bias` as the host adds it; a pass takes each lane's best untaken key, then the wave's by
             // a butterfly that keeps the greater key and, between equal keys, the lower expert — the host's strict
@@ -416,6 +426,8 @@ pub mod gfx11 {
             }
             // the last workgroup publishes
             fence(Ordering::Release);
+            let k4 = common::stat_clock!();
+            common::stat!(3, k4.wrapping_sub(k3) & common::stats::CLOCK_MASK);
             common::gfx11::workgroup_sync();
             if tid == 0 {
                 let prev = AtomicU32::from_ptr(count).fetch_add(1, Ordering::AcqRel);

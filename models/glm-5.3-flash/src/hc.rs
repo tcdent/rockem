@@ -331,6 +331,9 @@ pub mod gfx11 {
     pub extern "gpu-kernel" fn hc_pre(streams: *const f32, w: *const u16, part: *mut f32, base: *const f32, scale: *const f32, mix: *mut f32, x: *mut f32, x_host: *mut f32, count: *mut u32, value: u32, ln: *const u16, router: *const u16, scores: *mut f32, word: *mut u32, rows: u32, n: u32) {
         unsafe {
             let n = n as usize;
+            // stats (a stats code object only): slot 0 the collapse (its stores to `x` and, when given, `x_host`),
+            // 1 the release fence after it (the collapse's stores drained; router variant), 2 the router (from the
+            // second barrier to its scores' stores issued), 3 the release fence after the scores (their drain)
             let t = workitem_id_x() as usize;
             let (wave, lane) = (t / 32, (t % 32) as u32);
             let wg = workgroup_id_x() as usize;
@@ -477,6 +480,7 @@ pub mod gfx11 {
                 await_word(ready, value);
             }
             workgroup_sync();
+            let kc0 = common::stat_clock!();
             let d0 = wg * COLLAPSE;
             let d = d0 + t;
             if t < COLLAPSE && d < H {
@@ -496,12 +500,16 @@ pub mod gfx11 {
                     i += 1;
                 }
             }
+            let kc1 = common::stat_clock!();
+            common::stat!(0, kc1.wrapping_sub(kc0) & common::stats::CLOCK_MASK);
             if router.is_null() {
                 return;
             }
             // the collapse's arrival: this workgroup's channels to L2; workgroup 0 publishes; every workgroup waits
             let ready2 = ready.add(1);
             fence(Ordering::Release);
+            let kf1 = common::stat_clock!();
+            common::stat!(1, kf1.wrapping_sub(kc1) & common::stats::CLOCK_MASK);
             if arrive(b1, row, t, wave, lane, value) && t == 0 {
                 AtomicU32::from_ptr(ready2).store(value, Ordering::Release);
             }
@@ -617,7 +625,11 @@ pub mod gfx11 {
                 i += 8;
             }
             // the router's arrival: this workgroup's scores out over the link; workgroup 0 says so
+            let kr = common::stat_clock!();
+            common::stat!(2, kr.wrapping_sub(kf1) & common::stats::CLOCK_MASK);
             fence(Ordering::Release);
+            let kf2 = common::stat_clock!();
+            common::stat!(3, kf2.wrapping_sub(kr) & common::stats::CLOCK_MASK);
             if arrive(b2, row, t, wave, lane, value) && t == 0 {
                 AtomicU32::from_ptr(word).store(value, Ordering::Release);
             }
