@@ -2,7 +2,7 @@
 
 **Status:** Measured (2026-10-19) — the kernel reaches 6.3 TMAC/s over the phase's own access pattern on all 92 cores (1.35 ms a prompt token of the 2.1); the loss is the light experts at the bandwidth floor and the pool's runs, so the levers are bytes a token (the step width, 038), not a prefetch
 **Area:** prefill
-**Gain:** est. 2.1 → ~1.5 ms a prompt token at a 1024 step and/or with 038 (the floor 1.35 at the kernel's all-core rate)
+**Gain:** measured — `STEP` 1024: prefill 5.16 → 4.82 ms a prompt token at 18k (experts 2.12 → 1.93); the floor 1.35 at the kernel's all-core rate, 038 the next bytes lever
 
 ## Proposal
 The doc called the phase compute-bound (~7.7 of ~12.5 TOPS), but 12.5 was ik_llama's achieved
@@ -43,10 +43,18 @@ Our analysis, 2026-10-18; the 512-step profile (run ends 1.72–1.78 ms a token,
   cards, their bytes off the CPU — the heavy experts, which 063 now has resident from the first prefill
   steps).
 
+- 2026-10-19 03:52 (`STEP` 1024, run 03f082a1): prefill 5.16–5.20 → 4.82–4.84 ms a prompt token at 18k
+  (experts 2.12 → 1.93, kda card 2.13 → 2.05, the rest unchanged), the cold 18k prompt 96.5 → 90.6 s; decode
+  unchanged (48.4–48.8 ms a verify step on the hits, 26.4–27.5 ms an emitted token), the long SCORE
+  bit-identical (the step width changes no token's arithmetic), zero PCIe records. Kept. The experts' fall
+  with the width — 4.0 / 2.9 / 2.4 (2.1 with the multi-token kernel) / 1.93 at 128 / 256 / 512 / 1024 — is
+  the bytes-a-token half of the phase; the kernel's 1.35 is the floor it approaches. One read to know: the
+  first decode step after a prompt carries the last prefill step's draft pass in its row (the draft lands in
+  the step after it), so that step reads ~230 ms of `draft` at 1024 against 115 at 512 — prefill's time,
+  in decode's row.
+
 ## Next
-1. `STEP` 1024 (one constant; buffers scale with it): the bytes a token halve, the light experts get twice
-   the tokens — deployed as an experiment 2026-10-19 03:40, see below.
-2. 038: the resident experts' tokens to the cards in prefill.
+1. 038: the resident experts' tokens to the cards in prefill.
 3. The pool's three runs a layer as zones (`pool.run` is one already): the posting and tail imbalance sized.
 4. `gemm_rate` on metatron, one Zen 3 core, cache-resident and DRAM-streamed at the pool's share.
 2. If cache-resident × 96 ≫ ~10 TOPS: prefetch the next item into L2/L3 while computing (the

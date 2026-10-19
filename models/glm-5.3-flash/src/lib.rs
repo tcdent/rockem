@@ -75,7 +75,7 @@ pub const TOKENS: usize = common::gemv::TOKENS;
 /// host's experts group it by expert. Swept 2026-10-17 on metatron, a full step's prompt token:
 /// 128 → 9.1 ms, 256 → 8.1, 512 → 7.8 (experts 4.0 / 2.9 / 2.4: no longer falling as 1/n, so the
 /// card's 5.0 and the experts' compute are what is left). The kernels do not depend on it.
-pub const STEP: usize = 512;
+pub const STEP: usize = 1024;
 /// Tokens a speculative verify step holds at most (the drafts and the token they follow): the
 /// KDA layers keep a state a token of such a step (`kda_step`'s ring) so the state after the
 /// last accepted token is a copy away.
