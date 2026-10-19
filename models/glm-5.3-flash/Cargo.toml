@@ -11,6 +11,9 @@ stats = ["common/stats"]
 # The step's phases as zones on the main thread, each layer's lap from its start to its end, with
 # the routed experts, the pool's runs and the host's join for the cards' experts nested inside by time.
 track-zones = []
+# The CPU expert phase's items: a row a pool run a token-count bucket (items, their summed time, the
+# bytes they streamed, the (token, expert) pairs they served) — what bounds the phase, by the items' shape.
+track-experts = []
 
 [dependencies]
 common = { path = "../../common" }

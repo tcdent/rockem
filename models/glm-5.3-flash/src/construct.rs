@@ -536,6 +536,36 @@ pub struct CpuExperts<'a> {
     hs: Vec<f32>,
     hg: Vec<i32>,
     elapsed: f64,
+    /// `track-experts`: a run's items by token-count bucket, accumulated a pool slot (a core complex's
+    /// line, so eight cores share a counter and nothing bounces across the box), summed into rows after the run.
+    #[cfg(feature = "track-experts")]
+    item_acc: Vec<[ItemAcc; BUCKETS]>,
+}
+#[cfg(feature = "track-experts")]
+const BUCKETS: usize = 8;
+/// The token-count buckets of an item: 1, 2, 3–4, 5–8, 9–16, 17–32, 33–64, 65+.
+#[cfg(feature = "track-experts")]
+const BUCKET_NAMES: [&str; BUCKETS] = ["1", "2", "3-4", "5-8", "9-16", "17-32", "33-64", "65+"];
+#[cfg(feature = "track-experts")]
+fn bucket_of(tokens: usize) -> usize {
+    match tokens {
+        0 | 1 => 0,
+        2 => 1,
+        3..=4 => 2,
+        5..=8 => 3,
+        9..=16 => 4,
+        17..=32 => 5,
+        33..=64 => 6,
+        _ => 7,
+    }
+}
+#[cfg(feature = "track-experts")]
+#[repr(align(64))]
+#[derive(Default)]
+struct ItemAcc {
+    ns: std::sync::atomic::AtomicU64,
+    items: std::sync::atomic::AtomicU64,
+    pairs: std::sync::atomic::AtomicU64,
 }
 /// An item is the record's (`layout::gu_item`, `layout::down_item`): 32 gate/up items and 20 down items an expert.
 use crate::layout::{DOWN_ITEMS, GU_ITEMS};
@@ -544,7 +574,9 @@ use crate::STEP;
 impl<'a> CpuExperts<'a> {
     pub fn new(stream: &'a expert::Stream<'a>, pool: &'a dyn Pool) -> Self {
         use common::q4::GROUP;
-        let mut this = CpuExperts { stream, pool, slice_node: Vec::new(), slice_slot: Vec::new(), xq: vec![0; STEP * H], xs: vec![0.0; STEP * H / GROUP], xg: vec![0; STEP * H / GROUP], h: vec![0.0; STEP * TOP_K * D_FF], hq: vec![0; STEP * TOP_K * D_FF], hs: vec![0.0; STEP * TOP_K * D_FF / GROUP], hg: vec![0; STEP * TOP_K * D_FF / GROUP], elapsed: 0.0 };
+        #[cfg(feature = "track-experts")]
+        let item_acc = (0..SLOTS).map(|_| std::array::from_fn(|_| ItemAcc::default())).collect();
+        let mut this = CpuExperts { #[cfg(feature = "track-experts")] item_acc, stream, pool, slice_node: Vec::new(), slice_slot: Vec::new(), xq: vec![0; STEP * H], xs: vec![0.0; STEP * H / GROUP], xg: vec![0; STEP * H / GROUP], h: vec![0.0; STEP * TOP_K * D_FF], hq: vec![0; STEP * TOP_K * D_FF], hs: vec![0.0; STEP * TOP_K * D_FF / GROUP], hg: vec![0; STEP * TOP_K * D_FF / GROUP], elapsed: 0.0 };
         this.relearn();
         this
     }
@@ -728,7 +760,13 @@ impl Routed for CpuExperts<'_> {
         let uses_r = &uses;
         let experts_r = &experts;
         let gate_slot = move |i: usize| slot_of(experts_r[i / GU_PARTS], i % GU_PARTS / SUB);
-        self.pool.run_slotted(ne * GU_PARTS, &gate_slot, &move |i| {
+        #[cfg(feature = "track-experts")]
+        let acc = &self.item_acc;
+        {
+            prow::zone!("track-zones", "experts.gu");
+            self.pool.run_slotted(ne * GU_PARTS, &gate_slot, &move |i| {
+            #[cfg(feature = "track-experts")]
+            let t_item = std::time::Instant::now();
             let (j, c) = (i / GU_PARTS, i % GU_PARTS);
             let e = experts_r[j];
             let w = expert::Weights::at(stream, l, e);
@@ -751,7 +789,12 @@ impl Routed for CpuExperts<'_> {
                 }
                 b0 += GEMM_TOKENS;
             }
-        });
+            #[cfg(feature = "track-experts")]
+            acc[gate_slot(i)][bucket_of(pairs.len())].add(t_item.elapsed().as_nanos() as u64, pairs.len());
+            });
+        }
+        #[cfg(feature = "track-experts")]
+        self.item_rows(l, "gu", 2 * GU_ROWS * H / 2 + 2 * GU_ROWS * HG * 4);
         // every (token, slot)'s hidden state quantized once: here for a token (2 µs each, less than a
         // pool run's posting), over the pool for a step
         let (hq_p, hs_p, hg_p) = (self.hq.as_mut_ptr() as usize, self.hs.as_mut_ptr() as usize, self.hg.as_mut_ptr() as usize);
@@ -765,13 +808,18 @@ impl Routed for CpuExperts<'_> {
                 quantize_h(i);
             }
         } else {
+            prow::zone!("track-zones", "experts.quant");
             self.pool.run(n * TOP_K, &quantize_h);
         }
         // the down rows: part (j, c) owns rows c·DOWN_ROWS.. of expert experts[j]'s output, for all of its tokens, likewise
         let (hq, hs, hg) = (&self.hq, &self.hs, &self.hg);
         let out_p = out.as_mut_ptr() as usize;
         let down_slot = move |i: usize| slot_of(experts_r[i / DOWN_PARTS], GU_ITEMS + i % DOWN_PARTS / SUB);
-        self.pool.run_slotted(ne * DOWN_PARTS, &down_slot, &move |i| {
+        {
+            prow::zone!("track-zones", "experts.down");
+            self.pool.run_slotted(ne * DOWN_PARTS, &down_slot, &move |i| {
+            #[cfg(feature = "track-experts")]
+            let t_item = std::time::Instant::now();
             let (j, c) = (i / DOWN_PARTS, i % DOWN_PARTS);
             let e = experts_r[j];
             let w = expert::Weights::at(stream, l, e);
@@ -789,8 +837,42 @@ impl Routed for CpuExperts<'_> {
                 q4::gemm::<D_FF>(DOWN_ROWS, dw, ds, blk.len(), act, |i| unsafe { (out_p as *mut f32).add(slot(b0 + i) * H + r0) });
                 b0 += GEMM_TOKENS;
             }
-        });
+            #[cfg(feature = "track-experts")]
+            acc[down_slot(i)][bucket_of(pairs.len())].add(t_item.elapsed().as_nanos() as u64, pairs.len());
+            });
+        }
+        #[cfg(feature = "track-experts")]
+        self.item_rows(l, "down", DOWN_ROWS * D_FF / 2 + DOWN_ROWS * DG * 4);
         self.elapsed += t0.elapsed().as_secs_f64();
+    }
+}
+#[cfg(feature = "track-experts")]
+impl CpuExperts<'_> {
+    /// A run's items summed over the slots into a row a bucket (`expert_items`), and the accumulators cleared.
+    #[cfg(feature = "track-experts")]
+    fn item_rows(&self, l: usize, phase: &'static str, item_bytes: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        for b in 0..BUCKETS {
+            let (mut ns, mut items, mut pairs) = (0u64, 0u64, 0u64);
+            for sl in &self.item_acc {
+                ns += sl[b].ns.swap(0, Relaxed);
+                items += sl[b].items.swap(0, Relaxed);
+                pairs += sl[b].pairs.swap(0, Relaxed);
+            }
+            if items > 0 {
+                prow::row!("track-experts", "expert_items", { "layer" => l, "phase" => phase, "tokens" => BUCKET_NAMES[b], "items" => items, "pairs" => pairs, "ms" => ns as f64 / 1e6, "mb" => (items as usize * item_bytes) as f64 / 1e6 });
+            }
+        }
+    }
+}
+#[cfg(feature = "track-experts")]
+impl ItemAcc {
+    #[inline]
+    fn add(&self, ns: u64, pairs: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.ns.fetch_add(ns, Relaxed);
+        self.items.fetch_add(1, Relaxed);
+        self.pairs.fetch_add(pairs as u64, Relaxed);
     }
 }
 

@@ -1,8 +1,8 @@
 # 021 — What bounds the CPU expert phase in prefill
 
-**Status:** Measured (2026-10-19) — the kernel reaches 6.3 TMAC/s over the phase's own access pattern on all 92 cores (1.35 ms a prompt token of the 2.1); the loss is the light experts at the bandwidth floor and the pool's runs, so the levers are bytes a token (the step width, 038), not a prefetch
+**Status:** Resolved (instrumented and measured 2026-10-19) — at a 1024 step with the residents on the cards the host's phase is compute-bound: 94 % pool utilization, 83 % of the items' time in experts of 17+ tokens at 56–61 GMAC/s a core, the light experts 6 % of it
 **Area:** prefill
-**Gain:** measured — `STEP` 1024: prefill 5.16 → 4.82 ms a prompt token at 18k (experts 2.12 → 1.93); the floor 1.35 at the kernel's all-core rate, 038 the next bytes lever
+**Gain:** measured — `STEP` 1024 (5.16 → 4.82 ms a prompt token at 18k) and 038 (→ 4.55; experts 2.12 → 1.41); what is left is the kernel's all-core rate on real items (58 against the microbench's 69–75 GMAC/s a core)
 
 ## Proposal
 The doc called the phase compute-bound (~7.7 of ~12.5 TOPS), but 12.5 was ik_llama's achieved
@@ -53,9 +53,35 @@ Our analysis, 2026-10-18; the 512-step profile (run ends 1.72–1.78 ms a token,
   the step after it), so that step reads ~230 ms of `draft` at 1024 against 115 at 512 — prefill's time,
   in decode's row.
 
+- 2026-10-19 14:00 (`track-experts`, run 6274d8fa: a row a pool run a token-count bucket — items, (token, expert)
+  pairs, their summed time, their bytes — with the runs as `experts.gu` / `experts.quant` / `experts.down`
+  zones; `bringup/reads/experts.sh`). The cold 18k prompt at `STEP` 1024, 27 % of picks on the cards:
+
+  | items by tokens | share of gu time | GMAC/s a core | GB/s of weights a core |
+  |---|---|---|---|
+  | 1 | 0.4 % | 18 | 9.5 |
+  | 2 | 0.5 % | 27 | 7.1 |
+  | 3–4 | 1.2 % | 39 | 5.9 |
+  | 5–8 | 3.6 % | 49 | 4.0 |
+  | 9–16 | 11.8 % | 56 | 2.4 |
+  | 17–32 | 29.8 % | 60 | 1.4 |
+  | 33–64 | 34.1 % | 60 | 0.7 |
+  | 65+ | 18.7 % | 61 | 0.3 |
+
+  The down run reads the same way (56 GMAC/s from 17 tokens up, 20 at one). Utilization: the items' summed
+  time is 94.4 % (gu) and 93.2 % (down) of 92 cores over the runs' wall — the pool is busy, not waiting.
+  Items a prompt token: gu 0.83 ms, down 0.45, the lap 1.41 (the quantize run and the posting are the rest).
+  So the light experts are 6 % of the time, not the gap the 03:30 note supposed: with the residents taking
+  the heavy experts and the step at 1024, what is left on the host is compute-bound at 56–61 GMAC/s a core —
+  85 % of the microbench's all-core 69–75 on the same shapes (an item's activations stream beside its weights
+  here, and its outputs scatter into the hidden states; the bench reused one activation set). Decode's items
+  (one or two tokens an expert) run at 12–24 GMAC/s a core, the bandwidth floor, with the pool 62–73 % busy
+  over the runs' wall: the host's expert phase at a verify step has a quarter of idle in it (059/064).
+
 ## Next
-1. 038: the resident experts' tokens to the cards in prefill.
-3. The pool's three runs a layer as zones (`pool.run` is one already): the posting and tail imbalance sized.
-4. `gemm_rate` on metatron, one Zen 3 core, cache-resident and DRAM-streamed at the pool's share.
-2. If cache-resident × 96 ≫ ~10 TOPS: prefetch the next item into L2/L3 while computing (the
-   decode prefetch machinery applied to prefill). If not: the kernel's per-core rate.
+1. The kernel's rate on real items against the bench's (58 vs 69): the per-tile re-read of the item's
+   activations (eight 4-row tiles each walk every token's groups) and the scattered SwiGLU writes — a tile
+   order that keeps a token's activation in registers across the rows, or wider tiles.
+2. More picks on the cards: 038 takes 27 % at the residency the VRAM allows; the latent mirror's size (031)
+   decides the rest.
+3. The decode runs' 27–38 % idle: the items' tail and the post (059).

@@ -16,7 +16,7 @@ prow = { path = "../../prow" }
 # The prow categories the node's hooks name (docs/kernel-tuning-feedback.md, Observation). The dev image carries the defaults;
 # `--no-default-features` is the build that records nothing, the baseline for what tracking costs.
 [features]
-default = ["track-step", "track-store", "track-boot", "track-zones"]
+default = ["track-step", "track-store", "track-boot", "track-zones", "track-experts"]
 # GLM: a row a step of the token's time by phase (the CPU model's `Profile`), the step's expert runs
 # by NUMA node, and every 16 positions the experts' coverage and the cards' resident slots
 track-step = []
@@ -30,3 +30,5 @@ track-boot = []
 # GLM: the step's phases as zones, by time (glm_5_3_flash's category: every layer's laps, the routed
 # experts, the pool's runs, the join), so they stack and their gaps show
 track-zones = ["glm_5_3_flash/track-zones"]
+# GLM: the CPU expert phase's items by token-count bucket a pool run (`expert_items` rows: queue 021)
+track-experts = ["glm_5_3_flash/track-experts"]
