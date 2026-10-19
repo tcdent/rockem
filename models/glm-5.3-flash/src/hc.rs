@@ -629,29 +629,40 @@ pub mod gfx11 {
     /// channel looping the tokens, the block output `y` the sum of `ya` and `yb` (`yb` null for one
     /// source): the parts of a split attention block, or the shared expert's rows and the host's
     /// routed experts. The handoff first, so the update is one launch, not two: workgroup 0 copies
-    /// this card's `n` floats from `src` out to `dst`, writes `value` to `mine`, holds until `w0`
-    /// and `w1` (those not null) read `value`, then releases the other workgroups through `go`, a
-    /// VRAM word (one poller over the link a card: sixteen slowed the host's experts by 0.5 ms a
-    /// token, timeline 2026-10-16). Grid: CHANNEL_GRID.
+    /// this card's `n` floats from `src` out to `dst` and `dst2` (those not null: a peer card's
+    /// receiving buffer in its VRAM, queue 001), writes `value` to `mine` (this card's own word) and
+    /// `mine2` (the peer's copy of it), holds until `w0` and `w1` (those not null, in this card's
+    /// VRAM: the producers' words as they landed here) read `value`, then releases the other
+    /// workgroups through `go`, a VRAM word (one poller a card: sixteen slowed the host's experts by
+    /// 0.5 ms a token, timeline 2026-10-16). Grid: CHANNEL_GRID.
     #[no_mangle]
-    pub extern "gpu-kernel" fn hc_post(mix: *const f32, ya: *const f32, yb: *const f32, streams: *mut f32, src: *const f32, dst: *mut f32, n: u32, mine: *mut u32, w0: *const u32, w1: *const u32, value: u32, go: *mut u32, tokens: u32) {
+    pub extern "gpu-kernel" fn hc_post(mix: *const f32, ya: *const f32, yb: *const f32, streams: *mut f32, src: *const f32, dst: *mut f32, dst2: *mut f32, n: u32, mine: *mut u32, mine2: *mut u32, w0: *const u32, w1: *const u32, value: u32, go: *mut u32, tokens: u32) {
         unsafe {
             let t = workitem_id_x();
             if workgroup_id_x() == 0 {
                 if !src.is_null() {
                     let mut i = t;
                     while i < n {
-                        *dst.add(i as usize) = *src.add(i as usize);
+                        let v = *src.add(i as usize);
+                        if !dst.is_null() {
+                            *dst.add(i as usize) = v;
+                        }
+                        if !dst2.is_null() {
+                            *dst2.add(i as usize) = v;
+                        }
                         i += 256;
                     }
                     fence(Ordering::Release);
                     workgroup_sync();
                 }
-                // one poller a card over the link: this card's own word included, so no workgroup reads the
-                // shared buffer before the copy is out; then the others released through a VRAM word
+                // one poller a card: this card's own word included, so no workgroup reads a buffer before the
+                // copy is out; then the others released through a VRAM word
                 if t == 0 {
                     if !mine.is_null() {
                         AtomicU32::from_ptr(mine).store(value, Ordering::Release);
+                        if !mine2.is_null() {
+                            AtomicU32::from_ptr(mine2).store(value, Ordering::Release);
+                        }
                         while AtomicU32::from_ptr(mine).load(Ordering::Relaxed) != value {}
                     }
                     if !w0.is_null() {

@@ -1,6 +1,6 @@
 # 001 — Peer VRAM writes for the handoffs
 
-**Status:** Open — architectural (tcdent, 2026-10-19); the measured 0.1 ms was one handoff's latency, the day's findings are the design's cost
+**Status:** The card-to-card half done (2026-10-19): the three handoffs and their words in the receiving card's VRAM — prefill 4.42 → 4.20 ms a prompt token; the host-side half is 064's pieces moved onto the cards, open
 **Area:** decode, prefill
 **Gain:** measured piecemeal — a flag round trip 2.67 µs through peer VRAM against 3.47 through host memory; and on the host side of the same design: the join's 0.86 ms a step (038), the prefill expert handoff's 0.2 ms a prompt token, the route and sum laps' 3.5 ms a step (064), every one a CPU touch of a buffer that exists only because the cards hand off through the host
 
@@ -55,8 +55,33 @@ falls out:
 - **work on data the cards hold happens on the cards**: the router's top-k, the quantize, the weighted sum
   over the expert rows (064's pieces, 002's shape).
 
+## Built (2026-10-19 09:40, run a9f5139c)
+Each card owns a `Peer`: its receiving buffers for the KDA shares, the FFN rows and the MLA projection by
+layer parity, and its own copy of the handoff words, all fine-grained VRAM mapped for the peer
+(`vram_shared`). A producer's `hc_post` copies its share to the peer's buffer (a step of many tokens through
+the copy kernel's grid first, a few tokens inside `hc_post`) and writes its word into its own copy and the
+peer's; every card waits on its own words and reads its own share where it made it and the peer's where it
+landed. The host memory keeps what the host touches: the FFN input and router scores it reads, the routed
+experts' outputs it writes, the one word it waits on and the one it sets (into every card's copy). The long
+SCORE bit-identical, zero PCIe records.
+
+| at 18k, a 1024 step | host-memory handoffs | peer VRAM |
+|---|---|---|
+| prefill, ms a prompt token | 4.42–4.44 | 4.19–4.21 |
+| `kda_card` lap, a 1024 step | 2,136 ms | 1,958 |
+| `mla_proj` lap | 321 | 288 |
+| the cold 18k prompt | 83.7 s | 79.4 |
+| verify step at 18k | 46.5 ms | 46.5 |
+
+Five times the 0.04 ms a prompt token the entry estimated at 512: at 1024 a handoff is 16 MB, and the old
+path crossed the link three times a handoff (the producer's write to host memory, both cards' reads of it,
+each card reading its own share back over the link too). Decode's handoffs are a few tens of KB and
+latency-bound, as estimated: unchanged.
+
 ## Next
-1. The handoff buffers inventoried by who writes and who reads them (`Shared::{ys, fy, my, yexp, xh, xout,
+1. ~~The handoff buffers inventoried~~ — done above; the card-to-card ones moved.
+2. The host-side pieces of 064 onto the cards (route.pick, sum.y, the quantize, the dispatch's uploads).
+3. The handoff buffers inventoried by who writes and who reads them (`Shared::{ys, fy, my, yexp, xh, xout,
    scores_ffn, lg}`), each assigned by the rule; the card-to-card ones (`ys`, `fy`, `my`) to peer VRAM with
    the words in it — the refactor this entry always named.
 2. The host-side pieces of 064 moved onto the cards in the same pass, since they are the same decision.

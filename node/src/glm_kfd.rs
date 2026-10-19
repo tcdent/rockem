@@ -228,9 +228,6 @@ struct MtpOn {
 /// producer a layer ahead never overwrites what a consumer has yet to read (the handoff
 /// chain keeps them within one layer of each other).
 struct Shared {
-    ys: [Mem; 2],  // [2][PARTS][STEP][H] f32: the KDA parts' shares of the block output, by layer parity
-    fy: [Mem; 2],  // [STEP][H] f32: the FFN card's rows (the dense MLP or the shared expert)
-    my: [Mem; 2],  // [STEP][H] f32: the MLA card's output projection
     yexp: [Mem; 2], // [STEP][H] f32: the host's routed experts
     xh: Mem,       // [STEP][H] f32: a MoE layer's FFN input for the host
     xout: Mem,     // [STEP·TOP_K][H] f32, the host's own pages mapped for the cards: the routed experts' outputs by (token, pick) — the cards' jobs and the host's experts (038)
@@ -315,8 +312,21 @@ struct MlaOn {
     o: (Mem, Mem),
 }
 
+/// A card's receiving side of the card-to-card handoffs (queue 001): the peer's share of a KDA block's
+/// output, the FFN card's rows and the MLA card's output projection, by layer parity, in this card's
+/// VRAM (fine-grained, so its own polls and reads bypass its L2), mapped for the peers to write; and
+/// its copy of the handoff words — the producers write their word here too, so a card waits on its own
+/// memory and the host memory sees only what the host itself reads or writes.
+struct Peer {
+    ys: [Mem; 2], // [STEP][H] f32: the peer's part's share
+    fy: [Mem; 2], // [STEP][H] f32
+    my: [Mem; 2], // [STEP][H] f32
+    words: Mem,   // `word()` offsets, a cache line each
+}
+
 pub struct Cards {
     cards: Vec<Card>,
+    peers: Vec<Peer>,
     shared: Shared,
     layers: Vec<Option<Layer>>,
     ffns: Vec<Option<FfnOn>>,
@@ -466,15 +476,24 @@ impl Cards {
             assert!(per_cu * PRE_LDS as usize <= 64 * 1024, "hc_pre: {PRE_GRID} workgroups at {PRE_LDS} B of LDS are {per_cu} a CU on {} CUs and cannot all be resident", c.k.cu);
         }
         Kfd::clocks_high();
-        // the handoffs: host memory card 0 allocates and every other card maps too
+        // the card-to-card handoffs: each card's receiving buffers and words in its own VRAM, mapped for the peers (001)
+        assert!(cards.len() <= 2, "the handoff words reach one peer (`mine2`): {} cards", cards.len());
+        let peers: Vec<Peer> = (0..cards.len())
+            .map(|i| {
+                let k = &cards[i].k;
+                let others: Vec<&Kfd> = cards.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, c)| &*c.k).collect();
+                let buf = || k.vram_shared(STEP * H * 4, &others);
+                let words = k.vram_shared(word(W_KINDS, 0), &others);
+                unsafe { std::ptr::write_bytes(words.ptr() as *mut u8, 0, words.size) };
+                Peer { ys: [buf(), buf()], fy: [buf(), buf()], my: [buf(), buf()], words }
+            })
+            .collect();
+        // the host's handoffs: host memory card 0 allocates and every other card maps too
         let shared = {
             let k0 = &cards[0].k;
             let others: Vec<&Kfd> = cards[1..].iter().map(|c| &*c.k).collect();
             let buf = || k0.host_shared(STEP * H * 4, &others);
             Shared {
-                ys: [k0.host_shared(g::PARTS * STEP * H * 4, &others), k0.host_shared(g::PARTS * STEP * H * 4, &others)],
-                fy: [buf(), buf()],
-                my: [buf(), buf()],
                 yexp: [buf(), buf()],
                 xh: buf(),
                 xout: k0.host_owned(STEP * TOP_K * H * 4, &others),
@@ -729,7 +748,7 @@ impl Cards {
             }
             Resident { table: std::sync::Arc::new((0..moe * glm_5_3_flash::E).map(|_| AtomicU32::new(NONE)).collect()), loader: None, inflight: Default::default(), allowed: Default::default(), issued: Default::default(), steps: 0, prefill: false, count: vec![0; moe * glm_5_3_flash::E], turn: 0, owner: counts.iter().map(|&k| vec![(NONE, NONE); k]).collect(), free: counts.iter().map(|&k| (0..k as u32).rev().collect()).collect(), held: (0..n).map(|_| vec![0; moe]).collect(), per_layer, slots, jobs: (0..n).map(|_| Vec::new()).collect(), uploads: 0 }
         };
-        Cards { cards, shared, layers, ffns, mlas, head, head_card, mtp, resident, instrument, seq: 0, half_seq: vec![[0; 2]; NUM_HIDDEN_LAYERS], token_from: vec![0; n], npools: max_ctx.div_ceil(INDEX_KPOOL) }
+        Cards { cards, peers, shared, layers, ffns, mlas, head, head_card, mtp, resident, instrument, seq: 0, half_seq: vec![[0; 2]; NUM_HIDDEN_LAYERS], token_from: vec![0; n], npools: max_ctx.div_ceil(INDEX_KPOOL) }
     }
 
     /// With the launches stamped (`track-launches`): the step's launches on every card as zones on
@@ -775,11 +794,28 @@ impl Cards {
     /// (src, dst, floats) out to shared memory and `value` into its word `mine`, then the queue
     /// holds for `w0` and `w1`, then the block output (`ya` + `yb`) into its streams. One launch.
     #[allow(clippy::too_many_arguments)]
+    /// `copy`: (src in this card's VRAM, the peer's receiving buffer, floats) — a step of many tokens copies
+    /// with the copy kernel's grid first (one workgroup moving 16 MB over the link would hold the launch),
+    /// a few tokens' inside `hc_post`. `mine`: this card's word, written to its own copy and the peer's.
+    /// `w0`, `w1`: words read from this card's own copy. `ya`, `yb`: the shares, in this card's VRAM.
+    #[allow(clippy::too_many_arguments)]
     fn hc_post(&self, c: &Card, copy: Option<(usize, usize, usize)>, mine: Option<(usize, usize)>, w0: Option<(usize, usize)>, w1: Option<(usize, usize)>, value: u32, ya: usize, yb: Option<usize>, tokens: usize) {
-        let at = |w: Option<(usize, usize)>| w.map_or(0, |(k, d)| self.shared.words.at(word(k, d)));
-        let (src, dst, n) = copy.unwrap_or((0, 0, 0));
+        let me = c.k.index;
+        let own = |w: Option<(usize, usize)>| w.map_or(0, |(k, d)| self.peers[me].words.at(word(k, d)));
+        let peer = (0..self.cards.len()).find(|&j| j != me);
+        let mine2 = match (mine, peer) {
+            (Some((k, d)), Some(j)) => self.peers[j].words.at(word(k, d)),
+            _ => 0,
+        };
+        let (mut src, mut dst2, mut n) = copy.unwrap_or((0, 0, 0));
+        if copy.is_some() && tokens > SPEC_TOKENS {
+            let mut a = Args::new();
+            a.ptr(src).ptr(dst2).u32(n as u32);
+            c.k.launch(&c.copy, n.div_ceil(g::COPY_WG_WORDS) as u32, g::WG, 0, &a);
+            (src, dst2, n) = (0, 0, 0);
+        }
         let mut a = Args::new();
-        a.ptr(c.mix.va).ptr(ya).ptr(yb.unwrap_or(0)).ptr(c.streams.va).ptr(src).ptr(dst).u32(n as u32).ptr(at(mine)).ptr(at(w0)).ptr(at(w1)).u32(value).ptr(c.go.va).u32(tokens as u32);
+        a.ptr(c.mix.va).ptr(ya).ptr(yb.unwrap_or(0)).ptr(c.streams.va).ptr(src).ptr(0usize).ptr(dst2).u32(n as u32).ptr(own(mine)).ptr(mine2).ptr(own(w0)).ptr(own(w1)).u32(value).ptr(c.go.va).u32(tokens as u32);
         c.k.launch(&c.hc_post, CHANNEL_GRID, g::WG, 0, &a);
     }
     /// The FFN router's place: on the FFN card of a MoE layer, `hc_pre` runs layer `l`'s FFN router (and the
@@ -794,12 +830,25 @@ impl Cards {
     /// `parts[c]`: the part slots card `c` holds, contiguous.
     fn attention_out(&self, value: u32, parity: usize, parts: &[Vec<usize>], n: usize) {
         let producers: Vec<usize> = (0..self.cards.len()).filter(|&c| !parts[c].is_empty()).collect();
-        let ys = &self.shared.ys[parity];
         for c in &self.cards {
-            let mine = &parts[c.k.index];
-            // a part's share is [STEP][H] at its slot: this card's parts' n tokens each, one span from the first slot
-            let copy = mine.first().map(|&p0| (c.yv.at(p0 * STEP * H * 4), ys.at(p0 * STEP * H * 4), ((mine.len() - 1) * STEP + n) * H));
-            self.hc_post(c, copy, (!mine.is_empty()).then_some((W_Y, c.k.index)), Some((W_Y, producers[0])), producers.get(1).map(|&p| (W_Y, p)), value, ys.va, Some(ys.at(STEP * H * 4)), n);
+            let me = c.k.index;
+            let mine = &parts[me];
+            let peer = (0..self.cards.len()).find(|&j| j != me);
+            // this card's share stays where `rows_part` wrote it (`yv`, its parts' slots); a peer's share arrives in
+            // this card's receiving buffer. With a peer each card holds one part; alone it holds both in `yv`.
+            let (ya, yb) = match (mine.first(), peer) {
+                (Some(&p0), Some(_)) => {
+                    assert!(mine.len() == 1, "one part a card with a peer");
+                    (c.yv.at(p0 * STEP * H * 4), Some(self.peers[me].ys[parity].va))
+                }
+                (Some(&p0), None) => (c.yv.at(p0 * STEP * H * 4), (mine.len() > 1).then(|| c.yv.at((p0 + 1) * STEP * H * 4))),
+                (None, _) => (self.peers[me].ys[parity].va, None),
+            };
+            let copy = match (mine.first(), peer) {
+                (Some(&p0), Some(j)) => Some((c.yv.at(p0 * STEP * H * 4), self.peers[j].ys[parity].va, n * H)),
+                _ => None,
+            };
+            self.hc_post(c, copy, (!mine.is_empty()).then_some((W_Y, me)), Some((W_Y, producers[0])), producers.get(1).map(|&p| (W_Y, p)), value, ya, yb, n);
         }
     }
 
@@ -1108,7 +1157,7 @@ impl Placed for Cards {
         // the other cards fold the output in once it is there (posted now: they wait for the word)
         for (i, o) in self.cards.iter().enumerate() {
             if i != m.card {
-                self.hc_post(o, None, None, Some((W_Y, m.card)), None, value, self.shared.my[l % 2].va, None, n);
+                self.hc_post(o, None, None, Some((W_Y, m.card)), None, value, self.peers[i].my[l % 2].va, None, n);
             }
         }
     }
@@ -1444,14 +1493,14 @@ impl Placed for Cards {
     fn mla_out(&mut self, l: usize, n: usize) {
         let m = self.mlas[l].as_ref().unwrap();
         let c = &self.cards[m.card];
-        let my = self.shared.my[l % 2].va;
-        // the output projection over every token's heads, then the streams
+        // the output projection over every token's heads, then the streams (the projection out to the peer's receiving buffer)
         if n > SPEC_TOKENS {
             self.rows_w(c, &c.mla_o_w, c.mheads.va, None, m.o.0.va, Some(m.o.1.va), c.myv.va, H, n, false);
         } else {
             self.rows8(c, &c.mla_o, c.mheads.va, None, m.o.0.va, m.o.1.va, c.myv.va, H, O_IN, n, ROWS);
         }
-        self.hc_post(c, Some((c.myv.va, my, n * H)), Some((W_Y, m.card)), None, None, self.half_seq[l][0], my, None, n);
+        let copy = (0..self.cards.len()).find(|&j| j != m.card).map(|j| (c.myv.va, self.peers[j].my[l % 2].va, n * H));
+        self.hc_post(c, copy, Some((W_Y, m.card)), None, None, self.half_seq[l][0], c.myv.va, None, n);
     }
     fn mla_seed(&mut self, l: usize, pos: usize, latent: &[u16]) {
         let m = self.mlas[l].as_ref().unwrap();
@@ -1487,10 +1536,12 @@ impl Placed for Cards {
         let value = self.half_seq[l][1];
         let f = self.ffns[l].as_ref().unwrap();
         let parity = l % 2;
-        let fy = self.shared.fy[parity].va;
         for o in &self.cards {
-            let producer = o.k.index == f.card;
-            let copy = producer.then_some((o.fyv.va, fy, n * H));
+            let me = o.k.index;
+            let producer = me == f.card;
+            // the producer's rows stay in its `fyv`; the peer reads them from its receiving buffer
+            let copy = if producer { (0..self.cards.len()).find(|&j| j != me).map(|j| (o.fyv.va, self.peers[j].fy[parity].va, n * H)) } else { None };
+            let fy = if producer { o.fyv.va } else { self.peers[me].fy[parity].va };
             let mine = producer.then_some((W_FFN, f.card));
             if f.dense {
                 self.hc_post(o, copy, mine, Some((W_FFN, f.card)), None, value, fy, None, n);
@@ -1510,7 +1561,10 @@ impl Placed for Cards {
         // step's 16 MB took 4.8 ms a layer (0.2 ms a prompt token, 2026-10-19)
         let buf = &self.shared.yexp[l % 2];
         common::copy::stream(unsafe { std::slice::from_raw_parts_mut(buf.ptr() as *mut u8, n * H * 4) }, raw(&y[..n * H]));
-        unsafe { &*self.word_ptr(W_EXPERTS, 0) }.store(self.half_seq[l][1], std::sync::atomic::Ordering::Release);
+        // the word into every card's own copy (the cards wait on their own VRAM, 001)
+        for pe in &self.peers {
+            unsafe { &*(pe.words.at(word(W_EXPERTS, 0)) as *const AtomicU32) }.store(self.half_seq[l][1], std::sync::atomic::Ordering::Release);
+        }
     }
     fn layer_out(&mut self, _l: usize, i: usize, mean: &mut [f32]) {
         let c = &self.cards[self.head_card];
