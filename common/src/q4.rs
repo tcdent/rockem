@@ -659,6 +659,38 @@ mod tests {
         // (32 MB of nibbles, past one core's share of L3: the rate when the rows stream from DRAM)
         gemm_rate_rows::<32>(2000);
         gemm_rate_rows::<16384>(8);
+        gemm_rate_slabs();
+    }
+    /// The prefill expert phase's own shape: many 32-row slabs (an item's gate or up rows, 64 KB each) from a
+    /// pool far past the caches, each applied to `n` tokens and then the next — the rate when every item
+    /// starts a fresh stream, against the long slab above.
+    fn gemm_rate_slabs() {
+        const K: usize = 4096;
+        const M: usize = 32;
+        const SLABS: usize = 2048; // 128 MB of nibbles
+        let mut rng = Rng::new(5);
+        let w: Vec<i8> = (0..M * K).map(|_| rng.i4()).collect();
+        let sc: Vec<f32> = (0..M * (K / GROUP)).map(|_| 0.01).collect();
+        let (pw1, ps1) = pack(M, K, &w, &sc);
+        let pw: Vec<u8> = (0..SLABS).flat_map(|_| pw1.iter().copied()).collect();
+        let ps: Vec<f32> = (0..SLABS).flat_map(|_| ps1.iter().copied()).collect();
+        std::println!("{SLABS} slabs of {M} rows x {K} ({:.1} MB), each applied to n tokens then the next:", pw.len() as f64 / 1e6);
+        for &n in &[16usize, 64] {
+            let (mut q, mut s, mut g) = (vec![0i8; n * K], vec![0f32; n * K / GROUP], vec![0i32; n * K / GROUP]);
+            for i in 0..n {
+                let x: Vec<f32> = (0..K).map(|_| rng.unit()).collect();
+                QAct { q: &mut q[i * K..(i + 1) * K], scale: &mut s[i * (K / GROUP)..(i + 1) * (K / GROUP)], gsum: &mut g[i * (K / GROUP)..(i + 1) * (K / GROUP)] }.quantize(&x);
+            }
+            let act = |i: usize| Act { q: &q[i * K..(i + 1) * K], scale: &s[i * (K / GROUP)..(i + 1) * (K / GROUP)], gsum: &g[i * (K / GROUP)..(i + 1) * (K / GROUP)] };
+            let mut out = vec![0f32; n * M];
+            let op = out.as_mut_ptr() as usize;
+            let t0 = std::time::Instant::now();
+            for sl in 0..SLABS {
+                gemm::<K>(M, &pw[sl * pw1.len()..(sl + 1) * pw1.len()], &ps[sl * ps1.len()..(sl + 1) * ps1.len()], n, act, |i| unsafe { (op as *mut f32).add(i * M) });
+            }
+            let b = t0.elapsed().as_secs_f64() / (SLABS * n) as f64;
+            std::println!("n {n:>2}: gemm {:.2} µs a token a slab ({:.1} GMAC/s, {:.1} GB/s of weights)", b * 1e6, (M * K) as f64 / b / 1e9, pw1.len() as f64 / (b * n as f64) / 1e9);
+        }
     }
     fn gemm_rate_rows<const M: usize>(reps_at_one: usize) {
         const K: usize = 4096;
