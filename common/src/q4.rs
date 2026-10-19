@@ -655,12 +655,18 @@ mod tests {
     #[test]
     #[ignore]
     fn gemm_rate() {
+        // two weight shapes: 32 rows (64 KB, cache-resident: the kernel's own rate) and 16,384 rows
+        // (32 MB of nibbles, past one core's share of L3: the rate when the rows stream from DRAM)
+        gemm_rate_rows::<32>(2000);
+        gemm_rate_rows::<16384>(8);
+    }
+    fn gemm_rate_rows<const M: usize>(reps_at_one: usize) {
         const K: usize = 4096;
-        const M: usize = 32;
         let mut rng = Rng::new(3);
         let w: Vec<i8> = (0..M * K).map(|_| rng.i4()).collect();
         let sc: Vec<f32> = (0..M * (K / GROUP)).map(|_| 0.01).collect();
         let (pw, ps) = pack(M, K, &w, &sc);
+        std::println!("{M} rows x {K} ({:.1} MB packed):", (pw.len()) as f64 / 1e6);
         for &n in &[1usize, 4, 16, 64] {
             let (mut q, mut s, mut g) = (vec![0i8; n * K], vec![0f32; n * K / GROUP], vec![0i32; n * K / GROUP]);
             for i in 0..n {
@@ -669,7 +675,7 @@ mod tests {
             }
             let act = |i: usize| Act { q: &q[i * K..(i + 1) * K], scale: &s[i * (K / GROUP)..(i + 1) * (K / GROUP)], gsum: &g[i * (K / GROUP)..(i + 1) * (K / GROUP)] };
             let mut out = vec![0f32; n * M];
-            let reps = 2000 / n;
+            let reps = (reps_at_one / n).max(1);
             let t0 = std::time::Instant::now();
             for _ in 0..reps {
                 for i in 0..n {
