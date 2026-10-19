@@ -789,31 +789,7 @@ pub mod gfx11 {
         let (wave, lane) = ((tid / 32) as usize, (tid % 32) as usize);
         let mut g = wave;
         while g < K / GROUP {
-            let v = load(g * GROUP + lane * 4);
-            let mut amax = 0f32;
-            let mut i = 0;
-            while i < 4 {
-                let a = if v[i] < 0.0 { -v[i] } else { v[i] };
-                if a > amax {
-                    amax = a;
-                }
-                i += 1;
-            }
-            let amax = f32::from_bits(crate::gfx11::wave_max_u32(lane as u32, amax.to_bits()));
-            let s = amax / 127.0;
-            let inv = if s > 0.0 { 1.0 / s } else { 0.0 };
-            let mut packed = 0u32;
-            let mut sum = 0i32;
-            let mut i = 0;
-            while i < 4 {
-                let r = round(v[i] * inv);
-                let r = if r > 127.0 { 127.0 } else if r < -127.0 { -127.0 } else { r };
-                let q = r as i8;
-                packed |= ((q as u8) as u32) << (8 * i);
-                sum += q as i32;
-                i += 1;
-            }
-            let sum = crate::gfx11::wave_sum_i32(lane as u32, sum);
+            let ([packed], [s], [sum]) = quantize_groups(lane as u32, [load(g * GROUP + lane * 4)]);
             *(lds.add(g * GROUP + lane * 4) as *mut u32) = packed;
             if lane == 0 {
                 *scales.add(g) = s;
@@ -823,6 +799,48 @@ pub mod gfx11 {
         }
         workgroup_sync();
         (lds as *const i8, scales as *const f32, sums as *const i32)
+    }
+
+    /// `N` groups quantized as `QAct::quantize`, a wave a group (lane l holding the group's values 4l..4l + 3):
+    /// the scale amax / 127, each value rounded by the shared `round` and clamped to ±127, the bytes' sum. The `N`
+    /// groups' butterflies run in lockstep, so the wave waits once a step for all of them. Returns each group's
+    /// lane bytes packed (value 4l + i in byte i) and, on every lane, its scale and sum.
+    #[inline(always)]
+    pub unsafe fn quantize_groups<const N: usize>(lane: u32, v: [[f32; 4]; N]) -> ([u32; N], [f32; N], [i32; N]) {
+        let mut amax = [0u32; N];
+        let mut g = 0;
+        while g < N {
+            let mut m = 0f32;
+            let mut i = 0;
+            while i < 4 {
+                let a = if v[g][i] < 0.0 { -v[g][i] } else { v[g][i] };
+                if a > m {
+                    m = a;
+                }
+                i += 1;
+            }
+            amax[g] = m.to_bits();
+            g += 1;
+        }
+        let amax = crate::gfx11::wave_max_u32(lane, amax);
+        let (mut packed, mut scale, mut sum) = ([0u32; N], [0f32; N], [0i32; N]);
+        let mut g = 0;
+        while g < N {
+            let s = f32::from_bits(amax[g]) / 127.0;
+            let inv = if s > 0.0 { 1.0 / s } else { 0.0 };
+            let mut i = 0;
+            while i < 4 {
+                let r = round(v[g][i] * inv);
+                let r = if r > 127.0 { 127.0 } else if r < -127.0 { -127.0 } else { r };
+                let q = r as i8;
+                packed[g] |= ((q as u8) as u32) << (8 * i);
+                sum[g] += q as i32;
+                i += 1;
+            }
+            scale[g] = s;
+            g += 1;
+        }
+        (packed, scale, crate::gfx11::wave_sum_i32(lane, sum))
     }
 
     unsafe extern "C" {

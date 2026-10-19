@@ -739,7 +739,8 @@ pub mod gfx11 {
         let k1 = common::stat_clock!();
         common::stat!(1, k1.wrapping_sub(k0) & common::stats::CLOCK_MASK);
         let r = *misc;
-        // the groups: wave w quantizes groups w, w + 8, w + 16, w + 24, the four groups' loads issued first
+        // the groups: wave w quantizes groups w, w + 8, w + 16, w + 24, the four groups' loads issued first and their
+        // butterflies in lockstep
         const GW: usize = H / GROUP / 8;
         let mut v = [[0f32; 4]; GW];
         let mut gi = 0;
@@ -754,42 +755,19 @@ pub mod gfx11 {
             }
             gi += 1;
         }
+        let (packed, sc, sum) = common::q4::gfx11::quantize_groups(lane as u32, v);
         let mut gi = 0;
         while gi < GW {
             let g = wave + 8 * gi;
             let k0 = g * GROUP + lu * 4;
-            let mut amax = 0f32;
-            let mut jj = 0;
-            while jj < 4 {
-                let a = if v[gi][jj] < 0.0 { -v[gi][jj] } else { v[gi][jj] };
-                if a > amax {
-                    amax = a;
-                }
-                jj += 1;
-            }
-            let amax = f32::from_bits(common::gfx11::wave_max_u32(lane as u32, amax.to_bits()));
-            let sc = amax / 127.0;
-            let inv = if sc > 0.0 { 1.0 / sc } else { 0.0 };
-            let mut packed = 0u32;
-            let mut sum = 0i32;
-            let mut jj = 0;
-            while jj < 4 {
-                let rd = common::math::round(v[gi][jj] * inv);
-                let rd = if rd > 127.0 { 127.0 } else if rd < -127.0 { -127.0 } else { rd };
-                let qv = rd as i8;
-                packed |= ((qv as u8) as u32) << (8 * jj);
-                sum += qv as i32;
-                jj += 1;
-            }
-            let sum = common::gfx11::wave_sum_i32(lane as u32, sum);
-            *(xq.add(tok * H + k0) as *mut u32) = packed;
-            *(xq_h.add(tok * H + k0) as *mut u32) = packed;
+            *(xq.add(tok * H + k0) as *mut u32) = packed[gi];
+            *(xq_h.add(tok * H + k0) as *mut u32) = packed[gi];
             if lane == 0 {
                 let o = tok * (H / GROUP) + g;
-                *xs.add(o) = sc;
-                *xg.add(o) = sum;
-                *xs_h.add(o) = sc;
-                *xg_h.add(o) = sum;
+                *xs.add(o) = sc[gi];
+                *xg.add(o) = sum[gi];
+                *xs_h.add(o) = sc[gi];
+                *xg_h.add(o) = sum[gi];
             }
             gi += 1;
         }

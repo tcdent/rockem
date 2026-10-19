@@ -85,27 +85,47 @@ pub unsafe fn group_max(lane: u32, v: f32, n: u32) -> f32 {
     }
     v
 }
-/// Max of one u32 per lane across the wave by an xor butterfly over `ds_bpermute`; every lane gets it. Exact
-/// (a max has no order), and five steps where `wave_reduce_umax` compiles to a loop over the 32 lanes one at a
-/// time (13 µs for a token's quantize, 2026-10-19). Non-negative f32 bits compare as their floats.
+/// Max of `N` u32s a lane across the wave by xor butterflies over `ds_bpermute`, the `N` in lockstep (each step's
+/// `N` permutes issued before one wait); every lane gets each. Exact (a max has no order), and five steps where
+/// `wave_reduce_umax` compiles to a loop over the 32 lanes one at a time (13 µs for a token's quantize,
+/// 2026-10-19). Non-negative f32 bits compare as their floats.
 #[inline(always)]
-pub unsafe fn wave_max_u32(lane: u32, v: u32) -> u32 {
+pub unsafe fn wave_max_u32<const N: usize>(lane: u32, v: [u32; N]) -> [u32; N] {
     let mut v = v;
     let mut m = 1;
     while m < 32 {
-        let o = ds_bpermute((lane ^ m) * 4, v);
-        v = if o > v { o } else { v };
+        let mut o = [0u32; N];
+        let mut i = 0;
+        while i < N {
+            o[i] = ds_bpermute((lane ^ m) * 4, v[i]);
+            i += 1;
+        }
+        let mut i = 0;
+        while i < N {
+            v[i] = if o[i] > v[i] { o[i] } else { v[i] };
+            i += 1;
+        }
         m <<= 1;
     }
     v
 }
-/// Sum of one i32 per lane across the wave, likewise (integer: exact in any order).
+/// Sums of `N` i32s a lane across the wave, likewise (integer: exact in any order).
 #[inline(always)]
-pub unsafe fn wave_sum_i32(lane: u32, v: i32) -> i32 {
+pub unsafe fn wave_sum_i32<const N: usize>(lane: u32, v: [i32; N]) -> [i32; N] {
     let mut v = v;
     let mut m = 1;
     while m < 32 {
-        v = v.wrapping_add(ds_bpermute((lane ^ m) * 4, v as u32) as i32);
+        let mut o = [0u32; N];
+        let mut i = 0;
+        while i < N {
+            o[i] = ds_bpermute((lane ^ m) * 4, v[i] as u32);
+            i += 1;
+        }
+        let mut i = 0;
+        while i < N {
+            v[i] = v[i].wrapping_add(o[i] as i32);
+            i += 1;
+        }
         m <<= 1;
     }
     v

@@ -559,7 +559,6 @@ pub mod gfx11 {
                     let (k, gp) = (gi / 2, gi % 2);
                     let k0 = (g0 + gi) * GROUP + lane as usize * 4;
                     let mut v = [0f32; 4];
-                    let mut amax = 0f32;
                     let mut jj = 0;
                     while jj < 4 {
                         let gate = *g.add(k0 + jj);
@@ -567,27 +566,9 @@ pub mod gfx11 {
                         let gc = if gate > limit { limit } else { gate };
                         let uc = if up > limit { limit } else if up < -limit { -limit } else { up };
                         v[jj] = silu(gc) * uc;
-                        let a = if v[jj] < 0.0 { -v[jj] } else { v[jj] };
-                        if a > amax {
-                            amax = a;
-                        }
                         jj += 1;
                     }
-                    let amax = f32::from_bits(common::gfx11::wave_max_u32(lane as u32, amax.to_bits()));
-                    let s = amax / 127.0;
-                    let inv = if s > 0.0 { 1.0 / s } else { 0.0 };
-                    let mut packed = 0u32;
-                    let mut sum = 0i32;
-                    let mut jj = 0;
-                    while jj < 4 {
-                        let rd = common::math::round(v[jj] * inv);
-                        let rd = if rd > 127.0 { 127.0 } else if rd < -127.0 { -127.0 } else { rd };
-                        let qv = rd as i8;
-                        packed |= ((qv as u8) as u32) << (8 * jj);
-                        sum += qv as i32;
-                        jj += 1;
-                    }
-                    let sum = common::gfx11::wave_sum_i32(lane as u32, sum);
+                    let ([packed], [s], [sum]) = common::q4::gfx11::quantize_groups(lane as u32, [v]);
                     let d = dst.add(k * STEP_BYTES);
                     *(d.add(gp * GROUP + lane as usize * 4) as *mut u32) = packed;
                     if lane == 0 {
@@ -768,7 +749,6 @@ pub mod gfx11 {
             let limit = crate::SWIGLU_LIMIT;
             let k0 = gi * GROUP + lane as usize * 4;
             let mut v = [0f32; 4];
-            let mut amax = 0f32;
             let mut jj = 0;
             while jj < 4 {
                 let gate = *g.add(k0 + jj);
@@ -776,27 +756,9 @@ pub mod gfx11 {
                 let gc = if gate > limit { limit } else { gate };
                 let uc = if up > limit { limit } else if up < -limit { -limit } else { up };
                 v[jj] = silu(gc) * uc;
-                let a = if v[jj] < 0.0 { -v[jj] } else { v[jj] };
-                if a > amax {
-                    amax = a;
-                }
                 jj += 1;
             }
-            let amax = f32::from_bits(common::gfx11::wave_max_u32(lane as u32, amax.to_bits()));
-            let s = amax / 127.0;
-            let inv = if s > 0.0 { 1.0 / s } else { 0.0 };
-            let mut packed = 0u32;
-            let mut sum = 0i32;
-            let mut jj = 0;
-            while jj < 4 {
-                let rd = common::math::round(v[jj] * inv);
-                let rd = if rd > 127.0 { 127.0 } else if rd < -127.0 { -127.0 } else { rd };
-                let qv = rd as i8;
-                packed |= ((qv as u8) as u32) << (8 * jj);
-                sum += qv as i32;
-                jj += 1;
-            }
-            let sum = common::gfx11::wave_sum_i32(lane as u32, sum);
+            let ([packed], [s], [sum]) = common::q4::gfx11::quantize_groups(lane as u32, [v]);
             *(hq.add(j * D_FF + k0) as *mut u32) = packed;
             if lane == 0 {
                 *hs.add(j * XQ_GROUPS + gi) = s;

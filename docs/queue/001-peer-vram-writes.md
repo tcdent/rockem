@@ -1,6 +1,6 @@
 # 001 — Peer VRAM writes for the handoffs
 
-**Status:** Both halves built (2026-10-19): the card-to-card handoffs in the receiving card's VRAM, and the FFN input's norm, quantize and router pick on the card (`ffn_act`) — prefill 4.42 → 4.02 ms a prompt token; at a verify step the kernel's ~55 µs a layer sits on the FFN card's critical path (+0.8 ms a step), to fold into `hc_pre`
+**Status:** Both halves built (2026-10-19): the card-to-card handoffs in the receiving card's VRAM, and the FFN input's norm, quantize and router pick on the card, folded into the FFN card's `hc_pre` — prefill 4.42 → 4.02 ms a prompt token, a verify step at 18k 46.47 → 45.68 ms; the act phase's ~20 µs a layer still on the FFN card's critical path
 **Area:** decode, prefill
 **Gain:** measured piecemeal — a flag round trip 2.67 µs through peer VRAM against 3.47 through host memory; and on the host side of the same design: the join's 0.86 ms a step (038), the prefill expert handoff's 0.2 ms a prompt token, the route and sum laps' 3.5 ms a step (064), every one a CPU touch of a buffer that exists only because the cards hand off through the host
 
@@ -131,8 +131,47 @@ The fold took back 1.1 ms a step (the 22 µs idle and the 4 µs launch, 42 layer
 host's wake ~35 µs a layer past the old router word against the 10–15 µs expected — being stamped (the act phase in
 `hc_pre`'s four stats slots).
 
+## The act phase to the piece (2026-10-19 13:40–15:30, runs a8bdb6a6, 6615b39f, b6c5a3ab)
+Stamped (wave 0 of the first workgroup, the stats object on a track-launches boot, `kstats.sh`): the scores' wait
+4.1 µs, the norm 3.6, the quantize 8.6, and the picks unstamped but the rest of a launch that had grown from ~66 to
+118 µs. Two causes, both serial chains the compiler built:
+
+- **The wave reductions.** `core::arch::amdgpu::wave_reduce_umax` / `_add` compile to a loop over the 32 lanes, one
+  at a time. Replaced everywhere by xor butterflies over `ds_bpermute` (`common::gfx11::wave_max_u32`,
+  `wave_sum_i32`), exact (max and integer sum have no order) — fold2.
+- **The picks.** A rank a thread an expert (the count of experts above its key) loaded each key and waited on it,
+  288 times, twice over for threads 0–31 (288 experts on 256 threads); batching the loads left a float compare, an
+  equality compare, a tie test and an add a key with mask dependencies between them (18.9 µs). The key and the
+  expert now form one order-preserving u64 (the key's bits mapped to unsigned order above, the expert's complement
+  below: the host's greater key first, the lower expert between equals; −0 would sort below +0, and a sigmoid plus
+  a bias cannot be −0), one 64-bit compare and a carry-add a key, both of a thread's experts in one pass: 5.0 µs.
+
+| a verify step at 18k (`laps.sh`, the 96-token hit) | peer VRAM only | separate `ffn_act` | fold1 | fold2 | fold4 |
+|---|---|---|---|---|---|
+| run | a9f5139c | 550345f6 | b1cd9bfb | a8bdb6a6 | b6c5a3ab |
+| verify step, ms | 46.47 | 47.42 | 46.32 | 46.71 | **45.68** |
+| cards' wait (`kda_card`) | 18.70 | 21.43 | 20.19 | 20.56 | 19.55 |
+| host route lap | 1.62 | 0.35 | 0.35 | 0.36 | 0.36 |
+| the router `hc_pre`, µs (stamped lab) | | | | 118 | 85.5 |
+
+Long SCORE bit-identical to fold1 for fold2 and fold4; prefill 4.02–4.05 ms a prompt token; the cold 18k prompt
+76.7 s. (The separate-kernel column was read from runs d6b0296d/550345f6, whose route lap of 0.35 says they already
+carried the kernel though their commit is 2898ff0.)
+
+fold4's act phase on wave 0 is ~20 µs a layer (wait 2.6, norm 3.7, quantize 8.6, picks 5.0), which is what the
+cards' wait still holds over the peer-only build (0.85 ms a step, 42 layers) while the route lap gave back 1.26.
+The quantize ran its four groups one after another, five dependent permutes for the max and five for the sum a
+group: one `common::q4::gfx11::quantize_groups::<N>` now runs N groups' butterflies in lockstep, used at every
+quantize site (both models' expert kernels, `quantize_to_lds`, the act phase with N = 4) — fold5: no gain (run
+7746cdae: a verify step 45.76 ms, `kda_card` 19.74, within the noise of fold4; the quantize stamp 8.6 → 8.2 µs).
+The butterflies were not the quantize's cost: its loads issue together and its permutes interleave, so what is left
+is the latency of reading the token's row back from L2 after other workgroups wrote it (a stats object adds a
+coherent read a stamp, so its phases read high). Kept for the one quantize instead of six copies, bit-identical.
+
 ## Next
-1. The act phase's 35 µs, from its stamps.
+1. The act phase's ~20 µs a layer (fold4's stamps): the token's row is read twice (the norm's strided order, then
+   the groups'); one load in the groups' layout for both needs the norm's tree order redefined on both tiers (a
+   numeric change). The scores' wait (2.6–3.6) is the grid's arrival.
 1. ~~The handoff buffers inventoried~~ — done above; the card-to-card ones moved.
 2. The host-side pieces of 064 onto the cards (route.pick, sum.y, the quantize, the dispatch's uploads).
 3. The handoff buffers inventoried by who writes and who reads them (`Shared::{ys, fy, my, yexp, xh, xout,
