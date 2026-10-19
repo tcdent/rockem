@@ -226,14 +226,23 @@ pub mod gfx11_consts {
     pub const PRE_TOKENS: usize = 128;
     /// `hc_pre`'s LDS: per token of a round, 8 wave partials of the dots and 8 of the squares, the
     /// coefficients; then a transpose scratch per wave.
-    pub const PRE_LDS: u32 = (4 * (PRE_TOKENS * (16 + COEF_ROWS) + 8 * HC * HC)) as u32;
+    /// The LDS of the coefficient rounds, or of the FFN input's act phase (a token's 256 partials, the sigmoid
+    /// scores and the bias an expert, the picks, the norm's scale and the mass), whichever is larger.
+    const PRE_COEF_LDS: usize = 4 * (PRE_TOKENS * (16 + COEF_ROWS) + 8 * HC * HC);
+    pub const ACT_LDS: usize = 4 * (256 + 2 * E + TOP_K + 8);
+    pub const PRE_LDS: u32 = (if PRE_COEF_LDS > ACT_LDS { PRE_COEF_LDS } else { ACT_LDS }) as u32;
+    /// `hc_pre`'s act table (a MoE layer on its FFN card): the device addresses its act phase reads and writes,
+    /// in this order — the post-norm (f32), the router's bias (f32), the card's quantized activation (`xq`, `xs`,
+    /// `xg`), the host's copies of it, the host's picks (u32) and weights (f32), the host's word.
+    pub const ACT_SLOTS: usize = 11;
     /// `hc_pre`'s partials in VRAM, per token: the coefficient dots `[COEF_ROWS][SLICES]`, then every
     /// workgroup's sum of squares of its stream channels. The host allocates `STEP · PRE_STRIDE`.
     pub const PRE_STRIDE: usize = PRE_PARTS;
     /// `hc_pre`'s VRAM words: for each of its three device barriers, an arrival count a row (0 between
     /// launches) and a done word a row; then the mix's ready word and the collapse's.
     pub const PRE_BARRIERS: usize = 3;
-    pub const PRE_COUNTS: usize = PRE_BARRIERS * 2 * COEF_ROWS + 2;
+    /// The arrival counts, then the ready words: the mix, the collapse, the scores (the act phase's start), the act phase's arrivals.
+    pub const PRE_COUNTS: usize = PRE_BARRIERS * 2 * COEF_ROWS + 4;
     /// Router rows a workgroup takes in `hc_pre`'s tail.
     /// Rows the FFN half's router launch carries: layer l's router over the FFN input, then layer l+1's
     /// (the prefetch's predictor, named a layer ahead); `scores` is `[tokens][ROUTE_ROWS]`.
@@ -328,12 +337,13 @@ pub mod gfx11 {
     /// coefficients), a token's arithmetic the same whichever round it is in. Counts back at 0 when
     /// the launch leaves. LDS: PRE_LDS.
     #[no_mangle]
-    pub extern "gpu-kernel" fn hc_pre(streams: *const f32, w: *const u16, part: *mut f32, base: *const f32, scale: *const f32, mix: *mut f32, x: *mut f32, x_host: *mut f32, count: *mut u32, value: u32, ln: *const u16, router: *const u16, scores: *mut f32, word: *mut u32, rows: u32, n: u32) {
+    pub extern "gpu-kernel" fn hc_pre(streams: *const f32, w: *const u16, part: *mut f32, base: *const f32, scale: *const f32, mix: *mut f32, x: *mut f32, x_host: *mut f32, count: *mut u32, value: u32, ln: *const u16, router: *const u16, scores: *mut f32, scores_v: *mut f32, word: *mut u32, act: *const u64, rows: u32, n: u32) {
         unsafe {
             let n = n as usize;
-            // stats (a stats code object only): slot 0 the collapse (its stores to `x` and, when given, `x_host`),
-            // 1 the release fence after it (the collapse's stores drained; router variant), 2 the router (from the
-            // second barrier to its scores' stores issued), 3 the release fence after the scores (their drain)
+            // stats (a stats code object only), the act phase of the FFN card's launch: slot 0 from the scores' last
+            // arrival to the act phase's start (workgroup 0's poll of the rows, the ready word, the wait), 1 the
+            // token's loads and norm, 2 its quantize, 3 the picks and the arrival out (workgroup 0's values are
+            // the ones the host waits on)
             let t = workitem_id_x() as usize;
             let (wave, lane) = (t / 32, (t % 32) as u32);
             let wg = workgroup_id_x() as usize;
@@ -480,7 +490,6 @@ pub mod gfx11 {
                 await_word(ready, value);
             }
             workgroup_sync();
-            let kc0 = common::stat_clock!();
             let d0 = wg * COLLAPSE;
             let d = d0 + t;
             if t < COLLAPSE && d < H {
@@ -500,16 +509,12 @@ pub mod gfx11 {
                     i += 1;
                 }
             }
-            let kc1 = common::stat_clock!();
-            common::stat!(0, kc1.wrapping_sub(kc0) & common::stats::CLOCK_MASK);
             if router.is_null() {
                 return;
             }
             // the collapse's arrival: this workgroup's channels to L2; workgroup 0 publishes; every workgroup waits
             let ready2 = ready.add(1);
             fence(Ordering::Release);
-            let kf1 = common::stat_clock!();
-            common::stat!(1, kf1.wrapping_sub(kc1) & common::stats::CLOCK_MASK);
             if arrive(b1, row, t, wave, lane, value) && t == 0 {
                 AtomicU32::from_ptr(ready2).store(value, Ordering::Release);
             }
@@ -571,6 +576,7 @@ pub mod gfx11 {
                                     k += 1;
                                 }
                                 *scores.add(i * ROUTE_ROWS + rrow) = sum * rr;
+                                *scores_v.add(i * ROUTE_ROWS + rrow) = sum * rr;
                             }
                             workgroup_sync();
                         }
@@ -618,6 +624,7 @@ pub mod gfx11 {
                         }
                         if lane == 0 {
                             *scores.add(i * ROUTE_ROWS + rrow) = acc * rr;
+                            *scores_v.add(i * ROUTE_ROWS + rrow) = acc * rr;
                         }
                     }
                     r += 1;
@@ -625,15 +632,242 @@ pub mod gfx11 {
                 i += 8;
             }
             // the router's arrival: this workgroup's scores out over the link; workgroup 0 says so
-            let kr = common::stat_clock!();
-            common::stat!(2, kr.wrapping_sub(kf1) & common::stats::CLOCK_MASK);
             fence(Ordering::Release);
-            let kf2 = common::stat_clock!();
-            common::stat!(3, kf2.wrapping_sub(kr) & common::stats::CLOCK_MASK);
+            let ka = common::stat_clock!();
+            let ready3 = ready.add(2);
             if arrive(b2, row, t, wave, lane, value) && t == 0 {
                 AtomicU32::from_ptr(word).store(value, Ordering::Release);
+                if !act.is_null() {
+                    AtomicU32::from_ptr(ready3).store(value, Ordering::Release);
+                }
+            }
+            if act.is_null() {
+                return;
+            }
+            // the FFN input's host-side work (queue 001), once every score is in: a workgroup a token, the grid's
+            // workgroups taking tokens wg, wg + PRE_GRID, ... — the post-norm, the quantization, the router's picks
+            if wg < n {
+                if t == 0 {
+                    await_word(ready3, value);
+                }
+                workgroup_sync();
+                fence(Ordering::Acquire);
+                let kb = common::stat_clock!();
+                common::stat!(0, kb.wrapping_sub(ka) & common::stats::CLOCK_MASK);
+                let mut tok = wg;
+                while tok < n {
+                    act_token(tok, t, wave, lane, x, scores_v, act);
+                    tok += COEF_ROWS * SLICES;
+                }
+            }
+            // the act phase's arrival: the last workgroup out writes the host's word
+            let kd = common::stat_clock!();
+            fence(Ordering::Release);
+            workgroup_sync();
+            if t == 0 {
+                let done = ready.add(3);
+                if AtomicU32::from_ptr(done).fetch_add(1, Ordering::AcqRel) == (COEF_ROWS * SLICES) as u32 - 1 {
+                    AtomicU32::from_ptr(done).store(0, Ordering::Relaxed);
+                    AtomicU32::from_ptr(*act.add(10) as *mut u32).store(value, Ordering::Release);
+                }
+            }
+            let ke = common::stat_clock!();
+            common::stat!(3, ke.wrapping_sub(kd) & common::stats::CLOCK_MASK);
+        }
+    }
+
+    /// One token's FFN input, the host's arithmetic exactly (whole workgroup): the post-norm's scale as
+    /// `common::rmsnorm::sumsq_tree` (thread j sums x[j + 256i] in order, lanes of wave 0 add eight of those
+    /// in order, lane 0 the 32 in order), each group quantized as `QAct::quantize` (a wave four groups, their
+    /// loads first), and the router's picks and weights as `ffn::route_scores` (wave 0: expert e on lane e % 32,
+    /// a pass's best by a butterfly keeping the greater key and between equals the lower expert; the mass in
+    /// id order). Writes the card's activation buffers and the host's copies, picks and weights (`act`'s table).
+    #[inline(always)]
+    unsafe fn act_token(tok: usize, t: usize, wave: usize, lane: u32, x: *const f32, scores_v: *const f32, act: *const u64) {
+        use common::q4::GROUP;
+        const _: () = assert!(H == 256 * 16 && E % 32 == 0 && E / 32 <= 32 && crate::ROUTED_K == TOP_K && (H / GROUP) % 8 == 0);
+        let at = |k: usize| *act.add(k) as usize;
+        let (pln, bias) = (at(0) as *const f32, at(1) as *const f32);
+        let (xq, xs, xg) = (at(2) as *mut i8, at(3) as *mut f32, at(4) as *mut i32);
+        let (xq_h, xs_h, xg_h) = (at(5) as *mut i8, at(6) as *mut f32, at(7) as *mut i32);
+        let (picks, wts) = (at(8) as *mut u32, at(9) as *mut f32);
+        let k0 = common::stat_clock!();
+        let xt = x.add(tok * H);
+        let l = lds::<f32>();
+        let part = l; // [256] the threads' sums of squares
+        let sig = l.add(256); // [E] the sigmoid scores
+        let bs = sig.add(E); // [E] the bias
+        let idx = bs.add(E) as *mut u32; // [TOP_K] the picks in id order
+        let misc = idx.add(TOP_K) as *mut f32; // [0] the norm's scale, [1] the mass
+        let lu = lane as usize;
+        // thread t's squares, in order; the sigmoids and the bias a thread an expert
+        let mut p = 0f32;
+        let mut i = 0;
+        while i < 16 {
+            let v = *xt.add(t + 256 * i);
+            p += v * v;
+            i += 1;
+        }
+        *part.add(t) = p;
+        let mut e = t;
+        while e < E {
+            *sig.add(e) = sigmoid(*scores_v.add(tok * ROUTE_ROWS + e));
+            *bs.add(e) = *bias.add(e);
+            e += 256;
+        }
+        workgroup_sync();
+        if wave == 0 {
+            let mut q = 0f32;
+            let mut k = 0;
+            while k < 8 {
+                q += *part.add(8 * lu + k);
+                k += 1;
+            }
+            let mut ss = 0f32;
+            let mut j = 0;
+            while j < 32 {
+                ss += lane_read(j, q);
+                j += 1;
+            }
+            if lane == 0 {
+                *misc = common::math::rsqrt(ss / H as f32 + RMS_NORM_EPS);
             }
         }
+        workgroup_sync();
+        let k1 = common::stat_clock!();
+        common::stat!(1, k1.wrapping_sub(k0) & common::stats::CLOCK_MASK);
+        let r = *misc;
+        // the groups: wave w quantizes groups w, w + 8, w + 16, w + 24, the four groups' loads issued first
+        const GW: usize = H / GROUP / 8;
+        let mut v = [[0f32; 4]; GW];
+        let mut gi = 0;
+        while gi < GW {
+            let k0 = (wave + 8 * gi) * GROUP + lu * 4;
+            let xv: [f32; 4] = core::ptr::read(xt.add(k0) as *const [f32; 4]);
+            let lv: [f32; 4] = core::ptr::read(pln.add(k0) as *const [f32; 4]);
+            let mut jj = 0;
+            while jj < 4 {
+                v[gi][jj] = lv[jj] * (xv[jj] * r);
+                jj += 1;
+            }
+            gi += 1;
+        }
+        let mut gi = 0;
+        while gi < GW {
+            let g = wave + 8 * gi;
+            let k0 = g * GROUP + lu * 4;
+            let mut amax = 0f32;
+            let mut jj = 0;
+            while jj < 4 {
+                let a = if v[gi][jj] < 0.0 { -v[gi][jj] } else { v[gi][jj] };
+                if a > amax {
+                    amax = a;
+                }
+                jj += 1;
+            }
+            let amax = f32::from_bits(core::arch::amdgpu::wave_reduce_umax::<0>(amax.to_bits()));
+            let sc = amax / 127.0;
+            let inv = if sc > 0.0 { 1.0 / sc } else { 0.0 };
+            let mut packed = 0u32;
+            let mut sum = 0i32;
+            let mut jj = 0;
+            while jj < 4 {
+                let rd = common::math::round(v[gi][jj] * inv);
+                let rd = if rd > 127.0 { 127.0 } else if rd < -127.0 { -127.0 } else { rd };
+                let qv = rd as i8;
+                packed |= ((qv as u8) as u32) << (8 * jj);
+                sum += qv as i32;
+                jj += 1;
+            }
+            let sum = core::arch::amdgpu::wave_reduce_add::<0>(sum as u32) as i32;
+            *(xq.add(tok * H + k0) as *mut u32) = packed;
+            *(xq_h.add(tok * H + k0) as *mut u32) = packed;
+            if lane == 0 {
+                let o = tok * (H / GROUP) + g;
+                *xs.add(o) = sc;
+                *xg.add(o) = sum;
+                *xs_h.add(o) = sc;
+                *xg_h.add(o) = sum;
+            }
+            gi += 1;
+        }
+        let k2 = common::stat_clock!();
+        common::stat!(2, k2.wrapping_sub(k1) & common::stats::CLOCK_MASK);
+        // the router's picks on wave 0
+        if wave == 0 {
+            const SL: usize = E / 32;
+            let mut key = [0f32; SL];
+            let mut sl = 0;
+            while sl < SL {
+                let e = sl * 32 + lu;
+                key[sl] = *sig.add(e) + *bs.add(e);
+                sl += 1;
+            }
+            let mut taken = 0u32;
+            let mut mine = 0u32;
+            let mut k = 0;
+            while k < TOP_K {
+                let (mut bv, mut be) = (f32::NEG_INFINITY, E as u32);
+                let mut sl = 0;
+                while sl < SL {
+                    if taken & (1 << sl) == 0 {
+                        let e = (sl * 32 + lu) as u32;
+                        if key[sl] > bv || (key[sl] == bv && e < be) {
+                            bv = key[sl];
+                            be = e;
+                        }
+                    }
+                    sl += 1;
+                }
+                let mut m = 16u32;
+                while m >= 1 {
+                    let ov = lane_read(lane ^ m, bv);
+                    let oe = lane_read(lane ^ m, f32::from_bits(be)).to_bits();
+                    if ov > bv || (ov == bv && oe < be) {
+                        bv = ov;
+                        be = oe;
+                    }
+                    m >>= 1;
+                }
+                if be as usize % 32 == lu {
+                    taken |= 1 << (be as usize / 32);
+                }
+                if lu == k {
+                    mine = be;
+                }
+                k += 1;
+            }
+            // lane k < TOP_K holds the k-th pick taken; its place in id order is the picks below it
+            let mut pos = 0u32;
+            let mut j = 0;
+            while j < TOP_K as u32 {
+                let o = lane_read(j, f32::from_bits(mine)).to_bits();
+                if o < mine {
+                    pos += 1;
+                }
+                j += 1;
+            }
+            if lu < TOP_K {
+                *idx.add(pos as usize) = mine;
+            }
+            common::gfx11::wave_lds_sync();
+            if lane == 0 {
+                let mut mass = 1e-20f32;
+                let mut k = 0;
+                while k < TOP_K {
+                    mass += *sig.add(*idx.add(k) as usize);
+                    k += 1;
+                }
+                *misc.add(1) = mass;
+            }
+            common::gfx11::wave_lds_sync();
+            if lu < TOP_K {
+                let e = *idx.add(lu) as usize;
+                *picks.add(tok * TOP_K + lu) = e as u32;
+                *wts.add(tok * TOP_K + lu) = *sig.add(e) / *misc.add(1) * ROUTED_SCALING_FACTOR;
+            }
+        }
+        workgroup_sync();
     }
 
     /// `stream_ij[d] = post_ij · y_i[d] + Σ_k comb_ikj · stream_ik[d]` for the `tokens` tokens of a

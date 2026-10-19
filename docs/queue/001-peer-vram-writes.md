@@ -108,8 +108,31 @@ own work is ~15 µs; the rest is the launch and the word. Folding it into `hc_pr
 already ends with an arrival and the router's word) removes the launch and the barrier; a side queue (057)
 would overlap it with the shared expert's rows.
 
+## The act phase folded into `hc_pre` (2026-10-19 13:10, run b1cd…)
+The decode regression measured to the piece first (a track-launches boot and in-kernel phase stamps, `kstats.sh`):
+the FFN card's router `hc_pre` was always followed by 22 µs of idle before the next kernel (31 before `ffn_gu`
+before 001, invisible then because the host woke on the router's own word); `ffn_act` was 54 µs of serial chains
+in two workgroups (loads 5, the norm's eight chains 20, quantize 13, the wave-0 top-k and its tail 19). A theory
+that the idle was the link draining the router's host-memory writes was tested against a 1024-token prefill step
+(16 MB of such writes, 4 µs of idle) and is wrong; the idle's cause is not known. The fold removes the kernel
+boundary whatever it is: after the scores' arrival every workgroup with a token waits on a VRAM ready word and runs
+the token's act phase (`act_token`: the norm as a 256-thread tree, `common::rmsnorm::sumsq_tree` on the host; the
+four groups a wave with their loads first; the top-k butterfly with the id-order positions from the lanes), the last
+workgroup out writing the host's word. Long SCORE NLL 0.0419 (the tree's order; the act build 0.0393, aw3 0.0436).
+
+| a verify step at 18k | peer VRAM only | separate `ffn_act` | folded |
+|---|---|---|---|
+| verify step | 46.47 ms | 47.42 | 46.32 |
+| cards' wait (`kda_card`) | 18.70 | 21.43 | 20.19 |
+| host route lap | 1.62 | 0.35 | 0.35 |
+| prefill, ms a prompt token | 4.19–4.21 | 4.02–4.10 | 4.00–4.07 |
+
+The fold took back 1.1 ms a step (the 22 µs idle and the 4 µs launch, 42 layers); the act phase still holds the
+host's wake ~35 µs a layer past the old router word against the 10–15 µs expected — being stamped (the act phase in
+`hc_pre`'s four stats slots).
+
 ## Next
-1. `ffn_act` folded into `hc_pre`'s tail: no launch between the router and the host's word.
+1. The act phase's 35 µs, from its stamps.
 1. ~~The handoff buffers inventoried~~ — done above; the card-to-card ones moved.
 2. The host-side pieces of 064 onto the cards (route.pick, sum.y, the quantize, the dispatch's uploads).
 3. The handoff buffers inventoried by who writes and who reads them (`Shared::{ys, fy, my, yexp, xh, xout,

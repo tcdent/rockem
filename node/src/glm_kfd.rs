@@ -37,7 +37,7 @@
 use crate::kfd::{read, Args, Kfd, Mem};
 use glm_5_3_flash::construct::Placed;
 use glm_5_3_flash::ffn::gfx11_consts::{DENSE_GU_ROWS, SHARED_GU_ROWS};
-use glm_5_3_flash::hc::gfx11_consts::{CHANNEL_GRID, MIX as HC_MIX, PRE_COUNTS, PRE_GRID, PRE_LDS, PRE_STRIDE, ROUTE_ROWS};
+use glm_5_3_flash::hc::gfx11_consts::{ACT_SLOTS, CHANNEL_GRID, MIX as HC_MIX, PRE_COUNTS, PRE_GRID, PRE_LDS, PRE_STRIDE, ROUTE_ROWS};
 use glm_5_3_flash::kda::gfx11_consts as g;
 use common::gemv::ROWS;
 use glm_5_3_flash::ffn::gfx11_consts::ROWS_GU;
@@ -127,9 +127,8 @@ struct Card {
     k: Rc<Kfd>,
     xpt_gu: crate::kfd::Kernel,
     xpt_down: crate::kfd::Kernel,
-    /// The FFN input's host-side work done here (001/064): norm, quantize, router pick; `xcount` its arrival word.
-    ffn_act: crate::kfd::Kernel,
-    xcount: Mem,
+    /// The FFN router's scores in VRAM beside the host's copy (`[STEP][ROUTE_ROWS]` f32): `hc_pre`'s act phase reads them.
+    scores_v: Mem,
     xpt_gemm_gu: crate::kfd::Kernel,
     xpt_quant: crate::kfd::Kernel,
     xpt_gemm_down: crate::kfd::Kernel,
@@ -234,13 +233,13 @@ struct Shared {
     yexp: [Mem; 2], // [STEP][H] f32: the host's routed experts
     xh: Mem,       // [STEP][H] f32: a MoE layer's FFN input for the host
     xout: Mem,     // [STEP·TOP_K][H] f32, the host's own pages mapped for the cards: the routed experts' outputs by (token, pick) — the cards' jobs and the host's experts (038)
-    xact: Mem,     // the FFN input's quantized activations [STEP][H] i8 | [STEP][HG] f32 | [STEP][HG] i32, then the picks [STEP][TOP_K] u32 and weights f32: `ffn_act`'s, for the host (XA_*)
+    xact: Mem,     // the FFN input's quantized activations [STEP][H] i8 | [STEP][HG] f32 | [STEP][HG] i32, then the picks [STEP][TOP_K] u32 and weights f32: `hc_pre`'s act phase, for the host (XA_*)
     scores_ffn: Mem, // [STEP][ROUTE_ROWS] f32: the FFN half's router over its input (this layer's rows, then the next layer's: the prefetch's predictor), for the host's picks
     words: Mem,    // the handoff words, a cache line each: `word()`
 }
 /// A handoff word's byte offset in `Shared::words`: the kind, and the card for a block output.
 /// The kernels a stats code object stamps (`common::stats`), reported by `timeline_report`.
-const STAT_KERNELS: &[&str] = &["ffn_act", "hc_pre"];
+const STAT_KERNELS: &[&str] = &["hc_pre"];
 /// `Shared::xact`'s regions, in bytes.
 const HG: usize = H / common::q4::GROUP;
 const XA_Q: usize = 0;
@@ -259,7 +258,7 @@ const W_Y: usize = 0;
 const W_X: usize = 2;
 const W_FFN: usize = 3;
 const W_EXPERTS: usize = 4;
-/// The FFN input's quantized activations, picks and weights are in (the FFN card's `ffn_act`, for the host).
+/// The FFN input's quantized activations, picks and weights are in (the FFN card's `hc_pre` act phase, for the host).
 const W_ACT: usize = 5;
 const W_KINDS: usize = 6;
 const MKVA: usize = 0;
@@ -308,8 +307,9 @@ struct FfnOn {
     down_s: Mem,
     /// A MoE layer's router rows (`[E][H]` bf16), for the early routing.
     router: Option<Mem>,
-    /// A MoE layer's post-norm weights (f32) and the router's selection bias (f32): `ffn_act`'s, the host's arithmetic.
-    act: Option<(Mem, Mem)>,
+    /// A MoE layer's post-norm weights (f32), the router's selection bias (f32) and `hc_pre`'s act table
+    /// (`ACT_SLOTS` device addresses) on its FFN card.
+    act: Option<(Mem, Mem, Mem)>,
 }
 
 /// An MLA layer's projections on a card: q_a and kv_a (FP8, over the input-normed
@@ -405,12 +405,7 @@ impl Cards {
                     copy: k.kernel("copy_f32"),
                     xpt_gu: k.kernel("xpt_gu"),
                     xpt_down: k.kernel("xpt_down"),
-                    ffn_act: k.kernel("ffn_act"),
-                    xcount: {
-                        let m = k.vram_visible(4096);
-                        k.upload(&m, 0, &[0u8; 4096]);
-                        m
-                    },
+                    scores_v: k.vram(STEP * ROUTE_ROWS * 4),
                     xpt_gemm_gu: k.kernel("xpt_gemm_gu"),
                     xpt_quant: k.kernel("xpt_quant"),
                     xpt_gemm_down: k.kernel("xpt_gemm_down"),
@@ -633,7 +628,12 @@ impl Cards {
                     k.upload(&ln32, 0, raw(w.layers[l].post_ln));
                     let bias = k.vram_visible(glm_5_3_flash::E * 4);
                     k.upload(&bias, 0, raw(m.bias));
-                    Some((ln32, bias))
+                    let cd = &cards[card];
+                    let xa = &shared.xact;
+                    let tab: [u64; ACT_SLOTS] = [ln32.va, bias.va, cd.xq.va, cd.xs.va, cd.xg.va, xa.at(XA_Q), xa.at(XA_S), xa.at(XA_G), xa.at(XA_P), xa.at(XA_W), shared.words.at(word(W_ACT, card))].map(|a| a as u64);
+                    let table = k.vram_visible(ACT_SLOTS * 8);
+                    k.upload(&table, 0, raw(&tab));
+                    Some((ln32, bias, table))
                 }
                 Ffn::Dense(_) => None,
             };
@@ -828,12 +828,15 @@ impl Cards {
     /// given (the host's word follows the router's logits, in the handoff after them).
     /// `router`: (the FFN half's norm, the router rows, the host's scores, the host's word) — the
     /// router over the collapse, run by the same launch, its logits and word to the host.
-    fn hc_pre(&self, c: &Card, hc: &(Mem, Mem, Mem), x_host: Option<usize>, value: u32, router: Option<(usize, usize, usize, usize)>, n: usize) {
+    /// `act`: a MoE layer's act table on its FFN card — the FFN input's norm, quantize and router picks done in
+    /// the launch's tail once the scores are in (queue 001), the host's word at its end.
+    #[allow(clippy::too_many_arguments)]
+    fn hc_pre(&self, c: &Card, hc: &(Mem, Mem, Mem), x_host: Option<usize>, value: u32, router: Option<(usize, usize, usize, usize)>, act: Option<usize>, n: usize) {
         let (ln, rw, sc, wd) = router.unwrap_or((0, 0, 0, 0));
         // the next layer's rows only for a step of a few tokens (the prefetch's predictor); a long step names most experts
         let rows = if router.is_none() { 0 } else if n <= SPEC_TOKENS { ROUTE_ROWS } else { glm_5_3_flash::E };
         let mut a = Args::new();
-        a.ptr(c.streams.va).ptr(hc.0.va).ptr(c.part.va).ptr(hc.1.va).ptr(hc.2.va).ptr(c.mix.va).ptr(c.x.va).ptr(x_host.unwrap_or(0)).ptr(c.count.va).u32(value).ptr(ln).ptr(rw).ptr(sc).ptr(wd).u32(rows as u32).u32(n as u32);
+        a.ptr(c.streams.va).ptr(hc.0.va).ptr(c.part.va).ptr(hc.1.va).ptr(hc.2.va).ptr(c.mix.va).ptr(c.x.va).ptr(x_host.unwrap_or(0)).ptr(c.count.va).u32(value).ptr(ln).ptr(rw).ptr(sc).ptr(c.scores_v.va).ptr(wd).ptr(act.unwrap_or(0)).u32(rows as u32).u32(n as u32);
         c.k.launch(&c.hc_pre, PRE_GRID, g::WG, PRE_LDS, &a);
     }
     /// The hyper-connection's output half on card `c`, the handoff first: this card's `copy`
@@ -1145,7 +1148,7 @@ impl Placed for Cards {
         self.half_seq[l][0] = value;
         let f = self.ffns[l].as_ref().unwrap();
         for c in &self.cards {
-            self.hc_pre(c, &f.hc[c.k.index][0], None, value, None, n);
+            self.hc_pre(c, &f.hc[c.k.index][0], None, value, None, None, n);
         }
         let lay = self.layers[l].as_ref().unwrap();
         let parity = l % 2;
@@ -1196,7 +1199,7 @@ impl Placed for Cards {
         self.half_seq[l][0] = value;
         let f = self.ffns[l].as_ref().unwrap();
         for c in &self.cards {
-            self.hc_pre(c, &f.hc[c.k.index][0], None, value, None, n);
+            self.hc_pre(c, &f.hc[c.k.index][0], None, value, None, None, n);
         }
         let m = self.mlas[l].as_ref().unwrap();
         self.mla_rows(m, n);
@@ -1332,7 +1335,7 @@ impl Placed for Cards {
             }
             total += jobs.len();
             let card = &self.cards[c];
-            // the FFN card quantized the step's activations into its own buffers (`ffn_act`); the other card takes
+            // the FFN card quantized the step's activations into its own buffers (`hc_pre`'s act phase); the other card takes
             // the host's copy of them
             if c != self.ffns[l].as_ref().unwrap().card {
                 card.k.upload(&card.xq, 0, raw(xq));
@@ -1564,16 +1567,10 @@ impl Placed for Cards {
             // the FFN card's collapse goes to the host too when the routed experts need it, with the router's logits and the word
             let to_host = (!f.dense && c.k.index == f.card).then_some(self.shared.xh.va);
             let router = self.ffn_router(l, c);
-            self.hc_pre(c, &f.hc[c.k.index][1], to_host, value, router, n);
+            let act = f.act.as_ref().filter(|_| c.k.index == f.card).map(|(_, _, tab)| tab.va);
+            self.hc_pre(c, &f.hc[c.k.index][1], to_host, value, router, act, n);
         }
         let c = &self.cards[f.card];
-        if let Some((ln32, bias)) = &f.act {
-            // the FFN input's norm, quantize and router pick here, into this card's activation buffers and the host's
-            let xa = &self.shared.xact;
-            let mut a = Args::new();
-            a.ptr(c.x.va).ptr(ln32.va).ptr(bias.va).ptr(self.shared.scores_ffn.va).ptr(c.xq.va).ptr(c.xs.va).ptr(c.xg.va).ptr(xa.at(XA_Q)).ptr(xa.at(XA_S)).ptr(xa.at(XA_G)).ptr(xa.at(XA_P)).ptr(xa.at(XA_W)).ptr(c.xcount.va).ptr(self.shared.words.at(word(W_ACT, f.card))).u32(value).u32(n as u32);
-            c.k.launch(&c.ffn_act, n as u32, g::WG, glm_5_3_flash::ffn::gfx11_consts::ACT_LDS, &a);
-        }
         let (rows, down, k_width) = if f.dense { (DENSE_GU_ROWS, &c.ffn_down_dense, INTERMEDIATE_SIZE) } else { (SHARED_GU_ROWS, &c.ffn_down_shared, N_SHARED_EXPERTS * D_FF) };
         if n > SPEC_TOKENS {
             let down_w = if f.dense { &c.ffn_down_dense_w } else { &c.ffn_down_shared_w };

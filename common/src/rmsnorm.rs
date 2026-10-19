@@ -15,31 +15,35 @@ pub fn rmsnorm<const N: usize>(x: &[f32], w: &[f32], eps: f32, out: &mut [f32]) 
     }
 }
 
-/// `rmsnorm` with the squares summed in eight strided accumulators (lane `j` takes `x[8i + j]`), the eight
-/// added in order at the end: the same expression on a CPU and on a card's eight lanes, so a norm both tiers
-/// compute agrees bit for bit at the speed of eight chains (one chain of 4096 was 30 µs a token on gfx1100,
-/// 2026-10-19). The routed experts' input norm uses it (`ffn_act`); the other norms keep `rmsnorm`.
+/// `rmsnorm` with the squares summed as a tree a card's workgroup computes in parallel (`sumsq_tree`):
+/// the same expression on the CPU and on the card, so a norm both tiers compute agrees bit for bit. The
+/// routed experts' input norm uses it (the FFN card's `hc_pre`, queue 001); the other norms keep `rmsnorm`.
 #[inline(always)]
-pub fn rmsnorm8<const N: usize>(x: &[f32], w: &[f32], eps: f32, out: &mut [f32]) {
-    let r = rsqrt(sumsq8::<N>(x) / N as f32 + eps);
+pub fn rmsnorm_tree<const N: usize>(x: &[f32], w: &[f32], eps: f32, out: &mut [f32]) {
+    let r = rsqrt(sumsq_tree::<N>(x) / N as f32 + eps);
     for i in 0..N {
         out[i] = w[i] * (x[i] * r);
     }
 }
-/// The sum of squares of `x[..N]` in eight strided accumulators, added in order.
+/// The sum of squares of `x[..N]` (N = 256 · 16): p[j] = Σ_i x[j + 256 i]² in order, q[l] = Σ_k p[8 l + k]
+/// in order, the result Σ_l q[l] in order — a workgroup's 256 threads, wave 0's 32 lanes, lane 0.
 #[inline(always)]
-pub fn sumsq8<const N: usize>(x: &[f32]) -> f32 {
-    let mut acc = [0f32; 8];
-    let mut i = 0;
-    while i < N {
-        for j in 0..8 {
-            acc[j] += x[i + j] * x[i + j];
+pub fn sumsq_tree<const N: usize>(x: &[f32]) -> f32 {
+    assert!(N == 256 * 16);
+    let mut p = [0f32; 256];
+    for (j, pj) in p.iter_mut().enumerate() {
+        for i in 0..16 {
+            let v = x[j + 256 * i];
+            *pj += v * v;
         }
-        i += 8;
     }
     let mut ss = 0f32;
-    for a in acc {
-        ss += a;
+    for l in 0..32 {
+        let mut q = 0f32;
+        for k in 0..8 {
+            q += p[8 * l + k];
+        }
+        ss += q;
     }
     ss
 }

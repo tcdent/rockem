@@ -1706,7 +1706,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             pl.ffn(l, n);
             if let Some(m) = moe {
                 // the FFN input as the card made it (001/064): the activations quantized once for both tiers, the
-                // router's picks and weights — the host's norm, quantize and routing moved to `ffn_act`
+                // router's picks and weights — the host's norm, quantize and routing moved to the FFN card's `hc_pre`
                 const HG: usize = H / common::q4::GROUP;
                 // (and the router's logits: the next layer's rows in them are the L3 prefetch's predictor — without them the
                 // prefetch pulled the wrong experts and a verify step's items ran at DRAM speed, 12 → 7 GMAC/s a core, 2026-10-19)
@@ -1718,13 +1718,13 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     pl.ffn_logits(l, n, &mut s.b_x, &mut s.b_score);
                     let forced_l = forced.map(|f| &f[l - FIRST_K_DENSE_REPLACE]);
                     for i in 0..n {
-                        common::rmsnorm::rmsnorm8::<H>(&s.b_x[i * H..(i + 1) * H], lw.post_ln, RMS_NORM_EPS, &mut s.b_xn[i * H..(i + 1) * H]);
+                        common::rmsnorm::rmsnorm_tree::<H>(&s.b_x[i * H..(i + 1) * H], lw.post_ln, RMS_NORM_EPS, &mut s.b_xn[i * H..(i + 1) * H]);
                         let (idx, wt) = ffn::route_scores(m, &mut s.b_score[i * ROUTE_ROWS..i * ROUTE_ROWS + E], forced_l);
                         if forced.is_some() {
                             picks[i] = idx;
                             wts[i] = wt;
                         } else {
-                            // the card's `ffn_act` against the host's own arithmetic: picks, weights, the quantized activation
+                            // the card's act phase (`hc_pre`) against the host's own arithmetic: picks, weights, the quantized activation
                             let (mut q, mut sc, mut g) = (vec![0i8; H], vec![0f32; HG], vec![0i32; HG]);
                             common::q4::QAct { q: &mut q, scale: &mut sc, gsum: &mut g }.quantize(&s.b_xn[i * H..(i + 1) * H]);
                             let dq = (0..H).filter(|&d| q[d] != s.b_xq[i * H + d]).count();
@@ -1732,7 +1732,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                             let dw = (0..TOP_K).filter(|&k| wts[i][k].to_bits() != wt[k].to_bits()).count();
                             if picks[i] != idx || dq + ds + dw > 0 {
                                 let d0 = (0..H).find(|&d| q[d] != s.b_xq[i * H + d]);
-                                eprintln!("ffn_act check: layer {l} token {i}: picks card {:?} host {idx:?}; weights differ {dw} (card {:?} host {wt:?}); q differ {dq} of {H} (first {:?}: card {:?} host {:?}), scales/sums {ds} of {HG} (card s0 {:e} g0 {} host {:e} {})", picks[i], wts[i], d0, d0.map(|d| s.b_xq[i * H + d]), d0.map(|d| q[d]), s.b_xs[i * HG], s.b_xg[i * HG], sc[0], g[0]);
+                                eprintln!("act check: layer {l} token {i}: picks card {:?} host {idx:?}; weights differ {dw} (card {:?} host {wt:?}); q differ {dq} of {H} (first {:?}: card {:?} host {:?}), scales/sums {ds} of {HG} (card s0 {:e} g0 {} host {:e} {})", picks[i], wts[i], d0, d0.map(|d| s.b_xq[i * H + d]), d0.map(|d| q[d]), s.b_xs[i * HG], s.b_xg[i * HG], sc[0], g[0]);
                             }
                         }
                     }

@@ -11,9 +11,9 @@ q "SELECT name, lane, count(*) AS n, round(sum(dur_ns)/1e6, 1) AS total_ms, roun
           round(median(dur_ns)/1e6, 3) AS p50_ms, round(quantile_cont(dur_ns, 0.95)/1e6, 3) AS p95_ms, round(max(dur_ns)/1e6, 2) AS max_ms
    FROM zones WHERE run = '$RUN' AND ts BETWEEN TIMESTAMPTZ '$SINCE' AND TIMESTAMPTZ '$UNTIL'
    GROUP BY ALL ORDER BY total_ms DESC"
-q "WITH s AS (SELECT lane, ts, dur_ns, lead(ts) OVER (PARTITION BY lane ORDER BY ts) AS next_ts
+q "WITH s AS (SELECT lane, epoch_us(ts) AS us, dur_ns, lead(epoch_us(ts)) OVER (PARTITION BY lane ORDER BY ts) AS next_us
              FROM zones WHERE run = '$RUN' AND name IN ('prefill', 'score', 'verify', 'token') AND ts BETWEEN TIMESTAMPTZ '$SINCE' AND TIMESTAMPTZ '$UNTIL'),
-        g AS (SELECT lane, epoch_ms(next_ts - ts) - dur_ns/1e6 AS gap_ms, dur_ns/1e6 AS step_ms FROM s WHERE next_ts IS NOT NULL)
+        g AS (SELECT lane, (next_us - us) / 1e3 - dur_ns/1e6 AS gap_ms, dur_ns/1e6 AS step_ms FROM s WHERE next_us IS NOT NULL)
    SELECT lane, count(*) AS steps, round(avg(step_ms), 2) AS step_ms, round(avg(gap_ms), 2) AS gap_mean_ms, round(median(gap_ms), 2) AS gap_p50_ms,
           round(quantile_cont(gap_ms, 0.95), 2) AS gap_p95_ms, round(max(gap_ms), 1) AS gap_max_ms, round(sum(gap_ms), 0) AS gap_total_ms,
           round(100.0 * sum(step_ms) / (sum(step_ms) + sum(gap_ms)), 1) AS in_step_pct
