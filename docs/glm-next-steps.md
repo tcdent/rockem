@@ -45,6 +45,11 @@ the index. Reorganized 2026-10-18 from the single-page version (in git history b
 - Once a measurement picks a shape, the switch that compared the shapes goes.
 - The timeline stays on while the work needs it; turning it off is a late saving (044).
 
+- **Nothing with a gain is pruned** (tcdent, 2026-10-19: "we are not arbitrarily pruning techniques which have
+  theoretical or measured gains no matter what the number actually is"). A technique with a theoretical or measured
+  gain keeps an entry of its own with the number; a shelf note inside another entry's text is promoted when that
+  entry closes.
+
 ## Status vocabulary
 
 | Status | Meaning |
@@ -127,6 +132,16 @@ the index. Reorganized 2026-10-18 from the single-page version (in git history b
 | [062](queue/062-profile-placement-split.md) | Separate placement training from the profile | Open — a refactor candidate, not scheduled | decode, prefill (CPU model, placement retrain) |
 | [063](queue/063-residency-filled-in-prefill.md) | Residency filled during prefill, from the prompt's own routing | Open — the largest exact decode lever at long context | decode (long context), prefill |
 | [064](queue/064-host-laps-off-the-critical-path.md) | The host's between-phase laps off the critical path | Open | decode |
+| [065](queue/065-expert-activation-reread.md) | The expert kernel's activation re-read a part | Quantified, on the shelf — ≤ 0.13 ms a prompt token | prefill |
+| [066](queue/066-expert-phase-quantize-and-posting.md) | The expert phase's quantize run and posting | Quantified, on the shelf — ~0.13 ms a prompt token | prefill |
+| [067](queue/067-scalar-qabs-at-decode.md) | The scalar q_abs at a verify step | Quantified, on the shelf — 0.4 ms a verify step | decode |
+| [068](queue/068-attend-tile-loop.md) | The WMMA attend's tile loop | Quantified, on the shelf — ~5 µs a tile, ~1.3 ms a verify step at 18k | decode, prefill (long context) |
+| [069](queue/069-select-round-trips.md) | The indexer selection's round trips at long context | Quantified, on the shelf — ~0.7 ms a verify step past 32k | long context |
+| [070](queue/070-scorer-short-context-twin.md) | The indexer scorer's short-context form | Quantified, on the shelf — 0.05 ms a verify step | decode |
+| [071](queue/071-prefill-residency-churn.md) | The residency's replacement churn through a prompt | Quantified, on the shelf — ~3 % of prefill at 512 | prefill |
+| [072](queue/072-head-parts-readback.md) | The split head's readback | Quantified, on the shelf — ≤ 0.1 ms a step token | decode |
+| [073](queue/073-grouped-expert-kernel-rate.md) | The grouped expert kernel's own rate | Quantified, on the shelf — none today; needed before more picks move to the cards | prefill |
+| [074](queue/074-decode-expert-runs-idle.md) | The decode expert runs' idle | Open — up to ~4 ms a verify step measured | decode |
 
 ## Order (2026-10-18, evening — the 20 ms path)
 
