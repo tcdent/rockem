@@ -35,6 +35,13 @@ pub trait Routed {
             self.run(l, picks, &x[i * H..(i + 1) * H], &mut out[i * TOP_K * H..(i + 1) * TOP_K * H]);
         }
     }
+    /// `run_batch` over activations already quantized (`xq: [n][H]` i8, `xs`/`xg: [n][H/GROUP]`, as `QAct`
+    /// makes them): the cards quantize a step's FFN input once for both tiers (queue 001/064). The shipped
+    /// INT4×INT8 realization takes this form; the others take `run_batch`.
+    fn run_batch_act(&mut self, l: usize, idx: &[[usize; TOP_K]], xq: &[i8], xs: &[f32], xg: &[i32], out: &mut [f32]) {
+        let _ = (l, idx, xq, xs, xg, out);
+        unimplemented!("run_batch_act: this realization takes f32 activations (run_batch)");
+    }
     /// A hint, before `run`: these experts (distinct) are likely layer `l`'s next; a realization may
     /// start pulling them toward the cores that will stream them.
     fn prefetch(&self, l: usize, idx: &[usize]) {
@@ -52,6 +59,9 @@ impl<R: Routed + ?Sized> Routed for Box<R> {
     }
     fn run_batch(&mut self, l: usize, idx: &[[usize; TOP_K]], x: &[f32], out: &mut [f32]) {
         (**self).run_batch(l, idx, x, out)
+    }
+    fn run_batch_act(&mut self, l: usize, idx: &[[usize; TOP_K]], xq: &[i8], xs: &[f32], xg: &[i32], out: &mut [f32]) {
+        (**self).run_batch_act(l, idx, xq, xs, xg, out)
     }
     fn elapsed(&mut self) -> f64 {
         (**self).elapsed()
@@ -194,6 +204,11 @@ pub fn moe_shared(w: &weights::Moe, xn: &[f32], s: &mut Scratch, pool: &dyn Pool
 
 pub mod gfx11_consts {
     use crate::*;
+    /// `ffn_act`'s LDS: the token's sigmoid scores and a taken flag an expert, and the norm's scale.
+    /// `ffn_act`'s LDS: the token's row (the norm's sum reads it in order from here, not VRAM), the sigmoid
+    /// scores, the bias and a taken flag an expert, the norm's scale, the picks twice.
+    pub const ACT_LDS: u32 = (H * 4 + E * 12 + 16 + 2 * TOP_K * 4) as u32;
+    const _: () = assert!(E % 32 == 0 && E / 32 <= 32, "ffn_act: an expert a lane slot");
     /// Rows of the fused gate|up launch: the gate's rows, then the up's.
     pub const SHARED_GU_ROWS: usize = 2 * N_SHARED_EXPERTS * D_FF;
     pub const DENSE_GU_ROWS: usize = 2 * INTERMEDIATE_SIZE;
@@ -217,6 +232,215 @@ pub mod gfx11 {
     use super::gfx11_consts::ROWS_GU;
     use common::swiglu::silu;
     use core::arch::amdgpu::workitem_id_x;
+
+    /// The FFN input's host-side work, on the card (queue 001, 064): for token `t` (a workgroup of 256),
+    /// the post-norm of `x[t]` with `ln` exactly as the host's `rmsnorm8` (eight lanes sum the squares of
+    /// their stride, the eight added in order), its groups quantized exactly as `QAct::quantize` (a wave a group) into the card's own
+    /// activation buffers (`xq`, `xs`, `xg`: the resident experts read them) and the host's copies
+    /// (`xq_h`, `xs_h`, `xg_h`), and the router's picks and weights from its logits in `scores[t]` exactly
+    /// as `ffn::route_scores` (the sigmoid an expert a thread into LDS, then one lane: the top-k with the
+    /// bias, the mass in id order, the ranked picks past ROUTED_K dropped) into `picks` and `wts` (host).
+    /// The last workgroup to finish writes `value` to `word`. Grid: n workgroups, LDS ACT_LDS.
+    #[no_mangle]
+    pub extern "gpu-kernel" fn ffn_act(x: *const f32, ln: *const f32, bias: *const f32, scores: *const f32, xq: *mut i8, xs: *mut f32, xg: *mut i32, xq_h: *mut i8, xs_h: *mut f32, xg_h: *mut i32, picks: *mut u32, wts: *mut f32, count: *mut u32, word: *mut u32, value: u32, n: u32) {
+        use common::q4::GROUP;
+        use core::arch::amdgpu::{wave_reduce_add, wave_reduce_umax, workgroup_id_x};
+        use core::sync::atomic::{fence, AtomicU32, Ordering};
+        unsafe {
+            let t = workgroup_id_x() as usize;
+            let tid = workitem_id_x();
+            let (wave, lane) = ((tid / 32) as usize, tid as usize % 32);
+            let xt = x.add(t * H);
+            let l: *mut f32 = common::gfx11::lds();
+            let row = l; // [H] the token's row
+            let sig = l.add(H); // [E] the sigmoid scores
+            let bs = sig.add(E); // [E] the selection bias
+            let taken = bs.add(E) as *mut u32; // [E]
+            let rr = bs.add(2 * E); // [1] the norm's scale
+            let ranked = rr.add(4) as *mut u32; // [TOP_K] the picks in the order taken (LDS: a lane's array indexed at run time would be scratch)
+            let idx = ranked.add(TOP_K); // [TOP_K] the picks in id order
+            // the row into LDS (coalesced), the sigmoids and the bias a thread an expert (E past a workgroup's 256: strided)
+            let mut i = tid as usize;
+            while i < H {
+                *row.add(i) = *xt.add(i);
+                i += 256;
+            }
+            let mut e = tid as usize;
+            while e < E {
+                *sig.add(e) = crate::hc::sigmoid(*scores.add(t * crate::hc::gfx11_consts::ROUTE_ROWS + e));
+                *bs.add(e) = *bias.add(e);
+                *taken.add(e) = 0;
+                e += 256;
+            }
+            common::gfx11::workgroup_sync();
+            // the norm's scale as `rmsnorm8`: lane j of wave 0 sums the squares of x[8i + j] in order, lane 0 adds the
+            // eight in order — the host's `sumsq8` exactly, on eight chains
+            if wave == 0 && lane < 8 {
+                let mut a = 0f32;
+                let mut i = lane;
+                while i < H {
+                    let v = *row.add(i);
+                    a += v * v;
+                    i += 8;
+                }
+                let mut ss = 0f32;
+                let mut j = 0;
+                while j < 8 {
+                    ss += common::gfx11::lane_read(j, a);
+                    j += 1;
+                }
+                if lane == 0 {
+                    *rr = common::math::rsqrt(ss / H as f32 + RMS_NORM_EPS);
+                }
+            }
+            common::gfx11::workgroup_sync();
+            let r = *rr;
+            // the groups: wave w takes groups w, w + 8, ...: `ln[i] · (x[i] · r)`, then absmax/127, the shared round, the clamp, Σq
+            let mut g = wave;
+            while g < H / GROUP {
+                let k0 = g * GROUP + lane * 4;
+                let mut v = [0f32; 4];
+                let mut amax = 0f32;
+                let mut jj = 0;
+                while jj < 4 {
+                    v[jj] = *ln.add(k0 + jj) * (*row.add(k0 + jj) * r);
+                    let a = if v[jj] < 0.0 { -v[jj] } else { v[jj] };
+                    if a > amax {
+                        amax = a;
+                    }
+                    jj += 1;
+                }
+                let amax = f32::from_bits(wave_reduce_umax::<0>(amax.to_bits()));
+                let sc = amax / 127.0;
+                let inv = if sc > 0.0 { 1.0 / sc } else { 0.0 };
+                let mut packed = 0u32;
+                let mut sum = 0i32;
+                let mut jj = 0;
+                while jj < 4 {
+                    let rd = common::math::round(v[jj] * inv);
+                    let rd = if rd > 127.0 { 127.0 } else if rd < -127.0 { -127.0 } else { rd };
+                    let qv = rd as i8;
+                    packed |= ((qv as u8) as u32) << (8 * jj);
+                    sum += qv as i32;
+                    jj += 1;
+                }
+                let sum = wave_reduce_add::<0>(sum as u32) as i32;
+                *(xq.add(t * H + k0) as *mut u32) = packed;
+                *(xq_h.add(t * H + k0) as *mut u32) = packed;
+                if lane == 0 {
+                    *xs.add(t * (H / GROUP) + g) = sc;
+                    *xg.add(t * (H / GROUP) + g) = sum;
+                    *xs_h.add(t * (H / GROUP) + g) = sc;
+                    *xg_h.add(t * (H / GROUP) + g) = sum;
+                }
+                g += 8;
+            }
+            // the router's picks, `route_scores`'s arithmetic on wave 0: expert e sits on lane e % 32, slot e / 32,
+            // its key `score + bias` as the host adds it; a pass takes each lane's best untaken key, then the wave's by
+            // a butterfly that keeps the greater key and, between equal keys, the lower expert — the host's strict
+            // `>` scanning e upward. Then one lane: the mass over the picks in id order, the ranked picks past
+            // ROUTED_K dropped, the weights.
+            if wave == 0 {
+                const SLOTS: usize = E / 32;
+                let mut key = [0f32; SLOTS];
+                let mut taken_mask = 0u32;
+                let mut sl = 0;
+                while sl < SLOTS {
+                    let e = sl * 32 + lane;
+                    key[sl] = *sig.add(e) + *bs.add(e);
+                    sl += 1;
+                }
+                let mut k = 0;
+                while k < TOP_K {
+                    let (mut bv, mut be) = (f32::NEG_INFINITY, E as u32);
+                    let mut sl = 0;
+                    while sl < SLOTS {
+                        if taken_mask & (1 << sl) == 0 {
+                            let e = (sl * 32 + lane) as u32;
+                            if key[sl] > bv || (key[sl] == bv && e < be) {
+                                bv = key[sl];
+                                be = e;
+                            }
+                        }
+                        sl += 1;
+                    }
+                    let mut m = 16u32;
+                    while m >= 1 {
+                        let ov = common::gfx11::lane_read(lane as u32 ^ m, bv);
+                        let oe = common::gfx11::lane_read(lane as u32 ^ m, f32::from_bits(be)).to_bits();
+                        if ov > bv || (ov == bv && oe < be) {
+                            bv = ov;
+                            be = oe;
+                        }
+                        m >>= 1;
+                    }
+                    // every lane holds the pass's pick; its owner marks it taken
+                    if be as usize % 32 == lane {
+                        taken_mask |= 1 << (be as usize / 32);
+                    }
+                    if lane == 0 {
+                        *ranked.add(k) = be;
+                        *idx.add(k) = be;
+                    }
+                    k += 1;
+                }
+                if lane == 0 {
+                    sort8(idx);
+                    let mut mass = 1e-20f32;
+                    let mut k = 0;
+                    while k < TOP_K {
+                        mass += *sig.add(*idx.add(k) as usize);
+                        k += 1;
+                    }
+                    let mut k = ROUTED_K;
+                    while k < TOP_K {
+                        let e = *ranked.add(k);
+                        let mut j = 0;
+                        while j < TOP_K {
+                            if *idx.add(j) == e {
+                                *idx.add(j) = E as u32;
+                            }
+                            j += 1;
+                        }
+                        k += 1;
+                    }
+                    sort8(idx);
+                    let mut k = 0;
+                    while k < TOP_K {
+                        let e = *idx.add(k) as usize;
+                        *picks.add(t * TOP_K + k) = e as u32;
+                        *wts.add(t * TOP_K + k) = if e < E { *sig.add(e) / mass * ROUTED_SCALING_FACTOR } else { 0.0 };
+                        k += 1;
+                    }
+                }
+            }
+            // the last workgroup publishes
+            fence(Ordering::Release);
+            common::gfx11::workgroup_sync();
+            if tid == 0 {
+                let prev = AtomicU32::from_ptr(count).fetch_add(1, Ordering::AcqRel);
+                if prev + 1 == n {
+                    AtomicU32::from_ptr(count).store(0, Ordering::Relaxed);
+                    AtomicU32::from_ptr(word).store(value, Ordering::Release);
+                }
+            }
+        }
+    }
+    /// `TOP_K` indices in LDS sorted ascending (`sort_unstable` on the host: the order is the result, not the algorithm).
+    #[inline(always)]
+    unsafe fn sort8(a: *mut u32) {
+        let mut i = 1;
+        while i < TOP_K {
+            let v = *a.add(i);
+            let mut j = i;
+            while j > 0 && *a.add(j - 1) > v {
+                *a.add(j) = *a.add(j - 1);
+                j -= 1;
+            }
+            *a.add(j) = v;
+            i += 1;
+        }
+    }
 
     /// `out[i][row] = W[row] · rmsnorm_ln(x[i])`, FP8 rows of width H. Grid: rows_grid(m).
     #[no_mangle]

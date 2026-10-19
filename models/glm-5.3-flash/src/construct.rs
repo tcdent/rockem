@@ -732,6 +732,22 @@ impl Routed for CpuExperts<'_> {
     /// pool: the gate/up parts (each token's input quantized once before), the hidden states
     /// quantized once each, the down parts. One token is a step of one.
     fn run_batch(&mut self, l: usize, idx: &[[usize; TOP_K]], x: &[f32], out: &mut [f32]) {
+        use common::q4::{QAct, GROUP};
+        const HG: usize = H / GROUP;
+        let (mut xq, mut xs, mut xg) = (std::mem::take(&mut self.xq), std::mem::take(&mut self.xs), std::mem::take(&mut self.xg));
+        for i in 0..idx.len() {
+            QAct { q: &mut xq[i * H..(i + 1) * H], scale: &mut xs[i * HG..(i + 1) * HG], gsum: &mut xg[i * HG..(i + 1) * HG] }.quantize(&x[i * H..(i + 1) * H]);
+        }
+        self.run_batch_q(l, idx, &xq, &xs, &xg, out);
+        (self.xq, self.xs, self.xg) = (xq, xs, xg);
+    }
+    fn run_batch_act(&mut self, l: usize, idx: &[[usize; TOP_K]], xq: &[i8], xs: &[f32], xg: &[i32], out: &mut [f32]) {
+        self.run_batch_q(l, idx, xq, xs, xg, out)
+    }
+}
+impl CpuExperts<'_> {
+    /// The step's experts over quantized activations (`run_batch_act`'s form; `run_batch` quantizes first).
+    fn run_batch_q(&mut self, l: usize, idx: &[[usize; TOP_K]], xq: &[i8], xs: &[f32], xg: &[i32], out: &mut [f32]) {
         /// Pair `i`'s (token, slot) as the index of its hidden state and output row.
         fn blk_slot(pairs: &[(u16, u8)], i: usize) -> usize {
             pairs[i].0 as usize * TOP_K + pairs[i].1 as usize
@@ -744,9 +760,6 @@ impl Routed for CpuExperts<'_> {
         assert!(n <= STEP);
         const HG: usize = H / GROUP;
         const DG: usize = D_FF / GROUP;
-        for i in 0..n {
-            QAct { q: &mut self.xq[i * H..(i + 1) * H], scale: &mut self.xs[i * HG..(i + 1) * HG], gsum: &mut self.xg[i * HG..(i + 1) * HG] }.quantize(&x[i * H..(i + 1) * H]);
-        }
         // the experts picked, each with the (token, slot) pairs that picked it: a counting sort into one
         // list, `first[e]..first[e + 1]` an expert's pairs (no allocation an expert)
         // a pick of `E` is resident on a card and runs there (`Placed::xpt_dispatch`): skipped here, its
@@ -778,7 +791,6 @@ impl Routed for CpuExperts<'_> {
         let stream = self.stream;
         let slice_slot = &self.slice_slot;
         let slot_of = |e: usize, j: usize| slice_slot[((l - FIRST_K_DENSE_REPLACE) * E + e) * (GU_ITEMS + DOWN_ITEMS) + j] as usize;
-        let (xq, xs, xg) = (&self.xq, &self.xs, &self.xg);
         let h_p = self.h.as_mut_ptr() as usize;
         // the gate/up rows: part (j, c) owns expert experts[j]'s hidden channels c·GU_ROWS.., for all of
         // its tokens at once (`q4::gemm`: the part's bytes read once, every token's dot on them), in
@@ -979,7 +991,10 @@ pub trait Placed {
     fn mla_seed(&mut self, l: usize, pos: usize, latent: &[u16]);
     fn ffn(&mut self, l: usize, n: usize);
     /// A MoE layer's FFN input for every token (`[n][H]`) and the FFN router's logits (`[n][E]`).
-    fn ffn_input(&mut self, l: usize, n: usize, x: &mut [f32], logits: &mut [f32]);
+    fn ffn_input(&mut self, l: usize, n: usize, xq: &mut [i8], xs: &mut [f32], xg: &mut [i32], picks: &mut [[usize; TOP_K]], wts: &mut [[f32; TOP_K]], logits: &mut [f32]);
+    /// Bring-up: a MoE layer's FFN input (`x: [n][H]`) and its router's logits (`[n][ROUTE_ROWS]`) as the card
+    /// made them, for forced picks and the traces' edges; serving reads `ffn_input`'s quantized form instead.
+    fn ffn_logits(&mut self, l: usize, n: usize, x: &mut [f32], logits: &mut [f32]);
     /// The routed experts' output for every token (`[n][H]`), into the streams.
     fn ffn_routed(&mut self, l: usize, n: usize, y: &[f32]);
     /// Token `i`'s layer output off the streams (bring-up).
@@ -1690,31 +1705,36 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             }
             pl.ffn(l, n);
             if let Some(m) = moe {
-                pl.ffn_input(l, n, &mut s.b_x, &mut s.b_score);
+                // the FFN input as the card made it (001/064): the activations quantized once for both tiers, the
+                // router's picks and weights — the host's norm, quantize and routing moved to `ffn_act`
+                const HG: usize = H / common::q4::GROUP;
+                // (and the router's logits: the next layer's rows in them are the L3 prefetch's predictor — without them the
+                // prefetch pulled the wrong experts and a verify step's items ran at DRAM speed, 12 → 7 GMAC/s a core, 2026-10-19)
+                pl.ffn_input(l, n, &mut s.b_xq[..n * H], &mut s.b_xs[..n * HG], &mut s.b_xg[..n * HG], &mut s.b_picks[..n], &mut s.b_wts[..n], &mut s.b_score);
                 lap(&mut p.kda_card, "kda_card");
-                // every token's norm, picks and weights from the card's router logits, a token an item over
-                // the pool (one token runs inline); the step's experts as one grouped run
-                // (the step's picks and weights live on the model: 96 KB of stack a layer zeroed was 0.2 ms a step)
                 let (picks, wts) = (&mut s.b_picks, &mut s.b_wts);
-                {
-                    prow::zone!("track-zones", "route.pick");
-                    let (xn_p, sc_p, pk_p, wt_p) = (s.b_xn.as_mut_ptr() as usize, s.b_score.as_mut_ptr() as usize, picks.as_mut_ptr() as usize, wts.as_mut_ptr() as usize);
-                    let (x, post_ln, forced_l) = (&s.b_x, lw.post_ln, forced.map(|f| &f[l - FIRST_K_DENSE_REPLACE]));
-                    let pick = move |i: usize| unsafe {
-                        let xn = std::slice::from_raw_parts_mut((xn_p as *mut f32).add(i * H), H);
-                        rmsnorm::<H>(&x[i * H..(i + 1) * H], post_ln, RMS_NORM_EPS, xn);
-                        let score = std::slice::from_raw_parts_mut((sc_p as *mut f32).add(i * ROUTE_ROWS), E);
-                        let (idx, wt) = ffn::route_scores(m, score, forced_l);
-                        *(pk_p as *mut [usize; TOP_K]).add(i) = idx;
-                        *(wt_p as *mut [f32; TOP_K]).add(i) = wt;
-                    };
-                    // a few tokens here (a pool run's round trip is ~15 µs against ~2 µs of work a token: 064), a step's on the pool
-                    if n <= 16 {
-                        for i in 0..n {
-                            pick(i);
+                // bring-up: forced picks and the traces take the card's logits and input through the host's own routing and norm
+                if forced.is_some() || tr.wants_edges() || pl.checks() {
+                    pl.ffn_logits(l, n, &mut s.b_x, &mut s.b_score);
+                    let forced_l = forced.map(|f| &f[l - FIRST_K_DENSE_REPLACE]);
+                    for i in 0..n {
+                        common::rmsnorm::rmsnorm8::<H>(&s.b_x[i * H..(i + 1) * H], lw.post_ln, RMS_NORM_EPS, &mut s.b_xn[i * H..(i + 1) * H]);
+                        let (idx, wt) = ffn::route_scores(m, &mut s.b_score[i * ROUTE_ROWS..i * ROUTE_ROWS + E], forced_l);
+                        if forced.is_some() {
+                            picks[i] = idx;
+                            wts[i] = wt;
+                        } else {
+                            // the card's `ffn_act` against the host's own arithmetic: picks, weights, the quantized activation
+                            let (mut q, mut sc, mut g) = (vec![0i8; H], vec![0f32; HG], vec![0i32; HG]);
+                            common::q4::QAct { q: &mut q, scale: &mut sc, gsum: &mut g }.quantize(&s.b_xn[i * H..(i + 1) * H]);
+                            let dq = (0..H).filter(|&d| q[d] != s.b_xq[i * H + d]).count();
+                            let ds = (0..HG).filter(|&d| sc[d].to_bits() != s.b_xs[i * HG + d].to_bits() || g[d] != s.b_xg[i * HG + d]).count();
+                            let dw = (0..TOP_K).filter(|&k| wts[i][k].to_bits() != wt[k].to_bits()).count();
+                            if picks[i] != idx || dq + ds + dw > 0 {
+                                let d0 = (0..H).find(|&d| q[d] != s.b_xq[i * H + d]);
+                                eprintln!("ffn_act check: layer {l} token {i}: picks card {:?} host {idx:?}; weights differ {dw} (card {:?} host {wt:?}); q differ {dq} of {H} (first {:?}: card {:?} host {:?}), scales/sums {ds} of {HG} (card s0 {:e} g0 {} host {:e} {})", picks[i], wts[i], d0, d0.map(|d| s.b_xq[i * H + d]), d0.map(|d| q[d]), s.b_xs[i * HG], s.b_xg[i * HG], sc[0], g[0]);
+                            }
                         }
-                    } else {
-                        s.pool.run(n, &pick);
                     }
                 }
                 if n == 1 {
@@ -1724,22 +1744,6 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 // the picks resident on the cards run there, concurrently with the host's (the dispatch marks them
                 // `E` in `picks`); the picks as routed are kept for the accounting
                 s.b_routed[..n].copy_from_slice(&picks[..n]);
-                const HG: usize = H / common::q4::GROUP;
-                {
-                    prow::zone!("track-zones", "route.quant");
-                    let (xq_p, xs_p, xg_p, xn) = (s.b_xq.as_mut_ptr() as usize, s.b_xs.as_mut_ptr() as usize, s.b_xg.as_mut_ptr() as usize, &s.b_xn);
-                    let quantize = move |i: usize| {
-                        let (q, sc, g) = unsafe { (std::slice::from_raw_parts_mut((xq_p as *mut i8).add(i * H), H), std::slice::from_raw_parts_mut((xs_p as *mut f32).add(i * HG), HG), std::slice::from_raw_parts_mut((xg_p as *mut i32).add(i * HG), HG)) };
-                        common::q4::QAct { q, scale: sc, gsum: g }.quantize(&xn[i * H..(i + 1) * H]);
-                    };
-                    if n <= 16 {
-                        for i in 0..n {
-                            quantize(i);
-                        }
-                    } else {
-                        s.pool.run(n, &quantize);
-                    }
-                }
                 let jobs = pl.xpt_dispatch(l, n, &mut picks[..n], &s.b_xq[..n * H], &s.b_xs[..n * HG], &s.b_xg[..n * HG]);
                 pl.ffn_post(l, n);
                 p.resident += jobs;
@@ -1749,7 +1753,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 // the host's FFN phase as laps: the route (the picks, the residents' dispatch), the experts' run,
                 // the join of the cards' jobs, the sum and the handoff back — each a zone of its own
                 lap(&mut p.route, "route");
-                s.routed.run_batch(l, &picks[..n], &s.b_xn[..n * H], out);
+                s.routed.run_batch_act(l, &picks[..n], &s.b_xq[..n * H], &s.b_xs[..n * HG], &s.b_xg[..n * HG], out);
                 lap(&mut p.experts, "experts");
                 s.routed.elapsed(); // the pool's own timer, taken so it does not accumulate (the lap is the measure here)
                 if jobs > 0 || n > SPEC_TOKENS {

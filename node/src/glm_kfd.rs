@@ -127,6 +127,9 @@ struct Card {
     k: Rc<Kfd>,
     xpt_gu: crate::kfd::Kernel,
     xpt_down: crate::kfd::Kernel,
+    /// The FFN input's host-side work done here (001/064): norm, quantize, router pick; `xcount` its arrival word.
+    ffn_act: crate::kfd::Kernel,
+    xcount: Mem,
     xpt_gemm_gu: crate::kfd::Kernel,
     xpt_quant: crate::kfd::Kernel,
     xpt_gemm_down: crate::kfd::Kernel,
@@ -231,10 +234,19 @@ struct Shared {
     yexp: [Mem; 2], // [STEP][H] f32: the host's routed experts
     xh: Mem,       // [STEP][H] f32: a MoE layer's FFN input for the host
     xout: Mem,     // [STEP·TOP_K][H] f32, the host's own pages mapped for the cards: the routed experts' outputs by (token, pick) — the cards' jobs and the host's experts (038)
+    xact: Mem,     // the FFN input's quantized activations [STEP][H] i8 | [STEP][HG] f32 | [STEP][HG] i32, then the picks [STEP][TOP_K] u32 and weights f32: `ffn_act`'s, for the host (XA_*)
     scores_ffn: Mem, // [STEP][ROUTE_ROWS] f32: the FFN half's router over its input (this layer's rows, then the next layer's: the prefetch's predictor), for the host's picks
     words: Mem,    // the handoff words, a cache line each: `word()`
 }
 /// A handoff word's byte offset in `Shared::words`: the kind, and the card for a block output.
+/// `Shared::xact`'s regions, in bytes.
+const HG: usize = H / common::q4::GROUP;
+const XA_Q: usize = 0;
+const XA_S: usize = XA_Q + STEP * H;
+const XA_G: usize = XA_S + STEP * HG * 4;
+const XA_P: usize = XA_G + STEP * HG * 4;
+const XA_W: usize = XA_P + STEP * TOP_K * 4;
+const XA_END: usize = XA_W + STEP * TOP_K * 4;
 const fn word(kind: usize, card: usize) -> usize {
     (kind * MAX_CARDS + card) * 64
 }
@@ -245,7 +257,9 @@ const W_Y: usize = 0;
 const W_X: usize = 2;
 const W_FFN: usize = 3;
 const W_EXPERTS: usize = 4;
-const W_KINDS: usize = 5;
+/// The FFN input's quantized activations, picks and weights are in (the FFN card's `ffn_act`, for the host).
+const W_ACT: usize = 5;
+const W_KINDS: usize = 6;
 const MKVA: usize = 0;
 const MIX: usize = MKVA + STEP * KV_LORA_RANK;
 const MPROJ: usize = MIX + STEP * IX_ROWS;
@@ -292,6 +306,8 @@ struct FfnOn {
     down_s: Mem,
     /// A MoE layer's router rows (`[E][H]` bf16), for the early routing.
     router: Option<Mem>,
+    /// A MoE layer's post-norm weights (f32) and the router's selection bias (f32): `ffn_act`'s, the host's arithmetic.
+    act: Option<(Mem, Mem)>,
 }
 
 /// An MLA layer's projections on a card: q_a and kv_a (FP8, over the input-normed
@@ -349,9 +365,6 @@ pub struct Cards {
     npools: usize,
 }
 
-fn raw_i8(v: &[i8]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()) }
-}
 fn raw<T>(v: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
@@ -390,6 +403,12 @@ impl Cards {
                     copy: k.kernel("copy_f32"),
                     xpt_gu: k.kernel("xpt_gu"),
                     xpt_down: k.kernel("xpt_down"),
+                    ffn_act: k.kernel("ffn_act"),
+                    xcount: {
+                        let m = k.vram_visible(4096);
+                        k.upload(&m, 0, &[0u8; 4096]);
+                        m
+                    },
                     xpt_gemm_gu: k.kernel("xpt_gemm_gu"),
                     xpt_quant: k.kernel("xpt_quant"),
                     xpt_gemm_down: k.kernel("xpt_gemm_down"),
@@ -497,6 +516,7 @@ impl Cards {
                 yexp: [buf(), buf()],
                 xh: buf(),
                 xout: k0.host_owned(STEP * TOP_K * H * 4, &others),
+                xact: k0.host_shared(XA_END, &others),
                 scores_ffn: k0.host_shared(STEP * ROUTE_ROWS * 4, &others),
                 words: {
                     let m = k0.host_shared(word(W_KINDS, 0), &others);
@@ -605,6 +625,16 @@ impl Cards {
                 k.upload(&m, 0, raw(&bf16_of(w.layers[l].post_ln)));
                 m
             };
+            let act = match &w.layers[l].ffn {
+                Ffn::Moe(m) => {
+                    let ln32 = k.vram_visible(H * 4);
+                    k.upload(&ln32, 0, raw(w.layers[l].post_ln));
+                    let bias = k.vram_visible(glm_5_3_flash::E * 4);
+                    k.upload(&bias, 0, raw(m.bias));
+                    Some((ln32, bias))
+                }
+                Ffn::Dense(_) => None,
+            };
             let (is_dense, (gu_w, gu_s), (down_w, down_s), router) = match &w.layers[l].ffn {
                 Ffn::Dense(d) => (true, pair(d.gate, d.up), one(d.down), None),
                 Ffn::Moe(m) => {
@@ -642,7 +672,7 @@ impl Cards {
                 })
                 .collect();
             bytes += hc.iter().flatten().map(|(f, b, sc)| f.size + b.size + sc.size).sum::<usize>();
-            ffns.push(Some(FfnOn { card, dense: is_dense, ln, hc, gu_w, gu_s, down_w, down_s, router }));
+            ffns.push(Some(FfnOn { card, dense: is_dense, ln, hc, gu_w, gu_s, down_w, down_s, router, act }));
         }
         // the MLA layers' projections
         let mut mlas: Vec<Option<MlaOn>> = (0..NUM_HIDDEN_LAYERS).map(|_| None).collect();
@@ -1286,9 +1316,13 @@ impl Placed for Cards {
             }
             total += jobs.len();
             let card = &self.cards[c];
-            card.k.upload(&card.xq, 0, raw_i8(xq));
-            card.k.upload(&card.xs, 0, raw(xs));
-            card.k.upload(&card.xg, 0, raw(xg));
+            // the FFN card quantized the step's activations into its own buffers (`ffn_act`); the other card takes
+            // the host's copy of them
+            if c != self.ffns[l].as_ref().unwrap().card {
+                card.k.upload(&card.xq, 0, raw(xq));
+                card.k.upload(&card.xs, 0, raw(xs));
+                card.k.upload(&card.xg, 0, raw(xg));
+            }
             if !prefill {
                 let list: Vec<u32> = jobs.iter().flat_map(|&(sl, tok, k)| [sl, tok, tok * TOP_K as u32 + k as u32]).collect();
                 card.k.upload(&card.xjobs, 0, raw(&list));
@@ -1517,6 +1551,13 @@ impl Placed for Cards {
             self.hc_pre(c, &f.hc[c.k.index][1], to_host, value, router, n);
         }
         let c = &self.cards[f.card];
+        if let Some((ln32, bias)) = &f.act {
+            // the FFN input's norm, quantize and router pick here, into this card's activation buffers and the host's
+            let xa = &self.shared.xact;
+            let mut a = Args::new();
+            a.ptr(c.x.va).ptr(ln32.va).ptr(bias.va).ptr(self.shared.scores_ffn.va).ptr(c.xq.va).ptr(c.xs.va).ptr(c.xg.va).ptr(xa.at(XA_Q)).ptr(xa.at(XA_S)).ptr(xa.at(XA_G)).ptr(xa.at(XA_P)).ptr(xa.at(XA_W)).ptr(c.xcount.va).ptr(self.shared.words.at(word(W_ACT, f.card))).u32(value).u32(n as u32);
+            c.k.launch(&c.ffn_act, n as u32, g::WG, glm_5_3_flash::ffn::gfx11_consts::ACT_LDS, &a);
+        }
         let (rows, down, k_width) = if f.dense { (DENSE_GU_ROWS, &c.ffn_down_dense, INTERMEDIATE_SIZE) } else { (SHARED_GU_ROWS, &c.ffn_down_shared, N_SHARED_EXPERTS * D_FF) };
         if n > SPEC_TOKENS {
             let down_w = if f.dense { &c.ffn_down_dense_w } else { &c.ffn_down_shared_w };
@@ -1550,11 +1591,29 @@ impl Placed for Cards {
             }
         }
     }
-    fn ffn_input(&mut self, l: usize, n: usize, x: &mut [f32], logits: &mut [f32]) {
+    fn ffn_logits(&mut self, l: usize, n: usize, x: &mut [f32], logits: &mut [f32]) {
         let f = self.ffns[l].as_ref().unwrap();
         crate::kfd::wait_word(self.word_ptr(W_X, f.card), self.half_seq[l][1]);
         read(&self.shared.xh, 0, &mut x[..n * H]);
         read(&self.shared.scores_ffn, 0, &mut logits[..n * ROUTE_ROWS]);
+    }
+    fn ffn_input(&mut self, l: usize, n: usize, xq: &mut [i8], xs: &mut [f32], xg: &mut [i32], picks: &mut [[usize; TOP_K]], wts: &mut [[f32; TOP_K]], logits: &mut [f32]) {
+        let f = self.ffns[l].as_ref().unwrap();
+        crate::kfd::wait_word(self.word_ptr(W_ACT, f.card), self.half_seq[l][1]);
+        // the router's logits too: their second half is the next layer's rows, the prefetch's predictor (005)
+        read(&self.shared.scores_ffn, 0, &mut logits[..n * ROUTE_ROWS]);
+        let xa = &self.shared.xact;
+        read(xa, XA_Q, &mut xq[..n * H]);
+        read(xa, XA_S, &mut xs[..n * HG]);
+        read(xa, XA_G, &mut xg[..n * HG]);
+        let mut p = vec![0u32; n * TOP_K];
+        read(xa, XA_P, &mut p);
+        for (i, pk) in picks[..n].iter_mut().enumerate() {
+            for k in 0..TOP_K {
+                pk[k] = p[i * TOP_K + k] as usize;
+            }
+        }
+        read(xa, XA_W, unsafe { std::slice::from_raw_parts_mut(wts.as_mut_ptr() as *mut f32, n * TOP_K) });
     }
     fn ffn_routed(&mut self, l: usize, n: usize, y: &[f32]) {
         // streamed: the handoff buffer is write-combining for the CPU, and a plain copy of a 1024-token

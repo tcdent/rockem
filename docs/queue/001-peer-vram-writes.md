@@ -1,6 +1,6 @@
 # 001 — Peer VRAM writes for the handoffs
 
-**Status:** The card-to-card half done (2026-10-19): the three handoffs and their words in the receiving card's VRAM — prefill 4.42 → 4.20 ms a prompt token; the host-side half is 064's pieces moved onto the cards, open
+**Status:** Both halves built (2026-10-19): the card-to-card handoffs in the receiving card's VRAM, and the FFN input's norm, quantize and router pick on the card (`ffn_act`) — prefill 4.42 → 4.02 ms a prompt token; at a verify step the kernel's ~55 µs a layer sits on the FFN card's critical path (+0.8 ms a step), to fold into `hc_pre`
 **Area:** decode, prefill
 **Gain:** measured piecemeal — a flag round trip 2.67 µs through peer VRAM against 3.47 through host memory; and on the host side of the same design: the join's 0.86 ms a step (038), the prefill expert handoff's 0.2 ms a prompt token, the route and sum laps' 3.5 ms a step (064), every one a CPU touch of a buffer that exists only because the cards hand off through the host
 
@@ -78,7 +78,38 @@ path crossed the link three times a handoff (the producer's write to host memory
 each card reading its own share back over the link too). Decode's handoffs are a few tens of KB and
 latency-bound, as estimated: unchanged.
 
+## Built, the host-side half (2026-10-19 10:00–12:00, runs prow21–26)
+`ffn_act` on the FFN card, launched after `hc_pre`: for each token the post-norm of the FFN input, its
+quantization (`QAct::quantize`'s arithmetic, exact), and the router's picks and weights (`route_scores`'s:
+the sigmoid, the top-k with the bias as a wave butterfly keeping the lower expert between equal keys, the
+mass in id order) — into the card's own activation buffers for its resident jobs and into host memory for the
+host's experts (`Shared::xact`, read streamed after the kernel's word). The host's `route.pick` and
+`route.quant` laps are gone and the dispatch uploads to the other card only. Five deploys to get there:
+the first missed experts 256–287 (288 routed experts, 256-thread loops — found by the host-versus-card check
+in a lab boot: the quantized bytes matched, the picks did not); the second recovered the layer-ahead
+prefetch's predictor (the router logits' second half), without which a verify step's items ran at DRAM speed
+(12 → 7 GMAC/s a core); the norm's sum became `rmsnorm8` on both tiers (eight strided chains added in order:
+one chain of 4096 was the kernel's long pole) — a numeric change, gated: long SCORE NLL 0.04362 → 0.03931,
+mean |Δ logprob| 8.3e-3, the same class as the bf16 attention state's.
+
+| at 18k | peer VRAM only | + `ffn_act` |
+|---|---|---|
+| prefill, ms a prompt token | 4.19–4.21 | 4.02–4.10 |
+| route lap, a 1024 step | 94 ms | 7 ms |
+| the cold 18k prompt | 79.4 s | 77.2 s |
+| verify step | 46.5 ms | 50.2–50.7 ms |
+| of which the host's route lap | 1.5 ms | 0.3 |
+| of which the cards' wait (`kda_card`) | 18.9 ms | 21.3 |
+
+Decode lost 0.8 ms a step: the kernel runs on the FFN card's queue between `hc_pre` and the shared expert's
+rows, and at a verify step that card's FFN phase is the longer side, so its ~55 µs a layer lands on the step
+(the host's 26 µs a layer of routing and quantizing moved off the host, onto the card's path, and grew). Its
+own work is ~15 µs; the rest is the launch and the word. Folding it into `hc_pre`'s last phase (the kernel
+already ends with an arrival and the router's word) removes the launch and the barrier; a side queue (057)
+would overlap it with the shared expert's rows.
+
 ## Next
+1. `ffn_act` folded into `hc_pre`'s tail: no launch between the router and the host's word.
 1. ~~The handoff buffers inventoried~~ — done above; the card-to-card ones moved.
 2. The host-side pieces of 064 onto the cards (route.pick, sum.y, the quantize, the dispatch's uploads).
 3. The handoff buffers inventoried by who writes and who reads them (`Shared::{ys, fy, my, yexp, xh, xout,
