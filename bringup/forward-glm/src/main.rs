@@ -333,7 +333,10 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
         let maxd = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
         // the numeric distance too (a prefill kernel pair is gated by it): top-1 agreement and the mean KL of
         // the step path's distributions from the token-at-a-time path's, over the positions computed
+        // and each path's quality on the text itself — the mean −ln p of the next id and the top-1 hits —
+        // which says whether two realizations merely differ (near-ties) or one is worse
         let (mut agree, mut kl, mut npos) = (0usize, 0f64, 0usize);
+        let (mut nll1, mut nll2, mut hit1, mut hit2, mut scored) = (0f64, 0f64, 0usize, 0usize, 0usize);
         for t in FIRST_POS..n {
             let (a, b) = (&lg1[t * VOCAB_SIZE..(t + 1) * VOCAB_SIZE], &lg2[t * VOCAB_SIZE..(t + 1) * VOCAB_SIZE]);
             agree += (argmax(a) == argmax(b)) as usize;
@@ -341,8 +344,17 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
             let (za, zb): (f64, f64) = (a.iter().map(|&v| ((v - ma) as f64).exp()).sum(), b.iter().map(|&v| ((v - mb) as f64).exp()).sum());
             kl += a.iter().zip(b).map(|(&x, &y)| { let p = ((x - ma) as f64).exp() / za; p * (((x - ma) as f64 - za.ln()) - ((y - mb) as f64 - zb.ln())) }).sum::<f64>();
             npos += 1;
+            if t + 1 < n {
+                let next = ids[t + 1];
+                nll1 -= (a[next] - ma) as f64 - za.ln();
+                nll2 -= (b[next] - mb) as f64 - zb.ln();
+                hit1 += (argmax(a) == next) as usize;
+                hit2 += (argmax(b) == next) as usize;
+                scored += 1;
+            }
         }
         println!("step gate: {} positions a token at a time in {t1:.1} s, in steps of {st} in {t2:.1} s ({:.1}×); differing f32s — logits {dl} of every position's (max {:.2e}), rows {dr} (max {:.2e}), state {ds} (max {:.2e}); top-1 agreement {:.4}, mean KL {:.3e}", n - FIRST_POS, t1 / t2, maxd(&lg1, &lg2), maxd(&rows1, &rows2), maxd(&snap1, &snap2), agree as f64 / npos as f64, kl / npos as f64);
+        println!("step gate: on the text — a token at a time NLL {:.4} (top-1 hits {:.4}), in steps NLL {:.4} (top-1 hits {:.4}) over {scored} positions", nll1 / scored as f64, hit1 as f64 / scored as f64, nll2 / scored as f64, hit2 as f64 / scored as f64);
         if dr > 0 {
             // where it starts: the first position with a differing row, and how many of its floats differ
             let first = rows1.iter().zip(&rows2).position(|(x, y)| x.to_bits() != y.to_bits()).unwrap();

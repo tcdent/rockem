@@ -50,8 +50,27 @@ experiments 014–016 (every scalar shape tried; this one untried).
   logprob| 9.6e-3, 99 % moved, max 4.9 at a near-tie — the same size as the bf16-state step and the
   text's ±0.003 floor. Decode acceptance on the short text 0.85 (0.88).
 
+- 2026-10-19 01:27–02:46 (lab boot: `rockem.resident=0`, `forward-glm-lab2` static beside the node, `--step 512`
+  over the 18k prompt's ids and its first 4k and 8k): the step path (WMMA rows, attend and scorer) against the
+  token-at-a-time path (scalar rows, the chunked WMMA attend of 017, the WMMA scorer) over the same ids:
+
+  | positions | top-1 agreement | mean KL | NLL a token at a time | NLL in steps |
+  |---|---|---|---|---|
+  | 650 (step.ids, 2026-10-18) | 0.9954 | 2.3e-3 | — | — |
+  | 4k | 0.9507 | 4.3e-2 | 0.9528 (hits 0.766) | 0.9618 (hits 0.762) |
+  | 8k | 0.9387 | 1.6e-1 | — | — |
+  | 18k | 0.9364 | 1.6e-1 | 0.9461 (hits 0.771) | 0.9436 (hits 0.770) |
+
+  The two realizations drift apart with length (the KDA state carries every rounding forward, and a flipped
+  near-tie in the routing or the top-2048 moves the rest of the row), saturating by 8k. On the text itself
+  they are equals: the step path reads +0.009 NLL at 4k and −0.0025 at 18k, within the noise either way, and
+  the top-1 hit rate moves by 0.1–0.4 points. So the gate for a prefill kernel pair at long context is the
+  two paths' NLL on the text, not their agreement with each other — the gate now prints both (`forward-glm
+  --step`, "on the text"). The token-at-a-time pass runs 18k positions in 1,242 s (69 ms a position, one
+  thread of launches, no draft); the step pass in 188 s.
+
 ## Next
-The step gate (top-1/KL) at long positions needs the gate binary beside the node: a `rockem.resident=0`
+The gate obligation is closed. The step gate (top-1/KL) at long positions needs the gate binary beside the node: a `rockem.resident=0`
 lab boot, batched with the next lab run. Then: `mla_attend` → the three launches by the step (q_abs and W_uv twins by `SPEC_TOKENS`, the
 chunked form with its merge below it); the gate (step gate top-1/KL at long positions, long SCORE);
 deploy; the scalar `mla_attend` kernel stays as the bench's reference. On the shelf after: the attend
