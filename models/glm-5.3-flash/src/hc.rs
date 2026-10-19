@@ -229,7 +229,7 @@ pub mod gfx11_consts {
     /// The LDS of the coefficient rounds, or of the FFN input's act phase (a token's 256 partials, the sigmoid
     /// scores and the bias an expert, the picks, the norm's scale and the mass), whichever is larger.
     const PRE_COEF_LDS: usize = 4 * (PRE_TOKENS * (16 + COEF_ROWS) + 8 * HC * HC);
-    pub const ACT_LDS: usize = 4 * (256 + 2 * E + TOP_K + 8);
+    pub const ACT_LDS: usize = 4 * (256 + E + 2 * TOP_K + 8) + 8 * E;
     pub const PRE_LDS: u32 = (if PRE_COEF_LDS > ACT_LDS { PRE_COEF_LDS } else { ACT_LDS }) as u32;
     /// `hc_pre`'s act table (a MoE layer on its FFN card): the device addresses its act phase reads and writes,
     /// in this order — the post-norm (f32), the router's bias (f32), the card's quantized activation (`xq`, `xs`,
@@ -342,7 +342,7 @@ pub mod gfx11 {
             let n = n as usize;
             // stats (a stats code object only), the act phase of the FFN card's launch: slot 0 from the scores' last
             // arrival to the act phase's start (workgroup 0's poll of the rows, the ready word, the wait), 1 the
-            // token's loads and norm, 2 its quantize, 3 the picks and the arrival out (workgroup 0's values are
+            // token's loads and norm, 2 its quantize, 3 the picks (rank through the picks' writes; workgroup 0's values are
             // the ones the host waits on)
             let t = workitem_id_x() as usize;
             let (wave, lane) = (t / 32, (t % 32) as u32);
@@ -661,7 +661,6 @@ pub mod gfx11 {
                 }
             }
             // the act phase's arrival: the last workgroup out writes the host's word
-            let kd = common::stat_clock!();
             fence(Ordering::Release);
             workgroup_sync();
             if t == 0 {
@@ -671,17 +670,14 @@ pub mod gfx11 {
                     AtomicU32::from_ptr(*act.add(10) as *mut u32).store(value, Ordering::Release);
                 }
             }
-            let ke = common::stat_clock!();
-            common::stat!(3, ke.wrapping_sub(kd) & common::stats::CLOCK_MASK);
         }
     }
 
     /// One token's FFN input, the host's arithmetic exactly (whole workgroup): the post-norm's scale as
     /// `common::rmsnorm::sumsq_tree` (thread j sums x[j + 256i] in order, lanes of wave 0 add eight of those
     /// in order, lane 0 the 32 in order), each group quantized as `QAct::quantize` (a wave four groups, their
-    /// loads first), and the router's picks and weights as `ffn::route_scores` (wave 0: expert e on lane e % 32,
-    /// a pass's best by a butterfly keeping the greater key and between equals the lower expert; the mass in
-    /// id order). Writes the card's activation buffers and the host's copies, picks and weights (`act`'s table).
+    /// loads first), and the router's picks and weights as `ffn::route_scores` (each expert's rank counted
+    /// against every key: the greater key first, between equals the lower expert; the mass in id order). Writes the card's activation buffers and the host's copies, picks and weights (`act`'s table).
     #[inline(always)]
     unsafe fn act_token(tok: usize, t: usize, wave: usize, lane: u32, x: *const f32, scores_v: *const f32, act: *const u64) {
         use common::q4::GROUP;
@@ -696,9 +692,10 @@ pub mod gfx11 {
         let l = lds::<f32>();
         let part = l; // [256] the threads' sums of squares
         let sig = l.add(256); // [E] the sigmoid scores
-        let bs = sig.add(E); // [E] the bias
-        let idx = bs.add(E) as *mut u32; // [TOP_K] the picks in id order
-        let misc = idx.add(TOP_K) as *mut f32; // [0] the norm's scale, [1] the mass
+        let idx = sig.add(E) as *mut u32; // [TOP_K] the picks in id order
+        let ranked = idx.add(TOP_K); // [TOP_K] the picks by rank
+        let misc = ranked.add(TOP_K) as *mut f32; // [0] the norm's scale, [1] the mass
+        let ck = misc.add(8) as *mut u64; // [E] the selection order's keys (16-byte aligned: 4·(256 + E + 2·TOP_K + 8))
         let lu = lane as usize;
         // thread t's squares, in order; the sigmoids and the bias a thread an expert
         let mut p = 0f32;
@@ -711,8 +708,13 @@ pub mod gfx11 {
         *part.add(t) = p;
         let mut e = t;
         while e < E {
-            *sig.add(e) = sigmoid(*scores_v.add(tok * ROUTE_ROWS + e));
-            *bs.add(e) = *bias.add(e);
+            let sv = sigmoid(*scores_v.add(tok * ROUTE_ROWS + e));
+            *sig.add(e) = sv;
+            // the selection key (`top`'s sum) as one u64 in the host's order: the key's bits mapped to an unsigned
+            // order above, the complement of the expert below, so between equal keys the lower expert is greater
+            let kb = (sv + *bias.add(e)).to_bits();
+            let ko = if kb >> 31 != 0 { !kb } else { kb | 0x8000_0000 };
+            *ck.add(e) = ((ko as u64) << 32) | (!(e as u32)) as u64;
             e += 256;
         }
         workgroup_sync();
@@ -765,7 +767,7 @@ pub mod gfx11 {
                 }
                 jj += 1;
             }
-            let amax = f32::from_bits(core::arch::amdgpu::wave_reduce_umax::<0>(amax.to_bits()));
+            let amax = f32::from_bits(common::gfx11::wave_max_u32(lane as u32, amax.to_bits()));
             let sc = amax / 127.0;
             let inv = if sc > 0.0 { 1.0 / sc } else { 0.0 };
             let mut packed = 0u32;
@@ -779,7 +781,7 @@ pub mod gfx11 {
                 sum += qv as i32;
                 jj += 1;
             }
-            let sum = core::arch::amdgpu::wave_reduce_add::<0>(sum as u32) as i32;
+            let sum = common::gfx11::wave_sum_i32(lane as u32, sum);
             *(xq.add(tok * H + k0) as *mut u32) = packed;
             *(xq_h.add(tok * H + k0) as *mut u32) = packed;
             if lane == 0 {
@@ -793,50 +795,36 @@ pub mod gfx11 {
         }
         let k2 = common::stat_clock!();
         common::stat!(2, k2.wrapping_sub(k1) & common::stats::CLOCK_MASK);
-        // the router's picks on wave 0
+        // the router's picks: the host's `top` takes the greatest key first and, between equal keys, the lower expert,
+        // which is the u64 order of `ck` (the one order the mapping changes, −0 below +0, needs a sum both of whose
+        // terms are −0, and the sigmoid is not); an expert's rank is the count of keys above its own, the TOP_K ranked
+        // below TOP_K are the picks, the rank their order taken. A thread ranks expert t and, the 32 experts past 256,
+        // expert t + 256 in the same pass: a 64-bit compare and a carry-add a key, eight keys' loads issued together
+        const _: () = assert!(E % 8 == 0 && E > 256 && E <= 512 && (4 * (256 + E + 2 * TOP_K + 8)) % 16 == 0);
+        let e2 = t + 256;
+        let ke = *ck.add(t);
+        let ke2 = if e2 < E { *ck.add(e2) } else { u64::MAX };
+        let (mut rk, mut rk2) = (0u32, 0u32);
+        let mut f = 0;
+        while f < E {
+            let kf: [u64; 8] = core::ptr::read(ck.add(f) as *const [u64; 8]);
+            let mut j = 0;
+            while j < 8 {
+                rk += (kf[j] > ke) as u32;
+                rk2 += (kf[j] > ke2) as u32;
+                j += 1;
+            }
+            f += 8;
+        }
+        if (rk as usize) < TOP_K {
+            *ranked.add(rk as usize) = t as u32;
+        }
+        if e2 < E && (rk2 as usize) < TOP_K {
+            *ranked.add(rk2 as usize) = e2 as u32;
+        }
+        workgroup_sync();
         if wave == 0 {
-            const SL: usize = E / 32;
-            let mut key = [0f32; SL];
-            let mut sl = 0;
-            while sl < SL {
-                let e = sl * 32 + lu;
-                key[sl] = *sig.add(e) + *bs.add(e);
-                sl += 1;
-            }
-            let mut taken = 0u32;
-            let mut mine = 0u32;
-            let mut k = 0;
-            while k < TOP_K {
-                let (mut bv, mut be) = (f32::NEG_INFINITY, E as u32);
-                let mut sl = 0;
-                while sl < SL {
-                    if taken & (1 << sl) == 0 {
-                        let e = (sl * 32 + lu) as u32;
-                        if key[sl] > bv || (key[sl] == bv && e < be) {
-                            bv = key[sl];
-                            be = e;
-                        }
-                    }
-                    sl += 1;
-                }
-                let mut m = 16u32;
-                while m >= 1 {
-                    let ov = lane_read(lane ^ m, bv);
-                    let oe = lane_read(lane ^ m, f32::from_bits(be)).to_bits();
-                    if ov > bv || (ov == bv && oe < be) {
-                        bv = ov;
-                        be = oe;
-                    }
-                    m >>= 1;
-                }
-                if be as usize % 32 == lu {
-                    taken |= 1 << (be as usize / 32);
-                }
-                if lu == k {
-                    mine = be;
-                }
-                k += 1;
-            }
+            let mine = if lu < TOP_K { *ranked.add(lu) } else { u32::MAX };
             // lane k < TOP_K holds the k-th pick taken; its place in id order is the picks below it
             let mut pos = 0u32;
             let mut j = 0;
@@ -868,6 +856,8 @@ pub mod gfx11 {
             }
         }
         workgroup_sync();
+        let k3 = common::stat_clock!();
+        common::stat!(3, k3.wrapping_sub(k2) & common::stats::CLOCK_MASK);
     }
 
     /// `stream_ij[d] = post_ij · y_i[d] + Σ_k comb_ikj · stream_ik[d]` for the `tokens` tokens of a

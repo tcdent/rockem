@@ -491,7 +491,7 @@ pub mod gfx11 {
     use common::q4::gfx11::{gemv_tile_step, STEP_BYTES};
     use common::q4::{GROUP, TILE};
     use common::swiglu::silu;
-    use core::arch::amdgpu::{wave_reduce_add, wave_reduce_umax, workgroup_id_x, workitem_id_x};
+    use core::arch::amdgpu::{workgroup_id_x, workitem_id_x};
     const HG: usize = H / GROUP;
 
     /// `gu[j][2·D_FF] = [gate; up] · xq[tok]` for job `j = (slot, tok, output row)` of `jobs` (`[jobs][3]` u32).
@@ -573,7 +573,7 @@ pub mod gfx11 {
                         }
                         jj += 1;
                     }
-                    let amax = f32::from_bits(wave_reduce_umax::<0>(amax.to_bits()));
+                    let amax = f32::from_bits(common::gfx11::wave_max_u32(lane as u32, amax.to_bits()));
                     let s = amax / 127.0;
                     let inv = if s > 0.0 { 1.0 / s } else { 0.0 };
                     let mut packed = 0u32;
@@ -587,7 +587,7 @@ pub mod gfx11 {
                         sum += qv as i32;
                         jj += 1;
                     }
-                    let sum = wave_reduce_add::<0>(sum as u32) as i32;
+                    let sum = common::gfx11::wave_sum_i32(lane as u32, sum);
                     let d = dst.add(k * STEP_BYTES);
                     *(d.add(gp * GROUP + lane as usize * 4) as *mut u32) = packed;
                     if lane == 0 {
@@ -782,7 +782,7 @@ pub mod gfx11 {
                 }
                 jj += 1;
             }
-            let amax = f32::from_bits(wave_reduce_umax::<0>(amax.to_bits()));
+            let amax = f32::from_bits(common::gfx11::wave_max_u32(lane as u32, amax.to_bits()));
             let s = amax / 127.0;
             let inv = if s > 0.0 { 1.0 / s } else { 0.0 };
             let mut packed = 0u32;
@@ -796,7 +796,7 @@ pub mod gfx11 {
                 sum += qv as i32;
                 jj += 1;
             }
-            let sum = wave_reduce_add::<0>(sum as u32) as i32;
+            let sum = common::gfx11::wave_sum_i32(lane as u32, sum);
             *(hq.add(j * D_FF + k0) as *mut u32) = packed;
             if lane == 0 {
                 *hs.add(j * XQ_GROUPS + gi) = s;

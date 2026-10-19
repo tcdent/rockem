@@ -744,7 +744,7 @@ pub mod gfx11 {
     use super::{GROUP, TILE, WBIAS};
     use crate::gfx11::{lds, workgroup_sync};
     use crate::math::round;
-    use core::arch::amdgpu::{ds_bpermute, wave_reduce_add, wave_reduce_umax};
+    use core::arch::amdgpu::ds_bpermute;
 
     /// Bytes of launch-sized LDS one workgroup needs to stage a `K`-wide
     /// quantized activation: the i8 vector, then its per-group scales and Σq.
@@ -799,7 +799,7 @@ pub mod gfx11 {
                 }
                 i += 1;
             }
-            let amax = f32::from_bits(wave_reduce_umax::<0>(amax.to_bits()));
+            let amax = f32::from_bits(crate::gfx11::wave_max_u32(lane as u32, amax.to_bits()));
             let s = amax / 127.0;
             let inv = if s > 0.0 { 1.0 / s } else { 0.0 };
             let mut packed = 0u32;
@@ -813,7 +813,7 @@ pub mod gfx11 {
                 sum += q as i32;
                 i += 1;
             }
-            let sum = wave_reduce_add::<0>(sum as u32) as i32;
+            let sum = crate::gfx11::wave_sum_i32(lane as u32, sum);
             *(lds.add(g * GROUP + lane * 4) as *mut u32) = packed;
             if lane == 0 {
                 *scales.add(g) = s;

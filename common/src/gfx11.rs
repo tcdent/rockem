@@ -85,6 +85,32 @@ pub unsafe fn group_max(lane: u32, v: f32, n: u32) -> f32 {
     }
     v
 }
+/// Max of one u32 per lane across the wave by an xor butterfly over `ds_bpermute`; every lane gets it. Exact
+/// (a max has no order), and five steps where `wave_reduce_umax` compiles to a loop over the 32 lanes one at a
+/// time (13 µs for a token's quantize, 2026-10-19). Non-negative f32 bits compare as their floats.
+#[inline(always)]
+pub unsafe fn wave_max_u32(lane: u32, v: u32) -> u32 {
+    let mut v = v;
+    let mut m = 1;
+    while m < 32 {
+        let o = ds_bpermute((lane ^ m) * 4, v);
+        v = if o > v { o } else { v };
+        m <<= 1;
+    }
+    v
+}
+/// Sum of one i32 per lane across the wave, likewise (integer: exact in any order).
+#[inline(always)]
+pub unsafe fn wave_sum_i32(lane: u32, v: i32) -> i32 {
+    let mut v = v;
+    let mut m = 1;
+    while m < 32 {
+        v = v.wrapping_add(ds_bpermute((lane ^ m) * 4, v as u32) as i32);
+        m <<= 1;
+    }
+    v
+}
+
 /// The value lane `src` holds, to every lane of the wave.
 #[inline(always)]
 pub unsafe fn lane_read(src: u32, v: f32) -> f32 {
