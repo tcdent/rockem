@@ -1,8 +1,8 @@
 # 001 — Peer VRAM writes for the handoffs
 
-**Status:** Quantified, on the shelf — ≤ 0.1 ms a step token (decode), ~0.04 ms a prompt token (prefill); the helper and the benches exist, the handoff refactor is the work left
+**Status:** Open — architectural (tcdent, 2026-10-19); the measured 0.1 ms was one handoff's latency, the day's findings are the design's cost
 **Area:** decode, prefill
-**Gain:** measured — a flag round trip 2.67 µs through peer VRAM against 3.47 through host memory (0.4 µs a one-way message); a single wave's 64 KB payload 2.7× faster
+**Gain:** measured piecemeal — a flag round trip 2.67 µs through peer VRAM against 3.47 through host memory; and on the host side of the same design: the join's 0.86 ms a step (038), the prefill expert handoff's 0.2 ms a prompt token, the route and sum laps' 3.5 ms a step (064), every one a CPU touch of a buffer that exists only because the cards hand off through the host
 
 ## Proposal
 Every card-to-card handoff goes through uncached host memory: two PCIe trips (one card writes,
@@ -33,6 +33,36 @@ Our own design discussion, 2026-10-17. The KFD topology (read 2026-10-18) puts t
    host-memory handoff; CPU-to-VRAM BAR write rate and flag latency from each socket;
    visibility (data read after its flag with L2 bypassed or invalidated), many times.
 3. ~~Move the attention-phase handoffs if the ping-pong shows a real difference.~~ Measured, below.
+
+## Reopened (2026-10-19, tcdent)
+> I mentioned something like this way back with zero zero one, and it got pushed off because we didn't think
+> there was enough game. But I think that this is an architectural decision that is just fundamental and
+> informs the way that the system is built.
+
+What the day showed, each measured in its own entry: KFD's host memory is write-combining for the CPU, so the
+host's bulk reads and writes of any handoff buffer are slow (the old join's 160 KB copy 0.86 ms a step; the
+expert handoff's 16 MB copy 4.8 ms a layer at prefill; 038, 064). The fix that worked — the host's own pages
+registered for the cards (`Kfd::host_owned`), the cards writing into them — is one half of the rule; the other
+half is the cards handing to each other through the receiver's VRAM (this entry's measurement), never through
+the host. And the host's laps between card phases (064: route.pick, sum.y, dispatch, the handoff — 3.5 ms a
+verify step) exist because the data comes down to the host and goes back up twice a layer. The rule that
+falls out:
+
+- **host-touched memory is the host's**: anonymous pages, cached, registered for the cards (`host_owned`);
+  nothing the CPU reads or writes in bulk lives in a GTT allocation;
+- **card-to-card memory is the receiver's VRAM**, peer-mapped (`vram_shared`): one trip, the receiver polls its own;
+- **the handoff words stay coherent and tiny**;
+- **work on data the cards hold happens on the cards**: the router's top-k, the quantize, the weighted sum
+  over the expert rows (064's pieces, 002's shape).
+
+## Next
+1. The handoff buffers inventoried by who writes and who reads them (`Shared::{ys, fy, my, yexp, xh, xout,
+   scores_ffn, lg}`), each assigned by the rule; the card-to-card ones (`ys`, `fy`, `my`) to peer VRAM with
+   the words in it — the refactor this entry always named.
+2. The host-side pieces of 064 moved onto the cards in the same pass, since they are the same decision.
+3. The coherence rule for `host_owned` data a kernel publishes with its own word (not a packet completion):
+   the kernel's release must write the card's L2 back; verify on gfx11 before relying on it (038's rows are
+   read after the packet's completion signal, which does).
 
 ## Measured (2026-10-18 09:40, `bench-p2p` beside the serving node)
 - The helper: `Kfd::vram_shared(size, others)` — fine-grained VRAM (`MEM_COHERENT`, gfx11 maps it

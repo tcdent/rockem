@@ -1079,7 +1079,10 @@ pub struct CpuModel<'p, R: Routed> {
     b_xq: Vec<i8>,
     b_xs: Vec<f32>,
     b_xg: Vec<i32>,
-    /// A step's picks as routed, kept beside `picks` (which the dispatch marks) for the accounting and the checks.
+    /// A step's picks and weights from the router, and the picks as routed, kept beside `b_picks` (which the
+    /// dispatch marks) for the accounting and the checks.
+    b_picks: Vec<[usize; TOP_K]>,
+    b_wts: Vec<[f32; TOP_K]>,
     b_routed: Vec<[usize; TOP_K]>,
     d_x: Vec<f32>,
     d_xn: Vec<f32>,
@@ -1155,6 +1158,8 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             b_xq: vec![0; STEP * H],
             b_xs: vec![0.0; STEP * (H / common::q4::GROUP)],
             b_xg: vec![0; STEP * (H / common::q4::GROUP)],
+            b_picks: vec![[0; TOP_K]; STEP],
+            b_wts: vec![[0.0; TOP_K]; STEP],
             b_routed: vec![[E; TOP_K]; STEP],
             d_x: vec![0.0; H],
             d_xn: vec![0.0; H],
@@ -1689,19 +1694,28 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 lap(&mut p.kda_card, "kda_card");
                 // every token's norm, picks and weights from the card's router logits, a token an item over
                 // the pool (one token runs inline); the step's experts as one grouped run
-                let mut picks = [[0usize; TOP_K]; STEP];
-                let mut wts = [[0f32; TOP_K]; STEP];
+                // (the step's picks and weights live on the model: 96 KB of stack a layer zeroed was 0.2 ms a step)
+                let (picks, wts) = (&mut s.b_picks, &mut s.b_wts);
                 {
+                    prow::zone!("track-zones", "route.pick");
                     let (xn_p, sc_p, pk_p, wt_p) = (s.b_xn.as_mut_ptr() as usize, s.b_score.as_mut_ptr() as usize, picks.as_mut_ptr() as usize, wts.as_mut_ptr() as usize);
                     let (x, post_ln, forced_l) = (&s.b_x, lw.post_ln, forced.map(|f| &f[l - FIRST_K_DENSE_REPLACE]));
-                    s.pool.run(n, &move |i| unsafe {
+                    let pick = move |i: usize| unsafe {
                         let xn = std::slice::from_raw_parts_mut((xn_p as *mut f32).add(i * H), H);
                         rmsnorm::<H>(&x[i * H..(i + 1) * H], post_ln, RMS_NORM_EPS, xn);
                         let score = std::slice::from_raw_parts_mut((sc_p as *mut f32).add(i * ROUTE_ROWS), E);
                         let (idx, wt) = ffn::route_scores(m, score, forced_l);
                         *(pk_p as *mut [usize; TOP_K]).add(i) = idx;
                         *(wt_p as *mut [f32; TOP_K]).add(i) = wt;
-                    });
+                    };
+                    // a few tokens here (a pool run's round trip is ~15 µs against ~2 µs of work a token: 064), a step's on the pool
+                    if n <= 16 {
+                        for i in 0..n {
+                            pick(i);
+                        }
+                    } else {
+                        s.pool.run(n, &pick);
+                    }
                 }
                 if n == 1 {
                     tr.edge(l, "ffn_in", &s.b_xn[..H]);
@@ -1712,6 +1726,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 s.b_routed[..n].copy_from_slice(&picks[..n]);
                 const HG: usize = H / common::q4::GROUP;
                 {
+                    prow::zone!("track-zones", "route.quant");
                     let (xq_p, xs_p, xg_p, xn) = (s.b_xq.as_mut_ptr() as usize, s.b_xs.as_mut_ptr() as usize, s.b_xg.as_mut_ptr() as usize, &s.b_xn);
                     let quantize = move |i: usize| {
                         let (q, sc, g) = unsafe { (std::slice::from_raw_parts_mut((xq_p as *mut i8).add(i * H), H), std::slice::from_raw_parts_mut((xs_p as *mut f32).add(i * HG), HG), std::slice::from_raw_parts_mut((xg_p as *mut i32).add(i * HG), HG)) };
@@ -1761,7 +1776,8 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 // each token's weighted sum of its experts' outputs, likewise (on the pool for any width: a few
                 // tokens summed on this thread instead measured 25 against 22 µs a layer, 2026-10-19)
                 {
-                    let (y_p, out, wts_r) = (s.b_y.as_mut_ptr() as usize, &*out, &wts);
+                    prow::zone!("track-zones", "sum.y");
+                    let (y_p, out, wts_r) = (s.b_y.as_mut_ptr() as usize, &*out, &*wts);
                     s.pool.run(n, &move |i| {
                         let y = unsafe { std::slice::from_raw_parts_mut((y_p as *mut f32).add(i * H), H) };
                         y.fill(0.0);
@@ -1780,9 +1796,15 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     }
                     tr.edge(l, "routed", &s.b_y[..H]);
                 }
-                pl.ffn_routed(l, n, &s.b_y[..n * H]);
-                for i in 0..n {
-                    account(p, &mut s.last_picks, &mut s.freq, s.pool, l, s.b_routed[i], if n <= SPEC_TOKENS { pre_picks[i] } else { [E; TOP_K] });
+                {
+                    prow::zone!("track-zones", "sum.handoff");
+                    pl.ffn_routed(l, n, &s.b_y[..n * H]);
+                }
+                {
+                    prow::zone!("track-zones", "sum.account");
+                    for i in 0..n {
+                        account(p, &mut s.last_picks, &mut s.freq, s.pool, l, s.b_routed[i], if n <= SPEC_TOKENS { pre_picks[i] } else { [E; TOP_K] });
+                    }
                 }
                 lap(&mut p.route, "sum");
                 // the next MoE layer's picks, predicted by its router over this layer's FFN input (the second

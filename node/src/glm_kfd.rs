@@ -1506,8 +1506,10 @@ impl Placed for Cards {
         read(&self.shared.scores_ffn, 0, &mut logits[..n * ROUTE_ROWS]);
     }
     fn ffn_routed(&mut self, l: usize, n: usize, y: &[f32]) {
+        // streamed: the handoff buffer is write-combining for the CPU, and a plain copy of a 1024-token
+        // step's 16 MB took 4.8 ms a layer (0.2 ms a prompt token, 2026-10-19)
         let buf = &self.shared.yexp[l % 2];
-        unsafe { std::ptr::copy_nonoverlapping(y.as_ptr(), buf.ptr() as *mut f32, n * H) };
+        common::copy::stream(unsafe { std::slice::from_raw_parts_mut(buf.ptr() as *mut u8, n * H * 4) }, raw(&y[..n * H]));
         unsafe { &*self.word_ptr(W_EXPERTS, 0) }.store(self.half_seq[l][1], std::sync::atomic::Ordering::Release);
     }
     fn layer_out(&mut self, _l: usize, i: usize, mean: &mut [f32]) {

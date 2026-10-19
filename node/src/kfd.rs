@@ -991,6 +991,11 @@ pub fn raw<T>(v: &[T]) -> &[u8] {
 pub fn raw_u32(v: &[u32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, 4 * v.len()) }
 }
+/// The host's read of a card's host-memory buffer (write-combining for the CPU): streamed.
 pub fn read<T: Copy>(m: &Mem, off: usize, out: &mut [T]) {
-    unsafe { std::ptr::copy_nonoverlapping(m.at(off) as *const T, out.as_mut_ptr(), out.len()) }
+    let bytes = out.len() * size_of::<T>();
+    assert!(off + bytes <= m.size);
+    let src = unsafe { std::slice::from_raw_parts(m.at(off) as *const u8, bytes) };
+    let dst = unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, bytes) };
+    common::copy::stream_read(dst, src);
 }
