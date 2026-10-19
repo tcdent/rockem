@@ -51,6 +51,8 @@ pub struct Threads {
     prefetched: std::sync::Mutex<(usize, usize)>,
     /// The calling thread's node.
     node: usize,
+    /// The workers, the calling thread counted first.
+    workers: usize,
     /// Since the last `node_ends`: each node's items and the sum of its run-end times (s), over the placed runs.
     node_stats: std::sync::Mutex<([usize; MAX_NODES], [f64; MAX_NODES])>,
     /// Since the last `overheads`, over the placed runs: seconds slotting (entry to post), to the
@@ -90,6 +92,10 @@ struct Job {
     node_end: [std::sync::atomic::AtomicU64; MAX_NODES],
     /// When the first item was claimed (ns after the job was posted): the workers' wake.
     first: std::sync::atomic::AtomicU64,
+    /// `track-experts`: when each worker finished its last item of this job (ns after the post; 0: none taken),
+    /// the main thread first — a run's tail read per core (074).
+    #[cfg(feature = "track-experts")]
+    core_end: Box<[std::sync::atomic::AtomicU64]>,
     t0: std::time::Instant,
     /// A prefetch's closure, owned by its job (the runs' closures are the caller's, alive through the run).
     _owned: Option<Box<dyn Fn(usize) + Send + Sync>>,
@@ -154,7 +160,7 @@ fn slot_order(node: usize, ccd: usize, node_ccds: &[Vec<usize>]) -> Vec<usize> {
 }
 /// Every item of `job` this thread can claim, slot by slot in its order; the completions
 /// counted once, at the end.
-unsafe fn work(job: *const Job, order: &[usize], node: usize) {
+unsafe fn work(job: *const Job, order: &[usize], node: usize, who: usize) {
     let j = &*job;
     let f = &*j.f;
     INSIDE.with(|c| c.set(job));
@@ -178,7 +184,12 @@ unsafe fn work(job: *const Job, order: &[usize], node: usize) {
     }
     if mine > 0 {
         // this thread's last item ends its node's run as far as it is concerned (no cross-node stealing: its items were its node's)
-        j.node_end[node].fetch_max(j.t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let end = j.t0.elapsed().as_nanos() as u64;
+        #[cfg(feature = "track-experts")]
+        j.core_end[who].store(end, Ordering::Relaxed);
+        #[cfg(not(feature = "track-experts"))]
+        let _ = who;
+        j.node_end[node].fetch_max(end, Ordering::Relaxed);
         j.node_done[node].0.fetch_add(mine, Ordering::Relaxed);
         j.done.0.fetch_add(mine, Ordering::AcqRel);
         j.local.0.fetch_add(local, Ordering::Relaxed);
@@ -205,7 +216,7 @@ impl Threads {
         let shared = std::sync::Arc::new(Shared { job: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()), active: AtomicUsize::new(0), busy: std::sync::atomic::AtomicBool::new(false), quit: std::sync::atomic::AtomicBool::new(false) });
         let mut seen_in_ccd = vec![0usize; ccd_keys.len()];
         seen_in_ccd[ccd_of(cores[0])] += 1;
-        for &core in &cores[1..] {
+        for (who, &core) in cores.iter().enumerate().skip(1) {
             let sh = shared.clone();
             let node = node_of_core(core);
             let order = slot_order(node, ccd_of(core), &node_ccds);
@@ -233,7 +244,7 @@ impl Threads {
                     let job = sh.job.load(Ordering::Acquire);
                     seen = job;
                     if !job.is_null() && !(unsafe { (*job).light } && rank >= PREFETCH_CORES) {
-                        unsafe { work(job, &order, node) };
+                        unsafe { work(job, &order, node, who) };
                     }
                     sh.active.fetch_sub(1, Ordering::AcqRel);
                 }
@@ -241,7 +252,7 @@ impl Threads {
         }
         let node = node_of_core(cores[0]);
         let order = slot_order(node, ccd_of(cores[0]), &node_ccds);
-        Threads { shared, retired: std::sync::Mutex::new(Vec::new()), order, node_ccds, placed: std::sync::Mutex::new(Vec::new()), locality: std::sync::Mutex::new((0, 0)), prefetched: std::sync::Mutex::new((0, 0)), node, node_stats: std::sync::Mutex::new(([0; MAX_NODES], [0.0; MAX_NODES])), overheads: std::sync::Mutex::new((0.0, 0.0, 0.0, 0)), last_ends: std::sync::Mutex::new(0.0), post_stats: std::sync::Mutex::new((0.0, 0.0, 0.0)) }
+        Threads { workers: cores.len(), shared, retired: std::sync::Mutex::new(Vec::new()), order, node_ccds, placed: std::sync::Mutex::new(Vec::new()), locality: std::sync::Mutex::new((0, 0)), prefetched: std::sync::Mutex::new((0, 0)), node, node_stats: std::sync::Mutex::new(([0; MAX_NODES], [0.0; MAX_NODES])), overheads: std::sync::Mutex::new((0.0, 0.0, 0.0, 0)), last_ends: std::sync::Mutex::new(0.0), post_stats: std::sync::Mutex::new((0.0, 0.0, 0.0)) }
     }
     /// Tell the pool where a region's memory lives: `nodes[p]` is the node of its `p`th `PAGE`.
     pub fn place(&self, base: usize, len: usize, nodes: Vec<u8>) {
@@ -275,9 +286,24 @@ impl Threads {
         prow::zone!("track-zones", "pool.run");
         let entered = std::time::Instant::now();
         let job = self.post(n, at, node, ccd, slot, f, None);
-        unsafe { work(job, &self.order, self.node) };
+        unsafe { work(job, &self.order, self.node, 0) };
         while unsafe { (*job).done.0.load(Ordering::Acquire) } != n {
             std::hint::spin_loop();
+        }
+        #[cfg(feature = "track-experts")]
+        if slot.is_some() {
+            // the run's tail by core: when each worker finished, against the run's wall (074)
+            let j = unsafe { &*job };
+            let total = j.t0.elapsed().as_nanos() as u64;
+            let mut ends: Vec<u64> = j.core_end.iter().map(|e| e.load(Ordering::Relaxed)).filter(|&e| e > 0).collect();
+            ends.sort_unstable();
+            let at = |q: f64| ends.get(((ends.len() as f64 - 1.0) * q) as usize).copied().unwrap_or(0) as f64 / 1e3;
+            let ne = |d: usize| j.node_end[d].load(Ordering::Relaxed) as f64 / 1e3;
+            prow::row!("track-experts", "pool_run", {
+                "items" => n, "wall_us" => total as f64 / 1e3, "wake_us" => j.first.load(Ordering::Relaxed).min(total) as f64 / 1e3,
+                "busy_cores" => ends.len(), "end_p10_us" => at(0.1), "end_p50_us" => at(0.5), "end_p90_us" => at(0.9), "end_max_us" => at(1.0),
+                "node0_us" => ne(0), "node1_us" => ne(1), "node2_us" => ne(2), "node3_us" => ne(3),
+            });
         }
         if ccd.is_some() || slot.is_some() {
             *self.locality.lock().unwrap() = (unsafe { (*job).local.0.load(Ordering::Relaxed) }, n);
@@ -358,7 +384,7 @@ impl Threads {
         }
         let fp: *const (dyn Fn(usize) + Sync) = unsafe { std::mem::transmute(f) };
         let light = owned.is_some();
-        let job = Box::into_raw(Box::new(Job { f: fp, order, next: std::array::from_fn(|s| Counter(AtomicUsize::new(start[s]))), start, done: Counter(AtomicUsize::new(0)), local: Counter(AtomicUsize::new(0)), stop: std::sync::atomic::AtomicBool::new(false), n, node_done: std::array::from_fn(|_| Counter(AtomicUsize::new(0))), node_end: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)), first: std::sync::atomic::AtomicU64::new(u64::MAX), t0: std::time::Instant::now(), _owned: owned, light }));
+        let job = Box::into_raw(Box::new(Job { f: fp, order, next: std::array::from_fn(|s| Counter(AtomicUsize::new(start[s]))), start, done: Counter(AtomicUsize::new(0)), local: Counter(AtomicUsize::new(0)), stop: std::sync::atomic::AtomicBool::new(false), n, node_done: std::array::from_fn(|_| Counter(AtomicUsize::new(0))), node_end: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)), #[cfg(feature = "track-experts")] core_end: (0..self.workers).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(), first: std::sync::atomic::AtomicU64::new(u64::MAX), t0: std::time::Instant::now(), _owned: owned, light }));
         let old = sh.job.swap(job, Ordering::AcqRel);
         if !old.is_null() {
             self.retired.lock().unwrap().push(old as usize);
