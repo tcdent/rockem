@@ -29,6 +29,25 @@ timeline without the bring-up checks (2026-10-20).
 ## History
 - 2026-10-20: measured and listed.
 
+## The launch to the phase (2026-10-20, stats object on the real-time counter, `kstats.sh`)
+`hc_pre`'s four stamps on its phases, wave 0 of workgroup 0, medians in µs (wide = a 512-token chunk):
+
+| `hc_pre` | total | dots | mix + collapse | router | act |
+|---|---|---|---|---|---|
+| few tokens, plain | 33 | 14 | 15 | — | — |
+| few tokens, FFN card | 74 | 14 | 19 | 22 | 17 |
+| wide, plain | 2,067 | 269 | 1,803 | — | — |
+| wide, FFN card | 9,758 | 246 | 4,360 | 4,112 | 982 |
+
+- **The mix is one workgroup's.** The last workgroup to arrive makes every token's mix (sigmoids, softmax rows,
+  Sinkhorn) for all 512 tokens while the other 191 wait: ~1.5–1.8 ms in every wide launch, both halves of every layer,
+  both cards. Each workgroup making its own tokens' mixes, then one barrier, is exact and parallel.
+- **The FFN card's collapse writes the block input to host memory too** (`x_host`: 8 MB a chunk over the link), a
+  leftover from before 001 that serving never reads (only bring-up's `ffn_logits`): the likely reason its mix + collapse
+  is 4.4 ms against the plain 1.8. Bring-up can copy the card's `x` out when it asks.
+- **The router** (4.1 ms): the decode-shaped loop; the WMMA path is the core of 078.
+- **The act phase** (~1 ms for workgroup 0's three tokens, ~330 µs a token against 17 in decode): not explained yet.
+
 ## After 058 (2026-10-20): where prefill stands, and what 078 is for
 With the MLA attend split (058), prefill at 18k is 2.65 ms a prompt token: the host's experts 1.55, its wait on a
 chunk's FFN input from the cards 0.49, its wait on the MLA projections 0.37. Each card is ~97 % busy in a prefill step,
