@@ -96,6 +96,16 @@ struct Job {
     /// the main thread first — a run's tail read per core (074).
     #[cfg(feature = "track-experts")]
     core_end: Box<[std::sync::atomic::AtomicU64]>,
+    /// `track-experts`, a prefetch: the workers' time inside its items summed, and how many workers took any.
+    #[cfg(feature = "track-experts")]
+    busy_ns: std::sync::atomic::AtomicU64,
+    #[cfg(feature = "track-experts")]
+    takers: AtomicUsize,
+    /// `track-experts`: the post's wall clock and the last item's end (ns after the post), for the job's span.
+    #[cfg(feature = "track-experts")]
+    ts0: prow::Timestamp,
+    #[cfg(feature = "track-experts")]
+    last: std::sync::atomic::AtomicU64,
     t0: std::time::Instant,
     /// A prefetch's closure, owned by its job (the runs' closures are the caller's, alive through the run).
     _owned: Option<Box<dyn Fn(usize) + Send + Sync>>,
@@ -160,11 +170,33 @@ fn slot_order(node: usize, ccd: usize, node_ccds: &[Vec<usize>]) -> Vec<usize> {
 }
 /// Every item of `job` this thread can claim, slot by slot in its order; the completions
 /// counted once, at the end.
+/// A zone on the expert pool's lane, `cpu` (prow's `zone!` takes the calling thread's lane; the pool's runs and the
+/// expert phases are the pool's work, whichever thread drives them — lanes are devices: `main`, `cpu`, `card0`, `card1`).
+#[cfg(feature = "track-zones")]
+struct CpuZone {
+    name: &'static str,
+    start: prow::Timestamp,
+}
+#[cfg(feature = "track-zones")]
+impl Drop for CpuZone {
+    fn drop(&mut self) {
+        prow::zone_at!("track-zones", self.name, "cpu", self.start, prow::Timestamp::now());
+    }
+}
+macro_rules! cpu_zone {
+    ($name:expr) => {
+        #[cfg(feature = "track-zones")]
+        let _cpu_zone = CpuZone { name: $name, start: prow::Timestamp::now() };
+    };
+}
 unsafe fn work(job: *const Job, order: &[usize], node: usize, who: usize) {
     let j = &*job;
     let f = &*j.f;
     INSIDE.with(|c| c.set(job));
     let (mut mine, mut local) = (0, 0);
+    // a prefetch's time inside its items on this worker (`track-experts`)
+    #[cfg(feature = "track-experts")]
+    let (mut taken, mut busy0) = (false, std::time::Instant::now());
     for (k, &s) in order.iter().enumerate() {
         loop {
             if j.stop.load(Ordering::Relaxed) {
@@ -176,6 +208,10 @@ unsafe fn work(job: *const Job, order: &[usize], node: usize, who: usize) {
             }
             if mine == 0 {
                 j.first.fetch_min(j.t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                #[cfg(feature = "track-experts")]
+                if j.light {
+                    (taken, busy0) = (true, std::time::Instant::now());
+                }
             }
             f(j.order[i] as usize);
             mine += 1;
@@ -191,6 +227,12 @@ unsafe fn work(job: *const Job, order: &[usize], node: usize, who: usize) {
         let _ = who;
         j.node_end[node].fetch_max(end, Ordering::Relaxed);
         j.node_done[node].0.fetch_add(mine, Ordering::Relaxed);
+        #[cfg(feature = "track-experts")]
+        if taken {
+            j.busy_ns.fetch_add(busy0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            j.takers.fetch_add(1, Ordering::Relaxed);
+            j.last.fetch_max(end, Ordering::Relaxed);
+        }
         j.done.0.fetch_add(mine, Ordering::AcqRel);
         j.local.0.fetch_add(local, Ordering::Relaxed);
     }
@@ -283,7 +325,7 @@ impl Threads {
             }
             return;
         }
-        prow::zone!("track-zones", "pool.run");
+        cpu_zone!("pool.run");
         let entered = std::time::Instant::now();
         let job = self.post(n, at, node, ccd, slot, f, None);
         unsafe { work(job, &self.order, self.node, 0) };
@@ -381,10 +423,25 @@ impl Threads {
         if !current.is_null() && unsafe { (*current)._owned.is_some() } {
             // a prefetch it overtook: what it managed so far
             *self.prefetched.lock().unwrap() = unsafe { ((*current).done.0.load(Ordering::Relaxed), (*current).n) };
+            // `track-experts`: the prefetch as a row when the next job overtakes it — its window (post to now), its items
+            // done of its items, the workers' time inside them summed and how many took part (its cores' utilization)
+            #[cfg(feature = "track-experts")]
+            {
+                let c = unsafe { &*current };
+                let window = c.t0.elapsed().as_nanos() as u64;
+                let first = c.first.load(Ordering::Relaxed);
+                // its span on the pool's lane, `cpu` (the host's devices are lanes: `main` drives, `cpu` is the pool,
+                // `card0`, `card1` the cards): its first item's start to its last item's end
+                if first != u64::MAX {
+                    let at = |ns: u64| prow::Timestamp::from_unix_nanos(c.ts0.unix_nanos() + ns as i64);
+                    prow::zone_at!("track-experts", "prefetch", "cpu", at(first), at(c.last.load(Ordering::Relaxed).max(first)));
+                }
+                prow::row!("track-experts", "prefetch_job", { "items" => c.n, "done" => c.done.0.load(Ordering::Relaxed), "window_us" => window as f64 / 1e3, "first_us" => if first == u64::MAX { -1.0 } else { first as f64 / 1e3 }, "busy_us" => c.busy_ns.load(Ordering::Relaxed) as f64 / 1e3, "cores" => c.takers.load(Ordering::Relaxed) });
+            }
         }
         let fp: *const (dyn Fn(usize) + Sync) = unsafe { std::mem::transmute(f) };
         let light = owned.is_some();
-        let job = Box::into_raw(Box::new(Job { f: fp, order, next: std::array::from_fn(|s| Counter(AtomicUsize::new(start[s]))), start, done: Counter(AtomicUsize::new(0)), local: Counter(AtomicUsize::new(0)), stop: std::sync::atomic::AtomicBool::new(false), n, node_done: std::array::from_fn(|_| Counter(AtomicUsize::new(0))), node_end: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)), #[cfg(feature = "track-experts")] core_end: (0..self.workers).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(), first: std::sync::atomic::AtomicU64::new(u64::MAX), t0: std::time::Instant::now(), _owned: owned, light }));
+        let job = Box::into_raw(Box::new(Job { f: fp, order, next: std::array::from_fn(|s| Counter(AtomicUsize::new(start[s]))), start, done: Counter(AtomicUsize::new(0)), local: Counter(AtomicUsize::new(0)), stop: std::sync::atomic::AtomicBool::new(false), n, node_done: std::array::from_fn(|_| Counter(AtomicUsize::new(0))), node_end: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)), #[cfg(feature = "track-experts")] core_end: (0..self.workers).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(), #[cfg(feature = "track-experts")] busy_ns: std::sync::atomic::AtomicU64::new(0), #[cfg(feature = "track-experts")] takers: AtomicUsize::new(0), #[cfg(feature = "track-experts")] ts0: prow::Timestamp::now(), #[cfg(feature = "track-experts")] last: std::sync::atomic::AtomicU64::new(0), first: std::sync::atomic::AtomicU64::new(u64::MAX), t0: std::time::Instant::now(), _owned: owned, light }));
         let old = sh.job.swap(job, Ordering::AcqRel);
         if !old.is_null() {
             self.retired.lock().unwrap().push(old as usize);
@@ -801,7 +858,7 @@ impl CpuExperts<'_> {
         #[cfg(feature = "track-experts")]
         let acc = &self.item_acc;
         {
-            prow::zone!("track-zones", "experts.gu");
+            cpu_zone!("experts.gu");
             self.pool.run_slotted(ne * GU_PARTS, &gate_slot, &move |i| {
             #[cfg(feature = "track-experts")]
             let t_item = std::time::Instant::now();
@@ -846,7 +903,7 @@ impl CpuExperts<'_> {
                 quantize_h(i);
             }
         } else {
-            prow::zone!("track-zones", "experts.quant");
+            cpu_zone!("experts.quant");
             self.pool.run(n * TOP_K, &quantize_h);
         }
         // the down rows: part (j, c) owns rows c·DOWN_ROWS.. of expert experts[j]'s output, for all of its tokens, likewise
@@ -854,7 +911,7 @@ impl CpuExperts<'_> {
         let out_p = out.as_mut_ptr() as usize;
         let down_slot = move |i: usize| slot_of(experts_r[i / DOWN_PARTS], GU_ITEMS + i % DOWN_PARTS / SUB);
         {
-            prow::zone!("track-zones", "experts.down");
+            cpu_zone!("experts.down");
             self.pool.run_slotted(ne * DOWN_PARTS, &down_slot, &move |i| {
             #[cfg(feature = "track-experts")]
             let t_item = std::time::Instant::now();

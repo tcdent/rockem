@@ -71,5 +71,24 @@ fence was still outstanding when B's MLA projections posted theirs, the signal w
 ## Next
 1. ~~`STEP` 2048~~ — measured: prefill 2.84 → 2.65 against two resident slots a layer and ~+1 ms a verify step;
    its own entry, 075, on the shelf.
-2. The MLA layers: the host waits on a chunk's projections before the other chunk's experts can start (11 of 42
-   layers keep a bubble).
+2. ~~The MLA layers' bubble by reordering~~ — measured and reverted (2026-10-20, below); the remaining route is the
+   MLA rows finished on the card (no host round trip between a chunk's projections and its attend).
+
+## The MLA bubble by reordering (2026-10-20, runs fba2fed9, 40fc015f against ed18fd97)
+A decode verify step's trace (lab run 6615b39f) shows the host's own work on an MLA layer's rows is ~20 µs (the
+card's projections end at 3087 µs, the host's next lap at 3109): `mla_proj`'s 5.2 ms a verify step is the host
+waiting on the card. In prefill the cost is the pool's idle while the host waits on a chunk's projections (the
+lap, 0.34 ms a prompt token). Tried: each chunk's card half split at that wait (posting; the rows, selection, attend
+and the FFN's launches), the other chunk's experts run between, the output half posted after the other chunk's rest.
+
+| 18k prefill, ms a prompt token | the plain wavefront | split at every layer | split at MLA layers only |
+|---|---|---|---|
+| total | 2.77 | 3.35–3.61 | 2.91–3.00 |
+| the FFN input's wait (`kda_card`) | 0.35 | 1.32–1.37 | 1.02–1.06 |
+| `mla_proj` | 0.34 | 0.18 | 0.18 |
+| cold 18k prompt | 53.2 s | 64.0 s | 56.7 s |
+
+Long SCORE bit-identical throughout; decode unchanged. Splitting every layer held a KDA layer's FFN launches behind
+the other chunk's experts (the card finished the attention and idled). At MLA layers only, the card idles after a
+chunk's projections through the other chunk's experts, which cost more than the pool's idle it removed: the wait
+moved from the pool to the card. Reverted.
