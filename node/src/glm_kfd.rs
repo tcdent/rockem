@@ -1668,12 +1668,14 @@ impl Placed for Cards {
         c.k.sync();
         read(&self.shared.xh, 0, &mut hidden[..n * H]);
     }
-    fn mtp_ffn(&mut self, routed: &[f32], hidden: &mut [f32], n: usize) {
+    fn mtp_routed(&self) -> *mut f32 {
+        self.shared.yexp[0].ptr() as *mut f32
+    }
+    fn mtp_ffn(&mut self, hidden: &mut [f32], n: usize) {
         let t = self.mtp.as_ref().unwrap();
         let c = &self.cards[t.card];
         // the shared expert over the post-normed states, the host's routed experts, the residual
         let yexp = &self.shared.yexp[0];
-        unsafe { std::ptr::copy_nonoverlapping(routed.as_ptr(), yexp.ptr() as *mut f32, n * H) };
         if n > SPEC_TOKENS {
             self.rows_w(c, &c.ffn_gu_w, c.x.va, Some(t.post_ln.va), t.gu_w.va, Some(t.gu_s.va), c.gu.va, SHARED_GU_ROWS, n, false);
             self.rows_w(c, &c.ffn_down_shared_w, c.gu.va, None, t.down_w.va, Some(t.down_s.va), c.fyv.va, H, n, false);
@@ -1711,16 +1713,11 @@ impl Placed for Cards {
         // the draft's launches on the card lanes (the step's report closed before the draft ran)
         self.timeline_report();
     }
-    fn mla_wait(&mut self, l: usize, i: usize, kva: &mut [f32], ik: &mut [f32], igate: &mut [f32]) {
+    fn mla_proj(&mut self, l: usize) -> glm_5_3_flash::construct::MlaProj {
         let c = &self.cards[self.mlas[l].as_ref().unwrap().card];
-        if i == 0 {
-            c.k.wait();
-        }
-        let i = self.t0 + i;
-        read(&c.mproj, (MKVA + i * KV_LORA_RANK) * 4, &mut kva[..KV_LORA_RANK]);
-        let ix = MIX + i * IX_ROWS;
-        read(&c.mproj, ix * 4, &mut ik[..INDEX_HEAD_DIM]);
-        read(&c.mproj, (ix + INDEX_HEAD_DIM) * 4, &mut igate[..INDEX_HEAD_DIM]);
+        c.k.wait();
+        let base = c.mproj.ptr() as *const f32;
+        unsafe { glm_5_3_flash::construct::MlaProj { kva: base.add(MKVA + self.t0 * KV_LORA_RANK), ix: base.add(MIX + self.t0 * IX_ROWS), ix_rows: IX_ROWS } }
     }
     fn ix_pools(&mut self, l: usize, pools: &[u16], from: usize, to: usize) {
         let m = self.mlas[l].as_ref().unwrap();

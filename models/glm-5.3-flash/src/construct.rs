@@ -1000,9 +1000,9 @@ pub trait Placed {
     /// A KDA layer's state back to what it was after token `slot` of the last verify-sized step.
     fn kda_rewind(&mut self, l: usize, slot: usize);
     fn mla_post(&mut self, l: usize, n: usize);
-    /// Token `i`'s projections of the step (the launch waited for at `i == 0`): the latent before its
-    /// norm, the indexer's key before its norm, the position's gate.
-    fn mla_wait(&mut self, l: usize, i: usize, kva: &mut [f32], ik: &mut [f32], igate: &mut [f32]);
+    /// The step's projections once the launch is done: every token's latent before its norm, its indexer key
+    /// before its norm and its gate, in the host memory the card wrote them to.
+    fn mla_proj(&mut self, l: usize) -> MlaProj;
     /// The pool keys `from..to` into the card's mirror (every pool completed, by a step or a seed, goes
     /// there before any token scores among them).
     fn ix_pools(&mut self, l: usize, pools: &[u16], from: usize, to: usize);
@@ -1046,7 +1046,10 @@ pub trait Placed {
     /// its output projection and residual, the blocks' states out (`[n][H]`) for the host's routing;
     fn mtp_attn_out(&mut self, hidden: &mut [f32], n: usize);
     /// the shared expert, the host's routed experts' sums `routed` (`[n][H]`) and the residual, the states out;
-    fn mtp_ffn(&mut self, routed: &[f32], hidden: &mut [f32], n: usize);
+    fn mtp_ffn(&mut self, hidden: &mut [f32], n: usize);
+    /// The draft layer's routed sum, `[STEP][H]` f32 in host memory the draft's card reads: the host writes each
+    /// position's weighted sum there and `mtp_ffn` folds it in.
+    fn mtp_routed(&self) -> *mut f32;
     /// the shared head over token `i`'s state: its draft's logits.
     fn mtp_head(&mut self, i: usize, logits: &mut [f32]);
     /// The last step's tokens' hidden states (the streams' means before the final norm), `[n][H]`.
@@ -1490,19 +1493,21 @@ impl<'p, R: Routed> CpuModel<'p, R> {
         }
         pl.mtp_begin(&s.d_cats[..n * 2 * H], n);
         let z = draft_zone("draft.in", z);
-        for i in 0..n {
-            let (latent, ikey, igate) = mla::row(cache, pos + i);
-            pl.mla_wait(l, i, &mut s.m_kva, &mut s.m_ik, igate);
-            mla::finish_row(&m.attn, &s.m_kva, &s.m_ik, latent, ikey);
-            mla::pool_done(&m.attn, cache, pools, pos + i);
-        }
+        // inside `draft.attn`: the wait for the projections, the cache rows, the selection, the attend and output
+        let proj = pl.mla_proj(l);
+        let y = draft_zone("draft.attn.proj", z);
+        mla_rows(&m.attn, cache, pools, pos, n, proj);
+        let y = draft_zone("draft.attn.rows", y);
         pl.ix_pools(l, pools, pos / INDEX_KPOOL, (pos + n) / INDEX_KPOOL);
         pl.ix_select(l, pos, n, None);
+        let y = draft_zone("draft.attn.select", y);
         for i in 0..n {
             s.b_lat[i * KV_LORA_RANK..(i + 1) * KV_LORA_RANK].copy_from_slice(mla::latent(cache, pos + i));
         }
         pl.mla_attend(l, n, pos, &s.b_lat[..n * KV_LORA_RANK]);
+        let y = draft_zone("draft.attn.attend", y);
         pl.mtp_attn_out(&mut s.b_x[..n * H], n);
+        draft_zone("draft.attn.out", y);
         tr.edge(l, "mtp.attn", &s.b_x[(n - 1) * H..n * H]);
         let z = draft_zone("draft.attn", z);
         // the routing and the routed experts here, every token's
@@ -1540,18 +1545,26 @@ impl<'p, R: Routed> CpuModel<'p, R> {
         let z = draft_zone("draft.route", z);
         s.routed.run_batch(l, &picks[..n], &s.b_xn[..n * H], &mut s.b_out[..n * TOP_K * H]);
         let z = draft_zone("draft.experts", z);
-        for i in 0..n {
-            let y = &mut s.b_y[i * H..(i + 1) * H];
-            y.fill(0.0);
-            for k in 0..TOP_K {
-                let eo = &s.b_out[(i * TOP_K + k) * H..(i * TOP_K + k + 1) * H];
-                for d in 0..H {
-                    y[d] += wts[i][k] * eo[d];
+        // each position's weighted sum a pool item, straight into the card's staging (a prefill step's 1024 went
+        // serially on this thread and were then copied, ~24 ms with the shared expert, 2026-10-20); the same adds
+        let routed = pl.mtp_routed();
+        {
+            let (op, yp, wp) = (s.b_out.as_ptr() as usize, routed as usize, wts.as_ptr() as usize);
+            s.pool.run(n, &move |i| {
+                let wt = unsafe { *(wp as *const [f32; TOP_K]).add(i) };
+                let mut y = [0f32; H];
+                for k in 0..TOP_K {
+                    let eo = unsafe { std::slice::from_raw_parts((op as *const f32).add((i * TOP_K + k) * H), H) };
+                    for d in 0..H {
+                        y[d] += wt[k] * eo[d];
+                    }
                 }
-            }
+                unsafe { std::slice::from_raw_parts_mut((yp as *mut f32).add(i * H), H) }.copy_from_slice(&y);
+            });
         }
-        tr.edge(l, "routed", &s.b_y[(n - 1) * H..n * H]);
-        pl.mtp_ffn(&s.b_y[..n * H], &mut s.b_x[..n * H], n);
+        tr.edge(l, "routed", unsafe { std::slice::from_raw_parts(routed.add((n - 1) * H), H) });
+        let pl = s.placed.as_mut().expect("draft_batch: the cards'");
+        pl.mtp_ffn(&mut s.b_x[..n * H], n);
         tr.edge(l, "mtp.ffn", &s.b_x[(n - 1) * H..n * H]);
         s.d_hid.copy_from_slice(&s.b_x[(n - 1) * H..n * H]);
         let z = draft_zone("draft.ffn", z);
@@ -1818,12 +1831,8 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 if let (Attn::Mla(a), LayerState::Mla { cache, pools }) = (&lw.attn, &mut s.layers[l]) {
                     // every token's projections off the card into its cache row, its indexer query and head
                     // weights kept; the pools completed along the way gain their keys
-                    for i in 0..n {
-                        let (latent, ikey, igate) = mla::row(cache, pos + i);
-                        pl.mla_wait(l, i, &mut s.m_kva, &mut s.m_ik, igate);
-                        mla::finish_row(a, &s.m_kva, &s.m_ik, latent, ikey);
-                        mla::pool_done(a, cache, pools, pos + i);
-                    }
+                    let proj = pl.mla_proj(l);
+                    mla_rows(a, cache, pools, pos, n, proj);
                     lap(&mut p.mla_proj, "mla_proj");
                     // every token's selection on the card (this step's completed pools mirrored first): the
                     // scores, the picks, straight into the attend's lists — the one-token path had scored and
@@ -2050,4 +2059,34 @@ fn draft_zone(_name: &'static str, since: prow::Timestamp) -> prow::Timestamp {
     let now = prow::Timestamp::now();
     prow::zone_at!("track-zones", _name, prow::lane(), since, now);
     now
+}
+
+/// The step's MLA projections in host memory as the card wrote them (`Placed::mla_proj`): token `i`'s latent before
+/// its norm at `kva + i · KV_LORA_RANK`, its indexer key and gate at `ix + i · ix_rows` (the key, then the gate).
+#[derive(Clone, Copy)]
+pub struct MlaProj {
+    pub kva: *const f32,
+    pub ix: *const f32,
+    pub ix_rows: usize,
+}
+unsafe impl Send for MlaProj {}
+unsafe impl Sync for MlaProj {}
+
+/// Every token's cache row from the card's projections, then the pool it completes gains its key. On this thread:
+/// a token a pool item measured no faster in prefill and cost decode a round trip a layer (2026-10-20).
+fn mla_rows(a: &weights::Mla, cache: &mut [u16], pools: &mut [u16], pos: usize, n: usize, p: MlaProj) {
+    let (kp, xp, rows) = (p.kva as usize, p.ix as usize, p.ix_rows);
+    for i in 0..n {
+        let (latent, ikey, igate) = mla::row(cache, pos + i);
+        let (mut kva, mut ik) = ([0f32; KV_LORA_RANK], [0f32; INDEX_HEAD_DIM]);
+        let src = |at: *const f32, k: usize| unsafe { std::slice::from_raw_parts(at as *const u8, 4 * k) };
+        let dst = |v: &mut [f32]| unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, 4 * v.len()) };
+        unsafe {
+            common::copy::stream_read(dst(&mut kva), src((kp as *const f32).add(i * KV_LORA_RANK), KV_LORA_RANK));
+            common::copy::stream_read(dst(&mut ik), src((xp as *const f32).add(i * rows), INDEX_HEAD_DIM));
+            common::copy::stream_read(dst(&mut igate[..INDEX_HEAD_DIM]), src((xp as *const f32).add(i * rows + INDEX_HEAD_DIM), INDEX_HEAD_DIM));
+        }
+        mla::finish_row(a, &kva, &ik, latent, ikey);
+        mla::pool_done(a, cache, pools, pos + i);
+    }
 }

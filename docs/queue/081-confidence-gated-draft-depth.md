@@ -135,6 +135,18 @@ training cost.
   draft only). The draft lap a prefill step 208 → 173 (pooling) → 134 ms; prefill 2.09–2.19 → 2.02–2.04 ms a prompt
   token, the cold 18k prompt 41.65 → 40.35 s, warm 39.0 s. Left in it: the host's experts 49 ms, the attention 46
   (`mla_attend_w` ~9.6 ms a card), the FFN 24 (the host's weighted sum over every position's eight picks, serial).
+- 2026-10-20: the draft's FFN and attention in prefill. The weighted sum of every position's eight picks a pool item,
+  written straight into the card's staging (was serial, then a 16 MB copy): `draft.ffn` 24 → 12 ms a prefill step.
+  The MLA cache rows a pool item (main layers and the draft) measured: `draft.attn` 46 → 45, the main layers'
+  `mla_proj` no faster, a verify step +0.15 ms (`mla_proj` 5.44 → 5.59) — reverted to the main thread, keeping the
+  one wait for the projections (`Placed::mla_proj`, read with streaming loads). `draft.attn` split into zones
+  (`.proj`, `.rows`, `.select`, `.attend`, `.out`), a 1024-token prefill step's draft: `.out` 33.8 ms median, `.proj`
+  9.2, `.rows` 2.7, the selection and the attend's posting ~0.2. The card gap between `mla_qabs_w` and
+  `mla_attend_w` is the projections' tail and the rows (the host builds each position's cache row and the index
+  pools before the selection can run). `.out` is the cards' chain: `mla_attend_w` ~12 ms a card in parallel,
+  `mla_uv_w` 0.5, card0's half to card1 (`copy_f32` 2.0, card1 `word_wait` 1.75), `mla_two_merge` 0.2, `mla_o_w`
+  5.0, the copy to the host 1.5, then the host's read of the 8 MB hidden state ~3.6. Prefill 2.02–2.05 ms a prompt
+  token, the cold 18k prompt 40.5 s (39.8–40.5 across these runs).
 
 ## Next
 The draft's own cost: its head (~1.1 ms a draft, bandwidth over the vocabulary's rows) and its attention (~0.8 at
