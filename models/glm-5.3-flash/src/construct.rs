@@ -931,6 +931,9 @@ impl ItemAcc {
 pub trait Placed {
     /// The step's `n` tokens' embeddings (`[n][H]`) into every card's streams; the handoffs restart.
     fn begin(&mut self, rows: &[f32], n: usize);
+    /// The calls that follow address chunk `c` of the step (037): its tokens from `t0`, its own handoff words.
+    /// Their `n` is the chunk's width and their token indices are the chunk's own; `begin` starts at chunk 0.
+    fn chunk(&mut self, c: usize, t0: usize);
     /// A KDA layer's block over the step; a step of a verify's size (`2..=SPEC_TOKENS` tokens) keeps
     /// the state after each token for `kda_rewind`.
     fn attention(&mut self, l: usize, n: usize);
@@ -1658,61 +1661,89 @@ impl<'p, R: Routed> CpuModel<'p, R> {
         let p = &mut s.profile;
         p.tokens += n;
         let mut pre_next = [[E; TOP_K]; SPEC_TOKENS];
+        let mut pre_picks = [[E; TOP_K]; SPEC_TOKENS];
+        // the step as chunks in flight (037): a layer's card half of one chunk (its attention and the FFN's card
+        // launches, posted) while the host runs the other chunk's experts of the layer before — chunk 0's card
+        // half of layer l, chunk 1's host half of l - 1, chunk 1's card half of l, chunk 0's host half of l. Each
+        // card's queue is in order, so a chunk's attention follows the other's on the KDA state and the latents;
+        // a host half's experts overlap the cards' half of the other chunk. One chunk is the plain order.
+        let chunks = crate::chunk_count(n);
+        let mut order: Vec<(bool, usize, usize)> = Vec::with_capacity(2 * chunks * NUM_HIDDEN_LAYERS);
         for l in 0..NUM_HIDDEN_LAYERS {
+            order.push((true, 0, l));
+            if chunks > 1 && l > 0 {
+                order.push((false, 1, l - 1));
+            }
+            if chunks > 1 {
+                order.push((true, 1, l));
+            }
+            order.push((false, 0, l));
+        }
+        if chunks > 1 {
+            order.push((false, 1, NUM_HIDDEN_LAYERS - 1));
+        }
+        for (card_half, ch, l) in order {
+            let (t0, n) = crate::chunk_of(toks.len(), ch);
+            let pos = pos + t0;
+            pl.chunk(ch, t0);
             let lw = &w.layers[l];
             let moe = match &lw.ffn {
                 Ffn::Moe(m) => Some(m),
                 Ffn::Dense(_) => None,
             };
-            let is_mla = matches!(lw.attn, Attn::Mla(_));
-            if is_mla {
-                pl.mla_post(l, n);
-            } else {
-                pl.attention(l, n);
+            if card_half {
+                let is_mla = matches!(lw.attn, Attn::Mla(_));
+                if is_mla {
+                    pl.mla_post(l, n);
+                } else {
+                    pl.attention(l, n);
+                }
+                lap(&mut p.hc, "hc");
+                // the prefetch's predictor for this layer: the layer before named its picks over its own FFN
+                // input (the next layer's router rows ride in that router launch); `pre_picks` scores it
+                pre_picks = std::mem::replace(&mut pre_next, [[E; TOP_K]; SPEC_TOKENS]);
+                if let (Attn::Mla(a), LayerState::Mla { cache, pools }) = (&lw.attn, &mut s.layers[l]) {
+                    // every token's projections off the card into its cache row, its indexer query and head
+                    // weights kept; the pools completed along the way gain their keys
+                    for i in 0..n {
+                        let (latent, ikey, igate) = mla::row(cache, pos + i);
+                        pl.mla_wait(l, i, &mut s.m_kva, &mut s.m_ik, igate);
+                        mla::finish_row(a, &s.m_kva, &s.m_ik, latent, ikey);
+                        mla::pool_done(a, cache, pools, pos + i);
+                    }
+                    lap(&mut p.mla_proj, "mla_proj");
+                    // every token's selection on the card (this step's completed pools mirrored first): the
+                    // scores, the picks, straight into the attend's lists — the one-token path had scored and
+                    // picked on one thread, 150 ms a token at 17k positions (2026-10-17); then the host's round
+                    // trip for the picks, 1.8 ms a token at 18k
+                    pl.ix_pools(l, pools, pos / INDEX_KPOOL, (pos + n) / INDEX_KPOOL);
+                    let mut count = 0usize;
+                    pl.ix_select(l, pos, n, (n == 1 && tr.wants_edges()).then_some(&mut count));
+                    if n == 1 && tr.wants_edges() {
+                        tr.edge(l, "self_attn.indexer.count", &[count as f32]);
+                    }
+                    lap(&mut p.mla_attn, "mla_attn");
+                    // the step's latents gathered off the cache rows; every token's attention in one launch
+                    for i in 0..n {
+                        s.b_lat[i * KV_LORA_RANK..(i + 1) * KV_LORA_RANK].copy_from_slice(mla::latent(cache, pos + i));
+                    }
+                    pl.mla_attend(l, n, pos, &s.b_lat[..n * KV_LORA_RANK]);
+                    pl.mla_out(l, n);
+                    lap(&mut p.mla_out, "mla_out");
+                }
+                pl.ffn(l, n);
+                continue;
             }
-            lap(&mut p.hc, "hc");
-            // the prefetch's predictor for this layer: the layer before named its picks over its own FFN
-            // input (the next layer's router rows ride in that router launch); `pre_picks` scores it
-            let pre_picks = std::mem::replace(&mut pre_next, [[E; TOP_K]; SPEC_TOKENS]);
-            if let (Attn::Mla(a), LayerState::Mla { cache, pools }) = (&lw.attn, &mut s.layers[l]) {
-                // every token's projections off the card into its cache row, its indexer query and head
-                // weights kept; the pools completed along the way gain their keys
-                for i in 0..n {
-                    let (latent, ikey, igate) = mla::row(cache, pos + i);
-                    pl.mla_wait(l, i, &mut s.m_kva, &mut s.m_ik, igate);
-                    mla::finish_row(a, &s.m_kva, &s.m_ik, latent, ikey);
-                    mla::pool_done(a, cache, pools, pos + i);
-                }
-                lap(&mut p.mla_proj, "mla_proj");
-                // every token's selection on the card (this step's completed pools mirrored first): the
-                // scores, the picks, straight into the attend's lists — the one-token path had scored and
-                // picked on one thread, 150 ms a token at 17k positions (2026-10-17); then the host's round
-                // trip for the picks, 1.8 ms a token at 18k
-                pl.ix_pools(l, pools, pos / INDEX_KPOOL, (pos + n) / INDEX_KPOOL);
-                let mut count = 0usize;
-                pl.ix_select(l, pos, n, (n == 1 && tr.wants_edges()).then_some(&mut count));
-                if n == 1 && tr.wants_edges() {
-                    tr.edge(l, "self_attn.indexer.count", &[count as f32]);
-                }
-                lap(&mut p.mla_attn, "mla_attn");
-                // the step's latents gathered off the cache rows; every token's attention in one launch
-                for i in 0..n {
-                    s.b_lat[i * KV_LORA_RANK..(i + 1) * KV_LORA_RANK].copy_from_slice(mla::latent(cache, pos + i));
-                }
-                pl.mla_attend(l, n, pos, &s.b_lat[..n * KV_LORA_RANK]);
-                pl.mla_out(l, n);
-                lap(&mut p.mla_out, "mla_out");
-            }
-            pl.ffn(l, n);
             if let Some(m) = moe {
                 // the FFN input as the card made it (001/064): the activations quantized once for both tiers, the
                 // router's picks and weights — the host's norm, quantize and routing moved to the FFN card's `hc_pre`
                 const HG: usize = H / common::q4::GROUP;
                 // (and the router's logits: the next layer's rows in them are the L3 prefetch's predictor — without them the
                 // prefetch pulled the wrong experts and a verify step's items ran at DRAM speed, 12 → 7 GMAC/s a core, 2026-10-19)
-                pl.ffn_input(l, n, &mut s.b_xq[..n * H], &mut s.b_xs[..n * HG], &mut s.b_xg[..n * HG], &mut s.b_picks[..n], &mut s.b_wts[..n], &mut s.b_score);
+                pl.ffn_input(l, n, &mut s.b_xq[t0 * H..(t0 + n) * H], &mut s.b_xs[t0 * HG..(t0 + n) * HG], &mut s.b_xg[t0 * HG..(t0 + n) * HG], &mut s.b_picks[t0..t0 + n], &mut s.b_wts[t0..t0 + n], &mut s.b_score[t0 * ROUTE_ROWS..]);
                 lap(&mut p.kda_card, "kda_card");
-                let (picks, wts) = (&mut s.b_picks, &mut s.b_wts);
+                let (picks, wts) = (&mut s.b_picks[t0..t0 + n], &mut s.b_wts[t0..t0 + n]);
+                let (xq, xs, xg) = (&s.b_xq[t0 * H..(t0 + n) * H], &s.b_xs[t0 * HG..(t0 + n) * HG], &s.b_xg[t0 * HG..(t0 + n) * HG]);
                 // bring-up: forced picks and the traces take the card's logits and input through the host's own routing and norm
                 if forced.is_some() || tr.wants_edges() || pl.checks() {
                     pl.ffn_logits(l, n, &mut s.b_x, &mut s.b_score);
@@ -1727,12 +1758,12 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                             // the card's act phase (`hc_pre`) against the host's own arithmetic: picks, weights, the quantized activation
                             let (mut q, mut sc, mut g) = (vec![0i8; H], vec![0f32; HG], vec![0i32; HG]);
                             common::q4::QAct { q: &mut q, scale: &mut sc, gsum: &mut g }.quantize(&s.b_xn[i * H..(i + 1) * H]);
-                            let dq = (0..H).filter(|&d| q[d] != s.b_xq[i * H + d]).count();
-                            let ds = (0..HG).filter(|&d| sc[d].to_bits() != s.b_xs[i * HG + d].to_bits() || g[d] != s.b_xg[i * HG + d]).count();
+                            let dq = (0..H).filter(|&d| q[d] != xq[i * H + d]).count();
+                            let ds = (0..HG).filter(|&d| sc[d].to_bits() != xs[i * HG + d].to_bits() || g[d] != xg[i * HG + d]).count();
                             let dw = (0..TOP_K).filter(|&k| wts[i][k].to_bits() != wt[k].to_bits()).count();
                             if picks[i] != idx || dq + ds + dw > 0 {
-                                let d0 = (0..H).find(|&d| q[d] != s.b_xq[i * H + d]);
-                                eprintln!("act check: layer {l} token {i}: picks card {:?} host {idx:?}; weights differ {dw} (card {:?} host {wt:?}); q differ {dq} of {H} (first {:?}: card {:?} host {:?}), scales/sums {ds} of {HG} (card s0 {:e} g0 {} host {:e} {})", picks[i], wts[i], d0, d0.map(|d| s.b_xq[i * H + d]), d0.map(|d| q[d]), s.b_xs[i * HG], s.b_xg[i * HG], sc[0], g[0]);
+                                let d0 = (0..H).find(|&d| q[d] != xq[i * H + d]);
+                                eprintln!("act check: layer {l} token {i}: picks card {:?} host {idx:?}; weights differ {dw} (card {:?} host {wt:?}); q differ {dq} of {H} (first {:?}: card {:?} host {:?}), scales/sums {ds} of {HG} (card s0 {:e} g0 {} host {:e} {})", picks[i], wts[i], d0, d0.map(|d| xq[i * H + d]), d0.map(|d| q[d]), xs[i * HG], xg[i * HG], sc[0], g[0]);
                             }
                         }
                     }
@@ -1743,17 +1774,17 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 }
                 // the picks resident on the cards run there, concurrently with the host's (the dispatch marks them
                 // `E` in `picks`); the picks as routed are kept for the accounting
-                s.b_routed[..n].copy_from_slice(&picks[..n]);
-                let jobs = pl.xpt_dispatch(l, n, &mut picks[..n], &s.b_xq[..n * H], &s.b_xs[..n * HG], &s.b_xg[..n * HG]);
+                s.b_routed[t0..t0 + n].copy_from_slice(&picks[..n]);
+                let jobs = pl.xpt_dispatch(l, n, &mut picks[..n], xq, xs, xg);
                 pl.ffn_post(l, n);
                 p.resident += jobs;
                 p.picks += n * TOP_K;
                 // the outputs: the cards' host-memory rows when there are cards (their jobs land there), else the model's own
-                let out: &mut [f32] = if xout.is_null() { &mut s.b_out[..n * TOP_K * H] } else { unsafe { std::slice::from_raw_parts_mut(xout, n * TOP_K * H) } };
+                let out: &mut [f32] = if xout.is_null() { &mut s.b_out[t0 * TOP_K * H..(t0 + n) * TOP_K * H] } else { unsafe { std::slice::from_raw_parts_mut(xout.add(t0 * TOP_K * H), n * TOP_K * H) } };
                 // the host's FFN phase as laps: the route (the picks, the residents' dispatch), the experts' run,
                 // the join of the cards' jobs, the sum and the handoff back — each a zone of its own
                 lap(&mut p.route, "route");
-                s.routed.run_batch_act(l, &picks[..n], &s.b_xq[..n * H], &s.b_xs[..n * HG], &s.b_xg[..n * HG], out);
+                s.routed.run_batch_act(l, &picks[..n], xq, xs, xg, out);
                 lap(&mut p.experts, "experts");
                 s.routed.elapsed(); // the pool's own timer, taken so it does not accumulate (the lap is the measure here)
                 if jobs > 0 || n > SPEC_TOKENS {
@@ -1765,7 +1796,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                         for i in 0..n {
                             for k in 0..TOP_K {
                                 if picks[i][k] == E {
-                                    let e = s.b_routed[i][k];
+                                    let e = s.b_routed[t0 + i][k];
                                     s.routed.run(l, &[e; TOP_K], &s.b_xn[i * H..(i + 1) * H], &mut host);
                                     let card = &out[(i * TOP_K + k) * H..(i * TOP_K + k + 1) * H];
                                     if let Some(d) = (0..H).find(|&d| card[d].to_bits() != host[d].to_bits()) {
@@ -1781,7 +1812,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 // tokens summed on this thread instead measured 25 against 22 µs a layer, 2026-10-19)
                 {
                     prow::zone!("track-zones", "sum.y");
-                    let (y_p, out, wts_r) = (s.b_y.as_mut_ptr() as usize, &*out, &*wts);
+                    let (y_p, out, wts_r) = (s.b_y[t0 * H..].as_mut_ptr() as usize, &*out, &*wts);
                     s.pool.run(n, &move |i| {
                         let y = unsafe { std::slice::from_raw_parts_mut((y_p as *mut f32).add(i * H), H) };
                         y.fill(0.0);
@@ -1802,12 +1833,12 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 }
                 {
                     prow::zone!("track-zones", "sum.handoff");
-                    pl.ffn_routed(l, n, &s.b_y[..n * H]);
+                    pl.ffn_routed(l, n, &s.b_y[t0 * H..(t0 + n) * H]);
                 }
                 {
                     prow::zone!("track-zones", "sum.account");
                     for i in 0..n {
-                        account(p, &mut s.last_picks, &mut s.freq, s.pool, l, s.b_routed[i], if n <= SPEC_TOKENS { pre_picks[i] } else { [E; TOP_K] });
+                        account(p, &mut s.last_picks, &mut s.freq, s.pool, l, s.b_routed[t0 + i], if n <= SPEC_TOKENS { pre_picks[i] } else { [E; TOP_K] });
                     }
                 }
                 lap(&mut p.route, "sum");
@@ -1835,6 +1866,8 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 tr.edge(l, "out", &s.mean);
             }
         }
+        // the head, the draft layer and anything after the layers address the step whole again
+        pl.chunk(0, 0);
         match logits {
             Logits::None => pl.finish(),
             Logits::Last => pl.logits(n - 1, 1, &mut s.logits[(n - 1) * VOCAB_SIZE..n * VOCAB_SIZE]),

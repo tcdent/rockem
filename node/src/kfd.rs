@@ -826,7 +826,13 @@ impl Kfd {
         let t0 = std::time::Instant::now();
         while value.load(Ordering::Acquire) != 0 {
             unsafe { wait_on(value) };
-            assert!(t0.elapsed().as_secs() < 10, "gpu hang: gpu {} packet {idx} never completed (read index {}, write index {}, {} launched, name {})", self.gpu_id, unsafe { (*(self.queue.ptr() as *const AmdQueue)).read_dispatch_id.load(Ordering::Relaxed) }, unsafe { (*(self.queue.ptr() as *const AmdQueue)).write_dispatch_id.load(Ordering::Relaxed) }, self.write_index.get(), self.names.borrow()[(idx as usize) % RING_PACKETS]);
+            if t0.elapsed().as_secs() >= 10 {
+                // the packets from the read index on: the one the queue stopped at first (a fence has no name)
+                let read = unsafe { (*(self.queue.ptr() as *const AmdQueue)).read_dispatch_id.load(Ordering::Relaxed) };
+                let names = self.names.borrow();
+                let at: Vec<&str> = (read..=idx).map(|i| names[(i as usize) % RING_PACKETS]).collect();
+                panic!("gpu hang: gpu {} packet {idx} never completed (read index {read}, write index {}, {} launched; from the read index: {at:?})", self.gpu_id, unsafe { (*(self.queue.ptr() as *const AmdQueue)).write_dispatch_id.load(Ordering::Relaxed) }, self.write_index.get());
+            }
         }
         self.host_wrote.set(true); // the host reads and writes freely until the next launch
         if off == 0 {

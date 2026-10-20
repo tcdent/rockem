@@ -44,7 +44,7 @@ use glm_5_3_flash::ffn::gfx11_consts::ROWS_GU;
 use glm_5_3_flash::layout::{KDA_MEMORY, KDA_WINDOW};
 use glm_5_3_flash::mla::gfx11_consts::{aw_chunk, aw_chunks, aw_grid, ixw_grid, select_slices, select_state_init, AW_DECODE_CHUNKS, AW_HEAD_TILES, AW_LDS, AW_MERGE_LDS, AW_PART, AW_WG, IXW_LDS, IX_ROWS, O_IN, ROWS_QB, SELECT_LDS, SELECT_STATE};
 use glm_5_3_flash::expert::gfx11_consts::{DOWN_WGS as XPT_DOWN_WGS, SLOT_BYTES, UP_WGS as XPT_UP_WGS, XG_DOWN_WGS, XG_GU_WGS, XG_MAX_JOBS, XPT_LDS, XQ_GROUPS, XQ_WGS};
-use glm_5_3_flash::DENSE_BELOW;
+use glm_5_3_flash::{CHUNKS, DENSE_BELOW};
 use glm_5_3_flash::TOP_K;
 use glm_5_3_flash::{INDEX_HEAD_DIM, INDEX_N_HEADS, KV_LORA_RANK, Q_LORA_RANK, V_HEAD_DIM};
 use glm_5_3_flash::weights::{Attn, Ffn, Fp8, Weights};
@@ -251,6 +251,8 @@ const XA_END: usize = XA_W + STEP * TOP_K * 4;
 const fn word(kind: usize, card: usize) -> usize {
     (kind * MAX_CARDS + card) * 64
 }
+/// A chunk's set of handoff words (037): two chunks of a step in flight carry their own values.
+const WORD_SET: usize = word(W_KINDS, 0);
 const MAX_CARDS: usize = 4;
 /// The attention block's output is in (a card's), the early router's logits are in (the FFN card's),
 /// the FFN half's input is in (the FFN card's), the FFN rows are in (the FFN card's), the host's experts are in.
@@ -358,9 +360,15 @@ pub struct Cards {
     resident: Resident,
     /// Built with the launches stamped (`track-launches`): the bring-up checks run too.
     instrument: bool,
-    /// The handoff sequence: a value a half of a layer's words carry, and each layer's (attention, FFN) values this token.
+    /// The handoff sequence: a value a half of a layer's words carry, and each layer's (attention, FFN) values this
+    /// step, a pair a chunk.
     seq: u32,
-    half_seq: Vec<[u32; 2]>,
+    half_seq: Vec<[[u32; 2]; CHUNKS]>,
+    /// The chunk the calls address (037): its index (its words) and its first token (its rows in every step buffer).
+    ch: usize,
+    t0: usize,
+    /// The step's chunks (`glm_5_3_flash::chunk_count`).
+    chunks: usize,
     /// With the launches stamped: each card's first packet of the step.
     token_from: Vec<u64>,
     /// Pools the context can hold: the scores' row stride.
@@ -499,7 +507,7 @@ impl Cards {
                 let k = &cards[i].k;
                 let others: Vec<&Kfd> = cards.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, c)| &*c.k).collect();
                 let buf = || k.vram_shared(STEP * H * 4, &others);
-                let words = k.vram_shared(word(W_KINDS, 0), &others);
+                let words = k.vram_shared(CHUNKS * WORD_SET, &others);
                 unsafe { std::ptr::write_bytes(words.ptr() as *mut u8, 0, words.size) };
                 Peer { ys: [buf(), buf()], fy: [buf(), buf()], my: [buf(), buf()], words }
             })
@@ -516,7 +524,7 @@ impl Cards {
                 xact: k0.host_shared(XA_END, &others),
                 scores_ffn: k0.host_shared(STEP * ROUTE_ROWS * 4, &others),
                 words: {
-                    let m = k0.host_shared(word(W_KINDS, 0), &others);
+                    let m = k0.host_shared(CHUNKS * WORD_SET, &others);
                     unsafe { std::ptr::write_bytes(m.ptr() as *mut u8, 0, m.size) };
                     m
                 },
@@ -630,7 +638,7 @@ impl Cards {
                     k.upload(&bias, 0, raw(m.bias));
                     let cd = &cards[card];
                     let xa = &shared.xact;
-                    let tab: [u64; ACT_SLOTS] = [ln32.va, bias.va, cd.xq.va, cd.xs.va, cd.xg.va, xa.at(XA_Q), xa.at(XA_S), xa.at(XA_G), xa.at(XA_P), xa.at(XA_W), shared.words.at(word(W_ACT, card))].map(|a| a as u64);
+                    let tab: [u64; ACT_SLOTS] = [ln32.va, bias.va, cd.xq.va, cd.xs.va, cd.xg.va, xa.at(XA_Q), xa.at(XA_S), xa.at(XA_G), xa.at(XA_P), xa.at(XA_W)].map(|a| a as u64);
                     let table = k.vram_visible(ACT_SLOTS * 8);
                     k.upload(&table, 0, raw(&tab));
                     Some((ln32, bias, table))
@@ -780,7 +788,7 @@ impl Cards {
             }
             Resident { table: std::sync::Arc::new((0..moe * glm_5_3_flash::E).map(|_| AtomicU32::new(NONE)).collect()), loader: None, inflight: Default::default(), allowed: Default::default(), issued: Default::default(), steps: 0, prefill: false, count: vec![0; moe * glm_5_3_flash::E], turn: 0, owner: counts.iter().map(|&k| vec![(NONE, NONE); k]).collect(), free: counts.iter().map(|&k| (0..k as u32).rev().collect()).collect(), held: (0..n).map(|_| vec![0; moe]).collect(), per_layer, slots, jobs: (0..n).map(|_| Vec::new()).collect(), uploads: 0 }
         };
-        Cards { cards, peers, shared, layers, ffns, mlas, head, head_card, mtp, resident, instrument, seq: 0, half_seq: vec![[0; 2]; NUM_HIDDEN_LAYERS], token_from: vec![0; n], npools: max_ctx.div_ceil(INDEX_KPOOL) }
+        Cards { cards, peers, shared, layers, ffns, mlas, head, head_card, mtp, resident, instrument, seq: 0, half_seq: vec![[[0; 2]; CHUNKS]; NUM_HIDDEN_LAYERS], ch: 0, t0: 0, chunks: 1, token_from: vec![0; n], npools: max_ctx.div_ceil(INDEX_KPOOL) }
     }
 
     /// With the launches stamped (`track-launches`): the step's launches on every card as zones on
@@ -821,7 +829,18 @@ impl Cards {
     }
     /// The host-side atomic of a handoff word.
     fn word_ptr(&self, kind: usize, card: usize) -> *const AtomicU32 {
-        self.shared.words.at(word(kind, card)) as *const AtomicU32
+        self.shared.words.at(self.wd(kind, card)) as *const AtomicU32
+    }
+    /// A handoff word's offset in the chunk's set.
+    fn wd(&self, kind: usize, card: usize) -> usize {
+        self.ch * WORD_SET + word(kind, card)
+    }
+    /// Device address of the chunk's rows in a step buffer of `width` f32 a token (`tokb` for bytes a token).
+    fn tok(&self, m: &Mem, width: usize) -> usize {
+        m.at(self.t0 * width * 4)
+    }
+    fn tokb(&self, m: &Mem, bytes: usize) -> usize {
+        m.at(self.t0 * bytes)
     }
     /// The hyper-connection's input half on card `c`, one launch: the coefficients over its streams,
     /// the mix, the collapse into the block input `x` — and into `x_host` for the routed experts when
@@ -832,11 +851,13 @@ impl Cards {
     /// the launch's tail once the scores are in (queue 001), the host's word at its end.
     #[allow(clippy::too_many_arguments)]
     fn hc_pre(&self, c: &Card, hc: &(Mem, Mem, Mem), x_host: Option<usize>, value: u32, router: Option<(usize, usize, usize, usize)>, act: Option<usize>, n: usize) {
+        // the chunk's rows (037); the act phase's table rows from its first token, and its word in the chunk's set
+        let act_word = if act.is_some() { self.shared.words.at(self.wd(W_ACT, c.k.index)) } else { 0 };
         let (ln, rw, sc, wd) = router.unwrap_or((0, 0, 0, 0));
         // the next layer's rows only for a step of a few tokens (the prefetch's predictor); a long step names most experts
         let rows = if router.is_none() { 0 } else if n <= SPEC_TOKENS { ROUTE_ROWS } else { glm_5_3_flash::E };
         let mut a = Args::new();
-        a.ptr(c.streams.va).ptr(hc.0.va).ptr(c.part.va).ptr(hc.1.va).ptr(hc.2.va).ptr(c.mix.va).ptr(c.x.va).ptr(x_host.unwrap_or(0)).ptr(c.count.va).u32(value).ptr(ln).ptr(rw).ptr(sc).ptr(c.scores_v.va).ptr(wd).ptr(act.unwrap_or(0)).u32(rows as u32).u32(n as u32);
+        a.ptr(self.tok(&c.streams, HC * H)).ptr(hc.0.va).ptr(self.tok(&c.part, PRE_STRIDE)).ptr(hc.1.va).ptr(hc.2.va).ptr(self.tok(&c.mix, HC_MIX)).ptr(self.tok(&c.x, H)).ptr(x_host.unwrap_or(0)).ptr(c.count.va).u32(value).ptr(ln).ptr(rw).ptr(sc).ptr(self.tok(&c.scores_v, ROUTE_ROWS)).ptr(wd).ptr(act.unwrap_or(0)).ptr(act_word).u32(self.t0 as u32).u32(rows as u32).u32(n as u32);
         c.k.launch(&c.hc_pre, PRE_GRID, g::WG, PRE_LDS, &a);
     }
     /// The hyper-connection's output half on card `c`, the handoff first: this card's `copy`
@@ -850,10 +871,10 @@ impl Cards {
     #[allow(clippy::too_many_arguments)]
     fn hc_post(&self, c: &Card, copy: Option<(usize, usize, usize)>, mine: Option<(usize, usize)>, w0: Option<(usize, usize)>, w1: Option<(usize, usize)>, value: u32, ya: usize, yb: Option<usize>, tokens: usize) {
         let me = c.k.index;
-        let own = |w: Option<(usize, usize)>| w.map_or(0, |(k, d)| self.peers[me].words.at(word(k, d)));
+        let own = |w: Option<(usize, usize)>| w.map_or(0, |(k, d)| self.peers[me].words.at(self.wd(k, d)));
         let peer = (0..self.cards.len()).find(|&j| j != me);
         let mine2 = match (mine, peer) {
-            (Some((k, d)), Some(j)) => self.peers[j].words.at(word(k, d)),
+            (Some((k, d)), Some(j)) => self.peers[j].words.at(self.wd(k, d)),
             _ => 0,
         };
         let (mut src, mut dst2, mut n) = copy.unwrap_or((0, 0, 0));
@@ -864,7 +885,7 @@ impl Cards {
             (src, dst2, n) = (0, 0, 0);
         }
         let mut a = Args::new();
-        a.ptr(c.mix.va).ptr(ya).ptr(yb.unwrap_or(0)).ptr(c.streams.va).ptr(src).ptr(0usize).ptr(dst2).u32(n as u32).ptr(own(mine)).ptr(mine2).ptr(own(w0)).ptr(own(w1)).u32(value).ptr(c.go.va).u32(tokens as u32);
+        a.ptr(self.tok(&c.mix, HC_MIX)).ptr(ya).ptr(yb.unwrap_or(0)).ptr(self.tok(&c.streams, HC * H)).ptr(src).ptr(0usize).ptr(dst2).u32(n as u32).ptr(own(mine)).ptr(mine2).ptr(own(w0)).ptr(own(w1)).u32(value).ptr(c.go.va).u32(tokens as u32);
         c.k.launch(&c.hc_post, CHANNEL_GRID, g::WG, 0, &a);
     }
     /// The FFN router's place: on the FFN card of a MoE layer, `hc_pre` runs layer `l`'s FFN router (and the
@@ -872,7 +893,7 @@ impl Cards {
     /// norm) and hands the logits to the host with the half's word.
     fn ffn_router(&self, l: usize, c: &Card) -> Option<(usize, usize, usize, usize)> {
         let f = self.ffns[l].as_ref().unwrap();
-        f.router.as_ref().filter(|_| c.k.index == f.card).map(|r| (f.ln.va, r.va, self.shared.scores_ffn.va, self.shared.words.at(word(W_X, f.card))))
+        f.router.as_ref().filter(|_| c.k.index == f.card).map(|r| (f.ln.va, r.va, self.tok(&self.shared.scores_ffn, ROUTE_ROWS), self.shared.words.at(self.wd(W_X, f.card))))
     }
     /// A KDA block's output into every card's streams: each card copies the shares it made out to
     /// the shared buffer and says so (its word), waits for the producers' words, and folds the sum in.
@@ -888,13 +909,13 @@ impl Cards {
             let (ya, yb) = match (mine.first(), peer) {
                 (Some(&p0), Some(_)) => {
                     assert!(mine.len() == 1, "one part a card with a peer");
-                    (c.yv.at(p0 * STEP * H * 4), Some(self.peers[me].ys[parity].va))
+                    (c.yv.at((p0 * STEP + self.t0) * H * 4), Some(self.tok(&self.peers[me].ys[parity], H)))
                 }
-                (Some(&p0), None) => (c.yv.at(p0 * STEP * H * 4), (mine.len() > 1).then(|| c.yv.at((p0 + 1) * STEP * H * 4))),
-                (None, _) => (self.peers[me].ys[parity].va, None),
+                (Some(&p0), None) => (c.yv.at((p0 * STEP + self.t0) * H * 4), (mine.len() > 1).then(|| c.yv.at(((p0 + 1) * STEP + self.t0) * H * 4))),
+                (None, _) => (self.tok(&self.peers[me].ys[parity], H), None),
             };
             let copy = match (mine.first(), peer) {
-                (Some(&p0), Some(j)) => Some((c.yv.at(p0 * STEP * H * 4), self.peers[j].ys[parity].va, n * H)),
+                (Some(&p0), Some(j)) => Some((c.yv.at((p0 * STEP + self.t0) * H * 4), self.tok(&self.peers[j].ys[parity], H), n * H)),
                 _ => None,
             };
             self.hc_post(c, copy, (!mine.is_empty()).then_some((W_Y, me)), Some((W_Y, producers[0])), producers.get(1).map(|&p| (W_Y, p)), value, ya, yb, n);
@@ -942,28 +963,30 @@ impl Cards {
     fn mla_rows(&self, m: &MlaOn, n: usize) {
         let c = &self.cards[m.card];
         let ln = Some(m.input_ln.va);
+        let (x, mqa, mq, miq) = (self.tok(&c.x, H), self.tok(&c.mqa, Q_LORA_RANK), self.tok(&c.mq, MLA_HEADS * Q_HEAD), self.tok(&c.miq, INDEX_N_HEADS * INDEX_HEAD_DIM));
+        let (kva, ix) = (c.mproj.at((MKVA + self.t0 * KV_LORA_RANK) * 4), c.mproj.at((MIX + self.t0 * IX_ROWS) * 4));
         if n > SPEC_TOKENS {
-            self.rows_w(c, &c.ffn_gu_w, c.x.va, ln, m.q_a.0.va, Some(m.q_a.1.va), c.mqa.va, Q_LORA_RANK, n, false);
-            self.rows_w(c, &c.ffn_gu_w, c.x.va, ln, m.kv_a.0.va, Some(m.kv_a.1.va), c.mproj.at(MKVA * 4), KV_LORA_RANK, n, true);
+            self.rows_w(c, &c.ffn_gu_w, x, ln, m.q_a.0.va, Some(m.q_a.1.va), mqa, Q_LORA_RANK, n, false);
+            self.rows_w(c, &c.ffn_gu_w, x, ln, m.kv_a.0.va, Some(m.kv_a.1.va), kva, KV_LORA_RANK, n, true);
         } else {
-            self.rows8(c, &c.ffn_gu, c.x.va, ln, m.q_a.0.va, m.q_a.1.va, c.mqa.va, Q_LORA_RANK, H, n, ROWS_GU);
-            self.rows8_free(c, &c.ffn_gu, c.x.va, ln, m.kv_a.0.va, m.kv_a.1.va, c.mproj.at(MKVA * 4), KV_LORA_RANK, H, n, ROWS_GU);
+            self.rows8(c, &c.ffn_gu, x, ln, m.q_a.0.va, m.q_a.1.va, mqa, Q_LORA_RANK, H, n, ROWS_GU);
+            self.rows8_free(c, &c.ffn_gu, x, ln, m.kv_a.0.va, m.kv_a.1.va, kva, KV_LORA_RANK, H, n, ROWS_GU);
         }
         if n > SPEC_TOKENS {
             let mut a = Args::new();
-            a.ptr(c.x.va).ptr(m.input_ln.va).ptr(m.ix.va).ptr(c.mproj.at(MIX * 4)).u32(IX_ROWS as u32).u32(n as u32);
+            a.ptr(x).ptr(m.input_ln.va).ptr(m.ix.va).ptr(ix).u32(IX_ROWS as u32).u32(n as u32);
             c.k.launch_free(&c.rows_h_w, g::wmma_grid(IX_ROWS, n), g::WG, g::WMMA_LDS, &a);
         } else {
-            self.rows_free(c, &c.rows_h, c.x.va, ln, m.ix.va, c.mproj.at(MIX * 4), IX_ROWS, H, n, ROWS);
+            self.rows_free(c, &c.rows_h, x, ln, m.ix.va, ix, IX_ROWS, H, n, ROWS);
         }
         // over q_a's output normed with q_a's norm: the query and, alongside it, the indexer's query (VRAM: the card scores the pools)
         let qln = Some(m.qa_ln.va);
         if n > SPEC_TOKENS {
-            self.rows_w(c, &c.mla_qb_w, c.mqa.va, qln, m.q_b.0.va, Some(m.q_b.1.va), c.mq.va, MLA_HEADS * Q_HEAD, n, false);
-            self.rows_w(c, &c.mla_iq_w, c.mqa.va, qln, m.ix_wq_b.va, None, c.miq.va, INDEX_N_HEADS * INDEX_HEAD_DIM, n, true);
+            self.rows_w(c, &c.mla_qb_w, mqa, qln, m.q_b.0.va, Some(m.q_b.1.va), mq, MLA_HEADS * Q_HEAD, n, false);
+            self.rows_w(c, &c.mla_iq_w, mqa, qln, m.ix_wq_b.va, None, miq, INDEX_N_HEADS * INDEX_HEAD_DIM, n, true);
         } else {
-            self.rows8(c, &c.mla_qb, c.mqa.va, qln, m.q_b.0.va, m.q_b.1.va, c.mq.va, MLA_HEADS * Q_HEAD, Q_LORA_RANK, n, ROWS_QB);
-            self.rows_free(c, &c.mla_iq, c.mqa.va, qln, m.ix_wq_b.va, c.miq.va, INDEX_N_HEADS * INDEX_HEAD_DIM, Q_LORA_RANK, n, ROWS);
+            self.rows8(c, &c.mla_qb, mqa, qln, m.q_b.0.va, m.q_b.1.va, mq, MLA_HEADS * Q_HEAD, Q_LORA_RANK, n, ROWS_QB);
+            self.rows_free(c, &c.mla_iq, mqa, qln, m.ix_wq_b.va, miq, INDEX_N_HEADS * INDEX_HEAD_DIM, Q_LORA_RANK, n, ROWS);
         }
         c.k.fence();
     }
@@ -1129,6 +1152,7 @@ impl Cards {
 
 impl Placed for Cards {
     fn begin(&mut self, rows: &[f32], n: usize) {
+        (self.ch, self.t0, self.chunks) = (0, 0, glm_5_3_flash::chunk_count(n));
         // every card: the step's handoffs restart, each token's embedding into each of its streams
         let mut streams = Vec::with_capacity(n * HC * H);
         for i in 0..n {
@@ -1141,11 +1165,14 @@ impl Placed for Cards {
             self.token_from[i] = c.k.posted();
         }
     }
+    fn chunk(&mut self, c: usize, t0: usize) {
+        (self.ch, self.t0) = (c, t0);
+    }
     fn attention(&mut self, l: usize, n: usize) {
         let value = self.next_seq();
         // a step of a verify's size keeps a state a token (`kda_rewind`); one token and a prompt's step do not
         let ring = (2..=SPEC_TOKENS).contains(&n);
-        self.half_seq[l][0] = value;
+        self.half_seq[l][self.ch][0] = value;
         let f = self.ffns[l].as_ref().unwrap();
         for c in &self.cards {
             self.hc_pre(c, &f.hc[c.k.index][0], None, value, None, None, n);
@@ -1160,31 +1187,32 @@ impl Placed for Cards {
             // a step of many tokens takes the matrix path (bf16 activations, numerically its own)
             if n > SPEC_TOKENS {
                 let mut a = Args::new();
-                a.ptr(c.x.va).ptr(p.input_ln.va).ptr(p.sq.va).ptr(smix.va).u32(M_SMALL as u32).u32(n as u32);
+                a.ptr(self.tok(&c.x, H)).ptr(p.input_ln.va).ptr(p.sq.va).ptr(self.tok(smix, M_SMALL)).u32(M_SMALL as u32).u32(n as u32);
                 c.k.launch(&c.rows_h_w, g::wmma_grid(M_SMALL, n), g::WG, g::WMMA_LDS, &a);
             } else {
-                self.rows(c, &c.rows_h, c.x.va, Some(p.input_ln.va), p.sq.va, smix.va, M_SMALL, H, n, ROWS);
+                self.rows(c, &c.rows_h, self.tok(&c.x, H), Some(p.input_ln.va), p.sq.va, self.tok(smix, M_SMALL), M_SMALL, H, n, ROWS);
             }
             // the gates' second halves as one launch: f_b over f_a's output, g_b over g_a's — token i's input at smix[i · M_SMALL]
             let mut p0 = 0;
             while p0 < n {
                 let np = (n - p0).min(TOKENS);
                 let mut a = Args::new();
-                a.ptr(smix.at(p0 * M_SMALL * 4)).ptr(p.fg.va).ptr(fg.at(p0 * 2 * g::PART_QKV * 4)).u32(2 * g::PART_QKV as u32).u32(np as u32).u32(g::PART_QKV as u32).u32(M_SMALL as u32);
+                a.ptr(smix.at((self.t0 + p0) * M_SMALL * 4)).ptr(p.fg.va).ptr(fg.at((self.t0 + p0) * 2 * g::PART_QKV * 4)).u32(2 * g::PART_QKV as u32).u32(np as u32).u32(g::PART_QKV as u32).u32(M_SMALL as u32);
                 c.k.launch(&c.rows_d2, g::rows_grid(2 * g::PART_QKV, np, ROWS), g::WG, g::rows_lds(KDA_DIM, np) as u32, &a);
                 p0 += np;
             }
             // the delta rule over the step's tokens in order, the heads' memory in registers across them
-            let mixed = smix.at(SMALL_ROWS * 4);
+            let (smix0, fg0) = (self.tok(smix, M_SMALL), self.tok(fg, 2 * g::PART_QKV));
+            let mixed = smix0 + SMALL_ROWS * 4;
             let mut a = Args::new();
-            a.ptr(mixed).ptr(p.taps.va).ptr(p.window.va).ptr(fg.va).ptr(p.dt_bias.va).ptr(p.a_log.va).ptr(smix.at(2 * KDA_DIM * 4)).ptr(fg.at(g::PART_QKV * 4)).ptr(p.mem.va).ptr(p.o_norm.va).ptr(normed.va).u32(p.head0 as u32).u32(n as u32).u32(M_SMALL as u32).u32(2 * g::PART_QKV as u32).u32(M_SMALL as u32).ptr(if ring { p.ring.va } else { 0 }).ptr(if ring { p.ring_w.va } else { 0 });
+            a.ptr(mixed).ptr(p.taps.va).ptr(p.window.va).ptr(fg0).ptr(p.dt_bias.va).ptr(p.a_log.va).ptr(smix0 + 2 * KDA_DIM * 4).ptr(fg0 + g::PART_QKV * 4).ptr(p.mem.va).ptr(p.o_norm.va).ptr(self.tok(normed, g::PART_QKV)).u32(p.head0 as u32).u32(n as u32).u32(M_SMALL as u32).u32(2 * g::PART_QKV as u32).u32(M_SMALL as u32).ptr(if ring { p.ring.va } else { 0 }).ptr(if ring { p.ring_w.va } else { 0 });
             c.k.launch(&c.step, g::STEP_GRID, g::WG, g::STEP_LDS as u32, &a);
             if n > SPEC_TOKENS {
                 let mut a = Args::new();
-                a.ptr(normed.va).ptr(p.o.va).ptr(c.yv.at(i * STEP * H * 4)).u32(H as u32).u32(n as u32);
+                a.ptr(self.tok(normed, g::PART_QKV)).ptr(p.o.va).ptr(c.yv.at((i * STEP + self.t0) * H * 4)).u32(H as u32).u32(n as u32);
                 c.k.launch(&c.rows_part_w, g::wmma_grid(H, n), g::WG, g::WMMA_LDS, &a);
             } else {
-                self.rows(c, &c.rows_part, normed.va, None, p.o.va, c.yv.at(i * STEP * H * 4), H, g::PART_QKV, n, ROWS);
+                self.rows(c, &c.rows_part, self.tok(normed, g::PART_QKV), None, p.o.va, c.yv.at((i * STEP + self.t0) * H * 4), H, g::PART_QKV, n, ROWS);
             }
         }
         // each card's shares out and its word; every card folds the sum into its streams
@@ -1196,7 +1224,7 @@ impl Placed for Cards {
     }
     fn mla_post(&mut self, l: usize, n: usize) {
         let value = self.next_seq();
-        self.half_seq[l][0] = value;
+        self.half_seq[l][self.ch][0] = value;
         let f = self.ffns[l].as_ref().unwrap();
         for c in &self.cards {
             self.hc_pre(c, &f.hc[c.k.index][0], None, value, None, None, n);
@@ -1206,7 +1234,7 @@ impl Placed for Cards {
         // the other cards fold the output in once it is there (posted now: they wait for the word)
         for (i, o) in self.cards.iter().enumerate() {
             if i != m.card {
-                self.hc_post(o, None, None, Some((W_Y, m.card)), None, value, self.peers[i].my[l % 2].va, None, n);
+                self.hc_post(o, None, None, Some((W_Y, m.card)), None, value, self.tok(&self.peers[i].my[l % 2], H), None, n);
             }
         }
     }
@@ -1278,7 +1306,7 @@ impl Placed for Cards {
         let ml = l - glm_5_3_flash::FIRST_K_DENSE_REPLACE;
         let e_n = glm_5_3_flash::E;
         let prefill = n > SPEC_TOKENS;
-        if ml == 0 {
+        if ml == 0 && self.ch == 0 {
             self.begin_step(prefill);
         }
         let r = &mut self.resident;
@@ -1326,6 +1354,8 @@ impl Placed for Cards {
         // token, output row); a prefill step's jobs grouped by slot — a group table (slot, first job, jobs, 0)
         // and the jobs (token, output row) — through gate/up over every group, the hidden states quantized,
         // down into the shared output rows. The same split as the rows kernels', at SPEC_TOKENS.
+        // the chunk's rows of the activations and of the outputs: a job's token is the chunk's (037)
+        let (t0, xout) = (self.t0, self.shared.xout.at(self.t0 * TOP_K * H * 4));
         let r = &mut self.resident;
         let mut total = 0;
         for c in 0..self.cards.len() {
@@ -1338,18 +1368,18 @@ impl Placed for Cards {
             // the FFN card quantized the step's activations into its own buffers (`hc_pre`'s act phase); the other card takes
             // the host's copy of them
             if c != self.ffns[l].as_ref().unwrap().card {
-                card.k.upload(&card.xq, 0, raw(xq));
-                card.k.upload(&card.xs, 0, raw(xs));
-                card.k.upload(&card.xg, 0, raw(xg));
+                card.k.upload(&card.xq, self.t0 * H, raw(xq));
+                card.k.upload(&card.xs, self.t0 * HG * 4, raw(xs));
+                card.k.upload(&card.xg, self.t0 * HG * 4, raw(xg));
             }
             if !prefill {
                 let list: Vec<u32> = jobs.iter().flat_map(|&(sl, tok, k)| [sl, tok, tok * TOP_K as u32 + k as u32]).collect();
                 card.k.upload(&card.xjobs, 0, raw(&list));
                 let mut a = Args::new();
-                a.ptr(r.slots[c].va).ptr(card.xjobs.va).ptr(card.xq.va).ptr(card.xs.va).ptr(card.xg.va).ptr(card.xgu.va);
+                a.ptr(r.slots[c].va).ptr(card.xjobs.va).ptr(card.xq.at(t0 * H)).ptr(card.xs.at(t0 * HG * 4)).ptr(card.xg.at(t0 * HG * 4)).ptr(card.xgu.va);
                 card.k.launch(&card.xpt_gu, (jobs.len() * XPT_UP_WGS) as u32, g::WG, XPT_LDS as u32, &a);
                 let mut b = Args::new();
-                b.ptr(r.slots[c].va).ptr(card.xjobs.va).ptr(card.xgu.va).ptr(self.shared.xout.va);
+                b.ptr(r.slots[c].va).ptr(card.xjobs.va).ptr(card.xgu.va).ptr(xout);
                 card.k.launch(&card.xpt_down, (jobs.len() * XPT_DOWN_WGS) as u32, g::WG, XPT_LDS as u32, &b);
                 card.k.fence();
                 continue;
@@ -1376,13 +1406,13 @@ impl Placed for Cards {
             card.k.upload(&card.xjobs, 0, raw(&table));
             let jobs_va = card.xjobs.at(jobs_at * 4);
             let mut a = Args::new();
-            a.ptr(r.slots[c].va).ptr(card.xjobs.va).ptr(jobs_va).ptr(card.xq.va).ptr(card.xs.va).ptr(card.xg.va).ptr(card.xgu.va);
+            a.ptr(r.slots[c].va).ptr(card.xjobs.va).ptr(jobs_va).ptr(card.xq.at(t0 * H)).ptr(card.xs.at(t0 * HG * 4)).ptr(card.xg.at(t0 * HG * 4)).ptr(card.xgu.va);
             card.k.launch(&card.xpt_gemm_gu, groups * XG_GU_WGS as u32, g::WG, 0, &a);
             let mut q = Args::new();
             q.ptr(card.xgu.va).ptr(card.xhq.va).ptr(card.xhs.va).ptr(card.xhg.va);
             card.k.launch(&card.xpt_quant, (jobs.len() * XQ_WGS) as u32, g::WG, 0, &q);
             let mut b = Args::new();
-            b.ptr(r.slots[c].va).ptr(card.xjobs.va).ptr(jobs_va).ptr(card.xhq.va).ptr(card.xhs.va).ptr(card.xhg.va).ptr(self.shared.xout.va);
+            b.ptr(r.slots[c].va).ptr(card.xjobs.va).ptr(jobs_va).ptr(card.xhq.va).ptr(card.xhs.va).ptr(card.xhg.va).ptr(xout);
             card.k.launch(&card.xpt_gemm_down, groups * XG_DOWN_WGS as u32, g::WG, 0, &b);
             card.k.fence();
         }
@@ -1396,7 +1426,7 @@ impl Placed for Cards {
             }
         }
         // a prefill step's claims, now that no job of the layer reads a slot (063)
-        if self.resident.prefill {
+        if self.resident.prefill && self.ch + 1 == self.chunks {
             let none = [false; glm_5_3_flash::E];
             self.claim_prefill(l - glm_5_3_flash::FIRST_K_DENSE_REPLACE, &none);
         }
@@ -1471,6 +1501,7 @@ impl Placed for Cards {
         if i == 0 {
             c.k.wait();
         }
+        let i = self.t0 + i;
         read(&c.mproj, (MKVA + i * KV_LORA_RANK) * 4, &mut kva[..KV_LORA_RANK]);
         let ix = MIX + i * IX_ROWS;
         read(&c.mproj, ix * 4, &mut ik[..INDEX_HEAD_DIM]);
@@ -1494,18 +1525,18 @@ impl Placed for Cards {
             let visible = (pos + n) / INDEX_KPOOL;
             let (scale, wscale) = glm_5_3_flash::mla::score_scales();
             let mut a = Args::new();
-            a.ptr(c.miq.va).ptr(c.mproj.at(MIX * 4)).ptr(m.pools.va).ptr(c.mscore.va).u32(n as u32).u32(visible as u32).u32(stride as u32).f32(scale).f32(wscale);
+            a.ptr(self.tok(&c.miq, INDEX_N_HEADS * INDEX_HEAD_DIM)).ptr(c.mproj.at((MIX + self.t0 * IX_ROWS) * 4)).ptr(m.pools.va).ptr(self.tok(&c.mscore, stride)).u32(n as u32).u32(visible as u32).u32(stride as u32).f32(scale).f32(wscale);
             c.k.launch(&c.ix_score_w, ixw_grid(n, visible), 256, IXW_LDS as u32, &a);
         }
         // the selection across slices of the pools at a verify step past 32k positions (docs/queue/019)
         let slices = select_slices(n, (pos + n) / INDEX_KPOOL);
         let mut a = Args::new();
-        a.ptr(c.mscore.va).u32(stride as u32).u32(pos as u32).u32(slices as u32).ptr(c.mselst.va).ptr(c.msel.va).ptr(c.mseln.va);
+        a.ptr(self.tok(&c.mscore, stride)).u32(stride as u32).u32(pos as u32).u32(slices as u32).ptr(self.tok(&c.mselst, SELECT_STATE)).ptr(self.tok(&c.msel, DENSE_BELOW)).ptr(self.tok(&c.mseln, 1));
         c.k.launch(&c.ix_select, (n * slices) as u32, g::WG, SELECT_LDS as u32, &a);
         if let Some(count) = count {
             c.k.sync();
             let mut w = [0u32; 1];
-            read(&c.mseln, 0, &mut w);
+            read(&c.mseln, self.t0 * 4, &mut w);
             *count = w[0] as usize;
         }
     }
@@ -1517,8 +1548,9 @@ impl Placed for Cards {
         // verify step's token in chunks of positions merged after — and W_uv over the step; the few-token
         // twins of q_abs and W_uv below SPEC_TOKENS, like the rows kernels'
         c.k.upload(&m.lat, pos * KV_LORA_RANK * 2, raw(&latents[..n * KV_LORA_RANK]));
+        let (mq, mqabs, msel, mseln, molat, mheads) = (self.tok(&c.mq, MLA_HEADS * Q_HEAD), self.tokb(&c.mqabs, MLA_HEADS * KV_LORA_RANK * 2), self.tok(&c.msel, DENSE_BELOW), self.tok(&c.mseln, 1), self.tok(&c.molat, MLA_HEADS * KV_LORA_RANK), self.tok(&c.mheads, O_IN));
         let mut a = Args::new();
-        a.ptr(c.mq.va).ptr(m.kv_b.va).ptr(c.mqabs.va);
+        a.ptr(mq).ptr(m.kv_b.va).ptr(mqabs);
         if n > SPEC_TOKENS {
             a.u32(n as u32);
             c.k.launch(&c.mla_qabs_w, MLA_HEADS as u32 * g::wmma_grid(KV_LORA_RANK, n), g::WG, g::WMMA_LDS, &a);
@@ -1527,15 +1559,15 @@ impl Placed for Cards {
         }
         let (chunk, chunks) = (aw_chunk(n), aw_chunks(n));
         let mut a = Args::new();
-        a.ptr(c.mqabs.va).ptr(m.lat.va).ptr(c.msel.va).ptr(c.mseln.va).ptr(c.molat.va).ptr(c.mpart.va).u32(chunks as u32).u32(chunk as u32);
+        a.ptr(mqabs).ptr(m.lat.va).ptr(msel).ptr(mseln).ptr(molat).ptr(c.mpart.va).u32(chunks as u32).u32(chunk as u32);
         c.k.launch(&c.mla_attend_w, aw_grid(n), AW_WG, AW_LDS as u32, &a);
         if chunks > 1 {
             let mut a = Args::new();
-            a.ptr(c.mpart.va).ptr(c.molat.va);
+            a.ptr(c.mpart.va).ptr(molat);
             c.k.launch(&c.mla_attend_merge, (n * AW_HEAD_TILES) as u32, AW_WG, AW_MERGE_LDS as u32, &a);
         }
         let mut a = Args::new();
-        a.ptr(c.molat.va).ptr(m.kv_b.va).ptr(c.mheads.va);
+        a.ptr(molat).ptr(m.kv_b.va).ptr(mheads);
         if n > SPEC_TOKENS {
             a.u32(n as u32);
             c.k.launch(&c.mla_uv_w, MLA_HEADS as u32 * g::wmma_grid(V_HEAD_DIM, n), g::WG, g::WMMA_LDS, &a);
@@ -1546,14 +1578,15 @@ impl Placed for Cards {
     fn mla_out(&mut self, l: usize, n: usize) {
         let m = self.mlas[l].as_ref().unwrap();
         let c = &self.cards[m.card];
+        let (mheads, myv) = (self.tok(&c.mheads, O_IN), self.tok(&c.myv, H));
         // the output projection over every token's heads, then the streams (the projection out to the peer's receiving buffer)
         if n > SPEC_TOKENS {
-            self.rows_w(c, &c.mla_o_w, c.mheads.va, None, m.o.0.va, Some(m.o.1.va), c.myv.va, H, n, false);
+            self.rows_w(c, &c.mla_o_w, mheads, None, m.o.0.va, Some(m.o.1.va), myv, H, n, false);
         } else {
-            self.rows8(c, &c.mla_o, c.mheads.va, None, m.o.0.va, m.o.1.va, c.myv.va, H, O_IN, n, ROWS);
+            self.rows8(c, &c.mla_o, mheads, None, m.o.0.va, m.o.1.va, myv, H, O_IN, n, ROWS);
         }
-        let copy = (0..self.cards.len()).find(|&j| j != m.card).map(|j| (c.myv.va, self.peers[j].my[l % 2].va, n * H));
-        self.hc_post(c, copy, Some((W_Y, m.card)), None, None, self.half_seq[l][0], c.myv.va, None, n);
+        let copy = (0..self.cards.len()).find(|&j| j != m.card).map(|j| (myv, self.tok(&self.peers[j].my[l % 2], H), n * H));
+        self.hc_post(c, copy, Some((W_Y, m.card)), None, None, self.half_seq[l][self.ch][0], myv, None, n);
     }
     fn mla_seed(&mut self, l: usize, pos: usize, latent: &[u16]) {
         let m = self.mlas[l].as_ref().unwrap();
@@ -1561,24 +1594,25 @@ impl Placed for Cards {
     }
     fn ffn(&mut self, l: usize, n: usize) {
         let value = self.next_seq();
-        self.half_seq[l][1] = value;
+        self.half_seq[l][self.ch][1] = value;
         let f = self.ffns[l].as_ref().unwrap();
         for c in &self.cards {
             // the FFN card's collapse goes to the host too when the routed experts need it, with the router's logits and the word
-            let to_host = (!f.dense && c.k.index == f.card).then_some(self.shared.xh.va);
+            let to_host = (!f.dense && c.k.index == f.card).then_some(self.tok(&self.shared.xh, H));
             let router = self.ffn_router(l, c);
             let act = f.act.as_ref().filter(|_| c.k.index == f.card).map(|(_, _, tab)| tab.va);
             self.hc_pre(c, &f.hc[c.k.index][1], to_host, value, router, act, n);
         }
         let c = &self.cards[f.card];
         let (rows, down, k_width) = if f.dense { (DENSE_GU_ROWS, &c.ffn_down_dense, INTERMEDIATE_SIZE) } else { (SHARED_GU_ROWS, &c.ffn_down_shared, N_SHARED_EXPERTS * D_FF) };
+        let (x, gu, fyv) = (self.tok(&c.x, H), self.tok(&c.gu, rows), self.tok(&c.fyv, H));
         if n > SPEC_TOKENS {
             let down_w = if f.dense { &c.ffn_down_dense_w } else { &c.ffn_down_shared_w };
-            self.rows_w(c, &c.ffn_gu_w, c.x.va, Some(f.ln.va), f.gu_w.va, Some(f.gu_s.va), c.gu.va, rows, n, false);
-            self.rows_w(c, down_w, c.gu.va, None, f.down_w.va, Some(f.down_s.va), c.fyv.va, H, n, false);
+            self.rows_w(c, &c.ffn_gu_w, x, Some(f.ln.va), f.gu_w.va, Some(f.gu_s.va), gu, rows, n, false);
+            self.rows_w(c, down_w, gu, None, f.down_w.va, Some(f.down_s.va), fyv, H, n, false);
         } else {
-            self.rows8(c, &c.ffn_gu, c.x.va, Some(f.ln.va), f.gu_w.va, f.gu_s.va, c.gu.va, rows, H, n, ROWS_GU);
-            self.rows8_at(c, down, c.gu.va, 2 * k_width, None, f.down_w.va, f.down_s.va, c.fyv.va, H, k_width, n, ROWS, true);
+            self.rows8(c, &c.ffn_gu, x, Some(f.ln.va), f.gu_w.va, f.gu_s.va, gu, rows, H, n, ROWS_GU);
+            self.rows8_at(c, down, gu, 2 * k_width, None, f.down_w.va, f.down_s.va, fyv, H, k_width, n, ROWS, true);
         }
         // a dense layer's output half now; a MoE layer's waits for the host's experts and is posted after the
         // resident experts' launches (`ffn_post`): a queue is in order, and the output half spins on the word
@@ -1587,55 +1621,56 @@ impl Placed for Cards {
         }
     }
     fn ffn_post(&mut self, l: usize, n: usize) {
-        let value = self.half_seq[l][1];
+        let value = self.half_seq[l][self.ch][1];
         let f = self.ffns[l].as_ref().unwrap();
         let parity = l % 2;
         for o in &self.cards {
             let me = o.k.index;
             let producer = me == f.card;
             // the producer's rows stay in its `fyv`; the peer reads them from its receiving buffer
-            let copy = if producer { (0..self.cards.len()).find(|&j| j != me).map(|j| (o.fyv.va, self.peers[j].fy[parity].va, n * H)) } else { None };
-            let fy = if producer { o.fyv.va } else { self.peers[me].fy[parity].va };
+            let copy = if producer { (0..self.cards.len()).find(|&j| j != me).map(|j| (self.tok(&o.fyv, H), self.tok(&self.peers[j].fy[parity], H), n * H)) } else { None };
+            let fy = if producer { self.tok(&o.fyv, H) } else { self.tok(&self.peers[me].fy[parity], H) };
             let mine = producer.then_some((W_FFN, f.card));
             if f.dense {
                 self.hc_post(o, copy, mine, Some((W_FFN, f.card)), None, value, fy, None, n);
             } else {
-                self.hc_post(o, copy, mine, Some((W_FFN, f.card)), Some((W_EXPERTS, 0)), value, fy, Some(self.shared.yexp[parity].va), n);
+                self.hc_post(o, copy, mine, Some((W_FFN, f.card)), Some((W_EXPERTS, 0)), value, fy, Some(self.tok(&self.shared.yexp[parity], H)), n);
             }
         }
     }
     fn ffn_logits(&mut self, l: usize, n: usize, x: &mut [f32], logits: &mut [f32]) {
         let f = self.ffns[l].as_ref().unwrap();
-        crate::kfd::wait_word(self.word_ptr(W_X, f.card), self.half_seq[l][1]);
-        read(&self.shared.xh, 0, &mut x[..n * H]);
-        read(&self.shared.scores_ffn, 0, &mut logits[..n * ROUTE_ROWS]);
+        crate::kfd::wait_word(self.word_ptr(W_X, f.card), self.half_seq[l][self.ch][1]);
+        read(&self.shared.xh, self.t0 * H * 4, &mut x[..n * H]);
+        read(&self.shared.scores_ffn, self.t0 * ROUTE_ROWS * 4, &mut logits[..n * ROUTE_ROWS]);
     }
     fn ffn_input(&mut self, l: usize, n: usize, xq: &mut [i8], xs: &mut [f32], xg: &mut [i32], picks: &mut [[usize; TOP_K]], wts: &mut [[f32; TOP_K]], logits: &mut [f32]) {
         let f = self.ffns[l].as_ref().unwrap();
-        crate::kfd::wait_word(self.word_ptr(W_ACT, f.card), self.half_seq[l][1]);
+        crate::kfd::wait_word(self.word_ptr(W_ACT, f.card), self.half_seq[l][self.ch][1]);
         // the router's logits too: their second half is the next layer's rows, the prefetch's predictor (005)
-        read(&self.shared.scores_ffn, 0, &mut logits[..n * ROUTE_ROWS]);
+        let t0 = self.t0;
+        read(&self.shared.scores_ffn, t0 * ROUTE_ROWS * 4, &mut logits[..n * ROUTE_ROWS]);
         let xa = &self.shared.xact;
-        read(xa, XA_Q, &mut xq[..n * H]);
-        read(xa, XA_S, &mut xs[..n * HG]);
-        read(xa, XA_G, &mut xg[..n * HG]);
+        read(xa, XA_Q + t0 * H, &mut xq[..n * H]);
+        read(xa, XA_S + t0 * HG * 4, &mut xs[..n * HG]);
+        read(xa, XA_G + t0 * HG * 4, &mut xg[..n * HG]);
         let mut p = vec![0u32; n * TOP_K];
-        read(xa, XA_P, &mut p);
+        read(xa, XA_P + t0 * TOP_K * 4, &mut p);
         for (i, pk) in picks[..n].iter_mut().enumerate() {
             for k in 0..TOP_K {
                 pk[k] = p[i * TOP_K + k] as usize;
             }
         }
-        read(xa, XA_W, unsafe { std::slice::from_raw_parts_mut(wts.as_mut_ptr() as *mut f32, n * TOP_K) });
+        read(xa, XA_W + t0 * TOP_K * 4, unsafe { std::slice::from_raw_parts_mut(wts.as_mut_ptr() as *mut f32, n * TOP_K) });
     }
     fn ffn_routed(&mut self, l: usize, n: usize, y: &[f32]) {
         // streamed: the handoff buffer is write-combining for the CPU, and a plain copy of a 1024-token
         // step's 16 MB took 4.8 ms a layer (0.2 ms a prompt token, 2026-10-19)
         let buf = &self.shared.yexp[l % 2];
-        common::copy::stream(unsafe { std::slice::from_raw_parts_mut(buf.ptr() as *mut u8, n * H * 4) }, raw(&y[..n * H]));
+        common::copy::stream(unsafe { std::slice::from_raw_parts_mut((buf.ptr() as *mut u8).add(self.t0 * H * 4), n * H * 4) }, raw(&y[..n * H]));
         // the word into every card's own copy (the cards wait on their own VRAM, 001)
         for pe in &self.peers {
-            unsafe { &*(pe.words.at(word(W_EXPERTS, 0)) as *const AtomicU32) }.store(self.half_seq[l][1], std::sync::atomic::Ordering::Release);
+            unsafe { &*(pe.words.at(self.wd(W_EXPERTS, 0)) as *const AtomicU32) }.store(self.half_seq[l][self.ch][1], std::sync::atomic::Ordering::Release);
         }
     }
     fn layer_out(&mut self, _l: usize, i: usize, mean: &mut [f32]) {

@@ -76,6 +76,24 @@ pub const TOKENS: usize = common::gemv::TOKENS;
 /// 128 → 9.1 ms, 256 → 8.1, 512 → 7.8 (experts 4.0 / 2.9 / 2.4: no longer falling as 1/n, so the
 /// card's 5.0 and the experts' compute are what is left). The kernels do not depend on it.
 pub const STEP: usize = 1024;
+/// A prefill step runs as this many chunks in flight, a wavefront (037): chunk B's attention of a layer on
+/// the cards while the host runs chunk A's experts of it, then A's next attention while B's experts run — each
+/// chunk's arithmetic unchanged, the cards' and the host's halves of a layer overlapped instead of summed.
+/// A chunk is a contiguous run of the step's tokens (its rows in every step buffer at its first token's).
+pub const CHUNKS: usize = 2;
+/// The chunks of an `n`-token step: `CHUNKS` when each can be a launch pass (`TOKENS`) or more wide (so every
+/// chunk takes the prefill kernels and the prefill residency), else one.
+pub const fn chunk_count(n: usize) -> usize {
+    if n >= CHUNKS * TOKENS { CHUNKS } else { 1 }
+}
+/// Chunk `c` of an `n`-token step as (first token, tokens): equal runs of whole passes, the last taking the
+/// remainder — a chunk starts on a pass boundary, as a step's passes do.
+pub const fn chunk_of(n: usize, c: usize) -> (usize, usize) {
+    let k = chunk_count(n);
+    let base = if k == 1 { n } else { n / k / TOKENS * TOKENS };
+    let t0 = c * base;
+    (t0, if c + 1 == k { n - t0 } else { base })
+}
 /// Tokens a speculative verify step holds at most (the drafts and the token they follow): the
 /// KDA layers keep a state a token of such a step (`kda_step`'s ring) so the state after the
 /// last accepted token is a copy away.

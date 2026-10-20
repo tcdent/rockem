@@ -233,8 +233,9 @@ pub mod gfx11_consts {
     pub const PRE_LDS: u32 = (if PRE_COEF_LDS > ACT_LDS { PRE_COEF_LDS } else { ACT_LDS }) as u32;
     /// `hc_pre`'s act table (a MoE layer on its FFN card): the device addresses its act phase reads and writes,
     /// in this order — the post-norm (f32), the router's bias (f32), the card's quantized activation (`xq`, `xs`,
-    /// `xg`), the host's copies of it, the host's picks (u32) and weights (f32), the host's word.
-    pub const ACT_SLOTS: usize = 11;
+    /// `xg`), the host's copies of it, the host's picks (u32) and weights (f32) — each `[STEP]` tokens deep, the
+    /// launch's tokens written from row `t0` (a prefill chunk's first, 037); the host's word is the launch's `act_word`.
+    pub const ACT_SLOTS: usize = 10;
     /// `hc_pre`'s partials in VRAM, per token: the coefficient dots `[COEF_ROWS][SLICES]`, then every
     /// workgroup's sum of squares of its stream channels. The host allocates `STEP · PRE_STRIDE`.
     pub const PRE_STRIDE: usize = PRE_PARTS;
@@ -332,12 +333,15 @@ pub mod gfx11 {
     /// attention block's input, or the FFN router over its own), the workgroups arrive again, each
     /// takes its `ROUTER_ROWS_PER_WG` rows of the `[ROUTE_ROWS][H]` bf16 router (the first `rows` live) over every token's `x`
     /// normed with `ln` (a wave a token, no reduction through LDS) straight into `scores` (host
-    /// memory), and the last of them writes `value` to `word`. One token is n = 1 through the
+    /// memory), and the last of them writes `value` to `word`. With `act` (a MoE layer's FFN card), every
+    /// workgroup with a token then makes its FFN input (`act_token`) into `act`'s table at rows `t0..t0 + n`
+    /// (the pointers above are the chunk's own, 037), and the last workgroup out writes `value` to
+    /// `act_word`. One token is n = 1 through the
     /// same launch; the tokens go through the LDS `PRE_TOKENS` at a time (the partials, then the
     /// coefficients), a token's arithmetic the same whichever round it is in. Counts back at 0 when
     /// the launch leaves. LDS: PRE_LDS.
     #[no_mangle]
-    pub extern "gpu-kernel" fn hc_pre(streams: *const f32, w: *const u16, part: *mut f32, base: *const f32, scale: *const f32, mix: *mut f32, x: *mut f32, x_host: *mut f32, count: *mut u32, value: u32, ln: *const u16, router: *const u16, scores: *mut f32, scores_v: *mut f32, word: *mut u32, act: *const u64, rows: u32, n: u32) {
+    pub extern "gpu-kernel" fn hc_pre(streams: *const f32, w: *const u16, part: *mut f32, base: *const f32, scale: *const f32, mix: *mut f32, x: *mut f32, x_host: *mut f32, count: *mut u32, value: u32, ln: *const u16, router: *const u16, scores: *mut f32, scores_v: *mut f32, word: *mut u32, act: *const u64, act_word: *mut u32, t0: u32, rows: u32, n: u32) {
         unsafe {
             let n = n as usize;
             // stats (a stats code object only), the act phase of the FFN card's launch: slot 0 from the scores' last
@@ -656,7 +660,7 @@ pub mod gfx11 {
                 common::stat!(0, kb.wrapping_sub(ka) & common::stats::CLOCK_MASK);
                 let mut tok = wg;
                 while tok < n {
-                    act_token(tok, t, wave, lane, x, scores_v, act);
+                    act_token(tok, t0 as usize + tok, t, wave, lane, x, scores_v, act);
                     tok += COEF_ROWS * SLICES;
                 }
             }
@@ -667,7 +671,7 @@ pub mod gfx11 {
                 let done = ready.add(3);
                 if AtomicU32::from_ptr(done).fetch_add(1, Ordering::AcqRel) == (COEF_ROWS * SLICES) as u32 - 1 {
                     AtomicU32::from_ptr(done).store(0, Ordering::Relaxed);
-                    AtomicU32::from_ptr(*act.add(10) as *mut u32).store(value, Ordering::Release);
+                    AtomicU32::from_ptr(act_word).store(value, Ordering::Release);
                 }
             }
         }
@@ -677,9 +681,10 @@ pub mod gfx11 {
     /// `common::rmsnorm::sumsq_tree` (thread j sums x[j + 256i] in order, lanes of wave 0 add eight of those
     /// in order, lane 0 the 32 in order), each group quantized as `QAct::quantize` (a wave four groups, their
     /// loads first), and the router's picks and weights as `ffn::route_scores` (each expert's rank counted
-    /// against every key: the greater key first, between equals the lower expert; the mass in id order). Writes the card's activation buffers and the host's copies, picks and weights (`act`'s table).
+    /// against every key: the greater key first, between equals the lower expert; the mass in id order). Writes the card's activation buffers and the host's copies, picks and weights (`act`'s table) at row `ot`
+    /// (the launch's token `tok` past the chunk's first).
     #[inline(always)]
-    unsafe fn act_token(tok: usize, t: usize, wave: usize, lane: u32, x: *const f32, scores_v: *const f32, act: *const u64) {
+    unsafe fn act_token(tok: usize, ot: usize, t: usize, wave: usize, lane: u32, x: *const f32, scores_v: *const f32, act: *const u64) {
         use common::q4::GROUP;
         const _: () = assert!(H == 256 * 16 && E % 32 == 0 && E / 32 <= 32 && crate::ROUTED_K == TOP_K && (H / GROUP) % 8 == 0);
         let at = |k: usize| *act.add(k) as usize;
@@ -760,10 +765,10 @@ pub mod gfx11 {
         while gi < GW {
             let g = wave + 8 * gi;
             let k0 = g * GROUP + lu * 4;
-            *(xq.add(tok * H + k0) as *mut u32) = packed[gi];
-            *(xq_h.add(tok * H + k0) as *mut u32) = packed[gi];
+            *(xq.add(ot * H + k0) as *mut u32) = packed[gi];
+            *(xq_h.add(ot * H + k0) as *mut u32) = packed[gi];
             if lane == 0 {
-                let o = tok * (H / GROUP) + g;
+                let o = ot * (H / GROUP) + g;
                 *xs.add(o) = sc[gi];
                 *xg.add(o) = sum[gi];
                 *xs_h.add(o) = sc[gi];
@@ -829,8 +834,8 @@ pub mod gfx11 {
             common::gfx11::wave_lds_sync();
             if lu < TOP_K {
                 let e = *idx.add(lu) as usize;
-                *picks.add(tok * TOP_K + lu) = e as u32;
-                *wts.add(tok * TOP_K + lu) = *sig.add(e) / *misc.add(1) * ROUTED_SCALING_FACTOR;
+                *picks.add(ot * TOP_K + lu) = e as u32;
+                *wts.add(ot * TOP_K + lu) = *sig.add(e) / *misc.add(1) * ROUTED_SCALING_FACTOR;
             }
         }
         workgroup_sync();
