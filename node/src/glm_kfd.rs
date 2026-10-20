@@ -129,12 +129,14 @@ struct Card {
     xpt_down: crate::kfd::Kernel,
     /// The FFN router's scores in VRAM beside the host's copy (`[STEP][ROUTE_ROWS]` f32): `hc_pre`'s act phase reads them.
     scores_v: Mem,
+    /// The FFN input's routing weights in VRAM (`[STEP][TOP_K]` f32): the act phase's copy, the leader's routed sum reads it (002).
+    wv: Mem,
     xpt_gemm_gu: crate::kfd::Kernel,
     xpt_quant: crate::kfd::Kernel,
     xpt_gemm_down: crate::kfd::Kernel,
     /// The resident experts' work (038): the step's quantized activations and the group/job tables
     /// (host-visible), the jobs' gate/up state and quantized hidden states (VRAM); the outputs go to
-    /// `Shared::xout`.
+    /// the leader's rows (`Peer::rows`).
     xq: Mem,
     xs: Mem,
     xg: Mem,
@@ -230,9 +232,8 @@ struct MtpOn {
 /// producer a layer ahead never overwrites what a consumer has yet to read (the handoff
 /// chain keeps them within one layer of each other).
 struct Shared {
-    yexp: [Mem; 2], // [STEP][H] f32: the host's routed experts
+    yexp: [Mem; 2], // [STEP][H] f32: the draft layer's routed experts, staged by the host (`mtp_ffn`)
     xh: Mem,       // [STEP][H] f32: a MoE layer's FFN input for the host
-    xout: Mem,     // [STEP·TOP_K][H] f32, the host's own pages mapped for the cards: the routed experts' outputs by (token, pick) — the cards' jobs and the host's experts (038)
     xact: Mem,     // the FFN input's quantized activations [STEP][H] i8 | [STEP][HG] f32 | [STEP][HG] i32, then the picks [STEP][TOP_K] u32 and weights f32: `hc_pre`'s act phase, for the host (XA_*)
     scores_ffn: Mem, // [STEP][ROUTE_ROWS] f32: the FFN half's router over its input (this layer's rows, then the next layer's: the prefetch's predictor), for the host's picks
     words: Mem,    // the handoff words, a cache line each: `word()`
@@ -344,6 +345,11 @@ struct Peer {
     ys: [Mem; 2], // [STEP][H] f32: the peer's part's share
     fy: [Mem; 2], // [STEP][H] f32
     my: [Mem; 2], // [STEP][H] f32
+    /// The routed experts' output rows when this card leads a MoE layer (002): `[STEP · TOP_K][H]` f32 by (token,
+    /// pick), written by the host's experts through the BAR and by the cards' resident jobs (the peer's by peer write).
+    rows: Mem,
+    /// The leader's routed sums, forwarded here when the peer leads (`[STEP][H]` f32, by layer parity).
+    yr: [Mem; 2],
     words: Mem,   // `word()` offsets, a cache line each
 }
 
@@ -417,6 +423,7 @@ impl Cards {
                     xpt_gu: k.kernel("xpt_gu"),
                     xpt_down: k.kernel("xpt_down"),
                     scores_v: k.vram(STEP * ROUTE_ROWS * 4),
+                    wv: k.vram(STEP * TOP_K * 4),
                     xpt_gemm_gu: k.kernel("xpt_gemm_gu"),
                     xpt_quant: k.kernel("xpt_quant"),
                     xpt_gemm_down: k.kernel("xpt_gemm_down"),
@@ -512,7 +519,7 @@ impl Cards {
                 let buf = || k.vram_shared(STEP * H * 4, &others);
                 let words = k.vram_shared(CHUNKS * WORD_SET, &others);
                 unsafe { std::ptr::write_bytes(words.ptr() as *mut u8, 0, words.size) };
-                Peer { ys: [buf(), buf()], fy: [buf(), buf()], my: [buf(), buf()], words }
+                Peer { ys: [buf(), buf()], fy: [buf(), buf()], my: [buf(), buf()], rows: k.vram_shared(STEP * TOP_K * H * 4, &others), yr: [buf(), buf()], words }
             })
             .collect();
         // the host's handoffs: host memory card 0 allocates and every other card maps too
@@ -523,7 +530,6 @@ impl Cards {
             Shared {
                 yexp: [buf(), buf()],
                 xh: buf(),
-                xout: k0.host_owned(STEP * TOP_K * H * 4, &others),
                 xact: k0.host_shared(XA_END, &others),
                 scores_ffn: k0.host_shared(STEP * ROUTE_ROWS * 4, &others),
                 words: {
@@ -641,7 +647,7 @@ impl Cards {
                     k.upload(&bias, 0, raw(m.bias));
                     let cd = &cards[card];
                     let xa = &shared.xact;
-                    let tab: [u64; ACT_SLOTS] = [ln32.va, bias.va, cd.xq.va, cd.xs.va, cd.xg.va, xa.at(XA_Q), xa.at(XA_S), xa.at(XA_G), xa.at(XA_P), xa.at(XA_W)].map(|a| a as u64);
+                    let tab: [u64; ACT_SLOTS] = [ln32.va, bias.va, cd.xq.va, cd.xs.va, cd.xg.va, xa.at(XA_Q), xa.at(XA_S), xa.at(XA_G), xa.at(XA_P), xa.at(XA_W), cd.wv.va].map(|a| a as u64);
                     let table = k.vram_visible(ACT_SLOTS * 8);
                     k.upload(&table, 0, raw(&tab));
                     Some((ln32, bias, table))
@@ -872,7 +878,7 @@ impl Cards {
     /// a few tokens' inside `hc_post`. `mine`: this card's word, written to its own copy and the peer's.
     /// `w0`, `w1`: words read from this card's own copy. `ya`, `yb`: the shares, in this card's VRAM.
     #[allow(clippy::too_many_arguments)]
-    fn hc_post(&self, c: &Card, copy: Option<(usize, usize, usize)>, mine: Option<(usize, usize)>, w0: Option<(usize, usize)>, w1: Option<(usize, usize)>, value: u32, ya: usize, yb: Option<usize>, tokens: usize) {
+    fn hc_post(&self, c: &Card, copy: Option<(usize, usize, usize)>, mine: Option<(usize, usize)>, w0: Option<(usize, usize)>, w1: Option<(usize, usize)>, value: u32, ya: usize, yb: Option<usize>, tokens: usize, routed: Option<(usize, usize, usize, usize)>) {
         let me = c.k.index;
         let own = |w: Option<(usize, usize)>| w.map_or(0, |(k, d)| self.peers[me].words.at(self.wd(k, d)));
         let peer = (0..self.cards.len()).find(|&j| j != me);
@@ -889,6 +895,8 @@ impl Cards {
         }
         let mut a = Args::new();
         a.ptr(self.tok(&c.mix, HC_MIX)).ptr(ya).ptr(yb.unwrap_or(0)).ptr(self.tok(&c.streams, HC * H)).ptr(src).ptr(0usize).ptr(dst2).u32(n as u32).ptr(own(mine)).ptr(mine2).ptr(own(w0)).ptr(own(w1)).u32(value).ptr(c.go.va).u32(tokens as u32);
+        let (rows, wts, fwd, fwd_word) = routed.unwrap_or((0, 0, 0, 0));
+        a.ptr(rows).ptr(wts).ptr(fwd).ptr(fwd_word);
         c.k.launch(&c.hc_post, CHANNEL_GRID, g::WG, 0, &a);
     }
     /// The FFN router's place: on the FFN card of a MoE layer, `hc_pre` runs layer `l`'s FFN router (and the
@@ -921,7 +929,7 @@ impl Cards {
                 (Some(&p0), Some(j)) => Some((c.yv.at((p0 * STEP + self.t0) * H * 4), self.tok(&self.peers[j].ys[parity], H), n * H)),
                 _ => None,
             };
-            self.hc_post(c, copy, (!mine.is_empty()).then_some((W_Y, me)), Some((W_Y, producers[0])), producers.get(1).map(|&p| (W_Y, p)), value, ya, yb, n);
+            self.hc_post(c, copy, (!mine.is_empty()).then_some((W_Y, me)), Some((W_Y, producers[0])), producers.get(1).map(|&p| (W_Y, p)), value, ya, yb, n, None);
         }
     }
 
@@ -1237,7 +1245,7 @@ impl Placed for Cards {
         // the other cards fold the output in once it is there (posted now: they wait for the word)
         for (i, o) in self.cards.iter().enumerate() {
             if i != m.card {
-                self.hc_post(o, None, None, Some((W_Y, m.card)), None, value, self.tok(&self.peers[i].my[l % 2], H), None, n);
+                self.hc_post(o, None, None, Some((W_Y, m.card)), None, value, self.tok(&self.peers[i].my[l % 2], H), None, n, None);
             }
         }
     }
@@ -1358,7 +1366,7 @@ impl Placed for Cards {
         // and the jobs (token, output row) — through gate/up over every group, the hidden states quantized,
         // down into the shared output rows. The same split as the rows kernels', at SPEC_TOKENS.
         // the chunk's rows of the activations and of the outputs: a job's token is the chunk's (037)
-        let (t0, xout) = (self.t0, self.shared.xout.at(self.t0 * TOP_K * H * 4));
+        let (t0, xout) = (self.t0, self.peers[self.ffns[l].as_ref().unwrap().card].rows.at(self.t0 * TOP_K * H * 4));
         let r = &mut self.resident;
         let mut total = 0;
         for c in 0..self.cards.len() {
@@ -1434,8 +1442,8 @@ impl Placed for Cards {
             self.claim_prefill(l - glm_5_3_flash::FIRST_K_DENSE_REPLACE, &none);
         }
     }
-    fn expert_out(&self) -> *mut f32 {
-        self.shared.xout.ptr() as *mut f32
+    fn expert_out(&self, l: usize) -> *mut f32 {
+        self.peers[self.ffns[l].as_ref().unwrap().card].rows.ptr() as *mut f32
     }
     fn mtp_begin(&mut self, cat: &[f32], n: usize) {
         let t = self.mtp.as_ref().expect("no draft layer on the cards");
@@ -1589,7 +1597,7 @@ impl Placed for Cards {
             self.rows8(c, &c.mla_o, mheads, None, m.o.0.va, m.o.1.va, myv, H, O_IN, n, ROWS);
         }
         let copy = (0..self.cards.len()).find(|&j| j != m.card).map(|j| (myv, self.tok(&self.peers[j].my[l % 2], H), n * H));
-        self.hc_post(c, copy, Some((W_Y, m.card)), None, None, self.half_seq[l][self.ch][0], myv, None, n);
+        self.hc_post(c, copy, Some((W_Y, m.card)), None, None, self.half_seq[l][self.ch][0], myv, None, n, None);
     }
     fn mla_seed(&mut self, l: usize, pos: usize, latent: &[u16]) {
         let m = self.mlas[l].as_ref().unwrap();
@@ -1627,17 +1635,25 @@ impl Placed for Cards {
         let value = self.half_seq[l][self.ch][1];
         let f = self.ffns[l].as_ref().unwrap();
         let parity = l % 2;
+        let peer = (0..self.cards.len()).find(|&j| j != f.card);
         for o in &self.cards {
             let me = o.k.index;
             let producer = me == f.card;
             // the producer's rows stay in its `fyv`; the peer reads them from its receiving buffer
-            let copy = if producer { (0..self.cards.len()).find(|&j| j != me).map(|j| (self.tok(&o.fyv, H), self.tok(&self.peers[j].fy[parity], H), n * H)) } else { None };
+            let copy = if producer { peer.map(|j| (self.tok(&o.fyv, H), self.tok(&self.peers[j].fy[parity], H), n * H)) } else { None };
             let fy = if producer { self.tok(&o.fyv, H) } else { self.tok(&self.peers[me].fy[parity], H) };
             let mine = producer.then_some((W_FFN, f.card));
             if f.dense {
-                self.hc_post(o, copy, mine, Some((W_FFN, f.card)), None, value, fy, None, n);
+                self.hc_post(o, copy, mine, Some((W_FFN, f.card)), None, value, fy, None, n, None);
+            } else if producer {
+                // the leader (002): once the host's word says every expert row is in its VRAM, the routed sum of
+                // the rows in pick order, folded in and forwarded to the peer with the peer's copy of the word
+                let rows = self.peers[me].rows.at(self.t0 * TOP_K * H * 4);
+                let fwd = peer.map(|j| (self.tok(&self.peers[j].yr[parity], H), self.peers[j].words.at(self.wd(W_EXPERTS, 0))));
+                let (fwd, fwd_word) = fwd.unwrap_or((0, 0));
+                self.hc_post(o, copy, mine, Some((W_FFN, f.card)), Some((W_EXPERTS, 0)), value, fy, None, n, Some((rows, self.tok(&o.wv, TOP_K), fwd, fwd_word)));
             } else {
-                self.hc_post(o, copy, mine, Some((W_FFN, f.card)), Some((W_EXPERTS, 0)), value, fy, Some(self.tok(&self.shared.yexp[parity], H)), n);
+                self.hc_post(o, copy, mine, Some((W_FFN, f.card)), Some((W_EXPERTS, 0)), value, fy, Some(self.tok(&self.peers[me].yr[parity], H)), n, None);
             }
         }
     }
@@ -1666,15 +1682,12 @@ impl Placed for Cards {
         }
         read(xa, XA_W + t0 * TOP_K * 4, unsafe { std::slice::from_raw_parts_mut(wts.as_mut_ptr() as *mut f32, n * TOP_K) });
     }
-    fn ffn_routed(&mut self, l: usize, n: usize, y: &[f32]) {
-        // streamed: the handoff buffer is write-combining for the CPU, and a plain copy of a 1024-token
-        // step's 16 MB took 4.8 ms a layer (0.2 ms a prompt token, 2026-10-19)
-        let buf = &self.shared.yexp[l % 2];
-        common::copy::stream(unsafe { std::slice::from_raw_parts_mut((buf.ptr() as *mut u8).add(self.t0 * H * 4), n * H * 4) }, raw(&y[..n * H]));
-        // the word into every card's own copy (the cards wait on their own VRAM, 001)
-        for pe in &self.peers {
-            unsafe { &*(pe.words.at(self.wd(W_EXPERTS, 0)) as *const AtomicU32) }.store(self.half_seq[l][self.ch][1], std::sync::atomic::Ordering::Release);
-        }
+    fn ffn_done(&mut self, l: usize) {
+        // every expert row is in the leader's VRAM (the host's workers fenced their write-combining stores; the
+        // residents' fences were waited for): the leader's copy of the word, the leader sums and forwards (002)
+        unsafe { core::arch::x86_64::_mm_sfence() };
+        let f = self.ffns[l].as_ref().unwrap();
+        unsafe { &*(self.peers[f.card].words.at(self.wd(W_EXPERTS, 0)) as *const AtomicU32) }.store(self.half_seq[l][self.ch][1], std::sync::atomic::Ordering::Release);
     }
     fn layer_out(&mut self, _l: usize, i: usize, mean: &mut [f32]) {
         let c = &self.cards[self.head_card];

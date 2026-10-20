@@ -233,9 +233,10 @@ pub mod gfx11_consts {
     pub const PRE_LDS: u32 = (if PRE_COEF_LDS > ACT_LDS { PRE_COEF_LDS } else { ACT_LDS }) as u32;
     /// `hc_pre`'s act table (a MoE layer on its FFN card): the device addresses its act phase reads and writes,
     /// in this order — the post-norm (f32), the router's bias (f32), the card's quantized activation (`xq`, `xs`,
-    /// `xg`), the host's copies of it, the host's picks (u32) and weights (f32) — each `[STEP]` tokens deep, the
+    /// `xg`), the host's copies of it, the host's picks (u32) and weights (f32), the card's copy of the weights
+    /// (the leader's routed sum, queue 002) — each `[STEP]` tokens deep, the
     /// launch's tokens written from row `t0` (a prefill chunk's first, 037); the host's word is the launch's `act_word`.
-    pub const ACT_SLOTS: usize = 10;
+    pub const ACT_SLOTS: usize = 11;
     /// `hc_pre`'s partials in VRAM, per token: the coefficient dots `[COEF_ROWS][SLICES]`, then every
     /// workgroup's sum of squares of its stream channels. The host allocates `STEP · PRE_STRIDE`.
     pub const PRE_STRIDE: usize = PRE_PARTS;
@@ -691,7 +692,7 @@ pub mod gfx11 {
         let (pln, bias) = (at(0) as *const f32, at(1) as *const f32);
         let (xq, xs, xg) = (at(2) as *mut i8, at(3) as *mut f32, at(4) as *mut i32);
         let (xq_h, xs_h, xg_h) = (at(5) as *mut i8, at(6) as *mut f32, at(7) as *mut i32);
-        let (picks, wts) = (at(8) as *mut u32, at(9) as *mut f32);
+        let (picks, wts, wv) = (at(8) as *mut u32, at(9) as *mut f32, at(10) as *mut f32);
         let k0 = common::stat_clock!();
         let xt = x.add(tok * H);
         let l = lds::<f32>();
@@ -835,7 +836,9 @@ pub mod gfx11 {
             if lu < TOP_K {
                 let e = *idx.add(lu) as usize;
                 *picks.add(ot * TOP_K + lu) = e as u32;
-                *wts.add(ot * TOP_K + lu) = *sig.add(e) / *misc.add(1) * ROUTED_SCALING_FACTOR;
+                let wt = *sig.add(e) / *misc.add(1) * ROUTED_SCALING_FACTOR;
+                *wts.add(ot * TOP_K + lu) = wt;
+                *wv.add(ot * TOP_K + lu) = wt;
             }
         }
         workgroup_sync();
@@ -853,9 +856,12 @@ pub mod gfx11 {
     /// `mine2` (the peer's copy of it), holds until `w0` and `w1` (those not null, in this card's
     /// VRAM: the producers' words as they landed here) read `value`, then releases the other
     /// workgroups through `go`, a VRAM word (one poller a card: sixteen slowed the host's experts by
-    /// 0.5 ms a token, timeline 2026-10-16). Grid: CHANNEL_GRID.
+    /// 0.5 ms a token, timeline 2026-10-16). `rows` (the leader of a MoE layer, queue 002): the routed
+    /// experts' output rows `[tokens · TOP_K][H]` in its VRAM, weighted by `wts: [tokens][TOP_K]` and summed in
+    /// pick order in place of `yb`, the sums written to `fwd` (the peer's receiving buffer) and, once every
+    /// workgroup's are out, `value` to `fwd_word` (the peer's copy of the experts' word). Grid: CHANNEL_GRID.
     #[no_mangle]
-    pub extern "gpu-kernel" fn hc_post(mix: *const f32, ya: *const f32, yb: *const f32, streams: *mut f32, src: *const f32, dst: *mut f32, dst2: *mut f32, n: u32, mine: *mut u32, mine2: *mut u32, w0: *const u32, w1: *const u32, value: u32, go: *mut u32, tokens: u32) {
+    pub extern "gpu-kernel" fn hc_post(mix: *const f32, ya: *const f32, yb: *const f32, streams: *mut f32, src: *const f32, dst: *mut f32, dst2: *mut f32, n: u32, mine: *mut u32, mine2: *mut u32, w0: *const u32, w1: *const u32, value: u32, go: *mut u32, tokens: u32, rows: *const f32, wts: *const f32, fwd: *mut f32, fwd_word: *mut u32) {
         unsafe {
             let t = workitem_id_x();
             if workgroup_id_x() == 0 {
@@ -906,7 +912,25 @@ pub mod gfx11 {
                     res[k] = *st.add(k * H + d);
                     k += 1;
                 }
-                let yd = *ya.add(i * H + d) + if yb.is_null() { 0.0 } else { *yb.add(i * H + d) };
+                // the routed experts' part: the leader's weighted sum of the token's rows in pick order (the host's
+                // arithmetic, a multiply and an add a pick from zero), forwarded to the peer; else the part given
+                let ybv = if !rows.is_null() {
+                    let mut s = 0f32;
+                    let mut k = 0;
+                    while k < TOP_K {
+                        s += *wts.add(i * TOP_K + k) * *rows.add((i * TOP_K + k) * H + d);
+                        k += 1;
+                    }
+                    if !fwd.is_null() {
+                        *fwd.add(i * H + d) = s;
+                    }
+                    s
+                } else if yb.is_null() {
+                    0.0
+                } else {
+                    *yb.add(i * H + d)
+                };
+                let yd = *ya.add(i * H + d) + ybv;
                 let mut j = 0;
                 while j < HC {
                     let mut acc = 0f32;
@@ -919,6 +943,18 @@ pub mod gfx11 {
                     j += 1;
                 }
                 i += 1;
+            }
+            // the forwarded sums out: the last workgroup writes the peer's word (`go`'s next word counts arrivals)
+            if !fwd_word.is_null() {
+                fence(Ordering::Release);
+                workgroup_sync();
+                if workitem_id_x() == 0 {
+                    let count = go.add(1);
+                    if AtomicU32::from_ptr(count).fetch_add(1, Ordering::AcqRel) == CHANNEL_GRID - 1 {
+                        AtomicU32::from_ptr(count).store(0, Ordering::Relaxed);
+                        AtomicU32::from_ptr(fwd_word).store(value, Ordering::Release);
+                    }
+                }
             }
         }
     }

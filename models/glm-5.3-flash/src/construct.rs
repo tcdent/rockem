@@ -875,6 +875,9 @@ impl CpuExperts<'_> {
                 q4::gemm::<D_FF>(DOWN_ROWS, dw, ds, blk.len(), act, |i| unsafe { (out_p as *mut f32).add(slot(b0 + i) * H + r0) });
                 b0 += GEMM_TOKENS;
             }
+            // the rows may be a card's VRAM through the BAR (002): this core's write-combining stores out before the
+            // run ends and the main thread writes the leader's word
+            unsafe { core::arch::x86_64::_mm_sfence() };
             #[cfg(feature = "track-experts")]
             acc[down_slot(i)][bucket_of(pairs.len())].add(t_item.elapsed().as_nanos() as u64, pairs.len());
             });
@@ -923,7 +926,7 @@ impl ItemAcc {
 /// input (the prefetch's predictor, a one-token step's: a step of many tokens
 /// names most experts and runs no early router); `ffn` posts the FFN half, which for a
 /// MoE layer collapses the block input to the host (`ffn_input`) and folds
-/// the routed experts the host computes (`ffn_routed`) into the streams with
+/// the routed experts' rows (the leader card sums them on `ffn_done`) into the streams with
 /// the shared expert's rows; `logits` is the head over the streams' mean.
 /// Nothing is waited for but what the host reads. `seed` and `snapshot` move
 /// a KDA layer's state; `mla_seed` installs a latent; `layer_out` fetches a
@@ -962,10 +965,10 @@ pub trait Placed {
     /// marked `E` in `picks` so the host's run skips it; a pick not resident may claim a slot (a free one,
     /// or a less-used resident's past a margin), which the loader fills for the steps to come. Returns the jobs.
     fn xpt_dispatch(&mut self, l: usize, n: usize, picks: &mut [[usize; TOP_K]], xq: &[i8], xs: &[f32], xg: &[i32]) -> usize;
-    /// The routed experts' outputs, `[STEP · TOP_K][H]` f32 in host memory every card sees: the cards' jobs
-    /// land in their (token, pick) rows directly and the host's experts write theirs beside them, so the
-    /// join is a wait and no copy (038). Null without cards.
-    fn expert_out(&self) -> *mut f32;
+    /// MoE layer `l`'s routed experts' outputs, `[STEP · TOP_K][H]` f32 by (token, pick) in the VRAM of the layer's
+    /// leader card (its FFN card, 002), mapped for the host and the other card: the cards' jobs land there
+    /// directly and the host's experts write theirs through the BAR, so the join is a wait and no copy.
+    fn expert_out(&self, l: usize) -> *mut f32;
     /// The loader the residency fills slots with, off the step: `fetch(l, e, out)` gathers expert `e` of
     /// layer `l` as a slot holds it (`expert::Weights::slot_bytes`). Set once before the first step.
     fn xpt_loader(&mut self, fetch: Box<dyn Fn(usize, usize, &mut [u8]) + Send + 'static>);
@@ -998,8 +1001,9 @@ pub trait Placed {
     /// Bring-up: a MoE layer's FFN input (`x: [n][H]`) and its router's logits (`[n][ROUTE_ROWS]`) as the card
     /// made them, for forced picks and the traces' edges; serving reads `ffn_input`'s quantized form instead.
     fn ffn_logits(&mut self, l: usize, n: usize, x: &mut [f32], logits: &mut [f32]);
-    /// The routed experts' output for every token (`[n][H]`), into the streams.
-    fn ffn_routed(&mut self, l: usize, n: usize, y: &[f32]);
+    /// Every routed expert row of the chunk is in the leader's VRAM (the host's run and the residents' join done):
+    /// the leader's word, after which it sums the rows in pick order into the streams and forwards the sums (002).
+    fn ffn_done(&mut self, l: usize);
     /// Token `i`'s layer output off the streams (bring-up).
     fn layer_out(&mut self, l: usize, i: usize, mean: &mut [f32]);
     /// The head over tokens `from..from + n`'s streams, `[n][VOCAB_SIZE]`; the step ends.
@@ -1640,7 +1644,6 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             tr.edge(NONE, "embed", &s.b_x[..H]);
         }
         let pl = s.placed.as_mut().unwrap();
-        let xout = pl.expert_out();
         pl.begin(&s.b_x[..n * H], n);
         let mut t = std::time::Instant::now();
         // a lap is a phase from the previous lap to now: its time goes to the profile and, with
@@ -1801,10 +1804,11 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 let (picks, wts) = (&mut s.b_picks[t0..t0 + n], &mut s.b_wts[t0..t0 + n]);
                 let (xq, xs, xg) = (&s.b_xq[t0 * H..(t0 + n) * H], &s.b_xs[t0 * HG..(t0 + n) * HG], &s.b_xg[t0 * HG..(t0 + n) * HG]);
                 pl.ffn_post(l, n);
-                // the outputs: the cards' host-memory rows when there are cards (their jobs land there), else the model's own
-                let out: &mut [f32] = if xout.is_null() { &mut s.b_out[t0 * TOP_K * H..(t0 + n) * TOP_K * H] } else { unsafe { std::slice::from_raw_parts_mut(xout.add(t0 * TOP_K * H), n * TOP_K * H) } };
+                // the outputs: the layer's leader card's rows in its VRAM (002) — the host's experts write theirs through
+                // the BAR, the cards' jobs theirs directly; the leader sums them
+                let out: &mut [f32] = unsafe { std::slice::from_raw_parts_mut(pl.expert_out(l).add(t0 * TOP_K * H), n * TOP_K * H) };
                 // the host's FFN phase as laps: the route (the picks, the residents' dispatch), the experts' run,
-                // the join of the cards' jobs, the sum and the handoff back — each a zone of its own
+                // the join of the cards' jobs, the word to the leader and the accounting — each a zone of its own
                 s.routed.run_batch_act(l, &picks[..n], xq, xs, xg, out);
                 lap(&mut p.experts, "experts");
                 s.routed.elapsed(); // the pool's own timer, taken so it does not accumulate (the lap is the measure here)
@@ -1829,23 +1833,20 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                         }
                     }
                 }
-                // each token's weighted sum of its experts' outputs, likewise (on the pool for any width: a few
-                // tokens summed on this thread instead measured 25 against 22 µs a layer, 2026-10-19)
+                // the leader card sums the rows in pick order and folds them in (002); the host only says they are all there
                 {
-                    prow::zone!("track-zones", "sum.y");
-                    let (y_p, out, wts_r) = (s.b_y[t0 * H..].as_mut_ptr() as usize, &*out, &*wts);
-                    s.pool.run(n, &move |i| {
-                        let y = unsafe { std::slice::from_raw_parts_mut((y_p as *mut f32).add(i * H), H) };
-                        y.fill(0.0);
-                        for k in 0..TOP_K {
-                            let eo = &out[(i * TOP_K + k) * H..(i * TOP_K + k + 1) * H];
-                            for d in 0..H {
-                                y[d] += wts_r[i][k] * eo[d];
-                            }
-                        }
-                    });
+                    prow::zone!("track-zones", "done.word");
+                    pl.ffn_done(l);
                 }
-                if n == 1 {
+                if n == 1 && tr.wants_edges() {
+                    // bring-up: the routed sum as the leader makes it, from its rows, for the trace's edges
+                    let y = &mut s.b_y[..H];
+                    y.fill(0.0);
+                    for k in 0..TOP_K {
+                        for d in 0..H {
+                            y[d] += wts[0][k] * out[k * H + d];
+                        }
+                    }
                     tr.edge(l, "ffn_in", &s.b_xn[..H]);
                     for k in 0..TOP_K {
                         tr.routed(l, k, &out[k * H..(k + 1) * H]);
@@ -1853,16 +1854,12 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     tr.edge(l, "routed", &s.b_y[..H]);
                 }
                 {
-                    prow::zone!("track-zones", "sum.handoff");
-                    pl.ffn_routed(l, n, &s.b_y[t0 * H..(t0 + n) * H]);
-                }
-                {
-                    prow::zone!("track-zones", "sum.account");
+                    prow::zone!("track-zones", "done.account");
                     for i in 0..n {
                         account(p, &mut s.last_picks, &mut s.freq, s.pool, l, s.b_routed[t0 + i], if n <= SPEC_TOKENS { pre_picks[i] } else { [E; TOP_K] });
                     }
                 }
-                lap(&mut p.route, "sum");
+                lap(&mut p.route, "done");
                 // the next MoE layer's picks, predicted by its router over this layer's FFN input (the second
                 // half of each token's scores), prefetched now that this layer's run is done (a run abandons
                 // the prefetches in flight); a step of many tokens names most experts and runs none

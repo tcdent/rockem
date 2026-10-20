@@ -69,7 +69,7 @@ the index. Reorganized 2026-10-18 from the single-page version (in git history b
 | # | Concept | Status | Area |
 |---|---|---|---|
 | [001](queue/001-peer-vram-writes.md) | Peer VRAM writes for the handoffs | Quantified, on the shelf — ≤ 0.1 ms a step token (decode), ~0.04 ms a prompt token (prefill); the helper and the benches exist, the handoff refactor is the work left | decode, prefill |
-| [002](queue/002-card-controlled-expert-phase.md) | The expert phase controlled by a card | Quantified, on the shelf — ≤ 0.01–0.02 ms a step token as the cards' share stands; grows with the cards' share of a layer's picks (039) | decode |
+| [002](queue/002-card-controlled-expert-phase.md) | The expert phase controlled by a card | Built: the FFN card leads the routed experts, a verify step 45.9 → 43.5 ms | decode |
 | [003](queue/003-experts-resident-on-cards.md) | Routed experts resident on the cards | Resolved (decode) | decode |
 | [004](queue/004-expert-cache-policy.md) | The expert cache's replacement policy (ARC) | Done (aged counts + a layer turn for the one load a step; measured 2026-10-18 10:29) | decode |
 | [005](queue/005-layer-ahead-routing.md) | Layer-ahead routing for the prefetch | Resolved | decode |
@@ -131,7 +131,7 @@ the index. Reorganized 2026-10-18 from the single-page version (in git history b
 | [061](queue/061-gpu-architecture-quantified.md) | The cards' architecture, quantified | Open — topology read and probes first | decode, prefill (every card kernel) |
 | [062](queue/062-profile-placement-split.md) | Separate placement training from the profile | Open — a refactor candidate, not scheduled | decode, prefill (CPU model, placement retrain) |
 | [063](queue/063-residency-filled-in-prefill.md) | Residency filled during prefill, from the prompt's own routing | Open — the largest exact decode lever at long context | decode (long context), prefill |
-| [064](queue/064-host-laps-off-the-critical-path.md) | The host's between-phase laps off the critical path | Open | decode |
+| [064](queue/064-host-laps-off-the-critical-path.md) | The host's between-phase laps off the critical path | Done: 001 (input side) and 002 (output side) | decode |
 | [065](queue/065-expert-activation-reread.md) | The expert kernel's activation re-read a part | Quantified, on the shelf — ≤ 0.13 ms a prompt token | prefill |
 | [066](queue/066-expert-phase-quantize-and-posting.md) | The expert phase's quantize run and posting | Quantified, on the shelf — ~0.13 ms a prompt token | prefill |
 | [067](queue/067-scalar-qabs-at-decode.md) | The scalar q_abs at a verify step | Quantified, on the shelf — 0.4 ms a verify step | decode |

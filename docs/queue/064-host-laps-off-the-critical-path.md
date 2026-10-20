@@ -1,6 +1,6 @@
 # 064 — The host's between-phase laps off the critical path
 
-**Status:** Measured to the piece (2026-10-19); two pieces taken (the join by 038, the prefill handoff streamed), the rest sized and pointing at 001's architecture
+**Status:** Done (2026-10-20) — the input side moved to the cards by 001, the output side by 002 (the leader card sums the expert rows)
 **Area:** decode
 **Gain:** measured — 3.6 ms a verify step of host laps on the critical path (route 1.5, sum 2.1) in pieces of 3–40 µs a layer; taken: the join 0.86 → 0.07 (038), the prefill expert handoff 0.2 → 0.11 ms a prompt token (streamed)
 
@@ -56,3 +56,8 @@ top-k and norm there, the picks handed down), sum.y 1.77 (the weighted sum on th
 input — the host's rows would travel up instead, 002's shape), dispatch 0.41 and route.quant 0.11 (the card
 quantizing in `hc_pre`), sum.handoff 0.29. Together 3.5 ms a step, 1.9 an emitted token — and they are
 one design, 001's: the host's work between card phases moved to the cards with the data staying there.
+
+- 2026-10-20: the rest taken. 001 moved route.pick, route.quant and the dispatch's uploads onto the FFN card;
+  002 moved sum.y and sum.handoff (the leader card sums the rows the producers write into its VRAM): a verify
+  step at 18k 45.9 → 43.5 ms. What remains of the host's between-phase laps: `route` 0.31 (the residents'
+  dispatch 0.30), `done` 0.05, `slot` 1.67 (beside the cards' work).
