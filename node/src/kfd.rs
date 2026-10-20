@@ -218,7 +218,9 @@ const FENCE_AGENT: u16 = 1;
 const FENCE_SYSTEM: u16 = 2;
 const HEADER_ACQUIRE_SHIFT: u16 = 9;
 const HEADER_RELEASE_SHIFT: u16 = 11;
-const RING_PACKETS: usize = 1024;
+/// The AQL ring, its launches' stamps and names: a 1024-token prefill step posts ~2,000–2,500 launches a card, which
+/// 1024 cut to the step's last half on the card lanes (2026-10-20); 4096 holds a whole step.
+const RING_PACKETS: usize = 4096;
 const KERNARG_SLOT: usize = 256;
 const KERNARG_SLOTS: usize = RING_PACKETS;
 
