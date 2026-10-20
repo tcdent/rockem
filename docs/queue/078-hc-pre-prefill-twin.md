@@ -64,6 +64,15 @@ across the cards, the scores exchanged) is a separate, smaller step, to look at 
     watch. The preferred form.
   Both answer to the same first measurement: the run against its DRAM floor, and how much of the rest is barriers and
   tails (the pool's per-run rows: `pool.sh`).
+- **The idle windows' prefetch in prefill** (tcdent, 2026-10-20: "if we pick them right we can use the idle CPU time to
+  stream in as much as we can fit in the cache"). While the host waits on the cards (the FFN input ~6 ms a layer-chunk,
+  an MLA layer's projections ~9 ms) the pool and DRAM idle. A 512-token chunk picks nearly every expert, so before the
+  picks arrive each CCD can warm the first ~32 MB of its own queue in run order (an expert slice's CCD and slot are fixed;
+  the unpicked few are cheap waste) — four cores a CCD at ~22 GB/s fill it in ~1.5 ms. The cap is the cache, not the
+  window: ~384 MB of L3 against ~3.3 GB of non-resident experts a layer-chunk, so ~12 % of the run from cache — est.
+  ~1–1.3 ms of a ~19 ms run, ~0.06–0.08 ms a prompt token, if the run is DRAM-bound at its start. The cheapest of these
+  to try: the decode prefetch's job posted at each dispatch wait over each CCD's first slices; read `prefetch_job`
+  (done before overtaken) and the experts lap.
 
 ## Next
 The twin's arithmetic is the step gate's numeric kind (WMMA order) for the coefficients and the router; the act phase
