@@ -29,6 +29,29 @@ timeline without the bring-up checks (2026-10-20).
 ## History
 - 2026-10-20: measured and listed.
 
+## After 058 (2026-10-20): where prefill stands, and what 078 is for
+With the MLA attend split (058), prefill at 18k is 2.65 ms a prompt token: the host's experts 1.55, its wait on a
+chunk's FFN input from the cards 0.49, its wait on the MLA projections 0.37. Each card is ~97 % busy in a prefill step,
+but ~26 % of that is `hc_post` spinning (waiting on the host or the other card) and 28–30 % is `hc_pre` (cards.sh, run
+of mla2f). 078 is the speed of `hc_pre` at prefill widths on both cards, not a balance between them: both run it on
+their own streams; the FFN card's also carries the router and the act phase. Balancing that (the router's rows split
+across the cards, the scores exchanged) is a separate, smaller step, to look at after 078 shows what is left.
+
+## Context for later (tcdent, 2026-10-20: to think about before investing in it)
+- **The per-chunk FFN card** (chunk A's FFN half on card0, chunk B's on card1, at once): exact, ~0.9 GB a card (every
+  layer's shared expert and router rows on both, the three dense FFNs ~156 MB each; fits 1M at ~17.2 of 20.5 GB a card).
+  It fills a card's spin with the other chunk's FFN, which pays when the cards are prefill's bottleneck — after 058 the
+  host's experts are, so it waits.
+- **Moving routed-expert work from the CPU to the cards in prefill.** The movable work is the routed experts' picks:
+  today ~27 % of prefill picks hit experts resident in VRAM (~18 a layer a card, ~10.4 GB a card, full; 1M shrinks it).
+  Beyond residency, 039 streams the next layer's non-resident experts through a staging area (~25 GB/s a card over PCIe:
+  ~70 more experts a layer across both cards in a ~19 ms window, about a quarter of the CPU's). The catch: the cards'
+  copies read the same host DRAM the CPU would, so the gain is at most the CPU's non-DRAM share of the experts lap —
+  by arithmetic (not measured) a layer-chunk reads ~3.3 GB of non-resident experts, ~11 ms at ~300 GB/s, against ~19 ms
+  measured, so ~8 ms a layer-chunk is compute and the pool's overhead.
+  **First, before any build:** how close the CPU's prefill expert run sits to its DRAM floor (`pool.sh`, `experts.sh`,
+  the pool's per-run rows). Close to it, streaming buys little and the CPU side needs another lever.
+
 ## Next
 The twin's arithmetic is the step gate's numeric kind (WMMA order) for the coefficients and the router; the act phase
 stays exact. Then the card lanes again: card1's `hc_pre` share and the FFN-input wait.
