@@ -46,6 +46,18 @@ pub fn bf16<const M: usize, const K: usize>(w: &[u16], x: &[f32], out: &mut [f32
     bf16_scalar::<M, K>(w, x, out)
 }
 
+/// Rows `m0..m1` of `bf16` into `out[m0..m1]`, the same arithmetic a row (a pool item's share of a wider run).
+#[inline(always)]
+pub fn bf16_rows<const K: usize>(w: &[u16], x: &[f32], out: &mut [f32], m0: usize, m1: usize) {
+    debug_assert!(w.len() >= m1 * K && x.len() >= K && out.len() >= m1);
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        avx2::bf16_rows::<K>(w.as_ptr(), x.as_ptr(), out.as_mut_ptr(), m0, m1)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    bf16_scalar_rows::<K>(w, x, out, m0, m1)
+}
+
 /// `bf16` with the rows split over `pool` in `pool::ROWS`-row items: each item
 /// writes its own rows of `out`, so the result is the serial one exactly.
 #[inline(always)]

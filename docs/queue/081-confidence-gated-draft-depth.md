@@ -125,6 +125,16 @@ training cost.
   - attention: a chain of single-token kernels across both cards (058's split: `mtp_eh` 0.11, `mla_qb` 0.12, `mla_o`
     0.12, `mla_attend_w` 0.11, `mla_qabs` 0.10, `mla_uv` 0.07, `ix_select` 0.05, the merges ~0.06) and ~0.31 ms a
     draft of `word_wait` (a card spinning on the other's word); the zone 0.83.
+- 2026-10-20: the draft layer's prefill path (tcdent: "draft.route is the one that stands out"). After each prefill step
+  the draft runs over every position of it (its own cache), and its host side and card kernels were decode-shaped:
+  a 1024-token step's draft lap 208 ms median (attention 67, experts 51, FFN 36, route 33, input 16) — ~0.2 ms a
+  prompt token. Changed: the router rows of every position in one pool run (an item a position and 16 rows; was a run
+  a position), the picks and the input norms a pool item a position (all bit-identical: the long decode's 402 tokens
+  and 234/168 acceptance unchanged); the draft's `mla_o` and shared expert on the matrix-path twins past
+  `SPEC_TOKENS` as the main layers' (`mla_o` was 18 decode launches, ~15 ms of a 576-position draft; numeric in the
+  draft only). The draft lap a prefill step 208 → 173 (pooling) → 134 ms; prefill 2.09–2.19 → 2.02–2.04 ms a prompt
+  token, the cold 18k prompt 41.65 → 40.35 s, warm 39.0 s. Left in it: the host's experts 49 ms, the attention 46
+  (`mla_attend_w` ~9.6 ms a card), the FFN 24 (the host's weighted sum over every position's eight picks, serial).
 
 ## Next
 The draft's own cost: its head (~1.1 ms a draft, bandwidth over the vocabulary's rows) and its attention (~0.8 at

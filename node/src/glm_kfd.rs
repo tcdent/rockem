@@ -1655,8 +1655,14 @@ impl Placed for Cards {
         let t = self.mtp.as_ref().unwrap();
         let c = &self.cards[t.card];
         let m = self.mlas[glm_5_3_flash::layout::MTP_LAYER].as_ref().unwrap();
-        // the output projection, the residual, the block's states out to the host for its routing
-        self.rows8(c, &c.mla_o, c.mheads.va, None, m.o.0.va, m.o.1.va, c.myv.va, H, O_IN, n, ROWS);
+        // the output projection, the residual, the block's states out to the host for its routing; a prefill step's
+        // positions on the matrix path as the main layers' (the decode kernel in 32-token passes was ~15 ms of a
+        // 576-position draft, 2026-10-20)
+        if n > SPEC_TOKENS {
+            self.rows_w(c, &c.mla_o_w, c.mheads.va, None, m.o.0.va, Some(m.o.1.va), c.myv.va, H, n, false);
+        } else {
+            self.rows8(c, &c.mla_o, c.mheads.va, None, m.o.0.va, m.o.1.va, c.myv.va, H, O_IN, n, ROWS);
+        }
         self.add2(c, c.x.va, c.myv.va, 0, n);
         self.copy_out(c, c.x.va, self.shared.xh.va, n);
         c.k.sync();
@@ -1668,8 +1674,13 @@ impl Placed for Cards {
         // the shared expert over the post-normed states, the host's routed experts, the residual
         let yexp = &self.shared.yexp[0];
         unsafe { std::ptr::copy_nonoverlapping(routed.as_ptr(), yexp.ptr() as *mut f32, n * H) };
-        self.rows8(c, &c.ffn_gu, c.x.va, Some(t.post_ln.va), t.gu_w.va, t.gu_s.va, c.gu.va, SHARED_GU_ROWS, H, n, ROWS_GU);
-        self.rows8_at(c, &c.ffn_down_shared, c.gu.va, 2 * N_SHARED_EXPERTS * D_FF, None, t.down_w.va, t.down_s.va, c.fyv.va, H, N_SHARED_EXPERTS * D_FF, n, ROWS, true);
+        if n > SPEC_TOKENS {
+            self.rows_w(c, &c.ffn_gu_w, c.x.va, Some(t.post_ln.va), t.gu_w.va, Some(t.gu_s.va), c.gu.va, SHARED_GU_ROWS, n, false);
+            self.rows_w(c, &c.ffn_down_shared_w, c.gu.va, None, t.down_w.va, Some(t.down_s.va), c.fyv.va, H, n, false);
+        } else {
+            self.rows8(c, &c.ffn_gu, c.x.va, Some(t.post_ln.va), t.gu_w.va, t.gu_s.va, c.gu.va, SHARED_GU_ROWS, H, n, ROWS_GU);
+            self.rows8_at(c, &c.ffn_down_shared, c.gu.va, 2 * N_SHARED_EXPERTS * D_FF, None, t.down_w.va, t.down_s.va, c.fyv.va, H, N_SHARED_EXPERTS * D_FF, n, ROWS, true);
+        }
         self.add2(c, c.x.va, c.fyv.va, yexp.va, n);
         self.copy_out(c, c.x.va, self.shared.xh.va, n);
         c.k.sync();

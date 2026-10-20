@@ -1207,6 +1207,8 @@ pub struct CpuModel<'p, R: Routed> {
     f_expert_out: Vec<f32>,
     f_shared: Vec<f32>,
     f_score: Vec<f32>,
+    /// The draft's router scores, `[STEP][E]`: every position's at once (081).
+    d_scores: Vec<f32>,
     /// A step's per-token rows with the cards: the block inputs, their norms, the routed outputs,
     /// the routers' logits, the experts' outputs (`[STEP][…]`).
     b_x: Vec<f32>,
@@ -1282,6 +1284,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             f_expert_out: vec![0.0; TOP_K * H],
             f_shared: vec![0.0; H],
             f_score: vec![0.0; E],
+            d_scores: vec![0.0; STEP * E],
             b_x: vec![0.0; STEP * H],
             b_xn: vec![0.0; STEP * H],
             b_y: vec![0.0; STEP * H],
@@ -1469,15 +1472,21 @@ impl<'p, R: Routed> CpuModel<'p, R> {
         assert!(n >= 1 && n <= STEP && nexts.len() >= n && hiddens.len() >= n * H);
         // the draft's phases as zones inside `draft` (081): its input, attention, router, experts, FFN, head
         // every position's [enorm(embed(next)) | hnorm(hidden)]
+        // a position a pool item (a prefill step's 1024 went one at a time on this thread, ~16 ms, 2026-10-20)
         let z = prow::Timestamp::now();
-        for i in 0..n {
-            let row = &w.embed[nexts[i] as usize * H..(nexts[i] as usize + 1) * H];
-            for d in 0..H {
-                s.d_y[d] = widen(row[d]);
-            }
-            let (e, h) = s.d_cats[i * 2 * H..(i + 1) * 2 * H].split_at_mut(H);
-            rmsnorm::<H>(&s.d_y, m.enorm, RMS_NORM_EPS, e);
-            rmsnorm::<H>(&hiddens[i * H..(i + 1) * H], m.hnorm, RMS_NORM_EPS, h);
+        {
+            let (cp, hp, emb, en, hn) = (s.d_cats.as_mut_ptr() as usize, hiddens.as_ptr() as usize, w.embed, m.enorm, m.hnorm);
+            s.pool.run(n, &move |i| {
+                let row = &emb[nexts[i] as usize * H..(nexts[i] as usize + 1) * H];
+                let mut y = [0f32; H];
+                for d in 0..H {
+                    y[d] = widen(row[d]);
+                }
+                let cat = unsafe { std::slice::from_raw_parts_mut((cp as *mut f32).add(i * 2 * H), 2 * H) };
+                let (e, h) = cat.split_at_mut(H);
+                rmsnorm::<H>(&y, en, RMS_NORM_EPS, e);
+                rmsnorm::<H>(unsafe { std::slice::from_raw_parts((hp as *const f32).add(i * H), H) }, hn, RMS_NORM_EPS, h);
+            });
         }
         pl.mtp_begin(&s.d_cats[..n * 2 * H], n);
         let z = draft_zone("draft.in", z);
@@ -1499,12 +1508,34 @@ impl<'p, R: Routed> CpuModel<'p, R> {
         // the routing and the routed experts here, every token's
         let mut picks = [[0usize; TOP_K]; STEP];
         let mut wts = [[0f32; TOP_K]; STEP];
-        for i in 0..n {
-            rmsnorm::<H>(&s.b_x[i * H..(i + 1) * H], m.post_ln, RMS_NORM_EPS, &mut s.b_xn[i * H..(i + 1) * H]);
-            gemv::bf16_par::<E, H>(m.ffn.router, &s.b_xn[i * H..(i + 1) * H], &mut s.f_score, s.pool);
-            let (idx, wt) = ffn::route_scores(&m.ffn, &mut s.f_score, None);
-            picks[i] = idx;
-            wts[i] = wt;
+        // every position's router rows in one pool run, an item a (position, `pool::ROWS` rows): a prefill step's
+        // positions went through a run each (~33 ms a 1024-token step, 2026-10-20). Each item norms its position
+        // itself (the first block keeps it); the rows are `bf16_par`'s, so the scores are the same bits
+        {
+            const BLOCKS: usize = E.div_ceil(common::pool::ROWS);
+            let (xp, xnp, sp, rw, ln) = (s.b_x.as_ptr() as usize, s.b_xn.as_mut_ptr() as usize, s.d_scores.as_mut_ptr() as usize, m.ffn.router, m.post_ln);
+            s.pool.run_at(n * BLOCKS, &move |j| (rw.as_ptr() as usize + (j % BLOCKS) * common::pool::ROWS * H * 2) as *const u8, &move |j| {
+                let (i, b) = (j / BLOCKS, j % BLOCKS);
+                let x = unsafe { std::slice::from_raw_parts((xp as *const f32).add(i * H), H) };
+                let mut xn = [0f32; H];
+                rmsnorm::<H>(x, ln, RMS_NORM_EPS, &mut xn);
+                if b == 0 {
+                    unsafe { std::slice::from_raw_parts_mut((xnp as *mut f32).add(i * H), H) }.copy_from_slice(&xn);
+                }
+                let out = unsafe { std::slice::from_raw_parts_mut((sp as *mut f32).add(i * E), E) };
+                gemv::bf16_rows::<H>(rw, &xn, out, b * common::pool::ROWS, ((b + 1) * common::pool::ROWS).min(E));
+            });
+        }
+        {
+            // each position's picks a pool item (serially, ~9 µs a position: 9.6 ms a 1024-token step)
+            let (sp, pp, wp, f) = (s.d_scores.as_mut_ptr() as usize, picks.as_mut_ptr() as usize, wts.as_mut_ptr() as usize, &m.ffn);
+            s.pool.run(n, &move |i| {
+                let (idx, wt) = ffn::route_scores(f, unsafe { std::slice::from_raw_parts_mut((sp as *mut f32).add(i * E), E) }, None);
+                unsafe {
+                    *(pp as *mut [usize; TOP_K]).add(i) = idx;
+                    *(wp as *mut [f32; TOP_K]).add(i) = wt;
+                }
+            });
         }
         let z = draft_zone("draft.route", z);
         s.routed.run_batch(l, &picks[..n], &s.b_xn[..n * H], &mut s.b_out[..n * TOP_K * H]);
