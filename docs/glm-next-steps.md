@@ -144,6 +144,7 @@ the index. Reorganized 2026-10-18 from the single-page version (in git history b
 | [074](queue/074-decode-expert-runs-idle.md) | The decode expert runs' idle | Open — up to ~4 ms a verify step measured | decode |
 | [075](queue/075-step-2048-under-the-wavefront.md) | `STEP` 2048 under the wavefront | Quantified, on the shelf — prefill −0.19 ms a prompt token against two resident slots a layer and ~+1 ms a verify step | prefill, decode |
 | [076](queue/076-step-width-deep-dive.md) | The step's width under the wavefront: a deep dive | Open — a study (chunk width vs buffer depth, the residency, the draft lap) | prefill, decode |
+| [077](queue/077-warm-next-layer-weights.md) | Warm the next layer's weights while the cards wait for the host | Open — an experiment | decode |
 
 ## Order (2026-10-18, evening — the 20 ms path)
 
