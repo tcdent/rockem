@@ -1,8 +1,8 @@
 # 081 — Draft depth chosen a step by the draft's confidence
 
-**Status:** Deployed (2026-10-20) — the gate served, ms an emitted token at 18k 26.6–27.2 → 25.5–26.1; the draft instrumented
+**Status:** Deployed (2026-10-20) — gated depth 3 served, ms an emitted token at 18k 26.6–27.2 → 24.8–25.0; the draft instrumented, its card launches on the lanes
 **Area:** decode
-**Gain:** measured ~0.5–1.7 ms an emitted token at 18k (26.6–27.2 → 25.5–26.1, generations of different lengths); more as the draft gets cheaper (head ~1.0 and attention ~0.8 ms a draft)
+**Gain:** measured ~1.6–2.4 ms an emitted token at 18k (26.6–27.2 → 24.8–25.0 at gated depth 3, generations of different lengths); more as the draft gets cheaper (head ~1.1 and attention ~0.8 ms a draft)
 
 ## Proposal
 The draft layer proposes its second token every step, and the verify step takes it only when the draft's own
@@ -101,10 +101,37 @@ training cost.
   Where the draft's time goes, a verify step (both drafts, ms): head 1.97 (~1.0 a draft), attention 1.53 (~0.8 a
   draft at 18k), experts 1.26, FFN 0.51, router 0.17, input 0.07 — 5.5 in all, the second draft 2.2 (2.65 when
   made). 28 % of steps pay a second draft that is then dropped (~0.74 ms a step).
+- 2026-10-20: gated depth 3 served (`DRAFT_DEPTH` 3, the same gate a draft further; tcdent: "depth three is worth
+  considering as well, seeing as we're able to get performance at parity"). Long SCORE bit-identical. At 18k:
+
+  | | depth 1 | gated depth 2 | gated depth 3 |
+  |---|---|---|---|
+  | ms an emitted token (long decode; 96-token) | 26.6; 27.2 | 26.1; 25.5 | **25.0; 24.8** |
+  | verify step, laps median | 44.5 | 49.3 | 52.7 |
+  | drafts accepted / verified / made a step | 0.79 / 1 / 1 | 1.14 / 1.56 / 1.85 | 1.40 / 1.90 / 2.47 |
+
+  | made, verified (226 steps) | share | ≥ 1 accepted | ≥ 2 | 3 |
+  |---|---|---|---|---|
+  | 1, 1 | 13 % | 0.48 | — | — |
+  | 2, 1 | 27 % | 0.94 | — | — |
+  | 3, 2 | 29 % | 0.92 | 0.68 | — |
+  | 3, 3 | 31 % | 0.93 | 0.73 | 0.36 (0.50 of the second's) |
+
+  The draft's launches are now on the card lanes (the timeline also reports at the draft's end; before, the step's
+  report closed first and the draft's card work was invisible). A draft, both cards, read against the zones (the
+  lanes drift up to ~0.3 ms against the host's, so the split by zone is approximate):
+  - head: `rows_h` ~0.82 ms a card in parallel over each card's half of the vocabulary — the head weights' bytes;
+    the zone 1.13;
+  - attention: a chain of single-token kernels across both cards (058's split: `mtp_eh` 0.11, `mla_qb` 0.12, `mla_o`
+    0.12, `mla_attend_w` 0.11, `mla_qabs` 0.10, `mla_uv` 0.07, `ix_select` 0.05, the merges ~0.06) and ~0.31 ms a
+    draft of `word_wait` (a card spinning on the other's word); the zone 0.83.
 
 ## Next
-The draft's own cost, from the zones: its head (~1.0 ms a draft, the shared lm head over the vocabulary) and its
-attention (~0.8 at 18k) are most of it. Grouping the two drafts' duplicated work is the follow-on (tcdent).
+The draft's own cost: its head (~1.1 ms a draft, bandwidth over the vocabulary's rows) and its attention (~0.8 at
+18k, a chain of single-token kernels split across the cards with ~0.3 ms of word waits) are most of it; at depth 3 a
+step drafts 2.47 times. Candidates: the draft's head over a frequent-token subset of the vocabulary (FR-Spec; exact
+under rejection sampling, acceptance lowered by the subset's coverage, which is measurable first); the draft layer's
+attention on one card (the split's word waits at one token).
 
 Earlier plan, done:
 1. `forward-glm --mtp-accept` with the second draft's acceptance bucketed by the draft layer's probability for

@@ -105,7 +105,7 @@ pub const SPEC_TOKENS: usize = 4;
 /// step of three tokens cost 75–78 ms for ~2.45 tokens (the union of three tokens' experts, the
 /// three-token pass, the second draft) against 58 ms for 1.92 at depth 1: no gain at 0.92
 /// acceptance, a loss at 0.84, so one draft.
-pub const DRAFT_DEPTH: usize = 2;
+pub const DRAFT_DEPTH: usize = 3;
 /// A draft past the first is made only when the draft before it gives its own token at least this probability
 /// under the sampler, and verified only when it gives its own token as much (queue 081): ungated, the second draft
 /// was break-even at 18k (2026-10-20: its draft lap 2.9 ms and verify position 8.4 ms a step against ~0.40 tokens a

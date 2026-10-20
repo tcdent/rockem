@@ -873,11 +873,18 @@ impl Cards {
 
     /// With the launches stamped (`track-launches`): the step's launches on every card as zones on
     /// lanes `card0`, `card1`, …, their completion stamps in UTC through the card's clock. A step of
-    /// more launches than the ring holds keeps its last `RING_PACKETS`.
-    fn timeline_report(&self) {
+    /// more launches than the ring holds keeps its last `RING_PACKETS`. Reported launches are not reported again:
+    /// the window moves past them (the draft after a step reports its own, 081).
+    fn timeline_report(&mut self) {
         if !self.cards[0].k.instrumented() {
             return;
         }
+        self.timeline_lanes();
+        for (i, c) in self.cards.iter().enumerate() {
+            self.token_from[i] = c.k.posted();
+        }
+    }
+    fn timeline_lanes(&self) {
         for (i, c) in self.cards.iter().enumerate() {
             let lane = format!("card{}", c.k.index);
             let tl = c.k.timeline_from(self.token_from[i]);
@@ -1690,6 +1697,8 @@ impl Placed for Cards {
             c.k.sync();
             read(&c.lg, 0, &mut logits[r0..r0 + rows]);
         }
+        // the draft's launches on the card lanes (the step's report closed before the draft ran)
+        self.timeline_report();
     }
     fn mla_wait(&mut self, l: usize, i: usize, kva: &mut [f32], ik: &mut [f32], igate: &mut [f32]) {
         let c = &self.cards[self.mlas[l].as_ref().unwrap().card];
