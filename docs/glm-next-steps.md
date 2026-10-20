@@ -145,9 +145,10 @@ the index. Reorganized 2026-10-18 from the single-page version (in git history b
 | [075](queue/075-step-2048-under-the-wavefront.md) | `STEP` 2048 under the wavefront | Quantified, on the shelf — prefill −0.19 ms a prompt token against two resident slots a layer and ~+1 ms a verify step | prefill, decode |
 | [076](queue/076-step-width-deep-dive.md) | The step's width under the wavefront: a deep dive | Open — a study (chunk width vs buffer depth, the residency, the draft lap) | prefill, decode |
 | [077](queue/077-warm-next-layer-weights.md) | Warm the next layer's weights while the cards wait for the host | Open — an experiment | decode |
-| [078](queue/078-hc-pre-prefill-twin.md) | `hc_pre`'s matrix-path twin for prefill | Open — measured: the FFN card's `hc_pre` is 39 % of its prefill time and what the host's 0.63 ms a prompt token waits on | prefill |
+| [078](queue/078-hc-pre-prefill-twin.md) | `hc_pre`'s matrix-path twin for prefill | Built — the exact fixes and the router's matrix path: prefill 2.65 → 2.14–2.21 ms a prompt token; prefill now CPU-expert bound | prefill |
 | [079](queue/079-mla-o-rate.md) | The MLA output projection's rate in prefill | Open — 4.6 ms a 512-token launch, est. well under 1 ms | prefill |
 | [080](queue/080-launch-granularity.md) | Launch and timeline granularity: steps cut too fine | Open — noted (`rows_d2`'s 32-token passes, ~530 launches a card a prefill step) | prefill, profiling |
+| [081](queue/081-confidence-gated-draft-depth.md) | Draft depth chosen a step by the draft's confidence | Open — ungated depth 2 break-even at 18k; the gate est. ~+1.9 ms a verify step, bounded by the second draft's 2.9 ms lap | decode |
 
 ## Order (2026-10-18, evening — the 20 ms path)
 

@@ -384,7 +384,10 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
         let (mut agree, mut hit, mut n_acc, mut sum_acc, mut sum_acc_greedy_hit) = (0usize, 0usize, 0usize, 0f64, 0usize);
         // depth 2: the draft at t+1 from the draft's own hidden state at t and the text's token there (an
         // accepted first draft), its guess of ids[t+3] against the main model's logits at t+2
-        let mut q2: std::collections::HashMap<usize, Vec<f32>> = std::collections::HashMap::new();
+        // keyed by the position its guess is checked at: the second draft's logits, the first draft's confidence (its
+        // top probability under the sampler) and that first draft's acceptance, filled in a position later (081)
+        let mut q2: std::collections::HashMap<usize, (Vec<f32>, f64, f64, bool)> = std::collections::HashMap::new();
+        let (mut by_q1, mut by_q2, mut by_c1) = (Bands::default(), Bands::default(), Bands::default());
         let (mut agree2, mut n_acc2, mut sum_acc2) = (0usize, 0usize, 0f64);
         let (mut n_draft, mut card_agree, mut card_dmax) = (0usize, 0usize, 0f32);
         let s = &glm_5_3_flash::SAMPLING;
@@ -428,12 +431,17 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
             } else {
                 h.copy_from_slice(&h1);
             }
-            if let Some(q) = q2.remove(&t) {
+            if let Some((q, c1, a1, g1)) = q2.remove(&t) {
                 // the depth-2 draft made at t-1 (from the draft at t-2) and the main model's logits at t both predict ids[t+1]
                 let p = &model.logits[..VOCAB_SIZE];
-                agree2 += (argmax(p) == argmax(&q)) as usize;
-                sum_acc2 += overlap(p, &q, s);
+                let g2 = argmax(p) == argmax(&q);
+                agree2 += g2 as usize;
+                let a2 = overlap(p, &q, s);
+                sum_acc2 += a2;
                 n_acc2 += 1;
+                by_q2.add(p, &q, s);
+                // the third position's yield (both drafts accepted), by the first draft's confidence: the drafting gate
+                by_c1.add_point(c1, a1 * a2, g1 && g2);
             }
             if have_q {
                 // q_prev (drafted at t-1) and the main model's logits at t both predict ids[t+1]
@@ -443,6 +451,10 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
                 hit += (aq == ids[t + 1]) as usize;
                 let acc = overlap(p, &q_prev, s);
                 sum_acc += acc;
+                by_q1.add(p, &q_prev, s);
+                if let Some(e) = q2.get_mut(&(t + 1)) {
+                    (e.2, e.3) = (acc, ap == aq);
+                }
                 sum_acc_greedy_hit += (ap == ids[t + 1]) as usize;
                 n_acc += 1;
                 if t < FIRST_POS + 4 {
@@ -454,8 +466,9 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
             if t >= FIRST_POS && t + 2 < n {
                 // the served path: the cards' draft at t+1 from the cards' draft output at t
                 let mut q = vec![0f32; VOCAB_SIZE];
+                let c1 = common::sample::dist(&q_prev, s)[0].1;
                 model.draft_next(&w, ids[t + 2] as u32, t + 1, &mut q, &mut common::trace::NoTrace);
-                q2.insert(t + 2, q);
+                q2.insert(t + 2, (q, c1, 0.0, false));
             }
             if t % 100 == 0 {
                 println!("  mtp: {t} positions, {:.1} s", t0.elapsed().as_secs_f32());
@@ -463,6 +476,9 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
         }
         println!("mtp draft: cards vs host over {n_draft} positions — top-1 agree {:.3}, max |Δ logit| {card_dmax:.3e}", card_agree as f64 / n_draft as f64);
         println!("mtp accept, depth 2: {n_acc2} positions — draft top-1 = main top-1 {:.3}; expected acceptance under the sampler {:.3}", agree2 as f64 / n_acc2.max(1) as f64, sum_acc2 / n_acc2.max(1) as f64);
+        by_q1.print("first draft by its token's probability q(x)");
+        by_q2.print("second draft by its token's probability q(x)");
+        by_c1.print("both drafts accepted, by the first draft's top probability");
         println!("mtp accept: {n_acc} positions — draft top-1 = main top-1 {:.3}; draft top-1 = text {:.3} (main top-1 = text {:.3}); expected acceptance under the sampler (T {} top-k {} top-p {}) {:.3}; {:.1} s", agree as f64 / n_acc as f64, hit as f64 / n_acc as f64, sum_acc_greedy_hit as f64 / n_acc as f64, s.temperature, s.top_k, s.top_p, sum_acc / n_acc as f64, t0.elapsed().as_secs_f32());
     }
     // --routing-trace: the --step-ids text a token at a time; every MoE layer's picks a position to the
@@ -510,6 +526,56 @@ fn argmax(v: &[f32]) -> usize {
     v.iter().enumerate().fold((0, f32::NEG_INFINITY), |a, (i, &x)| if x > a.1 { (i, x) } else { a }).0
 }
 /// Expected acceptance of a draft from `q` verified against `p`: Σ_x min(p(x), q(x)).
+/// Acceptance in bands of the draft's probability (081): a band's mass (drafts falling in it) and its accepted
+/// mass under the sampler, and its greedy count and top-1 agreements. `add` spreads a position over the tokens the
+/// draft could sample, each x weighted q(x) and accepted min(p(x), q(x)) — the expectation of rejection sampling.
+#[derive(Default)]
+struct Bands {
+    mass: [f64; BANDS],
+    acc: [f64; BANDS],
+    n: [usize; BANDS],
+    top1: [usize; BANDS],
+}
+const BANDS: usize = 10;
+impl Bands {
+    fn band(c: f64) -> usize {
+        ((c * BANDS as f64) as usize).min(BANDS - 1)
+    }
+    fn add(&mut self, p: &[f32], q: &[f32], s: &common::sample::Sampling) {
+        let (dp, dq) = (common::sample::dist(p, s), common::sample::dist(q, s));
+        for (id, qx) in &dq {
+            let px = dp.iter().find(|(i, _)| i == id).map_or(0.0, |x| x.1);
+            let b = Self::band(*qx);
+            self.mass[b] += qx;
+            self.acc[b] += qx.min(px);
+        }
+        let b = Self::band(dq[0].1);
+        self.n[b] += 1;
+        self.top1[b] += (argmax(p) == argmax(q)) as usize;
+    }
+    fn add_point(&mut self, c: f64, acc: f64, top1: bool) {
+        let b = Self::band(c);
+        self.mass[b] += 1.0;
+        self.acc[b] += acc;
+        self.n[b] += 1;
+        self.top1[b] += top1 as usize;
+    }
+    /// A line a band, and the gate's view: drafts kept at or above the band, their share and acceptance.
+    fn print(&self, what: &str) {
+        let (tm, tn) = (self.mass.iter().sum::<f64>(), self.n.iter().sum::<usize>());
+        println!("mtp bands, {what} — band, share, acceptance (sampler) | greedy share, top-1 | kept at ≥ band: share, acceptance");
+        let (mut km, mut ka) = (0f64, 0f64);
+        for b in (0..BANDS).rev() {
+            km += self.mass[b];
+            ka += self.acc[b];
+            if self.mass[b] == 0.0 && self.n[b] == 0 {
+                continue;
+            }
+            println!("  {:.1}–{:.1}  {:.3}  {:.3} | {:.3}  {:.3} | {:.3}  {:.3}", b as f64 / BANDS as f64, (b + 1) as f64 / BANDS as f64, self.mass[b] / tm, self.acc[b] / self.mass[b].max(1e-12), self.n[b] as f64 / tn.max(1) as f64, self.top1[b] as f64 / self.n[b].max(1) as f64, km / tm, ka / km.max(1e-12));
+        }
+    }
+}
+
 fn overlap(p: &[f32], q: &[f32], s: &common::sample::Sampling) -> f64 {
     let (dp, dq) = (common::sample::dist(p, s), common::sample::dist(q, s));
     let mut acc = 0f64;
