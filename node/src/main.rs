@@ -528,7 +528,9 @@ impl Session {
         };
         let mut made = 1;
         let (mut x, mut p) = q(s, 0);
-        while made < s.drafts.len() && p >= keep {
+        // a further draft writes the draft layer's row at `end + made - 1`: never past the context (at 32k the third
+        // draft's row was position `max_ctx`, out of the cache, 2026-10-20)
+        while made < s.drafts.len() && p >= keep && end + made - 1 < s.max_ctx {
             s.e.draft_next(x, end + made - 1, &mut s.drafts[made]);
             (x, p) = q(s, made);
             made += 1;
