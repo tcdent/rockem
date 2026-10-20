@@ -21,23 +21,21 @@ pub const STAT_WAVES_PER_WG: u32 = 8;
 #[no_mangle]
 pub static mut ROCKEM_STATS: u64 = 0;
 
-/// The shader clock, in core cycles: `s_getreg` of SHADER_CYCLES, one
-/// scalar instruction, 20 bits wide (it wraps every ~0.4 ms at 2.5 GHz, so
-/// a phase must be shorter than that; `stat_clock!` deltas are taken modulo
-/// the width). The real-time clock the timeline uses is a returning
-/// send-message on gfx11 and costs about a microsecond a read — measured
-/// through this very channel — which is too coarse for phases inside a
-/// kernel. The host converts cycles to time with the clock rate it infers
-/// per kernel from the timeline (cycles per real-time tick).
+/// The real-time counter (100 MHz, 64 bits): a returning send-message on gfx11, about a microsecond a read
+/// (measured through this channel). The 20-bit SHADER_CYCLES register it replaced wraps every ~0.5 ms, so a prefill
+/// launch's phases (milliseconds, 2026-10-20) came out modulo it; a microsecond a stamp is noise beside them, and
+/// the few-token phases (tens of µs) carry it as a known bias.
 #[cfg(all(target_arch = "amdgpu", feature = "stats"))]
 #[inline(always)]
 pub unsafe fn clock() -> u64 {
-    let c: u32;
-    core::arch::asm!("s_getreg_b32 {c}, hwreg(HW_REG_SHADER_CYCLES, 0, 20)", c = out(sgpr32) c, options(nostack, nomem, preserves_flags));
-    c as u64
+    let c: u64;
+    core::arch::asm!("s_sendmsg_rtn_b64 {c}, sendmsg(MSG_RTN_GET_REALTIME)", "s_waitcnt lgkmcnt(0)", c = out(sgpr64) c, options(nostack, nomem, preserves_flags));
+    c
 }
-/// The difference of two `clock()` readings, modulo the counter's width.
-pub const CLOCK_MASK: u64 = (1 << 20) - 1;
+/// The difference of two `clock()` readings: the 64-bit real-time counter never wraps in a launch.
+pub const CLOCK_MASK: u64 = u64::MAX;
+/// `clock()` ticks a microsecond (the 100 MHz real-time counter).
+pub const CLOCK_PER_US: f64 = 100.0;
 
 #[cfg(all(target_arch = "amdgpu", feature = "stats"))]
 #[inline(always)]

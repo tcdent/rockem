@@ -346,10 +346,9 @@ pub mod gfx11 {
     pub extern "gpu-kernel" fn hc_pre(streams: *const f32, w: *const u16, part: *mut f32, base: *const f32, scale: *const f32, mix: *mut f32, x: *mut f32, x_host: *mut f32, count: *mut u32, value: u32, ln: *const u16, router: *const u16, scores: *mut f32, scores_v: *mut f32, word: *mut u32, act: *const u64, act_word: *mut u32, t0: u32, rows: u32, n: u32) {
         unsafe {
             let n = n as usize;
-            // stats (a stats code object only), the act phase of the FFN card's launch: slot 0 from the scores' last
-            // arrival to the act phase's start (workgroup 0's poll of the rows, the ready word, the wait), 1 the
-            // token's loads and norm, 2 its quantize, 3 the picks (rank through the picks' writes; workgroup 0's values are
-            // the ones the host waits on)
+            // stats (a stats code object only), the launch's phases as workgroup 0 sees them: slot 0 the coefficient dots to
+            // the grid's first arrival, 1 the mix and the collapse to the router's start (the plain launch's end), 2 the
+            // router to every score in, 3 the workgroup's tokens' act phase
             let t = workitem_id_x() as usize;
             let (wave, lane) = (t / 32, (t % 32) as u32);
             let wg = workgroup_id_x() as usize;
@@ -361,6 +360,7 @@ pub mod gfx11 {
             let trs = l.add(PRE_TOKENS * (16 + COEF_ROWS)); // [8 waves][HC·HC] transpose scratch
             let (b0, b1, b2) = (count, count.add(2 * COEF_ROWS), count.add(4 * COEF_ROWS));
             let ready = count.add(PRE_BARRIERS * 2 * COEF_ROWS);
+            let kt0 = common::stat_clock!();
             // this slice of the row: the thread's eight weights once, every token's channels against them
             let (w_row, c0) = (w.add(row * HC * H), slice * K_SLICE);
             let mut wv = [0f32; 8];
@@ -411,7 +411,10 @@ pub mod gfx11 {
                     workgroup_sync(); // the partials' LDS is the next round's
                 }
             }
-            if arrive(b0, row, t, wave, lane, value) {
+            let a0 = arrive(b0, row, t, wave, lane, value);
+            let kt1 = common::stat_clock!();
+            common::stat!(0, kt1.wrapping_sub(kt0) & common::stats::CLOCK_MASK);
+            if a0 {
                 // every token's coefficients, a round of tokens at a time: the norm from one row's slices'
                 // squares (every row's slices read the same channels; one row covers them all), the rows'
                 // partials in fixed order
@@ -516,6 +519,8 @@ pub mod gfx11 {
                 }
             }
             if router.is_null() {
+                let kt2 = common::stat_clock!();
+                common::stat!(1, kt2.wrapping_sub(kt1) & common::stats::CLOCK_MASK);
                 return;
             }
             // the collapse's arrival: this workgroup's channels to L2; workgroup 0 publishes; every workgroup waits
@@ -529,13 +534,14 @@ pub mod gfx11 {
             }
             workgroup_sync();
             fence(Ordering::Acquire);
+            let kt2 = common::stat_clock!();
+            common::stat!(1, kt2.wrapping_sub(kt1) & common::stats::CLOCK_MASK);
             // the router's rows `0..rows` (this layer's: the next layer's, the prefetch's predictor, run in their own launch
             // after this one, `hc_route_ahead` — a store to host memory leaves only at a launch's end-of-kernel release
             // here, so work behind the act phase's word in this launch held the word too, 2026-10-20)
             router_rows(0, rows as usize, n, x, ln, router, scores, scores_v, red, t, wave, lane, wg);
             // the router's arrival: this workgroup's scores out over the link; workgroup 0 says so
             fence(Ordering::Release);
-            let ka = common::stat_clock!();
             let ready3 = ready.add(2);
             if arrive(b2, row, t, wave, lane, value) && t == 0 {
                 if !word.is_null() {
@@ -554,13 +560,15 @@ pub mod gfx11 {
                     }
                     workgroup_sync();
                     fence(Ordering::Acquire);
-                    let kb = common::stat_clock!();
-                    common::stat!(0, kb.wrapping_sub(ka) & common::stats::CLOCK_MASK);
+                    let kt3 = common::stat_clock!();
+                    common::stat!(2, kt3.wrapping_sub(kt2) & common::stats::CLOCK_MASK);
                     let mut tok = wg;
                     while tok < n {
                         act_token(tok, t0 as usize + tok, t, wave, lane, x, scores_v, act);
                         tok += COEF_ROWS * SLICES;
                     }
+                    let kt4 = common::stat_clock!();
+                    common::stat!(3, kt4.wrapping_sub(kt3) & common::stats::CLOCK_MASK);
                 }
                 // the act phase's arrival: the last workgroup out writes the host's word
                 fence(Ordering::Release);
@@ -728,7 +736,6 @@ pub mod gfx11 {
         let (xq, xs, xg) = (at(2) as *mut i8, at(3) as *mut f32, at(4) as *mut i32);
         let (xq_h, xs_h, xg_h) = (at(5) as *mut i8, at(6) as *mut f32, at(7) as *mut i32);
         let (picks, wts, wv) = (at(8) as *mut u32, at(9) as *mut f32, at(10) as *mut f32);
-        let k0 = common::stat_clock!();
         let xt = x.add(tok * H);
         let l = lds::<f32>();
         let part = l; // [256] the threads' sums of squares
@@ -777,8 +784,6 @@ pub mod gfx11 {
             }
         }
         workgroup_sync();
-        let k1 = common::stat_clock!();
-        common::stat!(1, k1.wrapping_sub(k0) & common::stats::CLOCK_MASK);
         let r = *misc;
         // the groups: wave w quantizes groups w, w + 8, w + 16, w + 24, the four groups' loads issued first and their
         // butterflies in lockstep
@@ -812,8 +817,6 @@ pub mod gfx11 {
             }
             gi += 1;
         }
-        let k2 = common::stat_clock!();
-        common::stat!(2, k2.wrapping_sub(k1) & common::stats::CLOCK_MASK);
         // the router's picks: the host's `top` takes the greatest key first and, between equal keys, the lower expert,
         // which is the u64 order of `ck` (the one order the mapping changes, −0 below +0, needs a sum both of whose
         // terms are −0, and the sigmoid is not); an expert's rank is the count of keys above its own, the TOP_K ranked
@@ -877,8 +880,6 @@ pub mod gfx11 {
             }
         }
         workgroup_sync();
-        let k3 = common::stat_clock!();
-        common::stat!(3, k3.wrapping_sub(k2) & common::stats::CLOCK_MASK);
     }
 
     /// `stream_ij[d] = post_ij · y_i[d] + Σ_k comb_ikj · stream_ik[d]` for the `tokens` tokens of a
