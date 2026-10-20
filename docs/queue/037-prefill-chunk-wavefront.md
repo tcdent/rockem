@@ -69,6 +69,7 @@ fence was still outstanding when B's MLA projections posted theirs, the signal w
 | cold 18k prompt | 60.9 s | 54.9 s |
 
 ## Next
-1. `STEP` 2048 (chunks of 1024): each chunk's experts amortized as a 1024-token step's were.
+1. ~~`STEP` 2048~~ — measured: prefill 2.84 → 2.65 against two resident slots a layer and ~+1 ms a verify step;
+   its own entry, 075, on the shelf.
 2. The MLA layers: the host waits on a chunk's projections before the other chunk's experts can start (11 of 42
    layers keep a bubble).
