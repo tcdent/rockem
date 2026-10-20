@@ -1821,7 +1821,7 @@ impl Placed for Cards {
         read(&self.shared.xh, self.t0 * H * 4, &mut x[..n * H]);
         read(&self.shared.scores_ffn, self.t0 * ROUTE_ROWS * 4, &mut logits[..n * ROUTE_ROWS]);
     }
-    fn ffn_input(&mut self, l: usize, n: usize, xq: &mut [i8], xs: &mut [f32], xg: &mut [i32], picks: &mut [[usize; TOP_K]], wts: &mut [[f32; TOP_K]]) {
+    fn ffn_input(&mut self, l: usize, n: usize, xq: &mut [i8], xs: &mut [f32], xg: &mut [i32], picks: &mut [[usize; TOP_K]], wts: &mut [[f32; TOP_K]], pool: &dyn common::pool::Pool) {
         let f = self.ffns[l].as_ref().unwrap();
         {
             prow::zone!("track-zones", "act.wait");
@@ -1830,7 +1830,18 @@ impl Placed for Cards {
         prow::zone!("track-zones", "act.read");
         let t0 = self.t0;
         let xa = &self.shared.xact;
-        read(xa, XA_Q + t0 * H, &mut xq[..n * H]);
+        // the activations (~2 MB a prefill chunk) in 64 KB pieces over the pool, idle until they are in: one core streamed
+        // them at ~4.5 GB/s, 0.49 ms a chunk on the critical path (2026-10-20); a verify step's are one piece, inline
+        {
+            const PIECE: usize = 64 << 10;
+            let (src, dst, len) = (xa.at(XA_Q + t0 * H), xq.as_mut_ptr() as usize, n * H);
+            pool.run(len.div_ceil(PIECE), &move |i| {
+                let (o, e) = (i * PIECE, ((i + 1) * PIECE).min(len));
+                let s = unsafe { std::slice::from_raw_parts((src + o) as *const u8, e - o) };
+                let d = unsafe { std::slice::from_raw_parts_mut((dst + o) as *mut u8, e - o) };
+                common::copy::stream_read(d, s);
+            });
+        }
         read(xa, XA_S + t0 * HG * 4, &mut xs[..n * HG]);
         read(xa, XA_G + t0 * HG * 4, &mut xg[..n * HG]);
         let mut p = vec![0u32; n * TOP_K];

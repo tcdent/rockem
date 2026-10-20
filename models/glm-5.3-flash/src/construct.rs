@@ -1054,7 +1054,7 @@ pub trait Placed {
     fn mla_seed(&mut self, l: usize, pos: usize, latent: &[u16]);
     fn ffn(&mut self, l: usize, n: usize);
     /// A MoE layer's FFN input for every token (`[n][H]`) and the FFN router's logits (`[n][E]`).
-    fn ffn_input(&mut self, l: usize, n: usize, xq: &mut [i8], xs: &mut [f32], xg: &mut [i32], picks: &mut [[usize; TOP_K]], wts: &mut [[f32; TOP_K]]);
+    fn ffn_input(&mut self, l: usize, n: usize, xq: &mut [i8], xs: &mut [f32], xg: &mut [i32], picks: &mut [[usize; TOP_K]], wts: &mut [[f32; TOP_K]], pool: &dyn Pool);
     /// The FFN router's logits `[n][ROUTE_ROWS]` once the next layer's rows are in too (they follow the act phase's
     /// word, off its path): the second half is the prefetch's predictor (005).
     fn ffn_ahead(&mut self, l: usize, n: usize, logits: &mut [f32]);
@@ -1815,7 +1815,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 // router's picks and weights — the host's norm, quantize and routing moved to the FFN card's `hc_pre`
                 const HG: usize = H / common::q4::GROUP;
                 if phase == DISPATCH {
-                    pl.ffn_input(l, n, &mut s.b_xq[t0 * H..(t0 + n) * H], &mut s.b_xs[t0 * HG..(t0 + n) * HG], &mut s.b_xg[t0 * HG..(t0 + n) * HG], &mut s.b_picks[t0..t0 + n], &mut s.b_wts[t0..t0 + n]);
+                    pl.ffn_input(l, n, &mut s.b_xq[t0 * H..(t0 + n) * H], &mut s.b_xs[t0 * HG..(t0 + n) * HG], &mut s.b_xg[t0 * HG..(t0 + n) * HG], &mut s.b_picks[t0..t0 + n], &mut s.b_wts[t0..t0 + n], s.pool);
                     lap(&mut p.kda_card, "kda_card");
                     let (picks, wts) = (&mut s.b_picks[t0..t0 + n], &mut s.b_wts[t0..t0 + n]);
                     let (xq, xs, xg) = (&s.b_xq[t0 * H..(t0 + n) * H], &s.b_xs[t0 * HG..(t0 + n) * HG], &s.b_xg[t0 * HG..(t0 + n) * HG]);
