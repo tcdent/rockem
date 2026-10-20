@@ -148,7 +148,7 @@ the index. Reorganized 2026-10-18 from the single-page version (in git history b
 | [078](queue/078-hc-pre-prefill-twin.md) | `hc_pre`'s matrix-path twin for prefill | Built — the exact fixes and the router's matrix path: prefill 2.65 → 2.14–2.21 ms a prompt token; prefill now CPU-expert bound | prefill |
 | [079](queue/079-mla-o-rate.md) | The MLA output projection's rate in prefill | Open — 4.6 ms a 512-token launch, est. well under 1 ms | prefill |
 | [080](queue/080-launch-granularity.md) | Launch and timeline granularity: steps cut too fine | Open — noted (`rows_d2`'s 32-token passes, ~530 launches a card a prefill step) | prefill, profiling |
-| [081](queue/081-confidence-gated-draft-depth.md) | Draft depth chosen a step by the draft's confidence | Open — ungated depth 2 break-even at 18k; the gate est. ~+1.9 ms a verify step, bounded by the second draft's 2.9 ms lap | decode |
+| [081](queue/081-confidence-gated-draft-depth.md) | Draft depth chosen a step by the draft's confidence | Deployed — the gate served: 18k 26.6–27.2 → 25.5–26.1 ms an emitted token; the draft's phases instrumented | decode |
 
 ## Order (2026-10-18, evening — the 20 ms path)
 

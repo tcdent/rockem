@@ -263,6 +263,11 @@ struct Session {
     spec: bool,
     /// The drafts made after the last step, `[vocab]` each: the token after `next`, then the token after that one.
     drafts: Vec<Vec<f32>>,
+    /// Of those, the ones the next step verifies (`redraft`'s gate), and each draft's probability for the token
+    /// it will propose.
+    depth: usize,
+    draft_q: Vec<f64>,
+    draft_made: usize,
     /// Verify steps run and drafts accepted, over the connection.
     verified: usize,
     accepted: usize,
@@ -509,12 +514,28 @@ impl Session {
         let s = self;
         let seed = s.e.seed_value();
         let sam = s.e.sampling();
+        let keep = s.e.draft_keep();
         s.e.draft(toks, s.next, pos, &mut s.drafts[0]);
         let end = pos + toks.len(); // the position of `next`
-        for d in 1..s.drafts.len() {
-            let x = common::sample::draw(&s.drafts[d - 1], sam, common::sample::uniform_at(seed ^ DRAFT_SALT, (end + d) as u64)) as u32;
-            s.e.draft_next(x, end + d - 1, &mut s.drafts[d]);
+        // each draft's token (the verify draws the same) and the draft's own probability for it: the chain goes on
+        // past a draft only when it is that sure (queue 081); the probabilities are the draft's alone, drawn with its
+        // own uniforms, so how many drafts a step verifies leaves the emitted distribution the model's
+        let q = |s: &mut Self, d: usize| {
+            let x = common::sample::draw(&s.drafts[d], sam, common::sample::uniform_at(seed ^ DRAFT_SALT, (end + d + 1) as u64)) as u32;
+            let p = common::sample::dist(&s.drafts[d], sam).iter().find(|(i, _)| *i == x).map_or(0.0, |e| e.1);
+            s.draft_q[d] = p;
+            (x, p)
+        };
+        let mut made = 1;
+        let (mut x, mut p) = q(s, 0);
+        while made < s.drafts.len() && p >= keep {
+            s.e.draft_next(x, end + made - 1, &mut s.drafts[made]);
+            (x, p) = q(s, made);
+            made += 1;
         }
+        // the first draft is always verified; a further one only when sure of its own token
+        s.depth = if made > 1 && p < keep { made - 1 } else { made };
+        s.draft_made = made;
     }
     /// Tokens `toks` computed at `pos..` (their rows at `row0..` of the last step) into the active
     /// context: rows, ids, keys; the position advances past them.
@@ -577,7 +598,7 @@ impl Session {
             let s = self.e.sampling();
             let seed = self.e.seed_value();
             let pos = self.pos;
-            let k = self.drafts.len().min(limit - emitted).min(self.max_ctx - self.pos - 1);
+            let k = self.depth.min(limit - emitted).min(self.max_ctx - self.pos - 1);
             let mut toks = vec![id];
             for d in 0..k {
                 toks.push(common::sample::draw(&self.drafts[d], s, common::sample::uniform_at(seed ^ DRAFT_SALT, (pos + 1 + d) as u64)) as u32);
@@ -597,6 +618,10 @@ impl Session {
                 self.accepted += 1;
                 kept += 1;
             }
+            // the draft chain's gate a verify step (081): each draft's probability for its token (-1 where none was
+            // made), the drafts made and verified, and the ones accepted
+            let qd = |d: usize| if d < self.draft_made { self.draft_q[d] } else { -1.0 };
+            prow::row!("track-step", "spec_step", { "pos" => pos, "q1" => qd(0), "q2" => qd(1), "made" => self.draft_made, "verified" => k, "accepted" => kept - 1 });
             self.next = match tok {
                 Some(t) => t,
                 None => self.e.draw(k, common::sample::uniform_at(seed, (pos + 1 + k) as u64)),
@@ -817,9 +842,9 @@ fn main() {
     let spec = e.drafts() && debug.is_none();
     let e_depth = if spec { e.draft_depth() } else { 0 };
     let vocab_n = e.vocab_size();
-    let mut session = Session { e, scoring: false, last_row: 0, next: 0, pos: first, max_ctx, started: false, prefix_left: 0, debug, store, active: 0, pending: None, hits: 0, spec, drafts: vec![vec![0.0; vocab_n]; e_depth], verified: 0, accepted: 0 };
+    let mut session = Session { e, scoring: false, last_row: 0, next: 0, pos: first, max_ctx, started: false, prefix_left: 0, debug, store, active: 0, pending: None, hits: 0, spec, drafts: vec![vec![0.0; vocab_n]; e_depth], depth: e_depth.min(1), draft_q: vec![0.0; e_depth], draft_made: e_depth.min(1), verified: 0, accepted: 0 };
     if spec {
-        println!("spec     : the draft layer drafts {e_depth} tokens after every step; verified in the next");
+        println!("spec     : the draft layer drafts up to {e_depth} tokens after every step, a further one while the last gives its token {} or more; verified in the next", session.e.draft_keep());
     }
 
     // --- execution ---

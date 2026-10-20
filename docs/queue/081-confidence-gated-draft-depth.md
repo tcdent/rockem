@@ -1,8 +1,8 @@
 # 081 — Draft depth chosen a step by the draft's confidence
 
-**Status:** Open — steps 1 and 2 measured: ungated depth 2 break-even at 18k; the gate est. ~+1.9 ms a step, bounded by the second draft's 2.9 ms lap
+**Status:** Deployed (2026-10-20) — the gate served, ms an emitted token at 18k 26.6–27.2 → 25.5–26.1; the draft instrumented
 **Area:** decode
-**Gain:** est. ~1.9 ms a verify step at 18k (~1 ms an emitted token), from the bands and the measured step costs; more if the second draft gets cheaper
+**Gain:** measured ~0.5–1.7 ms an emitted token at 18k (26.6–27.2 → 25.5–26.1, generations of different lengths); more as the draft gets cheaper (head ~1.0 and attention ~0.8 ms a draft)
 
 ## Proposal
 The draft layer proposes its second token every step, and the verify step takes it only when the draft's own
@@ -77,8 +77,36 @@ training cost.
   ~0.51 × (0.63 × 26.8 − 8.4) ≈ 4.3 ms a step; drafting the second only when the first's top probability ≥ 0.5 costs
   ~0.82 × 2.9 ≈ 2.4. Net ~+1.9 ms a step (~4 %, ~1 ms an emitted token). The second draft's 2.9 ms lap is the
   bound: it is paid before its probability is known. Reverted to `DRAFT_DEPTH` 1 in the tree.
+- 2026-10-20: the gate built and served — `DRAFT_DEPTH` 2, `DRAFT_KEEP` 0.5 (node `redraft`: the second draft made
+  only when the first gives its token ≥ 0.5, verified only when it gives its own ≥ 0.5; the tokens are the ones the
+  verify draws). Instrumented: a `spec_step` row a verify step (q1, q2, made, verified, accepted; `track-step`) and
+  the draft's phases as zones (`draft.in/attn/route/experts/ffn/head`, the second draft under `draft.next`). Long
+  SCORE bit-identical to rw1. At 18k, same requests (the generations differ in length):
+
+  | | depth 1 | depth 2 ungated | gated |
+  |---|---|---|---|
+  | ms an emitted token (long decode; 96-token) | 26.6; 27.2 | 27.0; 26.5 | **26.1; 25.5** |
+  | verify step, laps median | 44.5 | 53.1 | 49.3 |
+  | drafts accepted a step | 0.79 | 1.19 | 1.14 |
+  | drafts made / verified a step | 1 / 1 | 2 / 2 | 1.85 / 1.56 |
+
+  The gate's decisions over 194 verify steps:
+
+  | made, verified | share | first accepted | both accepted | mean q1 | mean q2 |
+  |---|---|---|---|---|---|
+  | 1, 1 (first unsure) | 15 % | 0.67 | — | 0.24 | — |
+  | 2, 1 (second dropped) | 28 % | 0.93 | — | 0.92 | 0.22 |
+  | 2, 2 (three-token step) | 56 % | 0.80 | 0.58 (0.72 of first accepted) | 0.88 | 0.87 |
+
+  Where the draft's time goes, a verify step (both drafts, ms): head 1.97 (~1.0 a draft), attention 1.53 (~0.8 a
+  draft at 18k), experts 1.26, FFN 0.51, router 0.17, input 0.07 — 5.5 in all, the second draft 2.2 (2.65 when
+  made). 28 % of steps pay a second draft that is then dropped (~0.74 ms a step).
 
 ## Next
+The draft's own cost, from the zones: its head (~1.0 ms a draft, the shared lm head over the vocabulary) and its
+attention (~0.8 at 18k) are most of it. Grouping the two drafts' duplicated work is the follow-on (tcdent).
+
+Earlier plan, done:
 1. `forward-glm --mtp-accept` with the second draft's acceptance bucketed by the draft layer's probability for
    it (and by the first draft's probability, for the drafting gate). If a band of high probability holds
    acceptance well above the break-even, the gate has something to keep.

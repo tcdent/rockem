@@ -68,6 +68,10 @@ pub trait Engine {
     fn draft_depth(&self) -> usize {
         0
     }
+    /// The draft chain's gate: a further draft is made, and verified, only past this probability of its token.
+    fn draft_keep(&self) -> f64 {
+        0.0
+    }
     /// The next depth: the draft layer at `pos` from its own last output and `next`, the token the last
     /// draft proposed; `logits` receives the draft of the token after it.
     fn draft_next(&mut self, _next: u32, _pos: usize, _logits: &mut [f32]) {

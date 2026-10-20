@@ -292,6 +292,9 @@ impl Engine for Glm {
     fn draft_depth(&self) -> usize {
         if self.drafts() { glm_5_3_flash::DRAFT_DEPTH } else { 0 }
     }
+    fn draft_keep(&self) -> f64 {
+        glm_5_3_flash::DRAFT_KEEP
+    }
     fn draft_next(&mut self, next: u32, pos: usize, logits: &mut [f32]) {
         self.model.draft_next(&self.w, next, pos, logits, &mut common::trace::NoTrace);
     }

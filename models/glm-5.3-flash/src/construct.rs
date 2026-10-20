@@ -1467,7 +1467,9 @@ impl<'p, R: Routed> CpuModel<'p, R> {
         let pl = s.placed.as_mut().expect("draft_batch: the cards'");
         let l = layout::MTP_LAYER;
         assert!(n >= 1 && n <= STEP && nexts.len() >= n && hiddens.len() >= n * H);
+        // the draft's phases as zones inside `draft` (081): its input, attention, router, experts, FFN, head
         // every position's [enorm(embed(next)) | hnorm(hidden)]
+        let z = prow::Timestamp::now();
         for i in 0..n {
             let row = &w.embed[nexts[i] as usize * H..(nexts[i] as usize + 1) * H];
             for d in 0..H {
@@ -1478,6 +1480,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             rmsnorm::<H>(&hiddens[i * H..(i + 1) * H], m.hnorm, RMS_NORM_EPS, h);
         }
         pl.mtp_begin(&s.d_cats[..n * 2 * H], n);
+        let z = draft_zone("draft.in", z);
         for i in 0..n {
             let (latent, ikey, igate) = mla::row(cache, pos + i);
             pl.mla_wait(l, i, &mut s.m_kva, &mut s.m_ik, igate);
@@ -1492,6 +1495,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
         pl.mla_attend(l, n, pos, &s.b_lat[..n * KV_LORA_RANK]);
         pl.mtp_attn_out(&mut s.b_x[..n * H], n);
         tr.edge(l, "mtp.attn", &s.b_x[(n - 1) * H..n * H]);
+        let z = draft_zone("draft.attn", z);
         // the routing and the routed experts here, every token's
         let mut picks = [[0usize; TOP_K]; STEP];
         let mut wts = [[0f32; TOP_K]; STEP];
@@ -1502,7 +1506,9 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             picks[i] = idx;
             wts[i] = wt;
         }
+        let z = draft_zone("draft.route", z);
         s.routed.run_batch(l, &picks[..n], &s.b_xn[..n * H], &mut s.b_out[..n * TOP_K * H]);
+        let z = draft_zone("draft.experts", z);
         for i in 0..n {
             let y = &mut s.b_y[i * H..(i + 1) * H];
             y.fill(0.0);
@@ -1517,7 +1523,9 @@ impl<'p, R: Routed> CpuModel<'p, R> {
         pl.mtp_ffn(&s.b_y[..n * H], &mut s.b_x[..n * H], n);
         tr.edge(l, "mtp.ffn", &s.b_x[(n - 1) * H..n * H]);
         s.d_hid.copy_from_slice(&s.b_x[(n - 1) * H..n * H]);
+        let z = draft_zone("draft.ffn", z);
         pl.mtp_head(n - 1, logits);
+        draft_zone("draft.head", z);
         // the draft's expert time is the draft's (the step's `experts` lap takes what `elapsed` holds)
         s.routed.elapsed();
         s.profile.draft += t0.elapsed().as_secs_f64();
@@ -1526,6 +1534,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
     /// own output there and `next` (the token the last draft proposed, standing for an accepted draft);
     /// `logits` is the draft of the token after `next`.
     pub fn draft_next(&mut self, w: &Weights, next: u32, pos: usize, logits: &mut [f32], tr: &mut impl Trace) {
+        prow::zone!("track-zones", "draft.next");
         let hid = self.d_hid.clone(); // `draft_batch` writes `d_hid` for the depth after this one
         self.draft_batch(w, &hid, &[next], pos, 1, logits, tr);
     }
@@ -2003,4 +2012,11 @@ fn account(p: &mut Profile, last_picks: &mut [[usize; TOP_K]], freq: &mut [u32],
     p.post_sort += sort;
     p.post_drain += drain;
     p.post_free += free;
+}
+
+/// A draft phase from `since` to now as a zone on this lane (`track-zones`); returns now, the next phase's start.
+fn draft_zone(_name: &'static str, since: prow::Timestamp) -> prow::Timestamp {
+    let now = prow::Timestamp::now();
+    prow::zone_at!("track-zones", _name, prow::lane(), since, now);
+    now
 }
