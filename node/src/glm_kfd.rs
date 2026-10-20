@@ -263,6 +263,9 @@ const W_EXPERTS: usize = 4;
 /// The FFN input's quantized activations, picks and weights are in (the FFN card's `hc_pre` act phase, for the host).
 const W_ACT: usize = 5;
 const W_KINDS: usize = 6;
+/// The resident experts' completion line (`Kfd::fence_line`): a prefill chunk's residents are waited for after the
+/// other chunk's card half has posted and waited for its own fences (037).
+const XPT_LINE: usize = 1;
 const MKVA: usize = 0;
 const MIX: usize = MKVA + STEP * KV_LORA_RANK;
 const MPROJ: usize = MIX + STEP * IX_ROWS;
@@ -1381,7 +1384,7 @@ impl Placed for Cards {
                 let mut b = Args::new();
                 b.ptr(r.slots[c].va).ptr(card.xjobs.va).ptr(card.xgu.va).ptr(xout);
                 card.k.launch(&card.xpt_down, (jobs.len() * XPT_DOWN_WGS) as u32, g::WG, XPT_LDS as u32, &b);
-                card.k.fence();
+                card.k.fence_line(XPT_LINE);
                 continue;
             }
             jobs.sort_unstable_by_key(|&(slot, tok, k)| (slot, tok, k));
@@ -1414,7 +1417,7 @@ impl Placed for Cards {
             let mut b = Args::new();
             b.ptr(r.slots[c].va).ptr(card.xjobs.va).ptr(jobs_va).ptr(card.xhq.va).ptr(card.xhs.va).ptr(card.xhg.va).ptr(xout);
             card.k.launch(&card.xpt_gemm_down, groups * XG_DOWN_WGS as u32, g::WG, 0, &b);
-            card.k.fence();
+            card.k.fence_line(XPT_LINE);
         }
         total
     }
@@ -1422,7 +1425,7 @@ impl Placed for Cards {
         // the jobs' rows are in the shared output already; the wait is all
         for c in 0..self.cards.len() {
             if !self.resident.jobs[c].is_empty() {
-                self.cards[c].k.wait();
+                self.cards[c].k.wait_line(XPT_LINE);
             }
         }
         // a prefill step's claims, now that no job of the layer reads a slot (063)

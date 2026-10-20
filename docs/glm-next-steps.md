@@ -104,7 +104,7 @@ the index. Reorganized 2026-10-18 from the single-page version (in git history b
 | [034](queue/034-expert-deferral.md) | Expert deferral | Experiment (approximate) — not evaluated | decode |
 | [035](queue/035-intra-expert-sparsity.md) | Intra-expert activation sparsity | Experiment (approximate) — not evaluated | decode |
 | [036](queue/036-bit-plane-expert-storage.md) | Bit-plane expert storage | Experiment (approximate) — not evaluated | decode |
-| [037](queue/037-prefill-chunk-wavefront.md) | Prefill chunks in flight as a wavefront | Open | prefill |
+| [037](queue/037-prefill-chunk-wavefront.md) | Prefill chunks in flight as a wavefront | Built: 4.04 → 2.84 ms a prompt token | prefill |
 | [038](queue/038-resident-experts-in-prefill.md) | Resident experts in prefill | Open | prefill |
 | [039](queue/039-expert-staging-for-prefill.md) | Streaming experts through the cards for large prefill steps | Tentative (future) | prefill, long context |
 | [040](queue/040-head-vocab-split.md) | Split the head's vocabulary across both cards | Open | decode |

@@ -1662,27 +1662,37 @@ impl<'p, R: Routed> CpuModel<'p, R> {
         p.tokens += n;
         let mut pre_next = [[E; TOP_K]; SPEC_TOKENS];
         let mut pre_picks = [[E; TOP_K]; SPEC_TOKENS];
-        // the step as chunks in flight (037): a layer's card half of one chunk (its attention and the FFN's card
-        // launches, posted) while the host runs the other chunk's experts of the layer before — chunk 0's card
-        // half of layer l, chunk 1's host half of l - 1, chunk 1's card half of l, chunk 0's host half of l. Each
-        // card's queue is in order, so a chunk's attention follows the other's on the KDA state and the latents;
-        // a host half's experts overlap the cards' half of the other chunk. One chunk is the plain order.
+        // the step as chunks in flight (037), a layer of a chunk in three phases: its card half (the attention and
+        // the FFN's card launches, posted), its dispatch (its FFN input waited for, its resident experts launched)
+        // and its run (the FFN's output half posted, the host's experts, the join, the sum and the handoff). The
+        // order: A's card half of layer l, B's run of l - 1, A's dispatch of l, B's card half of l, A's run of l,
+        // B's dispatch of l — so a chunk's residents sit ahead of the other's attention in the cards' queues, and the
+        // host's experts of one chunk overlap the cards' half of the other. Each card's queue is in order, so a
+        // chunk's attention follows the other's on the KDA state and the latents. One chunk is the plain order.
+        const CARD: u8 = 0;
+        const DISPATCH: u8 = 1;
+        const RUN: u8 = 2;
         let chunks = crate::chunk_count(n);
-        let mut order: Vec<(bool, usize, usize)> = Vec::with_capacity(2 * chunks * NUM_HIDDEN_LAYERS);
+        let mut order: Vec<(u8, usize, usize)> = Vec::with_capacity(3 * chunks * NUM_HIDDEN_LAYERS);
         for l in 0..NUM_HIDDEN_LAYERS {
-            order.push((true, 0, l));
+            order.push((CARD, 0, l));
             if chunks > 1 && l > 0 {
-                order.push((false, 1, l - 1));
+                order.push((RUN, 1, l - 1));
             }
+            order.push((DISPATCH, 0, l));
             if chunks > 1 {
-                order.push((true, 1, l));
+                order.push((CARD, 1, l));
             }
-            order.push((false, 0, l));
+            order.push((RUN, 0, l));
+            if chunks > 1 {
+                order.push((DISPATCH, 1, l));
+            }
         }
         if chunks > 1 {
-            order.push((false, 1, NUM_HIDDEN_LAYERS - 1));
+            order.push((RUN, 1, NUM_HIDDEN_LAYERS - 1));
         }
-        for (card_half, ch, l) in order {
+        let mut jobs_of = [0usize; crate::CHUNKS];
+        for (phase, ch, l) in order {
             let (t0, n) = crate::chunk_of(toks.len(), ch);
             let pos = pos + t0;
             pl.chunk(ch, t0);
@@ -1691,7 +1701,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 Ffn::Moe(m) => Some(m),
                 Ffn::Dense(_) => None,
             };
-            if card_half {
+            if phase == CARD {
                 let is_mla = matches!(lw.attn, Attn::Mla(_));
                 if is_mla {
                     pl.mla_post(l, n);
@@ -1734,56 +1744,67 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 pl.ffn(l, n);
                 continue;
             }
+            if phase == DISPATCH && moe.is_none() {
+                continue;
+            }
             if let Some(m) = moe {
                 // the FFN input as the card made it (001/064): the activations quantized once for both tiers, the
                 // router's picks and weights — the host's norm, quantize and routing moved to the FFN card's `hc_pre`
                 const HG: usize = H / common::q4::GROUP;
-                // (and the router's logits: the next layer's rows in them are the L3 prefetch's predictor — without them the
-                // prefetch pulled the wrong experts and a verify step's items ran at DRAM speed, 12 → 7 GMAC/s a core, 2026-10-19)
-                pl.ffn_input(l, n, &mut s.b_xq[t0 * H..(t0 + n) * H], &mut s.b_xs[t0 * HG..(t0 + n) * HG], &mut s.b_xg[t0 * HG..(t0 + n) * HG], &mut s.b_picks[t0..t0 + n], &mut s.b_wts[t0..t0 + n], &mut s.b_score[t0 * ROUTE_ROWS..]);
-                lap(&mut p.kda_card, "kda_card");
-                let (picks, wts) = (&mut s.b_picks[t0..t0 + n], &mut s.b_wts[t0..t0 + n]);
-                let (xq, xs, xg) = (&s.b_xq[t0 * H..(t0 + n) * H], &s.b_xs[t0 * HG..(t0 + n) * HG], &s.b_xg[t0 * HG..(t0 + n) * HG]);
-                // bring-up: forced picks and the traces take the card's logits and input through the host's own routing and norm
-                if forced.is_some() || tr.wants_edges() || pl.checks() {
-                    pl.ffn_logits(l, n, &mut s.b_x, &mut s.b_score);
-                    let forced_l = forced.map(|f| &f[l - FIRST_K_DENSE_REPLACE]);
-                    for i in 0..n {
-                        common::rmsnorm::rmsnorm_tree::<H>(&s.b_x[i * H..(i + 1) * H], lw.post_ln, RMS_NORM_EPS, &mut s.b_xn[i * H..(i + 1) * H]);
-                        let (idx, wt) = ffn::route_scores(m, &mut s.b_score[i * ROUTE_ROWS..i * ROUTE_ROWS + E], forced_l);
-                        if forced.is_some() {
-                            picks[i] = idx;
-                            wts[i] = wt;
-                        } else {
-                            // the card's act phase (`hc_pre`) against the host's own arithmetic: picks, weights, the quantized activation
-                            let (mut q, mut sc, mut g) = (vec![0i8; H], vec![0f32; HG], vec![0i32; HG]);
-                            common::q4::QAct { q: &mut q, scale: &mut sc, gsum: &mut g }.quantize(&s.b_xn[i * H..(i + 1) * H]);
-                            let dq = (0..H).filter(|&d| q[d] != xq[i * H + d]).count();
-                            let ds = (0..HG).filter(|&d| sc[d].to_bits() != xs[i * HG + d].to_bits() || g[d] != xg[i * HG + d]).count();
-                            let dw = (0..TOP_K).filter(|&k| wts[i][k].to_bits() != wt[k].to_bits()).count();
-                            if picks[i] != idx || dq + ds + dw > 0 {
-                                let d0 = (0..H).find(|&d| q[d] != xq[i * H + d]);
-                                eprintln!("act check: layer {l} token {i}: picks card {:?} host {idx:?}; weights differ {dw} (card {:?} host {wt:?}); q differ {dq} of {H} (first {:?}: card {:?} host {:?}), scales/sums {ds} of {HG} (card s0 {:e} g0 {} host {:e} {})", picks[i], wts[i], d0, d0.map(|d| xq[i * H + d]), d0.map(|d| q[d]), xs[i * HG], xg[i * HG], sc[0], g[0]);
+                if phase == DISPATCH {
+                    // (and the router's logits: the next layer's rows in them are the L3 prefetch's predictor — without them the
+                    // prefetch pulled the wrong experts and a verify step's items ran at DRAM speed, 12 → 7 GMAC/s a core, 2026-10-19)
+                    pl.ffn_input(l, n, &mut s.b_xq[t0 * H..(t0 + n) * H], &mut s.b_xs[t0 * HG..(t0 + n) * HG], &mut s.b_xg[t0 * HG..(t0 + n) * HG], &mut s.b_picks[t0..t0 + n], &mut s.b_wts[t0..t0 + n], &mut s.b_score[t0 * ROUTE_ROWS..]);
+                    lap(&mut p.kda_card, "kda_card");
+                    let (picks, wts) = (&mut s.b_picks[t0..t0 + n], &mut s.b_wts[t0..t0 + n]);
+                    let (xq, xs, xg) = (&s.b_xq[t0 * H..(t0 + n) * H], &s.b_xs[t0 * HG..(t0 + n) * HG], &s.b_xg[t0 * HG..(t0 + n) * HG]);
+                    // bring-up: forced picks and the traces take the card's logits and input through the host's own routing and norm
+                    if forced.is_some() || tr.wants_edges() || pl.checks() {
+                        pl.ffn_logits(l, n, &mut s.b_x, &mut s.b_score);
+                        let forced_l = forced.map(|f| &f[l - FIRST_K_DENSE_REPLACE]);
+                        for i in 0..n {
+                            common::rmsnorm::rmsnorm_tree::<H>(&s.b_x[i * H..(i + 1) * H], lw.post_ln, RMS_NORM_EPS, &mut s.b_xn[i * H..(i + 1) * H]);
+                            let (idx, wt) = ffn::route_scores(m, &mut s.b_score[i * ROUTE_ROWS..i * ROUTE_ROWS + E], forced_l);
+                            if forced.is_some() {
+                                picks[i] = idx;
+                                wts[i] = wt;
+                            } else {
+                                // the card's act phase (`hc_pre`) against the host's own arithmetic: picks, weights, the quantized activation
+                                let (mut q, mut sc, mut g) = (vec![0i8; H], vec![0f32; HG], vec![0i32; HG]);
+                                common::q4::QAct { q: &mut q, scale: &mut sc, gsum: &mut g }.quantize(&s.b_xn[i * H..(i + 1) * H]);
+                                let dq = (0..H).filter(|&d| q[d] != xq[i * H + d]).count();
+                                let ds = (0..HG).filter(|&d| sc[d].to_bits() != xs[i * HG + d].to_bits() || g[d] != xg[i * HG + d]).count();
+                                let dw = (0..TOP_K).filter(|&k| wts[i][k].to_bits() != wt[k].to_bits()).count();
+                                if picks[i] != idx || dq + ds + dw > 0 {
+                                    let d0 = (0..H).find(|&d| q[d] != xq[i * H + d]);
+                                    eprintln!("act check: layer {l} token {i}: picks card {:?} host {idx:?}; weights differ {dw} (card {:?} host {wt:?}); q differ {dq} of {H} (first {:?}: card {:?} host {:?}), scales/sums {ds} of {HG} (card s0 {:e} g0 {} host {:e} {})", picks[i], wts[i], d0, d0.map(|d| xq[i * H + d]), d0.map(|d| q[d]), xs[i * HG], xg[i * HG], sc[0], g[0]);
+                                }
                             }
                         }
                     }
+                    if n == 1 {
+                        tr.edge(l, "ffn_in", &s.b_xn[..H]);
+                        tr.topk(l, &picks[0], &wts[0]);
+                    }
+                    // the picks resident on the cards run there, concurrently with the host's (the dispatch marks them
+                    // `E` in `picks`); the picks as routed are kept for the accounting
+                    s.b_routed[t0..t0 + n].copy_from_slice(&picks[..n]);
+                    let jobs = pl.xpt_dispatch(l, n, &mut picks[..n], xq, xs, xg);
+                    p.resident += jobs;
+                    p.picks += n * TOP_K;
+                    jobs_of[ch] = jobs;
+                    lap(&mut p.route, "route");
+                    continue;
                 }
-                if n == 1 {
-                    tr.edge(l, "ffn_in", &s.b_xn[..H]);
-                    tr.topk(l, &picks[0], &wts[0]);
-                }
-                // the picks resident on the cards run there, concurrently with the host's (the dispatch marks them
-                // `E` in `picks`); the picks as routed are kept for the accounting
-                s.b_routed[t0..t0 + n].copy_from_slice(&picks[..n]);
-                let jobs = pl.xpt_dispatch(l, n, &mut picks[..n], xq, xs, xg);
+                // the run: the FFN's output half posted behind the residents' launches (it waits for the host's word)
+                let jobs = jobs_of[ch];
+                let (picks, wts) = (&mut s.b_picks[t0..t0 + n], &mut s.b_wts[t0..t0 + n]);
+                let (xq, xs, xg) = (&s.b_xq[t0 * H..(t0 + n) * H], &s.b_xs[t0 * HG..(t0 + n) * HG], &s.b_xg[t0 * HG..(t0 + n) * HG]);
                 pl.ffn_post(l, n);
-                p.resident += jobs;
-                p.picks += n * TOP_K;
                 // the outputs: the cards' host-memory rows when there are cards (their jobs land there), else the model's own
                 let out: &mut [f32] = if xout.is_null() { &mut s.b_out[t0 * TOP_K * H..(t0 + n) * TOP_K * H] } else { unsafe { std::slice::from_raw_parts_mut(xout.add(t0 * TOP_K * H), n * TOP_K * H) } };
                 // the host's FFN phase as laps: the route (the picks, the residents' dispatch), the experts' run,
                 // the join of the cards' jobs, the sum and the handoff back — each a zone of its own
-                lap(&mut p.route, "route");
                 s.routed.run_batch_act(l, &picks[..n], xq, xs, xg, out);
                 lap(&mut p.experts, "experts");
                 s.routed.elapsed(); // the pool's own timer, taken so it does not accumulate (the lap is the measure here)

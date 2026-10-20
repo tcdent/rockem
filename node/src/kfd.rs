@@ -138,6 +138,8 @@ const MEM_UNCACHED: u32 = 1 << 25;
 const MEM_USERPTR: u32 = 1 << 2;
 
 // --- what the command processor expects in memory (ROCR amd_hsa_queue.h, amd_hsa_signal.h, hsa.h) ---
+/// Completion lines on a queue's signal page (a cache line each): line 0 is `fence`/`wait`'s.
+const FENCE_LINES: usize = 4;
 /// `amd_queue_t`: the CP is told where `write_dispatch_id` and `read_dispatch_id` live.
 #[repr(C, align(64))]
 struct AmdQueue {
@@ -305,8 +307,8 @@ pub struct Kfd {
     signal: Mem,
     doorbell: *mut u64,
     write_index: Cell<u64>,
-    /// The index of the barrier packet `fence` posted last.
-    fenced: Cell<u64>,
+    /// The barrier packet each completion line's last fence went out as.
+    fenced: [Cell<u64>; FENCE_LINES],
     /// When a packet was last posted or a completion seen: how long the card has been quiet.
     /// The host has written GPU-visible memory since the last launch: the next
     /// dispatch acquires at system scope (an L2 invalidate); the ones after it
@@ -395,7 +397,7 @@ impl Kfd {
             signal: Mem { va: 0, size: 0, handle: 0 },
             doorbell: std::ptr::null_mut(),
             write_index: Cell::new(0),
-            fenced: Cell::new(0),
+            fenced: std::array::from_fn(|_| Cell::new(0)),
             host_wrote: Cell::new(true),
             instrument,
             stamps: Mem { va: 0, size: 0, handle: 0 },
@@ -800,6 +802,18 @@ impl Kfd {
     pub fn wait(&self) {
         self.wait_at(0);
     }
+    /// `fence` and `wait` on completion line `line` (1..FENCE_LINES) instead of the queue's own: a sequence
+    /// whose completion is waited for later, while other fences go out and are waited for in between, takes
+    /// a line of its own — a line holds one completion outstanding (a second arms the signal again and the
+    /// counts cross: the wait never ends).
+    pub fn fence_line(&self, line: usize) {
+        assert!(line > 0 && line < FENCE_LINES);
+        self.fence_at(line * 64);
+    }
+    pub fn wait_line(&self, line: usize) {
+        assert!(line > 0 && line < FENCE_LINES);
+        self.wait_at(line * 64);
+    }
     /// The signal at byte `off` of the signal page (its own cache line), armed and carried by a barrier packet.
     fn fence_at(&self, off: usize) {
         let s = self.signal.at(off) as *const Signal;
@@ -815,13 +829,11 @@ impl Kfd {
         }
         let pkt = Packet { header: PACKET_INVALID, setup: 0, workgroup_size: [0; 3], reserved0: 0, grid_size: [0; 3], private_segment_size: 0, group_segment_size: 0, kernel_object: 0, kernarg_address: 0, reserved2: 0, completion_signal: self.signal.at(off) as u64 };
         self.post(idx, pkt, PACKET_BARRIER_AND | HEADER_BARRIER | (FENCE_SYSTEM << HEADER_ACQUIRE_SHIFT) | (FENCE_SYSTEM << HEADER_RELEASE_SHIFT));
-        if off == 0 {
-            self.fenced.set(idx);
-        }
+        self.fenced[off / 64].set(idx);
     }
     fn wait_at(&self, off: usize) {
         let s = self.signal.at(off) as *const Signal;
-        let idx = self.fenced.get();
+        let idx = self.fenced[off / 64].get();
         let value = unsafe { &(*s).value };
         let t0 = std::time::Instant::now();
         while value.load(Ordering::Acquire) != 0 {
@@ -830,7 +842,7 @@ impl Kfd {
                 // the packets from the read index on: the one the queue stopped at first (a fence has no name)
                 let read = unsafe { (*(self.queue.ptr() as *const AmdQueue)).read_dispatch_id.load(Ordering::Relaxed) };
                 let names = self.names.borrow();
-                let at: Vec<&str> = (read..=idx).map(|i| names[(i as usize) % RING_PACKETS]).collect();
+                let at: Vec<&str> = (read.min(idx)..=idx).map(|i| names[(i as usize) % RING_PACKETS]).collect();
                 panic!("gpu hang: gpu {} packet {idx} never completed (read index {read}, write index {}, {} launched; from the read index: {at:?})", self.gpu_id, unsafe { (*(self.queue.ptr() as *const AmdQueue)).write_dispatch_id.load(Ordering::Relaxed) }, self.write_index.get());
             }
         }
