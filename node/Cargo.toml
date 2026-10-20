@@ -20,9 +20,13 @@ default = ["track-step", "track-store", "track-boot", "track-zones", "track-expe
 # GLM: a row a step of the token's time by phase (the CPU model's `Profile`), the step's expert runs
 # by NUMA node, and every 16 positions the experts' coverage and the cards' resident slots
 track-step = []
-# GLM, with rockem.gpu: every launch on every card as a zone, from the launches' completion stamps
-# (each dispatch carries a signal: ~1.7 µs a launch, and the resident experts' host check runs too)
+# GLM, with rockem.gpu: every launch on every card as a zone on its card's lane, from the launches'
+# completion stamps (each dispatch carries a signal); nothing else changes
 track-launches = []
+# Not a prow category: the bring-up checks — the host recomputes the cards' FFN input (norm, quantize,
+# routing) and every resident expert's output and reports a mismatch. Several times slower in prefill;
+# a verification boot, never a profile
+bringup-checks = []
 # the context store's resumes and kept states, a row a request, the placement's re-trainings
 track-store = []
 # the loader's files and the engine's construction, timed

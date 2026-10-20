@@ -108,7 +108,7 @@ the index. Reorganized 2026-10-18 from the single-page version (in git history b
 | [038](queue/038-resident-experts-in-prefill.md) | Resident experts in prefill | Open | prefill |
 | [039](queue/039-expert-staging-for-prefill.md) | Streaming experts through the cards for large prefill steps | Tentative (future) | prefill, long context |
 | [040](queue/040-head-vocab-split.md) | Split the head's vocabulary across both cards | Open | decode |
-| [041](queue/041-router-lap-trace.md) | Trace the router lap | Open — a measurement | decode |
+| [041](queue/041-router-lap-trace.md) | Trace the router lap | Resolved: the host's lap is gone (064, 001, 002); the router's cost is on the FFN card, `hc_pre` (078 for prefill) | decode |
 | [042](queue/042-prefill-utilization-report.md) | A per-step utilization report for prefill | Open — an instrument | prefill |
 | [043](queue/043-prefill-inherited-patterns.md) | What prefill inherits from generation | Open — a living inventory | prefill |
 | [044](queue/044-timeline-offset.md) | The timeline instrument's own cost | Deferred — small gain (a known late saving) | decode, prefill |
@@ -145,6 +145,7 @@ the index. Reorganized 2026-10-18 from the single-page version (in git history b
 | [075](queue/075-step-2048-under-the-wavefront.md) | `STEP` 2048 under the wavefront | Quantified, on the shelf — prefill −0.19 ms a prompt token against two resident slots a layer and ~+1 ms a verify step | prefill, decode |
 | [076](queue/076-step-width-deep-dive.md) | The step's width under the wavefront: a deep dive | Open — a study (chunk width vs buffer depth, the residency, the draft lap) | prefill, decode |
 | [077](queue/077-warm-next-layer-weights.md) | Warm the next layer's weights while the cards wait for the host | Open — an experiment | decode |
+| [078](queue/078-hc-pre-prefill-twin.md) | `hc_pre`'s matrix-path twin for prefill | Open — measured: the FFN card's `hc_pre` is 39 % of its prefill time and what the host's 0.63 ms a prompt token waits on | prefill |
 
 ## Order (2026-10-18, evening — the 20 ms path)
 

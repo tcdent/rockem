@@ -1040,7 +1040,7 @@ pub trait Placed {
     fn resident_stats(&self) -> (usize, usize, usize) {
         (0, 0, 0)
     }
-    /// Whether the bring-up checks run this boot (the cards instrumented).
+    /// Whether the bring-up checks run (the node built with `bringup-checks`).
     fn checks(&self) -> bool;
     fn mtp_begin(&mut self, cat: &[f32], n: usize);
     /// its output projection and residual, the blocks' states out (`[n][H]`) for the host's routing;

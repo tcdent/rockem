@@ -367,8 +367,6 @@ pub struct Cards {
     head_card: usize,
     mtp: Option<MtpOn>,
     resident: Resident,
-    /// Built with the launches stamped (`track-launches`): the bring-up checks run too.
-    instrument: bool,
     /// The handoff sequence: a value a half of a layer's words carry, and each layer's (attention, FFN) values this
     /// step, a pair a chunk.
     seq: u32,
@@ -797,7 +795,7 @@ impl Cards {
             }
             Resident { table: std::sync::Arc::new((0..moe * glm_5_3_flash::E).map(|_| AtomicU32::new(NONE)).collect()), loader: None, inflight: Default::default(), allowed: Default::default(), issued: Default::default(), steps: 0, prefill: false, count: vec![0; moe * glm_5_3_flash::E], turn: 0, owner: counts.iter().map(|&k| vec![(NONE, NONE); k]).collect(), free: counts.iter().map(|&k| (0..k as u32).rev().collect()).collect(), held: (0..n).map(|_| vec![0; moe]).collect(), per_layer, slots, jobs: (0..n).map(|_| Vec::new()).collect(), uploads: 0 }
         };
-        Cards { cards, peers, shared, layers, ffns, mlas, head, head_card, mtp, resident, instrument, seq: 0, half_seq: vec![[[0; 2]; CHUNKS]; NUM_HIDDEN_LAYERS], ch: 0, t0: 0, chunks: 1, token_from: vec![0; n], npools: max_ctx.div_ceil(INDEX_KPOOL) }
+        Cards { cards, peers, shared, layers, ffns, mlas, head, head_card, mtp, resident, seq: 0, half_seq: vec![[[0; 2]; CHUNKS]; NUM_HIDDEN_LAYERS], ch: 0, t0: 0, chunks: 1, token_from: vec![0; n], npools: max_ctx.div_ceil(INDEX_KPOOL) }
     }
 
     /// With the launches stamped (`track-launches`): the step's launches on every card as zones on
@@ -1267,7 +1265,7 @@ impl Placed for Cards {
         }
     }
     fn checks(&self) -> bool {
-        self.instrument
+        cfg!(feature = "bringup-checks")
     }
     fn resident_stats(&self) -> (usize, usize, usize) {
         let r = &self.resident;
