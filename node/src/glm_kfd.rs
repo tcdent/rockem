@@ -176,6 +176,7 @@ struct Card {
     mtp_eh: crate::kfd::Kernel,
     mla_o: crate::kfd::Kernel,
     hc_pre: crate::kfd::Kernel,
+    hc_route_ahead: crate::kfd::Kernel,
     hc_post: crate::kfd::Kernel,
     hc_mean: crate::kfd::Kernel,
     // the residual streams and the hyper-connection's scratch: this card's copy
@@ -450,6 +451,7 @@ impl Cards {
                     mtp_eh: k.kernel("mtp_eh"),
                     mla_o: k.kernel("mla_o"),
                     hc_pre: k.kernel("hc_pre"),
+                    hc_route_ahead: k.kernel("hc_route_ahead"),
                     hc_post: k.kernel("hc_post"),
                     hc_mean: k.kernel("hc_mean"),
                     streams: alloc(STEP * HC * H),
@@ -861,11 +863,20 @@ impl Cards {
         // the chunk's rows (037); the act phase's table rows from its first token, and its word in the chunk's set
         let act_word = if act.is_some() { self.shared.words.at(self.wd(W_ACT, c.k.index)) } else { 0 };
         let (ln, rw, sc, wd) = router.unwrap_or((0, 0, 0, 0));
-        // the next layer's rows only for a step of a few tokens (the prefetch's predictor); a long step names most experts
-        let rows = if router.is_none() { 0 } else if n <= SPEC_TOKENS { ROUTE_ROWS } else { glm_5_3_flash::E };
+        // this layer's router rows here; a step of a few tokens runs the next layer's (the prefetch's predictor) in
+        // `hc_route_ahead` behind this launch, which then writes the router's word — a host-memory store leaves only at a
+        // launch's end, so rows behind the act phase's word in this launch held the word (2026-10-20). A long step names
+        // most experts and runs no predictor.
+        let rows = if router.is_none() { 0 } else { glm_5_3_flash::E };
+        let ahead = router.is_some() && n <= SPEC_TOKENS;
         let mut a = Args::new();
-        a.ptr(self.tok(&c.streams, HC * H)).ptr(hc.0.va).ptr(self.tok(&c.part, PRE_STRIDE)).ptr(hc.1.va).ptr(hc.2.va).ptr(self.tok(&c.mix, HC_MIX)).ptr(self.tok(&c.x, H)).ptr(x_host.unwrap_or(0)).ptr(c.count.va).u32(value).ptr(ln).ptr(rw).ptr(sc).ptr(self.tok(&c.scores_v, ROUTE_ROWS)).ptr(wd).ptr(act.unwrap_or(0)).ptr(act_word).u32(self.t0 as u32).u32(rows as u32).u32(n as u32);
+        a.ptr(self.tok(&c.streams, HC * H)).ptr(hc.0.va).ptr(self.tok(&c.part, PRE_STRIDE)).ptr(hc.1.va).ptr(hc.2.va).ptr(self.tok(&c.mix, HC_MIX)).ptr(self.tok(&c.x, H)).ptr(x_host.unwrap_or(0)).ptr(c.count.va).u32(value).ptr(ln).ptr(rw).ptr(sc).ptr(self.tok(&c.scores_v, ROUTE_ROWS)).ptr(if ahead { 0 } else { wd }).ptr(act.unwrap_or(0)).ptr(act_word).u32(self.t0 as u32).u32(rows as u32).u32(n as u32);
         c.k.launch(&c.hc_pre, PRE_GRID, g::WG, PRE_LDS, &a);
+        if ahead {
+            let mut b = Args::new();
+            b.ptr(self.tok(&c.x, H)).ptr(ln).ptr(rw).ptr(sc).ptr(self.tok(&c.scores_v, ROUTE_ROWS)).ptr(wd).ptr(c.count.va).u32(value).u32(n as u32);
+            c.k.launch(&c.hc_route_ahead, PRE_GRID, g::WG, 64, &b);
+        }
     }
     /// The hyper-connection's output half on card `c`, the handoff first: this card's `copy`
     /// (src, dst, floats) out to shared memory and `value` into its word `mine`, then the queue
@@ -1655,18 +1666,26 @@ impl Placed for Cards {
             }
         }
     }
+    fn ffn_ahead(&mut self, l: usize, n: usize, logits: &mut [f32]) {
+        // the router's word follows the next layer's rows, which `hc_pre` computes after the act phase's word
+        let f = self.ffns[l].as_ref().unwrap();
+        crate::kfd::wait_word(self.word_ptr(W_X, f.card), self.half_seq[l][self.ch][1]);
+        read(&self.shared.scores_ffn, self.t0 * ROUTE_ROWS * 4, &mut logits[..n * ROUTE_ROWS]);
+    }
     fn ffn_logits(&mut self, l: usize, n: usize, x: &mut [f32], logits: &mut [f32]) {
         let f = self.ffns[l].as_ref().unwrap();
         crate::kfd::wait_word(self.word_ptr(W_X, f.card), self.half_seq[l][self.ch][1]);
         read(&self.shared.xh, self.t0 * H * 4, &mut x[..n * H]);
         read(&self.shared.scores_ffn, self.t0 * ROUTE_ROWS * 4, &mut logits[..n * ROUTE_ROWS]);
     }
-    fn ffn_input(&mut self, l: usize, n: usize, xq: &mut [i8], xs: &mut [f32], xg: &mut [i32], picks: &mut [[usize; TOP_K]], wts: &mut [[f32; TOP_K]], logits: &mut [f32]) {
+    fn ffn_input(&mut self, l: usize, n: usize, xq: &mut [i8], xs: &mut [f32], xg: &mut [i32], picks: &mut [[usize; TOP_K]], wts: &mut [[f32; TOP_K]]) {
         let f = self.ffns[l].as_ref().unwrap();
-        crate::kfd::wait_word(self.word_ptr(W_ACT, f.card), self.half_seq[l][self.ch][1]);
-        // the router's logits too: their second half is the next layer's rows, the prefetch's predictor (005)
+        {
+            prow::zone!("track-zones", "act.wait");
+            crate::kfd::wait_word(self.word_ptr(W_ACT, f.card), self.half_seq[l][self.ch][1]);
+        }
+        prow::zone!("track-zones", "act.read");
         let t0 = self.t0;
-        read(&self.shared.scores_ffn, t0 * ROUTE_ROWS * 4, &mut logits[..n * ROUTE_ROWS]);
         let xa = &self.shared.xact;
         read(xa, XA_Q + t0 * H, &mut xq[..n * H]);
         read(xa, XA_S + t0 * HG * 4, &mut xs[..n * HG]);

@@ -1054,7 +1054,10 @@ pub trait Placed {
     fn mla_seed(&mut self, l: usize, pos: usize, latent: &[u16]);
     fn ffn(&mut self, l: usize, n: usize);
     /// A MoE layer's FFN input for every token (`[n][H]`) and the FFN router's logits (`[n][E]`).
-    fn ffn_input(&mut self, l: usize, n: usize, xq: &mut [i8], xs: &mut [f32], xg: &mut [i32], picks: &mut [[usize; TOP_K]], wts: &mut [[f32; TOP_K]], logits: &mut [f32]);
+    fn ffn_input(&mut self, l: usize, n: usize, xq: &mut [i8], xs: &mut [f32], xg: &mut [i32], picks: &mut [[usize; TOP_K]], wts: &mut [[f32; TOP_K]]);
+    /// The FFN router's logits `[n][ROUTE_ROWS]` once the next layer's rows are in too (they follow the act phase's
+    /// word, off its path): the second half is the prefetch's predictor (005).
+    fn ffn_ahead(&mut self, l: usize, n: usize, logits: &mut [f32]);
     /// Bring-up: a MoE layer's FFN input (`x: [n][H]`) and its router's logits (`[n][ROUTE_ROWS]`) as the card
     /// made them, for forced picks and the traces' edges; serving reads `ffn_input`'s quantized form instead.
     fn ffn_logits(&mut self, l: usize, n: usize, x: &mut [f32], logits: &mut [f32]);
@@ -1812,9 +1815,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 // router's picks and weights — the host's norm, quantize and routing moved to the FFN card's `hc_pre`
                 const HG: usize = H / common::q4::GROUP;
                 if phase == DISPATCH {
-                    // (and the router's logits: the next layer's rows in them are the L3 prefetch's predictor — without them the
-                    // prefetch pulled the wrong experts and a verify step's items ran at DRAM speed, 12 → 7 GMAC/s a core, 2026-10-19)
-                    pl.ffn_input(l, n, &mut s.b_xq[t0 * H..(t0 + n) * H], &mut s.b_xs[t0 * HG..(t0 + n) * HG], &mut s.b_xg[t0 * HG..(t0 + n) * HG], &mut s.b_picks[t0..t0 + n], &mut s.b_wts[t0..t0 + n], &mut s.b_score[t0 * ROUTE_ROWS..]);
+                    pl.ffn_input(l, n, &mut s.b_xq[t0 * H..(t0 + n) * H], &mut s.b_xs[t0 * HG..(t0 + n) * HG], &mut s.b_xg[t0 * HG..(t0 + n) * HG], &mut s.b_picks[t0..t0 + n], &mut s.b_wts[t0..t0 + n]);
                     lap(&mut p.kda_card, "kda_card");
                     let (picks, wts) = (&mut s.b_picks[t0..t0 + n], &mut s.b_wts[t0..t0 + n]);
                     let (xq, xs, xg) = (&s.b_xq[t0 * H..(t0 + n) * H], &s.b_xs[t0 * HG..(t0 + n) * HG], &s.b_xg[t0 * HG..(t0 + n) * HG]);
@@ -1921,6 +1922,10 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 // half of each token's scores), prefetched now that this layer's run is done (a run abandons
                 // the prefetches in flight); a step of many tokens names most experts and runs none
                 if let (true, Some(Ffn::Moe(m2))) = (n <= SPEC_TOKENS, w.layers.get(l + 1).map(|lw| &lw.ffn)) {
+                    // the router's logits, the next layer's rows in them the L3 prefetch's predictor (without them the prefetch
+                    // pulled the wrong experts and a verify step's items ran at DRAM speed, 12 → 7 GMAC/s a core, 2026-10-19);
+                    // `hc_pre` computes those rows after the act phase's word, so this waits for them only here
+                    pl.ffn_ahead(l, n, &mut s.b_score);
                     let mut union = [E; SPEC_TOKENS * TOP_K];
                     let mut nu = 0;
                     for i in 0..n {

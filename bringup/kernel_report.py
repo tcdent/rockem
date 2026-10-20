@@ -13,6 +13,14 @@ occupancy bound, or on a barrier count that changed (the run records the new cou
 import argparse, glob, json, os, re, subprocess, sys
 
 VGPR_MAX = 192          # past this a SIMD holds fewer than 8 waves
+# Kernels whose workgroups must all be resident at once (device barriers inside): (workgroups, waves each). The 7900 XT
+# has 84 CUs, 168 SIMD32s of 1536 VGPRs a lane; a kernel past the registers its grid allows hangs, it does not slow
+# down (hc_pre at 189 VGPRs ran 168 of its 192 workgroups and its barriers waited forever, 2026-10-20).
+SIMDS, VGPRS_PER_SIMD, VGPR_GRANULE = 168, 1536, 8
+GRID_RESIDENT = {"hc_pre": (192, 8)}
+def resident_vgpr_max(wgs, waves):
+    per_simd = -(-wgs * waves // SIMDS)
+    return VGPRS_PER_SIMD // per_simd // VGPR_GRANULE * VGPR_GRANULE
 INSTR_JUMP = 0.25       # fraction of change in a kernel's instruction count worth a line
 
 ap = argparse.ArgumentParser(); ap.add_argument("elf"); ap.add_argument("--show", action="store_true"); a = ap.parse_args()
@@ -59,6 +67,8 @@ for n in sorted(kernels):
         why.append("SCRATCH"); fail.append(n)
     if k.get("vgpr", 0) > VGPR_MAX:
         why.append(f"vgpr > {VGPR_MAX}"); fail.append(n)
+    if n in GRID_RESIDENT and k.get("vgpr", 0) > resident_vgpr_max(*GRID_RESIDENT[n]):
+        why.append(f"vgpr > {resident_vgpr_max(*GRID_RESIDENT[n])}: its grid no longer fits the card at once (its barriers would hang)"); fail.append(n)
     if p is None:
         why.append("new")
     else:

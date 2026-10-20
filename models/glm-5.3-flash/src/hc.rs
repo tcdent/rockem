@@ -243,8 +243,9 @@ pub mod gfx11_consts {
     /// `hc_pre`'s VRAM words: for each of its three device barriers, an arrival count a row (0 between
     /// launches) and a done word a row; then the mix's ready word and the collapse's.
     pub const PRE_BARRIERS: usize = 3;
-    /// The arrival counts, then the ready words: the mix, the collapse, the scores (the act phase's start), the act phase's arrivals.
-    pub const PRE_COUNTS: usize = PRE_BARRIERS * 2 * COEF_ROWS + 4;
+    /// The arrival counts, then the ready words: the mix, the collapse, the scores (the act phase's start), the act phase's
+    /// arrivals, `hc_route_ahead`'s arrivals.
+    pub const PRE_COUNTS: usize = PRE_BARRIERS * 2 * COEF_ROWS + 5;
     /// Router rows a workgroup takes in `hc_pre`'s tail.
     /// Rows the FFN half's router launch carries: layer l's router over the FFN input, then layer l+1's
     /// (the prefetch's predictor, named a layer ahead); `scores` is `[tokens][ROUTE_ROWS]`.
@@ -528,153 +529,187 @@ pub mod gfx11 {
             }
             workgroup_sync();
             fence(Ordering::Acquire);
-            // the router over every token's normed block input, this workgroup's rows. A few tokens: the
-            // 256-thread reduction a (token, row) at a time (two barriers each) — a token at a time
-            // keeps every wave busy. Many: a wave a token, the norm and every dot in that same order
-            // (thread lane + 32·w over elements 256 apart, each wave's lanes summed, the eight waves in
-            // order), so a score's bits are the same either way.
-            if n < 8 {
-                let mut i = 0;
-                while i < n {
-                    let xt = x.add(i * H);
-                    let mut ss = 0f32;
-                    let mut k = t;
-                    while k < H {
-                        let v = *xt.add(k);
-                        ss += v * v;
-                        k += 256;
-                    }
-                    ss = wave_sum(lane, ss);
-                    if lane == 0 {
-                        *red.add(wave) = ss;
-                    }
-                    workgroup_sync();
-                    let mut tot = 0f32;
-                    let mut k = 0;
-                    while k < 8 {
-                        tot += *red.add(k);
-                        k += 1;
-                    }
-                    let rr = 1.0 / sqrt(tot / H as f32 + RMS_NORM_EPS);
-                    workgroup_sync(); // red is reused below
-                    let mut r = 0;
-                    while r < ROUTER_ROWS_PER_WG {
-                        let rrow = wg + r * COEF_ROWS * SLICES;
-                        if rrow < rows as usize {
-                            let wr = router.add(rrow * H);
-                            let mut acc = 0f32;
-                            let mut k = t;
-                            while k < H {
-                                acc += *xt.add(k) * widen(*ln.add(k)) * widen(*wr.add(k));
-                                k += 256;
-                            }
-                            acc = wave_sum(lane, acc);
-                            if lane == 0 {
-                                *red.add(wave) = acc;
-                            }
-                            workgroup_sync();
-                            if t == 0 {
-                                let mut sum = 0f32;
-                                let mut k = 0;
-                                while k < 8 {
-                                    sum += *red.add(k);
-                                    k += 1;
-                                }
-                                *scores.add(i * ROUTE_ROWS + rrow) = sum * rr;
-                                *scores_v.add(i * ROUTE_ROWS + rrow) = sum * rr;
-                            }
-                            workgroup_sync();
-                        }
-                        r += 1;
-                    }
-                    i += 1;
-                }
-            }
-            let mut i = wave;
-            while i < n && n >= 8 {
-                let xt = x.add(i * H);
-                let mut tot = 0f32;
-                let mut w = 0;
-                while w < 8 {
-                    let mut part_ss = 0f32;
-                    let mut k = lane as usize + 32 * w;
-                    while k < H {
-                        let v = *xt.add(k);
-                        part_ss += v * v;
-                        k += 256;
-                    }
-                    tot += wave_sum(lane, part_ss);
-                    w += 1;
-                }
-                let rr = 1.0 / sqrt(tot / H as f32 + RMS_NORM_EPS);
-                let mut r = 0;
-                while r < ROUTER_ROWS_PER_WG {
-                    let rrow = wg + r * COEF_ROWS * SLICES;
-                    if rrow < rows as usize {
-                        let wr = router.add(rrow * H);
-                        // the workgroup's order on one wave, so a score's bits are what the 256-thread
-                        // reduction gave: thread (lane + 32·w) summed elements lane + 32·w + 256·j in
-                        // order, each wave's lanes summed, the eight waves summed in order
-                        let mut acc = 0f32;
-                        let mut w = 0;
-                        while w < 8 {
-                            let mut part = 0f32;
-                            let mut k = lane as usize + 32 * w;
-                            while k < H {
-                                part += *xt.add(k) * widen(*ln.add(k)) * widen(*wr.add(k));
-                                k += 256;
-                            }
-                            acc += wave_sum(lane, part);
-                            w += 1;
-                        }
-                        if lane == 0 {
-                            *scores.add(i * ROUTE_ROWS + rrow) = acc * rr;
-                            *scores_v.add(i * ROUTE_ROWS + rrow) = acc * rr;
-                        }
-                    }
-                    r += 1;
-                }
-                i += 8;
-            }
+            // the router's rows `0..rows` (this layer's: the next layer's, the prefetch's predictor, run in their own launch
+            // after this one, `hc_route_ahead` — a store to host memory leaves only at a launch's end-of-kernel release
+            // here, so work behind the act phase's word in this launch held the word too, 2026-10-20)
+            router_rows(0, rows as usize, n, x, ln, router, scores, scores_v, red, t, wave, lane, wg);
             // the router's arrival: this workgroup's scores out over the link; workgroup 0 says so
             fence(Ordering::Release);
             let ka = common::stat_clock!();
             let ready3 = ready.add(2);
             if arrive(b2, row, t, wave, lane, value) && t == 0 {
-                AtomicU32::from_ptr(word).store(value, Ordering::Release);
+                if !word.is_null() {
+                    AtomicU32::from_ptr(word).store(value, Ordering::Release);
+                }
                 if !act.is_null() {
                     AtomicU32::from_ptr(ready3).store(value, Ordering::Release);
                 }
             }
-            if act.is_null() {
-                return;
-            }
-            // the FFN input's host-side work (queue 001), once every score is in: a workgroup a token, the grid's
-            // workgroups taking tokens wg, wg + PRE_GRID, ... — the post-norm, the quantization, the router's picks
-            if wg < n {
-                if t == 0 {
-                    await_word(ready3, value);
+            if !act.is_null() {
+                // the FFN input's host-side work (queue 001), once every score is in: a workgroup a token, the grid's
+                // workgroups taking tokens wg, wg + PRE_GRID, ... — the post-norm, the quantization, the router's picks
+                if wg < n {
+                    if t == 0 {
+                        await_word(ready3, value);
+                    }
+                    workgroup_sync();
+                    fence(Ordering::Acquire);
+                    let kb = common::stat_clock!();
+                    common::stat!(0, kb.wrapping_sub(ka) & common::stats::CLOCK_MASK);
+                    let mut tok = wg;
+                    while tok < n {
+                        act_token(tok, t0 as usize + tok, t, wave, lane, x, scores_v, act);
+                        tok += COEF_ROWS * SLICES;
+                    }
                 }
+                // the act phase's arrival: the last workgroup out writes the host's word
+                fence(Ordering::Release);
                 workgroup_sync();
-                fence(Ordering::Acquire);
-                let kb = common::stat_clock!();
-                common::stat!(0, kb.wrapping_sub(ka) & common::stats::CLOCK_MASK);
-                let mut tok = wg;
-                while tok < n {
-                    act_token(tok, t0 as usize + tok, t, wave, lane, x, scores_v, act);
-                    tok += COEF_ROWS * SLICES;
+                if t == 0 {
+                    let done = ready.add(3);
+                    if AtomicU32::from_ptr(done).fetch_add(1, Ordering::AcqRel) == (COEF_ROWS * SLICES) as u32 - 1 {
+                        AtomicU32::from_ptr(done).store(0, Ordering::Relaxed);
+                        AtomicU32::from_ptr(act_word).store(value, Ordering::Release);
+                    }
                 }
             }
-            // the act phase's arrival: the last workgroup out writes the host's word
+        }
+    }
+
+    /// The next MoE layer's router rows (`E..ROUTE_ROWS` of the FFN half's `[ROUTE_ROWS][H]` router) over the block input
+    /// `x` the FFN card's `hc_pre` collapsed, into `scores` and `scores_v` as `hc_pre`'s own rows: the prefetch's
+    /// predictor (005), in a launch of its own behind `hc_pre` so the act phase's word leaves with `hc_pre`'s end; the
+    /// last workgroup out writes `value` to `word` (the router's, for the host). Grid PRE_GRID, `count` `hc_pre`'s.
+    #[no_mangle]
+    pub extern "gpu-kernel" fn hc_route_ahead(x: *const f32, ln: *const u16, router: *const u16, scores: *mut f32, scores_v: *mut f32, word: *mut u32, count: *mut u32, value: u32, n: u32) {
+        unsafe {
+            let t = workitem_id_x() as usize;
+            let (wave, lane) = (t / 32, (t % 32) as u32);
+            let wg = workgroup_id_x() as usize;
+            router_rows(E, ROUTE_ROWS, n as usize, x, ln, router, scores, scores_v, lds::<f32>(), t, wave, lane, wg);
             fence(Ordering::Release);
             workgroup_sync();
             if t == 0 {
-                let done = ready.add(3);
-                if AtomicU32::from_ptr(done).fetch_add(1, Ordering::AcqRel) == (COEF_ROWS * SLICES) as u32 - 1 {
+                let done = count.add(PRE_BARRIERS * 2 * COEF_ROWS + 4);
+                if AtomicU32::from_ptr(done).fetch_add(1, Ordering::AcqRel) == PRE_GRID - 1 {
                     AtomicU32::from_ptr(done).store(0, Ordering::Relaxed);
-                    AtomicU32::from_ptr(act_word).store(value, Ordering::Release);
+                    AtomicU32::from_ptr(word).store(value, Ordering::Release);
                 }
             }
+        }
+    }
+
+    /// The router's rows `lo..hi` this workgroup takes (`wg + r · PRE_GRID`) over the launch's `n` tokens' block
+    /// input `x` normed with `ln`, into `scores` (host memory) and `scores_v` (VRAM), `[n][ROUTE_ROWS]`.
+    #[inline(always)]
+    unsafe fn router_rows(lo: usize, hi: usize, n: usize, x: *const f32, ln: *const u16, router: *const u16, scores: *mut f32, scores_v: *mut f32, red: *mut f32, t: usize, wave: usize, lane: u32, wg: usize) {
+        // the router over every token's normed block input, this workgroup's rows. A few tokens: the
+        // 256-thread reduction a (token, row) at a time (two barriers each) — a token at a time
+        // keeps every wave busy. Many: a wave a token, the norm and every dot in that same order
+        // (thread lane + 32·w over elements 256 apart, each wave's lanes summed, the eight waves in
+        // order), so a score's bits are the same either way.
+        if n < 8 {
+            let mut i = 0;
+            while i < n {
+                let xt = x.add(i * H);
+                let mut ss = 0f32;
+                let mut k = t;
+                while k < H {
+                    let v = *xt.add(k);
+                    ss += v * v;
+                    k += 256;
+                }
+                ss = wave_sum(lane, ss);
+                if lane == 0 {
+                    *red.add(wave) = ss;
+                }
+                workgroup_sync();
+                let mut tot = 0f32;
+                let mut k = 0;
+                while k < 8 {
+                    tot += *red.add(k);
+                    k += 1;
+                }
+                let rr = 1.0 / sqrt(tot / H as f32 + RMS_NORM_EPS);
+                workgroup_sync(); // red is reused below
+                let mut r = 0;
+                while r < ROUTER_ROWS_PER_WG {
+                    let rrow = wg + r * COEF_ROWS * SLICES;
+                    if rrow >= lo && rrow < hi {
+                        let wr = router.add(rrow * H);
+                        let mut acc = 0f32;
+                        let mut k = t;
+                        while k < H {
+                            acc += *xt.add(k) * widen(*ln.add(k)) * widen(*wr.add(k));
+                            k += 256;
+                        }
+                        acc = wave_sum(lane, acc);
+                        if lane == 0 {
+                            *red.add(wave) = acc;
+                        }
+                        workgroup_sync();
+                        if t == 0 {
+                            let mut sum = 0f32;
+                            let mut k = 0;
+                            while k < 8 {
+                                sum += *red.add(k);
+                                k += 1;
+                            }
+                            *scores.add(i * ROUTE_ROWS + rrow) = sum * rr;
+                            *scores_v.add(i * ROUTE_ROWS + rrow) = sum * rr;
+                        }
+                        workgroup_sync();
+                    }
+                    r += 1;
+                }
+                i += 1;
+            }
+        }
+        let mut i = wave;
+        while i < n && n >= 8 {
+            let xt = x.add(i * H);
+            let mut tot = 0f32;
+            let mut w = 0;
+            while w < 8 {
+                let mut part_ss = 0f32;
+                let mut k = lane as usize + 32 * w;
+                while k < H {
+                    let v = *xt.add(k);
+                    part_ss += v * v;
+                    k += 256;
+                }
+                tot += wave_sum(lane, part_ss);
+                w += 1;
+            }
+            let rr = 1.0 / sqrt(tot / H as f32 + RMS_NORM_EPS);
+            let mut r = 0;
+            while r < ROUTER_ROWS_PER_WG {
+                let rrow = wg + r * COEF_ROWS * SLICES;
+                if rrow >= lo && rrow < hi {
+                    let wr = router.add(rrow * H);
+                    // the workgroup's order on one wave, so a score's bits are what the 256-thread
+                    // reduction gave: thread (lane + 32·w) summed elements lane + 32·w + 256·j in
+                    // order, each wave's lanes summed, the eight waves summed in order
+                    let mut acc = 0f32;
+                    let mut w = 0;
+                    while w < 8 {
+                        let mut part = 0f32;
+                        let mut k = lane as usize + 32 * w;
+                        while k < H {
+                            part += *xt.add(k) * widen(*ln.add(k)) * widen(*wr.add(k));
+                            k += 256;
+                        }
+                        acc += wave_sum(lane, part);
+                        w += 1;
+                    }
+                    if lane == 0 {
+                        *scores.add(i * ROUTE_ROWS + rrow) = acc * rr;
+                        *scores_v.add(i * ROUTE_ROWS + rrow) = acc * rr;
+                    }
+                }
+                r += 1;
+            }
+            i += 8;
         }
     }
 
