@@ -240,12 +240,12 @@ pub mod gfx11_consts {
     /// `hc_pre`'s partials in VRAM, per token: the coefficient dots `[COEF_ROWS][SLICES]`, then every
     /// workgroup's sum of squares of its stream channels. The host allocates `STEP · PRE_STRIDE`.
     pub const PRE_STRIDE: usize = PRE_PARTS;
-    /// `hc_pre`'s VRAM words: for each of its three device barriers, an arrival count a row (0 between
-    /// launches) and a done word a row; then the mix's ready word and the collapse's.
-    pub const PRE_BARRIERS: usize = 3;
-    /// The arrival counts, then the ready words: the mix, the collapse, the scores (the act phase's start), the act phase's
-    /// arrivals, `hc_route_ahead`'s arrivals.
-    pub const PRE_COUNTS: usize = PRE_BARRIERS * 2 * COEF_ROWS + 5;
+    /// `hc_pre`'s VRAM words: for each of its four device barriers (the dots, the collapse, the router, the mixes), an
+    /// arrival count a row (0 between launches) and a done word a row; then the ready words.
+    pub const PRE_BARRIERS: usize = 4;
+    /// The arrival counts, then the ready words: the dots (every workgroup's mixes may start), the collapse, the scores (the
+    /// act phase's start), the act phase's arrivals, `hc_route_ahead`'s arrivals, the mixes (the collapse may start).
+    pub const PRE_COUNTS: usize = PRE_BARRIERS * 2 * COEF_ROWS + 6;
     /// Router rows a workgroup takes in `hc_pre`'s tail.
     /// Rows the FFN half's router launch carries: layer l's router over the FFN input, then layer l+1's
     /// (the prefetch's predictor, named a layer ahead); `scores` is `[tokens][ROUTE_ROWS]`.
@@ -320,7 +320,7 @@ pub mod gfx11 {
     }
 
     /// The hyper-connection's input half as one launch over `COEF_ROWS · SLICES` workgroups, for
-    /// the `n` tokens of a step (`streams: [n][HC][H]`, `mix: [n][MIX]`, `x`, `x_host: [n][H]`,
+    /// the `n` tokens of a step (`streams: [n][HC][H]`, `mix: [n][MIX]`, `x: [n][H]`,
     /// `scores: [n][E]`, `part: [n][PRE_STRIDE]`). Workgroup (row, slice) takes, for every token,
     /// the dot of its `K_SLICE` of row `row` with the raw stream channels and the sum of squares of
     /// those channels (its eight weights a thread read once, the tokens looped), the wave partials
@@ -330,8 +330,8 @@ pub mod gfx11 {
     /// softmax rows and Sinkhorn on a wave a token, eight tokens at a time) into `mix` and
     /// publishes `value` in `count`'s ready word; every workgroup waits for it (all resident: the
     /// grid is a fraction of the card) and collapses its `COLLAPSE` channels of every token,
-    /// `x[i][d] = Σ_j pre_ij · stream_ij[d]`, into `x` and, when `x_host` is not null, there too
-    /// (the routed experts' input). Then, when `router` is not null (the FFN card: the early router over the
+    /// `x[i][d] = Σ_j pre_ij · stream_ij[d]`, into `x` (bring-up's host copy is a copy launch when it asks: the
+    /// collapse once wrote 8 MB a prefill chunk to host memory that serving never read). Then, when `router` is not null (the FFN card: the early router over the
     /// attention block's input, or the FFN router over its own), the workgroups arrive again, each
     /// takes its `ROUTER_ROWS_PER_WG` rows of the `[ROUTE_ROWS][H]` bf16 router (the first `rows` live) over every token's `x`
     /// normed with `ln` (a wave a token, no reduction through LDS) straight into `scores` (host
@@ -343,7 +343,7 @@ pub mod gfx11 {
     /// coefficients), a token's arithmetic the same whichever round it is in. Counts back at 0 when
     /// the launch leaves. LDS: PRE_LDS.
     #[no_mangle]
-    pub extern "gpu-kernel" fn hc_pre(streams: *const f32, w: *const u16, part: *mut f32, base: *const f32, scale: *const f32, mix: *mut f32, x: *mut f32, x_host: *mut f32, count: *mut u32, value: u32, ln: *const u16, router: *const u16, scores: *mut f32, scores_v: *mut f32, word: *mut u32, act: *const u64, act_word: *mut u32, t0: u32, rows: u32, n: u32) {
+    pub extern "gpu-kernel" fn hc_pre(streams: *const f32, w: *const u16, part: *mut f32, base: *const f32, scale: *const f32, mix: *mut f32, x: *mut f32, count: *mut u32, value: u32, ln: *const u16, router: *const u16, scores: *mut f32, scores_v: *mut f32, word: *mut u32, act: *const u64, act_word: *mut u32, t0: u32, rows: u32, n: u32) {
         unsafe {
             let n = n as usize;
             // stats (a stats code object only), the launch's phases as workgroup 0 sees them: slot 0 the coefficient dots to
@@ -358,7 +358,7 @@ pub mod gfx11 {
             let red2 = l.add(PRE_TOKENS * 8); // [PRE_TOKENS][8] square partials
             let coefs = l.add(PRE_TOKENS * 16); // [PRE_TOKENS][COEF_ROWS]
             let trs = l.add(PRE_TOKENS * (16 + COEF_ROWS)); // [8 waves][HC·HC] transpose scratch
-            let (b0, b1, b2) = (count, count.add(2 * COEF_ROWS), count.add(4 * COEF_ROWS));
+            let (b0, b1, b2, b3) = (count, count.add(2 * COEF_ROWS), count.add(4 * COEF_ROWS), count.add(6 * COEF_ROWS));
             let ready = count.add(PRE_BARRIERS * 2 * COEF_ROWS);
             let kt0 = common::stat_clock!();
             // this slice of the row: the thread's eight weights once, every token's channels against them
@@ -414,17 +414,26 @@ pub mod gfx11 {
             let a0 = arrive(b0, row, t, wave, lane, value);
             let kt1 = common::stat_clock!();
             common::stat!(0, kt1.wrapping_sub(kt0) & common::stats::CLOCK_MASK);
-            if a0 {
-                // every token's coefficients, a round of tokens at a time: the norm from one row's slices'
-                // squares (every row's slices read the same channels; one row covers them all), the rows'
-                // partials in fixed order
-                let mut r0 = 0;
-                while r0 < n {
-                    let m = if n - r0 < PRE_TOKENS { n - r0 } else { PRE_TOKENS };
+            // the dots are in: workgroup 0 says so, every workgroup then makes its own tokens' mixes (tokens wg, wg + the grid,
+            // ...: one workgroup made every token's, ~1.5–1.8 ms of a 512-token chunk while 191 waited, 2026-10-20)
+            if a0 && t == 0 {
+                AtomicU32::from_ptr(ready).store(value, Ordering::Release);
+            }
+            if t == 0 {
+                await_word(ready, value);
+            }
+            workgroup_sync();
+            {
+                const GRID: usize = COEF_ROWS * SLICES;
+                let tok = |k: usize| wg + k * GRID;
+                let m = if wg < n { (n - wg).div_ceil(GRID) } else { 0 };
+                {
+                    // every token's coefficients: the norm from one row's slices' squares (every row's slices read
+                    // the same channels; one row covers them all), the rows' partials in fixed order
                     if t < COEF_ROWS {
                         let mut i = 0;
                         while i < m {
-                            let pt = part.add((r0 + i) * PRE_STRIDE);
+                            let pt = part.add(tok(i) * PRE_STRIDE);
                             let mut tot = 0f32;
                             let mut k = 0;
                             while k < SLICES {
@@ -477,7 +486,7 @@ pub mod gfx11 {
                             cbv /= cs;
                             it += 1;
                         }
-                        let mt = mix.add((r0 + i) * MIX);
+                        let mt = mix.add(tok(i) * MIX);
                         if inb {
                             AtomicU32::from_ptr(mt.add(2 * HC + lu) as *mut u32).store(cbv.to_bits(), Ordering::Relaxed);
                         }
@@ -487,17 +496,18 @@ pub mod gfx11 {
                         }
                         i += 8;
                     }
-                    workgroup_sync(); // the coefficients' LDS is the next round's; after the last, the mix is written
-                    r0 += PRE_TOKENS;
+                }
+                // the mixes' arrival: every workgroup's tokens written; workgroup 0 says so
+                fence(Ordering::Release);
+                let ready_mix = ready.add(5);
+                if arrive(b3, row, t, wave, lane, value) && t == 0 {
+                    AtomicU32::from_ptr(ready_mix).store(value, Ordering::Release);
                 }
                 if t == 0 {
-                    AtomicU32::from_ptr(ready).store(value, Ordering::Release);
+                    await_word(ready_mix, value);
                 }
             }
             // every workgroup: each token's mix, then its channels of the token's collapse, and their squares
-            if t == 0 {
-                await_word(ready, value);
-            }
             workgroup_sync();
             let d0 = wg * COLLAPSE;
             let d = d0 + t;
@@ -512,9 +522,6 @@ pub mod gfx11 {
                         j += 1;
                     }
                     *x.add(i * H + d) = acc;
-                    if !x_host.is_null() {
-                        *x_host.add(i * H + d) = acc;
-                    }
                     i += 1;
                 }
             }

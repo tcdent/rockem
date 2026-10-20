@@ -1021,7 +1021,7 @@ pub trait Placed {
     /// resident becomes a job on its card over the token's quantized activation, launched at once, and is
     /// marked `E` in `picks` so the host's run skips it; a pick not resident may claim a slot (a free one,
     /// or a less-used resident's past a margin), which the loader fills for the steps to come. Returns the jobs.
-    fn xpt_dispatch(&mut self, l: usize, n: usize, picks: &mut [[usize; TOP_K]], xq: &[i8], xs: &[f32], xg: &[i32]) -> usize;
+    fn xpt_dispatch(&mut self, l: usize, n: usize, picks: &mut [[usize; TOP_K]]) -> usize;
     /// MoE layer `l`'s routed experts' outputs, `[STEP · TOP_K][H]` f32 by (token, pick) in the VRAM of the layer's
     /// leader card (its FFN card, 002), mapped for the host and the other card: the cards' jobs land there
     /// directly and the host's experts write theirs through the BAR, so the join is a wait and no copy.
@@ -1850,7 +1850,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     // the picks resident on the cards run there, concurrently with the host's (the dispatch marks them
                     // `E` in `picks`); the picks as routed are kept for the accounting
                     s.b_routed[t0..t0 + n].copy_from_slice(&picks[..n]);
-                    let jobs = pl.xpt_dispatch(l, n, &mut picks[..n], xq, xs, xg);
+                    let jobs = pl.xpt_dispatch(l, n, &mut picks[..n]);
                     p.resident += jobs;
                     p.picks += n * TOP_K;
                     jobs_of[ch] = jobs;

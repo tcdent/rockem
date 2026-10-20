@@ -1,8 +1,8 @@
 # 078 — `hc_pre`'s matrix-path twin for prefill
 
-**Status:** Open — measured, the kernel to write
+**Status:** Open — the exact fixes built (2026-10-20); the router's matrix path to write
 **Area:** prefill
-**Gain:** est. most of the host's 0.63 ms a prompt token wait on the FFN input (prefill 2.78 → ~2.2 ms a prompt token at 18k; an estimate)
+**Gain:** measured so far (the exact fixes, 2026-10-20): prefill 2.65 → 2.19–2.23 ms a prompt token at 18k; the router's matrix path est. ~4 ms of a chunk's 6.16 ms `hc_pre`
 
 ## Proposal
 `hc_pre` (the hyper-connection's input half: the coefficient dots over the four streams, the mix, the collapse, and on
@@ -47,6 +47,34 @@ timeline without the bring-up checks (2026-10-20).
   is 4.4 ms against the plain 1.8. Bring-up can copy the card's `x` out when it asks.
 - **The router** (4.1 ms): the decode-shaped loop; the WMMA path is the core of 078.
 - **The act phase** (~1 ms for workgroup 0's three tokens, ~330 µs a token against 17 in decode): not explained yet.
+
+## The exact fixes (2026-10-20, run 6725d575, build mix1)
+Three changes from the phase table, all exact (long SCORE bit-identical to the run before, NLL 0.04678):
+- **The mix distributed.** Every workgroup makes the mixes of its own tokens (`wg + k·GRID`, the same arithmetic),
+  then one barrier (`PRE_BARRIERS` 4, the mixes' ready word `+5`) before the collapse.
+- **`x_host` gone.** The FFN card's collapse no longer writes the block input to host memory; bring-up's
+  `ffn_logits` copies the card's `x` out when it asks.
+- **The other card's activations card to card.** The resident jobs on the non-FFN card read the act phase's
+  output copied from the FFN card's `xq`/`xs`/`xg` into `Peer::axq/axs/axg` behind a `W_XQ` word, instead of the
+  host uploading what it had just read: `xpt_dispatch(l, n, picks)`.
+
+| a 512-token chunk, medians | before | after |
+|---|---|---|
+| FFN card's wide `hc_pre` | 9.76 ms | 6.16 |
+| host `kda_card` | ~5 | 1.36 |
+| `act.wait` inside it | — | 1.26 |
+| `act.read` | 208 µs | 98 |
+| the residents' dispatch | 974 µs | 73 |
+
+Prefill at 18k 2.61–2.69 → 2.19–2.23 ms a prompt token; the cold 18k prompt ~51 → 43.5 s, warm 42.4; a verify step
+44.65 ms (neutral).
+
+**Does `hc_pre` need to publish mid-launch?** No, as long as the act phase is its last work. The host's `act.wait`
+ends 23 µs after the FFN card's `hc_pre` launch ends (the wait closest to the timeline's clock anchor); it waits on
+the launch, not on a held-back flush. A mid-launch flush would pay only if work stayed behind the act word in the
+same launch — none does. What is left of `act.wait` is `hc_pre`'s length: the router (the matrix path below).
+(The card lanes drift against the host's by ~230 ppm across a step — the same wait reads 347 µs at the step's start
+and 23 at its end, linearly — so a card launch's position in the timeline is off by up to ~0.3 ms early in a step.)
 
 ## After 058 (2026-10-20): where prefill stands, and what 078 is for
 With the MLA attend split (058), prefill at 18k is 2.65 ms a prompt token: the host's experts 1.55, its wait on a
