@@ -173,6 +173,17 @@ weight streams 4 groups ahead (exact) changed nothing: the experts lap 21.35 →
 tokens an item — the chunk's width, 076 — and the gemm's efficiency at 9–32 tokens; the activations' L3 traffic (SUB
 2 → 1, on the shelf) is the known part of the rest.
 
+**The rearrangement done ahead of time, measured (2026-10-20, `gemm_rate` on one metatron core; tcdent: "why are we
+rearranging it at runtime? We can pack these exactly how we need them in RAM").** `rearrange_r8` applied `gemm`'s
+dword transposes to the packed bytes once (the nibble masks are byte-local, so the same bytes permuted, the same
+size), and `gemm_r8` loaded and masked them straight into the dot layout — bit-identical at every token count. Its
+rate against `gemm`, cache-resident / 33.6 MB streaming: 2 tokens 1.20× / 1.15×, 4 1.14× / 1.14×, 8 1.07× / 1.07×,
+16 1.04× / 0.95×, 32 1.02× / 0.97×, 64 1.00× / 0.95× (one token stays `gemv`'s). On Zen 3 the shuffles cost little where
+prefill items live (9–64 tokens), and a stored layout would also change the cards' expert kernels (they read the same
+(row, group) cells): not built, code removed. The same kernel alone on a core runs 73–85 GMAC/s at 16–64 tokens; in a
+prefill run it gets 55–62. That ~25–30 % lost to 92 cores running at once (the activations' L3 traffic is the
+quantified part) is the larger gap.
+
 ## Next
 The twin's arithmetic is the step gate's numeric kind (WMMA order) for the coefficients and the router; the act phase
 stays exact. Then the card lanes again: card1's `hc_pre` share and the FFN-input wait.
