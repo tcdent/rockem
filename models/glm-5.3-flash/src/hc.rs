@@ -283,6 +283,7 @@ pub mod gfx11 {
     use common::math::{exp, sqrt};
     use core::arch::amdgpu::{workgroup_id_x, workitem_id_x};
     use core::sync::atomic::{fence, AtomicU32, Ordering};
+    const _: () = assert!(common::gemv::gfx11::WMMA_LDS <= PRE_LDS as usize, "the router's matrix path stages in hc_pre's LDS");
 
     #[inline(always)]
     fn sigmoid(x: f32) -> f32 {
@@ -546,7 +547,21 @@ pub mod gfx11 {
             // the router's rows `0..rows` (this layer's: the next layer's, the prefetch's predictor, run in their own launch
             // after this one, `hc_route_ahead` — a store to host memory leaves only at a launch's end-of-kernel release
             // here, so work behind the act phase's word in this launch held the word too, 2026-10-20)
-            router_rows(0, rows as usize, n, x, ln, router, scores, scores_v, red, t, wave, lane, wg);
+            // a step past SPEC_TOKENS on the matrix path (the rows kernels' twin, the activations bf16 as staged): the first
+            // `wmma_grid(rows, n)` workgroups a 128-row × 128-token block each; the decode-shaped loop re-read every token's
+            // input a row pair a workgroup, 4.1 ms of a 512-token chunk (2026-10-20)
+            if n > SPEC_TOKENS {
+                use common::gemv::gfx11::{rows_wmma_into, wmma_grid, WBf16};
+                let m = rows as usize;
+                if wg < wmma_grid(m, n) as usize {
+                    rows_wmma_into::<H, true, WBf16>(t as u32, wg, WBf16(router), ln, m, n, RMS_NORM_EPS, |i, k| *x.add(i * H + k), |tok, r, y| {
+                        *scores.add(tok * ROUTE_ROWS + r) = y;
+                        *scores_v.add(tok * ROUTE_ROWS + r) = y;
+                    });
+                }
+            } else {
+                router_rows(0, rows as usize, n, x, ln, router, scores, scores_v, red, t, wave, lane, wg);
+            }
             // the router's arrival: this workgroup's scores out over the link; workgroup 0 says so
             fence(Ordering::Release);
             let ready3 = ready.add(2);

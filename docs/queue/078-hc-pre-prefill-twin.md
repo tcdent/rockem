@@ -1,8 +1,8 @@
 # 078 — `hc_pre`'s matrix-path twin for prefill
 
-**Status:** Open — the exact fixes built (2026-10-20); the router's matrix path to write
+**Status:** Built (2026-10-20) — the exact fixes and the router's matrix path; prefill now CPU-expert bound
 **Area:** prefill
-**Gain:** measured so far (the exact fixes, 2026-10-20): prefill 2.65 → 2.19–2.23 ms a prompt token at 18k; the router's matrix path est. ~4 ms of a chunk's 6.16 ms `hc_pre`
+**Gain:** measured so far (the exact fixes, 2026-10-20): prefill 2.65 → 2.19–2.23 ms a prompt token at 18k; the router's matrix path 2.19–2.23 → 2.14–2.21 (the FFN card's `hc_pre` 6.16 → 2.54 ms a chunk; the host's FFN-input wait gone)
 
 ## Proposal
 `hc_pre` (the hyper-connection's input half: the coefficient dots over the four streams, the mix, the collapse, and on
@@ -75,6 +75,28 @@ the launch, not on a held-back flush. A mid-launch flush would pay only if work 
 same launch — none does. What is left of `act.wait` is `hc_pre`'s length: the router (the matrix path below).
 (The card lanes drift against the host's by ~230 ppm across a step — the same wait reads 347 µs at the step's start
 and 23 at its end, linearly — so a card launch's position in the timeline is off by up to ~0.3 ms early in a step.)
+
+## The router on the matrix path (2026-10-20, run 86c15b29, build rw1)
+A launch past `SPEC_TOKENS` runs this layer's 288 router rows through `rows_wmma_into` (the rows kernels' twin: the
+normed activations bf16 as staged, f32 accumulation): `wmma_grid(288, n)` workgroups, 12 for a 512-token chunk, a
+128-row × 128-token block each; decode keeps the loop and its bits. 128 VGPRs (the grid stays resident), two more
+barriers (the staging).
+
+| a prefill step at 18k | mix1 | rw1 |
+|---|---|---|
+| `hc_pre` over a chunk, median (card0 / card1) | 6.16 ms (FFN card) | 2.31 / 2.54 |
+| host `kda_card` median | 1.36 ms | 0.17 |
+| `act.wait` in the last step | 93.7 ms | 26.7 (median 0) |
+| the last step's main lane | 1,611 ms | 1,537 |
+| prefill, ms a prompt token | 2.19–2.23 | 2.14–2.21 |
+| cold 18k prompt | 43.5 s | 41.6 |
+
+Long SCORE numeric, as the rows twins: NLL 0.04678 → 0.04505, mean |Δ logprob| 1.8e-2, one position at 6.3 (a pick
+flipped at a near-tie). A verify step 24.53 → 24.42 ms (neutral).
+
+**What this leaves:** the host no longer waits on the cards' FFN input. A prefill step's main lane is now 79 % the
+host's experts (1,210 of 1,537 ms) and 15 % the MLA projections' wait (238 ms). Prefill is CPU-expert bound, which is
+this entry's "Context for later" below — the DRAM-floor read first.
 
 ## After 058 (2026-10-20): where prefill stands, and what 078 is for
 With the MLA attend split (058), prefill at 18k is 2.65 ms a prompt token: the host's experts 1.55, its wait on a
