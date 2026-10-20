@@ -146,6 +146,7 @@ the index. Reorganized 2026-10-18 from the single-page version (in git history b
 | [076](queue/076-step-width-deep-dive.md) | The step's width under the wavefront: a deep dive | Open — a study (chunk width vs buffer depth, the residency, the draft lap) | prefill, decode |
 | [077](queue/077-warm-next-layer-weights.md) | Warm the next layer's weights while the cards wait for the host | Open — an experiment | decode |
 | [078](queue/078-hc-pre-prefill-twin.md) | `hc_pre`'s matrix-path twin for prefill | Open — measured: the FFN card's `hc_pre` is 39 % of its prefill time and what the host's 0.63 ms a prompt token waits on | prefill |
+| [079](queue/079-mla-o-rate.md) | The MLA output projection's rate in prefill | Open — 4.6 ms a 512-token launch, est. well under 1 ms | prefill |
 
 ## Order (2026-10-18, evening — the 20 ms path)
 
@@ -160,6 +161,8 @@ tcdent's target is 20 ms an emitted token at long context (50 tok/s); the baseli
 5. Then tcdent's decision between 029 (FP8 KDA projections, 5–6 ms a step) and 025 + 026 (depth 2,
    a multiplier once the step is cheaper) — either reaches 20 on paper.
 6. Prefill as its own track: 042, 037, 038, 018/019 at longer positions.
+7. Prefill next (tcdent, 2026-10-20): 058 (the MLA attend across both cards: the MLA layers' card chain is ~7 ms longer
+   than the host's experts a chunk), then 078 (`hc_pre`'s prefill twin), then 079 (`mla_o_w`'s rate).
 
 ## Decisions open for tcdent
 
