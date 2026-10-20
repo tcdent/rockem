@@ -150,6 +150,19 @@ across the cards, the scores exchanged) is a separate, smaller step, to look at 
   not DRAM-bound at its start or the warmed lines are not served from L3 when it reaches them; the DRAM-floor read and
   an L3 hit count (the fill-source counters, l3-intentional-expert-path) would say which before trying it again.
 
+**The down items' stores (2026-10-20, runs 01969130 → 4cdf8832 → 07d1390e, 1M window).** `experts.sh` showed down a
+core ~35 % below gate/up at 9–32 tokens an item (36.8 / 40.7 against 55.8 / 62.5 GMAC/s). Since 002 the host's down
+items write into the leader card's VRAM through the BAR, and `q4::gemm` stores an eight-row tile (32 B) across every
+token of the block in turn, so each token's line went out in halves. Staging a block's rows in a cached buffer and
+streaming each token's 512 B run as whole lines (one fence an item) brought down to 46.1 / 53.8 / 56.9 / 56.7 GMAC/s a
+core at 5–8 / 9–16 / 17–32 / 33–64 tokens — level with gate/up — exact (long SCORE bit-identical, the decode's tokens
+unchanged). **The run's wall did not move:** prefill `experts.down` 6.82 → 6.74 ms median a layer-chunk, the experts
+lap 21.35 → 21.77, prefill 2.25–2.27 → 2.26–2.27 ms a prompt token. Reverted. The gate/up and down walls keep the
+proportion of their work (1.8 : 1, at 32k — 10.4 / 5.8 ms — and at 1M — 12.5 / 6.8), and by arithmetic
+(not measured: ~3.3 GB of non-resident experts a layer-chunk, above) the phase streams ~165–175 GB/s against the
+323–375 measured read ceilings: the per-item rate is not what sets a prefill expert run's length. The
+DRAM-floor read above, and what bounds a run's aggregate stream, come first.
+
 ## Next
 The twin's arithmetic is the step gate's numeric kind (WMMA order) for the coefficients and the router; the act phase
 stays exact. Then the card lanes again: card1's `hc_pre` share and the FFN-input wait.
