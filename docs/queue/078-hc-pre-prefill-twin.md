@@ -73,6 +73,13 @@ across the cards, the scores exchanged) is a separate, smaller step, to look at 
   ~1–1.3 ms of a ~19 ms run, ~0.06–0.08 ms a prompt token, if the run is DRAM-bound at its start. The cheapest of these
   to try: the decode prefetch's job posted at each dispatch wait over each CCD's first slices; read `prefetch_job`
   (done before overtaken) and the experts lap.
+  **Measured 2026-10-20 (run 778aa269 against 7c985d71): no gain; reverted.** Built as `Routed::prefetch_lead`: at each
+  prefill dispatch wait, the non-resident experts' gate/up slices in the run's order, each slot's first 32 MB (tcdent:
+  "24 is too conservative"). The warm-up worked — 98.6 % of a job's slices pulled before the run overtook it, in a
+  ~9.4 ms window, ~46 cores — and the run did not get faster: the experts lap a prefill layer-chunk 17.78 → 18.24 ms
+  median (16.34 → 18.20 average), prefill 2.65 → 2.68 ms a prompt token, long SCORE bit-identical. So either the run is
+  not DRAM-bound at its start or the warmed lines are not served from L3 when it reaches them; the DRAM-floor read and
+  an L3 hit count (the fill-source counters, l3-intentional-expert-path) would say which before trying it again.
 
 ## Next
 The twin's arithmetic is the step gate's numeric kind (WMMA order) for the coefficients and the router; the act phase
