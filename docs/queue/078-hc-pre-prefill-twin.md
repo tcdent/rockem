@@ -163,6 +163,16 @@ proportion of their work (1.8 : 1, at 32k — 10.4 / 5.8 ms — and at 1M — 12
 323–375 measured read ceilings: the per-item rate is not what sets a prefill expert run's length. The
 DRAM-floor read above, and what bounds a run's aggregate stream, come first.
 
+**The prefill expert run's aggregate, measured (2026-10-20, the cold 18k prompt's 1,513 runs a phase, run 07d1390e).**
+gate/up 3.43 TB in 18.7 s of run wall = 183 GB/s, down 1.72 TB in 10.1 s = 169 GB/s, the pool 93–94 % busy over the
+runs, the tails 5.4 % of a run (`pool.sh`). Decode's one-token runs reach 375 GB/s on the same box (074), so a prefill
+run is not DRAM-bound: its cores are busy computing at 55–62 GMAC/s an item. A software prefetch of each gemm's two
+weight streams 4 groups ahead (exact) changed nothing: the experts lap 21.35 → 21.62 ms a layer-chunk, gate/up 12.25 →
+12.61, down 6.82 → 7.03, prefill 2.24–2.25 ms a prompt token; reverted. What sets an item's rate is its token count
+(the kernel: 76 GMAC/s at 16 tokens, 85 at 64, cache-resident; the prefill items are mostly 9–32), so the levers are
+tokens an item — the chunk's width, 076 — and the gemm's efficiency at 9–32 tokens; the activations' L3 traffic (SUB
+2 → 1, on the shelf) is the known part of the rest.
+
 ## Next
 The twin's arithmetic is the step gate's numeric kind (WMMA order) for the coefficients and the router; the act phase
 stays exact. Then the card lanes again: card1's `hc_pre` share and the FFN-input wait.
