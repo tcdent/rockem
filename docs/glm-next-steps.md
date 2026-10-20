@@ -147,6 +147,7 @@ the index. Reorganized 2026-10-18 from the single-page version (in git history b
 | [077](queue/077-warm-next-layer-weights.md) | Warm the next layer's weights while the cards wait for the host | Open — an experiment | decode |
 | [078](queue/078-hc-pre-prefill-twin.md) | `hc_pre`'s matrix-path twin for prefill | Open — measured: the FFN card's `hc_pre` is 39 % of its prefill time and what the host's 0.63 ms a prompt token waits on | prefill |
 | [079](queue/079-mla-o-rate.md) | The MLA output projection's rate in prefill | Open — 4.6 ms a 512-token launch, est. well under 1 ms | prefill |
+| [080](queue/080-launch-granularity.md) | Launch and timeline granularity: steps cut too fine | Open — noted (`rows_d2`'s 32-token passes, ~530 launches a card a prefill step) | prefill, profiling |
 
 ## Order (2026-10-18, evening — the 20 ms path)
 
