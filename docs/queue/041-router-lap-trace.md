@@ -39,3 +39,14 @@ The 2026-10-17 profiles.
 - the cards: every launch on `card0` / `card1` with `track-launches` (`trace.sh`, `cards.sh`), at served speed in
   prefill and ~3 % in decode since the bring-up checks became their own feature (`bringup-checks`);
 - inside `hc_pre`: the phase stamps of a stats code object (`kstats.sh`).
+
+## Next: the host's words in the card's VRAM, read through the BAR
+A card's store to host memory leaves only at its launch's end, but its stores to fine-grained VRAM are visible
+mid-launch (two cards' `hc_post`s each wait on the other's word in its VRAM without deadlocking). So a word the host
+waits on could live in the producing card's fine-grained VRAM (`Kfd::vram_shared`, host-visible) and the host could
+poll it through the BAR: the act word mid-launch again, `hc_pre` and `hc_route_ahead` one launch, and the way persistent
+per-layer kernels (028) hand the host anything mid-run. Costs to measure first: an uncached BAR read is a PCIe round
+trip (~1 µs a poll, against MWAITX sleeping on host memory), the host's poll loop on a core, and whether the data the
+host reads after the word (the act phase's picks, weights, activations) moves to the card's VRAM too or stays in host
+memory, where it would again be visible only at the launch's end. First: a word written mid-launch into VRAM, polled
+over the BAR, against the same word in host memory — when the host sees each relative to the launch's end.
