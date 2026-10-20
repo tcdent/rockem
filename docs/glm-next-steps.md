@@ -143,6 +143,7 @@ the index. Reorganized 2026-10-18 from the single-page version (in git history b
 | [073](queue/073-grouped-expert-kernel-rate.md) | The grouped expert kernel's own rate | Quantified, on the shelf — none today; needed before more picks move to the cards | prefill |
 | [074](queue/074-decode-expert-runs-idle.md) | The decode expert runs' idle | Open — up to ~4 ms a verify step measured | decode |
 | [075](queue/075-step-2048-under-the-wavefront.md) | `STEP` 2048 under the wavefront | Quantified, on the shelf — prefill −0.19 ms a prompt token against two resident slots a layer and ~+1 ms a verify step | prefill, decode |
+| [076](queue/076-step-width-deep-dive.md) | The step's width under the wavefront: a deep dive | Open — a study (chunk width vs buffer depth, the residency, the draft lap) | prefill, decode |
 
 ## Order (2026-10-18, evening — the 20 ms path)
 

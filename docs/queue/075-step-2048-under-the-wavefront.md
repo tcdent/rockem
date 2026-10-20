@@ -36,4 +36,4 @@ being the card's VRAM remainder (the 1M-context latents claim it too).
 - 2026-10-19: measured and shelved; served `STEP` stays 1024.
 
 ## Next
-- The draft lap's growth with `STEP` traced (a verify step's laps on both builds side by side).
+- Folded into 076, the deep dive on the step's width.
