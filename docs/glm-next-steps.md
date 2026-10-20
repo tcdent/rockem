@@ -125,7 +125,7 @@ the index. Reorganized 2026-10-18 from the single-page version (in git history b
 | [055](queue/055-int4-expert-entropy.md) | Entropy of the INT4 expert nibbles | Deferred — likely a dead end; a cheap check | decode |
 | [056](queue/056-considered-and-set-aside.md) | Considered and set aside (by reasoning, not measurement) | Set aside — reopen if the stated reason changes | various |
 | [057](queue/057-side-queues-decode.md) | Side queues for independent decode work | Open | decode |
-| [058](queue/058-mla-layers-across-both-cards.md) | Indexer and attend of an MLA layer across both cards | Open | long context (decode and prefill) |
+| [058](queue/058-mla-layers-across-both-cards.md) | Indexer and attend of an MLA layer across both cards | Built (the attend, by positions): prefill 2.76 → 2.65 ms a prompt token, numeric | long context (decode and prefill) |
 | [059](queue/059-host-loop-occupancy.md) | How much of the decode step the host loop holds | Open — a measurement | decode |
 | [060](queue/060-decode-occupancy-audit.md) | Decode occupancy audit: what to fuse, what to split | Open — an audit, then our own experiments | decode (and the verify step's 2–4 tokens) |
 | [061](queue/061-gpu-architecture-quantified.md) | The cards' architecture, quantified | Open — topology read and probes first | decode, prefill (every card kernel) |

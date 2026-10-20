@@ -42,6 +42,12 @@ pub unsafe fn await_word(w: *const u32, value: u32) {
     }
 }
 
+/// The lanes of the wave (wave32) where `b` holds, a bit a lane.
+#[inline(always)]
+pub unsafe fn ballot(b: bool) -> u32 {
+    core::arch::amdgpu::ballot(b) as u32
+}
+
 /// A short sleep between looks at a word another workgroup will write.
 #[inline(always)]
 pub unsafe fn nap() {

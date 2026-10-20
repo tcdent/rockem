@@ -1,6 +1,6 @@
 # 058 — Indexer and attend of an MLA layer across both cards
 
-**Status:** Building (2026-10-20): the attend split by positions across both cards
+**Status:** Built (2026-10-20): the MLA attend split by positions across both cards — prefill at 18k 2.76 → 2.65 ms a prompt token, decode neutral, numeric (NLL 0.0419 → 0.0468)
 **Area:** long context (decode and prefill)
 **Gain:** est. up to half of the context-growing cost (~0.08 ms a prompt token per 1k positions today)
 
@@ -45,6 +45,27 @@ The split is by positions, not heads: by heads every card would mirror every MLA
 - **Numeric, not exact:** the two partials' merge reorders the softmax sums; gated on the long SCORE NLL distance.
 - The draft layer (MLA, on card 1) goes through the same functions.
 
+## Built (2026-10-20, runs of the track-launches gate: mla2c/mla2d, then mla2f)
+As designed above, with what the decode trace taught: `q_abs` (both cards) and the other card's `q_b` posted with the
+projections, behind the fence the host waits on (they need no rows); the other card's W_uv into its own VRAM, then one
+copy across (its scattered stores straight over the link ran 79 µs against 36); the verify step's attend chunk 256 →
+128 positions (each card's half list filled half the chunks and a workgroup's time stayed the whole list's) — and the
+chunk merge's (m, l) load looping, since 16 heads × 17 chunks is past its 256 threads (the first build of it read
+head 15's chunks from garbage, NaN logits, a panic in sampling).
+
+| 18k | before | split |
+|---|---|---|
+| prefill, ms a prompt token | 2.76 | 2.65 |
+| `mla_attend_w` a 512-token launch | 17.7 ms on one card | 8.5–9.0 ms on each |
+| the host's FFN-input wait, ms a prompt token | ~0.63 | 0.49 |
+| cold 18k prompt | 53.3 s | 51.3 s |
+| a verify step (`laps.sh`) | 44.05 ms | 44.34 |
+| long SCORE NLL | 0.04189 | 0.04678 (mean \|Δ logprob\| 1.4e-2, max 6.3) |
+
+The NLL moved as the earlier accepted numeric changes did (aw3 → act 8.3e-3, act → fold1 8.7e-3, wmma → aw3 9.6e-3
+mean |Δ|), at the top of their range. The first run of this build hit a PCIe error storm (11 APEI records, 21 AER
+lines on the cold prompt, the host's experts lap doubled); a fresh boot of the same build had none.
+
 ## Next
-Kernels (raw attend and merge, the selection split, the two-way merge, a word wait and a word post), then the host
-(half mirrors by owner, the query copy and weights on both cards, the launch order), then the gate.
+- The draft layer's attend rides the same split; nothing to do.
+- The indexer's pools sharded too (058's original second half) when long context makes the indexer matter.

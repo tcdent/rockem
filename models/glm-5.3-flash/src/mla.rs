@@ -473,6 +473,19 @@ pub mod gfx11_consts {
     /// softmaxes merged by `mla_attend_merge`.
     pub const AW_H: usize = 16;
     pub const AW_WG: u32 = 256;
+    /// The MLA attend split across two cards by positions (058): position `p` belongs to card `lat_owner(p)` and sits at
+    /// row `lat_local(p)` of that card's half mirror of the layer's latents — runs of `LAT_GRAIN` positions alternating.
+    pub const LAT_GRAIN: usize = 16;
+    pub const fn lat_owner(p: usize) -> usize {
+        (p / LAT_GRAIN) % 2
+    }
+    pub const fn lat_local(p: usize) -> usize {
+        (p / (2 * LAT_GRAIN)) * LAT_GRAIN + p % LAT_GRAIN
+    }
+    /// Rows a card's half mirror holds for `max_ctx` positions.
+    pub const fn lat_rows(max_ctx: usize) -> usize {
+        max_ctx.div_ceil(2 * LAT_GRAIN) * LAT_GRAIN
+    }
     pub const AW_XS: usize = KV_LORA_RANK + 8; // rows 16-byte aligned (1040 B), spread over eight banks
     pub const AW_QABS: usize = 0;
     /// Two latent tiles (16 positions each): the next tile is staged while the current one is mixed.
@@ -485,7 +498,9 @@ pub mod gfx11_consts {
     pub const AW_RED: usize = AW_LAT + 2 * 16 * AW_XS * 2;
     pub const AW_LDS: usize = AW_RED + 8 * 16 * AW_RS * 4;
     pub const AW_HEAD_TILES: usize = MLA_HEADS / AW_H;
-    pub const AW_DECODE_CHUNK: usize = 256;
+    /// Positions a verify step's attend workgroup takes: 128 since the attend split across the cards (058) halved each
+    /// card's list — at 256 the half list filled half the chunks and a workgroup's time stayed the whole list's.
+    pub const AW_DECODE_CHUNK: usize = 128;
     /// A partial: m[16], l[16], O[16][KV_LORA_RANK], f32.
     pub const AW_PART: usize = 2 * AW_H + AW_H * KV_LORA_RANK;
     pub const fn aw_chunk(n: usize) -> usize {
@@ -501,7 +516,7 @@ pub mod gfx11_consts {
     pub const AW_DECODE_CHUNKS: usize = aw_chunks(1);
     /// `mla_attend_merge`'s LDS: the chunks' (m, l) and weights, `[3][16][AW_DECODE_CHUNKS]`, and the heads' 1/l.
     pub const AW_MERGE_LDS: usize = 3 * AW_H * AW_DECODE_CHUNKS * 4 + AW_H * 4;
-    const _: () = assert!(V_HEAD_DIM == 256 && AW_LDS <= 60 * 1024 && MLA_HEADS % AW_H == 0 && KV_LORA_RANK % 128 == 0 && AW_DECODE_CHUNK % 16 == 0 && SPEC_TOKENS * AW_HEAD_TILES * aw_chunks(1) <= 4096 && AW_DECODE_CHUNKS <= 16);
+    const _: () = assert!(V_HEAD_DIM == 256 && AW_LDS <= 60 * 1024 && MLA_HEADS % AW_H == 0 && KV_LORA_RANK % 128 == 0 && AW_DECODE_CHUNK % 16 == 0 && SPEC_TOKENS * AW_HEAD_TILES * aw_chunks(1) <= 4096 && AW_DECODE_CHUNKS <= 17);
 }
 
 #[cfg(target_arch = "amdgpu")]
@@ -773,7 +788,7 @@ pub mod gfx11 {
     /// probabilities) with f32 sums, as here; the scalar kernel's f32 throughout was the
     /// bit-identical-to-the-host form. Grid: aw_grid(n), 256 threads, LDS AW_LDS.
     #[no_mangle]
-    pub extern "gpu-kernel" fn mla_attend_w(qabs_in: *const u16, lat: *const u16, sel: *const u32, counts: *const u32, olat: *mut f32, part: *mut f32, chunks: u32, chunk: u32) {
+    pub extern "gpu-kernel" fn mla_attend_w(qabs_in: *const u16, lat: *const u16, sel: *const u32, counts: *const u32, olat: *mut f32, part: *mut f32, ml: *mut f32, chunks: u32, chunk: u32) {
         unsafe {
             use common::gemv::gfx11::{to_bf16, v16i16, v8f32, wmma};
             use common::gfx11::{lane_read, lds, workgroup_sync};
@@ -933,11 +948,17 @@ pub mod gfx11 {
                 pos = next;
             }
             if chunks == 1 {
-                // the normalized mix out as f32 `[tokens][MLA_HEADS][D]`: `mla_uv_w` applies W_uv over the step
+                // the normalized mix out as f32 `[tokens][MLA_HEADS][D]`: `mla_uv_w` applies W_uv over the step. With
+                // `ml` (one card's half of a split attend, 058): the mix unnormalized and the heads' (max, sum) to
+                // `ml[i][h]`, for the two cards' merge after W_uv
                 let olat = olat.add((i * MLA_HEADS + h0) * D);
+                if !ml.is_null() && t < AW_H {
+                    *ml.add((i * MLA_HEADS + h0 + t) * 2) = m_h;
+                    *ml.add((i * MLA_HEADS + h0 + t) * 2 + 1) = l_h;
+                }
                 let mut rr = 0;
                 while rr < 8 {
-                    let inv = 1.0 / lane_read((2 * rr + lane / 16) as u32, l_h);
+                    let inv = if ml.is_null() { 1.0 / lane_read((2 * rr + lane / 16) as u32, l_h) } else { 1.0 };
                     let h = 2 * rr + lane / 16;
                     let mut nt = 0;
                     while nt < 4 {
@@ -974,7 +995,7 @@ pub mod gfx11 {
     /// mix 32 a thread with the chunk loop unrolled (a thread walking the chunks a head at a time with
     /// dependent loads took 356 µs a layer at nine chunks). LDS AW_MERGE_LDS.
     #[no_mangle]
-    pub extern "gpu-kernel" fn mla_attend_merge(part: *const f32, olat: *mut f32) {
+    pub extern "gpu-kernel" fn mla_attend_merge(part: *const f32, olat: *mut f32, ml: *mut f32) {
         unsafe {
             use common::gfx11::{lds, workgroup_sync};
             use core::arch::amdgpu::workgroup_id_x;
@@ -989,10 +1010,13 @@ pub mod gfx11 {
             let ws = ls.add(AW_H * C);
             let inv = ws.add(AW_H * C);
             let part = part.add((i * AW_HEAD_TILES + ht) * C * AW_PART);
-            if t < AW_H * C {
-                let (h, c) = (t / C, t % C);
+            // every (head, chunk)'s (m, l), the threads looping: 16 heads × 17 chunks is past the workgroup's 256
+            let mut q = t;
+            while q < AW_H * C {
+                let (h, c) = (q / C, q % C);
                 *ms.add(h * C + c) = *part.add(c * AW_PART + h);
                 *ls.add(h * C + c) = *part.add(c * AW_PART + AW_H + h);
+                q += AW_WG as usize;
             }
             workgroup_sync();
             if t < AW_H {
@@ -1015,7 +1039,14 @@ pub mod gfx11 {
                     l += *ls.add(h * C + c) * w;
                     c += 1;
                 }
-                *inv.add(h) = 1.0 / l;
+                // with `ml` (a split attend, 058): the mix stays unnormalized, the merged (max, sum) go out
+                if ml.is_null() {
+                    *inv.add(h) = 1.0 / l;
+                } else {
+                    *inv.add(h) = 1.0;
+                    *ml.add((i * MLA_HEADS + h0 + h) * 2) = m;
+                    *ml.add((i * MLA_HEADS + h0 + h) * 2 + 1) = l;
+                }
             }
             workgroup_sync();
             let olat = olat.add((i * MLA_HEADS + h0) * D);
@@ -1049,6 +1080,116 @@ pub mod gfx11 {
             let (h, sub) = (wg / per_head, wg % per_head);
             let w_uv = kvb.add(h * KVB_HEAD * D + QK_NOPE_HEAD_DIM * D);
             rows_wmma_into::<D, false, _>(workitem_id_x(), sub, WBf16(w_uv), core::ptr::null(), V_HEAD_DIM, n, 0.0, |tok, k| *olat.add((tok * MLA_HEADS + h) * D + k), |tok, row, y| *heads.add((tok * MLA_HEADS + h) * V_HEAD_DIM + row) = y);
+        }
+    }
+    /// A token's selected positions (`ix_select`'s list, `sel[i][..counts[i]]`) split by owner card (058) into this
+    /// card's list and the other card's, each as local rows of the owner's half mirror (`lat_local`), the order kept:
+    /// `own[i]`, `own_n[i]` here, `peer[i]`, `peer_n[i]` in the other card's VRAM. `me` is this card's owner index. A
+    /// workgroup a token, 256 threads: rounds of 256 entries, each wave's ballot and the waves' counts in LDS for the
+    /// prefix; the last workgroup out writes `value` to `word` (the other card's copy). Grid: tokens; LDS 64 B.
+    #[no_mangle]
+    pub extern "gpu-kernel" fn mla_sel_split(sel: *const u32, counts: *const u32, own: *mut u32, own_n: *mut u32, peer: *mut u32, peer_n: *mut u32, me: u32, word: *mut u32, done: *mut u32, value: u32, tokens: u32) {
+        unsafe {
+            use common::gfx11::{lds, workgroup_sync};
+            use core::arch::amdgpu::workgroup_id_x;
+            use core::sync::atomic::{fence, AtomicU32, Ordering};
+            let i = workgroup_id_x() as usize;
+            let t = workitem_id_x() as usize;
+            let (wave, lane) = (t / 32, t % 32);
+            let cnt: *mut u32 = lds(); // [8] own a wave, [8] peer a wave
+            let n = *counts.add(i) as usize;
+            let (sel, own, peer) = (sel.add(i * DENSE_BELOW), own.add(i * DENSE_BELOW), peer.add(i * DENSE_BELOW));
+            let (mut o_base, mut p_base) = (0usize, 0usize);
+            let mut r = 0;
+            while r < n {
+                let k = r + t;
+                let p = if k < n { *sel.add(k) as usize } else { 0 };
+                let mine = k < n && lat_owner(p) as u32 == me;
+                let other = k < n && !mine;
+                let bm = common::gfx11::ballot(mine);
+                let bo = common::gfx11::ballot(other);
+                let below = (1u32 << lane) - 1;
+                if lane == 0 {
+                    *cnt.add(wave) = bm.count_ones();
+                    *cnt.add(8 + wave) = bo.count_ones();
+                }
+                workgroup_sync();
+                let (mut om, mut oo) = (0usize, 0usize);
+                let mut w = 0;
+                while w < wave {
+                    om += *cnt.add(w) as usize;
+                    oo += *cnt.add(8 + w) as usize;
+                    w += 1;
+                }
+                if mine {
+                    *own.add(o_base + om + (bm & below).count_ones() as usize) = lat_local(p) as u32;
+                }
+                if other {
+                    *peer.add(p_base + oo + (bo & below).count_ones() as usize) = lat_local(p) as u32;
+                }
+                let (mut tm, mut to) = (0usize, 0usize);
+                let mut w = 0;
+                while w < 8 {
+                    tm += *cnt.add(w) as usize;
+                    to += *cnt.add(8 + w) as usize;
+                    w += 1;
+                }
+                o_base += tm;
+                p_base += to;
+                workgroup_sync();
+                r += 256;
+            }
+            if t == 0 {
+                *own_n.add(i) = o_base as u32;
+                *peer_n.add(i) = p_base as u32;
+            }
+            fence(Ordering::Release);
+            workgroup_sync();
+            if t == 0 && AtomicU32::from_ptr(done).fetch_add(1, Ordering::AcqRel) == tokens - 1 {
+                AtomicU32::from_ptr(done).store(0, Ordering::Relaxed);
+                AtomicU32::from_ptr(word).store(value, Ordering::Release);
+            }
+        }
+    }
+    /// The two cards' halves of a split attend merged (058): for token `i`, head `h`, value channel `v`,
+    /// `heads = (w_a · a + w_b · b) / (w_a · l_a + w_b · l_b)` with `w = exp(m − max(m_a, m_b))`, from each half's W_uv
+    /// over its unnormalized mix (`a`, `b`: `[tokens][MLA_HEADS][V_HEAD_DIM]`) and its (max, sum) (`ml_a`, `ml_b`:
+    /// `[tokens][MLA_HEADS][2]`). A half with no positions has max −∞ and weighs nothing. Grid: tokens × MLA_HEADS,
+    /// V_HEAD_DIM threads.
+    #[no_mangle]
+    pub extern "gpu-kernel" fn mla_two_merge(a: *const f32, ml_a: *const f32, b: *const f32, ml_b: *const f32, heads: *mut f32) {
+        unsafe {
+            use core::arch::amdgpu::workgroup_id_x;
+            let ih = workgroup_id_x() as usize;
+            let v = workitem_id_x() as usize;
+            let (ma, la, mb, lb) = (*ml_a.add(ih * 2), *ml_a.add(ih * 2 + 1), *ml_b.add(ih * 2), *ml_b.add(ih * 2 + 1));
+            let m = if ma > mb { ma } else { mb };
+            let wa = if ma == f32::NEG_INFINITY { 0.0 } else { exp(ma - m) };
+            let wb = if mb == f32::NEG_INFINITY { 0.0 } else { exp(mb - m) };
+            let o = ih * V_HEAD_DIM + v;
+            *heads.add(o) = (wa * *a.add(o) + wb * *b.add(o)) / (wa * la + wb * lb);
+        }
+    }
+    /// Hold the queue until `word` reads `value` (a card's VRAM word another card writes, 058). One thread.
+    #[no_mangle]
+    pub extern "gpu-kernel" fn word_wait(word: *const u32, value: u32) {
+        unsafe {
+            use core::sync::atomic::{AtomicU32, Ordering};
+            if workitem_id_x() == 0 {
+                while AtomicU32::from_ptr(word as *mut u32).load(Ordering::Acquire) != value {
+                    common::gfx11::nap();
+                }
+            }
+        }
+    }
+    /// Write `value` to `word` once every launch before this one is done (posted with the barrier), for another card.
+    #[no_mangle]
+    pub extern "gpu-kernel" fn word_post(word: *mut u32, value: u32) {
+        unsafe {
+            use core::sync::atomic::{AtomicU32, Ordering};
+            if workitem_id_x() == 0 {
+                AtomicU32::from_ptr(word).store(value, Ordering::Release);
+            }
         }
     }
     /// `mla_uv_w`'s twin for a step of up to `SPEC_TOKENS` tokens (the matrix path pads a verify step's two
