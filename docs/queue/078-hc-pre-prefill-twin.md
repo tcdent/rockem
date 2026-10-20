@@ -51,6 +51,19 @@ across the cards, the scores exchanged) is a separate, smaller step, to look at 
   measured, so ~8 ms a layer-chunk is compute and the pool's overhead.
   **First, before any build:** how close the CPU's prefill expert run sits to its DRAM floor (`pool.sh`, `experts.sh`,
   the pool's per-run rows). Close to it, streaming buys little and the CPU side needs another lever.
+- **The CPU's expert phases interleaved instead** (tcdent, 2026-10-20: gate/up and down "as a single, somewhat
+  interleaved kernel"). A token's down needs its whole hidden vector (every output row is a dot over all 2,048 values),
+  so down cannot overtake gate/up on the same rows. Two forms:
+  - *down split along the hidden dimension*: the core that made a slice of the hidden vector (whole 128-groups, so its
+    quantize is local and the quantize run goes) multiplies it by down's matching columns into a partial output summed
+    with the other slices' — one interleaved kernel a core, no barriers; numeric (the partials' sum reorders the adds),
+    down re-laid out by column slices in the bundle, a 4,096-value partial written a slice;
+  - *whole experts a CCD* (exact): a CCD's cores split an expert's gate/up rows, sync among themselves (the hidden
+    vector stays in that L3), split its down rows, take the next expert — the same arithmetic a row, the global
+    barriers and the 92-core run tails gone, the pipelining across the 11–12 CCDs; the hot experts' skew the sizing to
+    watch. The preferred form.
+  Both answer to the same first measurement: the run against its DRAM floor, and how much of the rest is barriers and
+  tails (the pool's per-run rows: `pool.sh`).
 
 ## Next
 The twin's arithmetic is the step gate's numeric kind (WMMA order) for the coefficients and the router; the act phase
