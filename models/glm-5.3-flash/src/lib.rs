@@ -122,6 +122,8 @@ pub mod mla;
 pub mod probe;
 #[cfg(feature = "std")]
 pub mod construct;
+#[cfg(feature = "std")]
+pub mod predict;
 pub mod weights;
 
 const _: () = assert!(LINEAR_ATTENTION.len() == NUM_HIDDEN_LAYERS);

@@ -1324,6 +1324,11 @@ pub struct CpuModel<'p, R: Routed> {
     b_picks: Vec<[usize; TOP_K]>,
     b_wts: Vec<[f32; TOP_K]>,
     b_routed: Vec<[usize; TOP_K]>,
+    /// The prefetch's predictor (made at the first decode step, from the weights' router biases), a step's
+    /// route-ahead logits (`[SPEC_TOKENS][E]`) and its logits for the next layer's experts.
+    pred: Option<predict::Predictor>,
+    b_ahead: Vec<f32>,
+    b_pz: Vec<f32>,
     d_x: Vec<f32>,
     d_xn: Vec<f32>,
     d_y: Vec<f32>,
@@ -1403,6 +1408,9 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             b_picks: vec![[0; TOP_K]; STEP],
             b_wts: vec![[0.0; TOP_K]; STEP],
             b_routed: vec![[E; TOP_K]; STEP],
+            pred: None,
+            b_ahead: vec![0.0; SPEC_TOKENS * E],
+            b_pz: vec![0.0; SPEC_TOKENS * E],
             d_x: vec![0.0; H],
             d_xn: vec![0.0; H],
             d_y: vec![0.0; H],
@@ -2135,35 +2143,33 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     #[cfg(feature = "dump-pred")]
                     dump_pred(l, n, &s.b_routed[t0..t0 + n], &s.b_xq[t0 * H..(t0 + n) * H], &s.b_xs[t0 * HG..(t0 + n) * HG], &s.b_score);
                     let z = draft_zone("slot.ahead", z);
-                    // the step's predicted experts not resident, ranked: picked by more of the step's tokens first, then
-                    // by their ranks in those picks; at most PREFETCH_CAP. A CCD's 32 MiB L3 kept less of a completed
-                    // prefetch the more the layer prefetched (86 % of its lines at <= 10 experts, 56 % at 23+): past what
-                    // the L3 retains a prefetched expert costs a DRAM read and evicts an earlier one (2026-10-20)
-                    let mut union = [(E, 0u32); SPEC_TOKENS * TOP_K];
-                    let mut nu = 0;
+                    // the step's experts not resident, ranked by the learned predictor (`predict`: the route-ahead logits
+                    // corrected by a bias and the picks here, learned online), at most PREFETCH_CAP. A CCD's 32 MiB L3 kept
+                    // less of a completed prefetch the more the layer prefetched (86 % of its lines at <= 10 experts, 56 % at
+                    // 23+): past what the L3 retains a prefetched expert costs a DRAM read and evicts an earlier one (2026-10-20)
+                    let pr = s.pred.get_or_insert_with(|| predict::Predictor::new(w.layers.iter().map(|lw| match &lw.ffn {
+                        Ffn::Moe(m) => m.bias.to_vec(),
+                        Ffn::Dense(_) => Vec::new(),
+                    }).collect()));
+                    for i in 0..n {
+                        s.b_ahead[i * E..(i + 1) * E].copy_from_slice(&s.b_score[i * ROUTE_ROWS + E..(i + 1) * ROUTE_ROWS]);
+                    }
+                    pr.predict(l, n, &s.b_ahead, &s.b_routed[t0..t0 + n], &mut s.b_pz);
                     for i in 0..n {
                         pre_next[i] = ffn::picks(m2, &mut s.b_score[i * ROUTE_ROWS + E..(i + 1) * ROUTE_ROWS]);
-                        for (r, &e) in pre_next[i].iter().enumerate() {
-                            if pl.resident(l + 1, e) {
-                                continue;
-                            }
-                            // a token's pick weighs more than any ranks' difference: count first, then rank
-                            let w = (TOP_K * SPEC_TOKENS) as u32 + (TOP_K - r) as u32;
-                            match union[..nu].iter_mut().find(|u| u.0 == e) {
-                                Some(u) => u.1 += w,
-                                None => {
-                                    union[nu] = (e, w);
-                                    nu += 1;
-                                }
-                            }
-                        }
                     }
-                    union[..nu].sort_by_key(|u| std::cmp::Reverse(u.1));
-                    let ranked: Vec<usize> = union[..nu.min(PREFETCH_CAP)].iter().map(|u| u.0).collect();
+                    let mut ranked = Vec::with_capacity(PREFETCH_CAP);
+                    predict::rank(&s.b_pz, n, &|e| pl.resident(l + 1, e), PREFETCH_CAP, &mut ranked);
                     let z = draft_zone("slot.pick", z);
                     s.routed.prefetch(l + 1, &ranked);
                     draft_zone("slot.post", z);
                     lap(&mut p.slot, "slot");
+                }
+                // the pair before learns from this layer's picks, under the prefetch it no longer feeds
+                if let (true, Some(pr)) = (n <= SPEC_TOKENS, s.pred.as_mut()) {
+                    let z = prow::Timestamp::now();
+                    pr.learn(l.wrapping_sub(1), &s.b_routed[t0..t0 + n]);
+                    draft_zone("slot.learn", z);
                 }
             }
             if tr.wants_edges() && n == 1 {

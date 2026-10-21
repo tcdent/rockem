@@ -119,3 +119,7 @@ path = "src/fp8_rows.rs"
 [[bin]]
 name = "bench-mla-attend"
 path = "src/mla_attend.rs"
+
+[[bin]]
+name = "bench-pred"
+path = "src/pred.rs"
