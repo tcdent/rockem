@@ -23,6 +23,10 @@ path = "src/dump_expert.rs"
 
 [profile.release]
 opt-level = 3
+# the node's codegen (one unit, LTO): a kernel's speed here is the node's (without them bench-power's gemm read 15 GMAC/s
+# against the node's ~105, 2026-10-20)
+lto = true
+codegen-units = 1
 
 [[bin]]
 name = "bench-gptq"
@@ -35,6 +39,10 @@ path = "src/kfd.rs"
 [[bin]]
 name = "bench-dram"
 path = "src/dram.rs"
+
+[[bin]]
+name = "bench-power"
+path = "src/power.rs"
 
 [[bin]]
 name = "bench-copy"

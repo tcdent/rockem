@@ -1,7 +1,7 @@
 # GLM-5.3-Flash: next steps
 
 The overview of the work on the serving node for GLM-5.3-Flash on metatron (dual EPYC 7R13,
-2× Radeon 7900 XT on socket 0). Each concept lives in its own numbered entry under
+2× Radeon 7900 XT on socket 1, NUMA nodes 2 and 3). Each concept lives in its own numbered entry under
 [`queue/`](queue/), in one format — status, area, gain, proposal, source, dated history, next —
 and new concepts take the next number. This page holds the state, the rules, the vocabulary and
 the index. Reorganized 2026-10-18 from the single-page version (in git history before then).
