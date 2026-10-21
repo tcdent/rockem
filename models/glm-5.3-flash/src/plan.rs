@@ -20,11 +20,15 @@
 //! before `hc_post`: `pred_input` and the router rows, then `pred_step`). The second margin, measured offline: settled
 //! recall@13 .6205 → .6255 (bringup/expert-cache/phase3b, 2026-10-21).
 
-use crate::{E, SPEC_TOKENS, TOP_K};
+use crate::{E, H, SPEC_TOKENS, TOP_K};
 
 /// Adam's learning rates: the co-routing table; the calibration (ca, cc) and the bias.
 pub const LR_CO: f32 = 3e-3;
 pub const LR_B: f32 = 1e-2;
+/// The input map's (U, V).
+pub const LR_X: f32 = 3e-4;
+/// The input map's rank: z += (x̂ · U) · V, x̂ the FFN input RMS-normed (no weight), U `[H][MAP_RANK]`, V `[MAP_RANK][E]`.
+pub const MAP_RANK: usize = 64;
 /// The simulation's loss divided by the 40 layer pairs it trained together; kept so its learning rates carry over.
 pub const PAIRS_SCALE: f32 = 40.0;
 /// Experts a decode plan names, best first: the host drops the ones resident on the cards and keeps `PREFETCH_CAP`.
@@ -45,16 +49,48 @@ pub const V_BIAS: usize = M_BIAS + E;
 pub const CO: usize = V_BIAS + E;
 pub const M_CO: usize = CO + E * E;
 pub const V_CO: usize = M_CO + E * E;
-pub const STATE: usize = V_CO + E * E;
+pub const MAP_U: usize = V_CO + E * E;
+pub const M_MAP_U: usize = MAP_U + H * MAP_RANK;
+pub const V_MAP_U: usize = M_MAP_U + H * MAP_RANK;
+pub const MAP_V: usize = V_MAP_U + H * MAP_RANK;
+pub const M_MAP_V: usize = MAP_V + MAP_RANK * E;
+pub const V_MAP_V: usize = M_MAP_V + MAP_RANK * E;
+pub const STATE: usize = V_MAP_V + MAP_RANK * E;
+/// A pair's input-map store, f32: a decode step's normed inputs `[SPEC_TOKENS][H]` and the gradients of their h
+/// `[SPEC_TOKENS][MAP_RANK]` (for `pred_map`), then a step's h `[STEP][MAP_RANK]` (for its update).
+pub const MS_X: usize = 0;
+pub const MS_DH: usize = MS_X + SPEC_TOKENS * H;
+pub const MS_RN: usize = MS_DH + SPEC_TOKENS * MAP_RANK;
+pub const MS_H: usize = MS_RN + SPEC_TOKENS;
+pub const MS_LEN: usize = MS_H + crate::STEP * MAP_RANK;
+/// `pred_h`'s workgroups, a slice of the input each, and its partials a card: `[MAP_HWGS][STEP][MAP_RANK + 1]` f32
+/// (each slice's x · U, unnormed, and its sum of squares). One workgroup reading U whole took ~490 µs a layer at 4 tokens.
+pub const MAP_HWGS: usize = 64;
+pub const MAP_SLICE: usize = H / MAP_HWGS;
+pub const MAP_PART: usize = MAP_HWGS * crate::STEP * (MAP_RANK + 1);
+/// `pred_map`'s workgroups: U's update spread over the card.
+pub const MAP_WGS: usize = 64;
 
-/// A pair's state before any update: ca 3, β1⁰ = β2⁰ = 1, the next layer's router bias, every correction zero.
+/// A pair's state before any update: ca 3, β1⁰ = β2⁰ = 1, the next layer's router bias, U small and random (normal /
+/// √H, from `seed`), every correction zero (V zero: the map starts at zero).
 #[cfg(feature = "std")]
-pub fn init(bias_next: &[f32]) -> Vec<f32> {
+pub fn init(bias_next: &[f32], seed: u64) -> Vec<f32> {
     let mut s = vec![0f32; STATE];
     s[HDR] = 3.0;
     s[HDR + B1T] = 1.0;
     s[HDR + B2T] = 1.0;
     s[BN..BN + E].copy_from_slice(&bias_next[..E]);
+    let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut u = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        ((x >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+    };
+    for v in &mut s[MAP_U..MAP_U + H * MAP_RANK] {
+        let (a, b) = (u(), u());
+        *v = ((-2.0 * a.ln()).sqrt() * (2.0 * std::f64::consts::PI * b).cos()) as f32 / (H as f32).sqrt();
+    }
     s
 }
 
@@ -63,10 +99,14 @@ pub fn init(bias_next: &[f32]) -> Vec<f32> {
 pub const LEARN_LDS: u32 = (4 * (2 * SPEC_TOKENS * E + 3 * SPEC_TOKENS * TOP_K + HDR_LEN + 16)) as u32;
 /// `pred_learn`'s workgroup: a thread an expert.
 pub const LEARN_WG: u32 = E as u32;
-/// `pred_learn`'s table: device addresses a pair.
-pub const LEARN_TAB: usize = 5;
-/// `pred_step`'s: the reductions, a token's scores and the plan's keys `[E]` each.
-pub const PLAN_LDS: u32 = (4 * (16 + 2 * E)) as u32;
+/// The map store keeps a decode step's inputs raw (`MS_X`) with their norms' reciprocals (`MS_RN`).
+/// `pred_learn`'s table: device addresses a pair (state, margins, picks here, labels, second margins, map store).
+pub const LEARN_TAB: usize = 6;
+/// `pred_step`'s: the reductions, a token's scores and the plan's keys `[E]` each, the normed input `[H]`, the map's
+/// partials `[256]` and its h `[MAP_RANK]`.
+pub const PLAN_LDS: u32 = (4 * (16 + 2 * E + MAP_RANK)) as u32;
+/// `pred_h`'s: a token's slice partials `[256]`.
+pub const MAP_H_LDS: u32 = 4 * 256;
 /// Workgroups that predict a long step's tokens, a token a workgroup at a time.
 pub const PLAN_PRED_WGS: usize = 64;
 
@@ -145,12 +185,72 @@ pub mod gfx11 {
         (m0, m1)
     }
 
+    /// The input map's x · U over the `n` tokens' FFN inputs (`xin` `[n][H]`), a slice of `MAP_SLICE` inputs a workgroup
+    /// (its U rows read once a token, from cache after the first): each slice's partial h and sum of squares into `part`
+    /// (rows from `t0`), a decode step's raw inputs into the map store. Grid `MAP_HWGS` of 256: a quarter of the slice
+    /// and a rank a thread.
+    #[no_mangle]
+    pub extern "gpu-kernel" fn pred_h(xin: *const f32, pred: *const f32, ms: *mut f32, part: *mut f32, t0: u32, n: u32) {
+        unsafe {
+            const Q: usize = 256 / MAP_RANK;
+            const _: () = assert!(256 % MAP_RANK == 0 && MAP_SLICE % Q == 0 && MAP_SLICE <= 256 && H % MAP_HWGS == 0);
+            let t = workitem_id_x() as usize;
+            let w = workgroup_id_x() as usize;
+            let (n, t0) = (n as usize, t0 as usize);
+            let lp = lds::<f32>();
+            let (qq, rr) = (t / MAP_RANK, t % MAP_RANK);
+            let k0 = w * MAP_SLICE;
+            let mut i = 0;
+            while i < n {
+                let x = xin.add(i * H + k0);
+                let mut acc = 0f32;
+                let mut k = qq * (MAP_SLICE / Q);
+                while k < (qq + 1) * (MAP_SLICE / Q) {
+                    acc += *x.add(k) * *pred.add(MAP_U + (k0 + k) * MAP_RANK + rr);
+                    k += 1;
+                }
+                *lp.add(t) = acc;
+                workgroup_sync();
+                let p = part.add((w * crate::STEP + t0 + i) * (MAP_RANK + 1));
+                if t < MAP_RANK {
+                    let mut h = 0f32;
+                    let mut j = 0;
+                    while j < Q {
+                        h += *lp.add(j * MAP_RANK + t);
+                        j += 1;
+                    }
+                    *p.add(t) = h;
+                }
+                workgroup_sync();
+                if t < MAP_SLICE {
+                    let v = *x.add(t);
+                    if n <= SPEC_TOKENS {
+                        *ms.add(MS_X + i * H + k0 + t) = v;
+                    }
+                    *lp.add(t) = v * v;
+                }
+                workgroup_sync();
+                if t == 0 {
+                    let mut ss = 0f32;
+                    let mut j = 0;
+                    while j < MAP_SLICE {
+                        ss += *lp.add(j);
+                        j += 1;
+                    }
+                    *p.add(MAP_RANK) = ss;
+                }
+                workgroup_sync();
+                i += 1;
+            }
+        }
+    }
+
     /// Pair l's prediction (see the module): its state, the route-ahead scores (`[n][ROUTE_ROWS]`, the next layer's
     /// from `E`), the second margin's (likewise), the margins it keeps `[n][E]` each, the picks at l `[n][TOP_K]`
     /// u32. `plan` (null in a long step): the decode plan and the host's `word`. Grid: 1 for a decode step,
     /// `PLAN_PRED_WGS` for a long one.
     #[no_mangle]
-    pub extern "gpu-kernel" fn pred_step(pred: *const f32, scores: *const f32, scores2: *const f32, p_d: *mut f32, p_d2: *mut f32, p_picks: *const u32, plan: *mut u32, word: *mut u32, value: u32, n: u32) {
+    pub extern "gpu-kernel" fn pred_step(pred: *const f32, scores: *const f32, scores2: *const f32, part: *const f32, ms: *mut f32, t0: u32, p_d: *mut f32, p_d2: *mut f32, p_picks: *const u32, plan: *mut u32, word: *mut u32, value: u32, n: u32) {
         unsafe {
             let t = workitem_id_x() as usize;
             let wg = workgroup_id_x() as usize;
@@ -160,6 +260,8 @@ pub mod gfx11 {
             let red = l; // [16]
             let gv = red.add(16); // [E]
             let sk = gv.add(E); // [E]
+            let hv = sk.add(E); // [MAP_RANK]
+            let t0 = t0 as usize;
             // the tokens this workgroup predicts: a decode step's all in one, a long step's striped
             let (first, stride) = if decode { (0, 1) } else { (wg, PLAN_PRED_WGS) };
             let (ca, cc, ca2) = (*pred.add(HDR), *pred.add(HDR + 1), *pred.add(HDR + 2));
@@ -167,6 +269,24 @@ pub mod gfx11 {
             let (mut s0, mut s1) = (1f32, 1f32);
             let mut i = first;
             while i < n {
+                // the input map's h from `pred_h`'s partials: Σ over the slices, then the norm (h is linear in x)
+                if t < MAP_RANK {
+                    let (mut h, mut ss) = (0f32, 0f32);
+                    let mut w = 0;
+                    while w < MAP_HWGS {
+                        let p = part.add((w * crate::STEP + t0 + i) * (MAP_RANK + 1));
+                        h += *p.add(t);
+                        ss += *p.add(MAP_RANK);
+                        w += 1;
+                    }
+                    let rn = 1.0 / (sqrt(ss / H as f32) + 1e-6);
+                    *hv.add(t) = h * rn;
+                    *ms.add(MS_H + (t0 + i) * MAP_RANK + t) = h * rn;
+                    if decode && t == 0 {
+                        *ms.add(MS_RN + i) = rn;
+                    }
+                }
+                workgroup_sync();
                 let (a0, a1) = margins(t, scores.add(i * crate::hc::gfx11_consts::ROUTE_ROWS + E), pred.add(BN), gv, red);
                 let (b0, b1) = margins(t, scores2.add(i * crate::hc::gfx11_consts::ROUTE_ROWS + E), pred.add(BN), gv, red);
                 let mut k = 0;
@@ -182,6 +302,11 @@ pub mod gfx11 {
                             while q < TOP_K {
                                 z += *pred.add(CO + *p_picks.add(i * TOP_K + q) as usize * E + e);
                                 q += 1;
+                            }
+                            let mut r = 0;
+                            while r < MAP_RANK {
+                                z += *hv.add(r) * *pred.add(MAP_V + r * E + e);
+                                r += 1;
                             }
                             let f = 1.0 + exp(if z < 20.0 { z } else { 20.0 });
                             if k == 0 {
@@ -239,7 +364,7 @@ pub mod gfx11 {
     /// prediction, the picks at its layer and at the next, its labels, each `[STEP][TOP_K]` u32). Workgroups of
     /// `LEARN_WG`, a thread an expert.
     #[no_mangle]
-    pub extern "gpu-kernel" fn pred_learn(tab: *const u64, first: u32, t0: u32, n: u32) {
+    pub extern "gpu-kernel" fn pred_learn(tab: *const u64, first: u32, t0: u32, n: u32, map: u32) {
         unsafe {
             const R: usize = SPEC_TOKENS * TOP_K;
             const NONE: u32 = u32::MAX;
@@ -252,6 +377,8 @@ pub mod gfx11 {
             let picks = (*row.add(2) as *const u32).add(t0 * TOP_K);
             let labels = (*row.add(3) as *const u32).add(t0 * TOP_K);
             let d2 = (*row.add(4) as *const f32).add(t0 * E);
+            let ms = *row.add(5) as *mut f32;
+            let hs = ms.add(MS_H + t0 * MAP_RANK) as *const f32;
             let l = lds::<f32>();
             let gz = l; // [SPEC_TOKENS][E]
             let y = gz.add(SPEC_TOKENS * E) as *mut u32; // [SPEC_TOKENS][E]
@@ -310,6 +437,11 @@ pub mod gfx11 {
                         z += *s.add(CO + *pk.add(i * TOP_K + q) as usize * E + e);
                         q += 1;
                     }
+                    let mut r = 0;
+                    while r < MAP_RANK {
+                        z += *hs.add((a + i) * MAP_RANK + r) * *s.add(MAP_V + r * E + e);
+                        r += 1;
+                    }
                     let g = (sigmoid(z) - *y.add(i * E + e) as f32) * sc;
                     *gz.add(i * E + e) = g;
                     gb += g;
@@ -323,6 +455,32 @@ pub mod gfx11 {
                 let gca2 = learn_sum(e, gca2, red);
                 let (b1t, b2t) = (*cal.add(B1T) * 0.9, *cal.add(B2T) * 0.999);
                 let (c1, c2) = (1.0 - b1t, sqrt(1.0 - b2t));
+                // a decode step's input map (`map`): h's gradients for `pred_map` (V as it stood), then V's update
+                if map != 0 {
+                    if e < m * MAP_RANK {
+                        let (i, r) = (e / MAP_RANK, e % MAP_RANK);
+                        let mut g = 0f32;
+                        let mut j = 0;
+                        while j < E {
+                            g += *s.add(MAP_V + r * E + j) * *gz.add(i * E + j);
+                            j += 1;
+                        }
+                        *ms.add(MS_DH + i * MAP_RANK + r) = g;
+                    }
+                    workgroup_sync();
+                    let mut r = 0;
+                    while r < MAP_RANK {
+                        let mut g = 0f32;
+                        let mut i = 0;
+                        while i < m {
+                            g += *hs.add((a + i) * MAP_RANK + r) * *gz.add(i * E + e);
+                            i += 1;
+                        }
+                        let o = r * E + e;
+                        adam(s.add(MAP_V + o), s.add(M_MAP_V + o), s.add(V_MAP_V + o), g, LR_X / c1, c2);
+                        r += 1;
+                    }
+                }
                 adam(s.add(BIAS + e), s.add(M_BIAS + e), s.add(V_BIAS + e), gb, LR_B / c1, c2);
                 // the rows, four at a time: their loads issued together
                 let lr = LR_CO / c1;
@@ -378,6 +536,33 @@ pub mod gfx11 {
             }
             if e < HDR_LEN {
                 *s.add(HDR + e) = *cal.add(e);
+            }
+        }
+    }
+
+    /// A decode step's update of a pair's U (after `pred_learn`, which leaves the step's β·ᵗ in the header and h's
+    /// gradients in the map store): dU[k][r] = Σ_i x̂_i[k] · dh_i[r], Adam. Entry `entry` of `tab`, `n` tokens. Grid
+    /// `MAP_WGS` of 256, U's entries strided over them.
+    #[no_mangle]
+    pub extern "gpu-kernel" fn pred_map(tab: *const u64, entry: u32, n: u32) {
+        unsafe {
+            let row = tab.add(entry as usize * LEARN_TAB);
+            let s = *row as *mut f32;
+            let ms = *row.add(5) as *const f32;
+            let n = n as usize;
+            let (b1t, b2t) = (*s.add(HDR + B1T), *s.add(HDR + B2T));
+            let (lr, c2) = (LR_X / (1.0 - b1t), sqrt(1.0 - b2t));
+            let mut o = workgroup_id_x() as usize * 256 + workitem_id_x() as usize;
+            while o < H * MAP_RANK {
+                let (k, r) = (o / MAP_RANK, o % MAP_RANK);
+                let mut g = 0f32;
+                let mut i = 0;
+                while i < n {
+                    g += *ms.add(MS_X + i * H + k) * *ms.add(MS_RN + i) * *ms.add(MS_DH + i * MAP_RANK + r);
+                    i += 1;
+                }
+                adam(s.add(MAP_U + o), s.add(M_MAP_U + o), s.add(V_MAP_U + o), g, lr, c2);
+                o += MAP_WGS * 256;
             }
         }
     }

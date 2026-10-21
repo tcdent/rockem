@@ -16,6 +16,7 @@ ap.add_argument('--maxrank',type=int,default=0)
 ap.add_argument('--data',default='phase3')   # data/<dir>/: phase3 (the first dump) or phase3b (the extended one)
 ap.add_argument('--lg',default='LG')         # the route-ahead logits the margin d comes from: LG, LG1, LG2, LG3 (phase3b)
 ap.add_argument('--lg2',default='')          # a second margin from these logits, with its own calibration
+ap.add_argument('--lg2prev',type=int,default=0) # 1: the second margin from the previous step's last token's logits (known before this step)
 a=ap.parse_args()
 torch.set_num_threads(a.threads); torch.manual_seed(0)
 D='/home/slomp/Work/rockem/bringup/expert-cache/data/'+a.data+'/'
@@ -54,7 +55,8 @@ def feats(s):
     y=torch.zeros(P,m,E); y.scatter_(2,torch.from_numpy(PK[1:41,t0:t1]),1.0)
     f=dict(d=d,y=y,m=m)
     if a.lg2:
-        g2=torch.sigmoid(torch.from_numpy(np.ascontiguousarray(LG2[0:40,t0:t1])))+bias_next[:,None,:]
+        src=np.ascontiguousarray(LG2[0:40,t0:t1]) if not a.lg2prev else np.repeat(np.ascontiguousarray(LG2[0:40,max(t0-1,0):max(t0,1)]),t1-t0,axis=1)
+        g2=torch.sigmoid(torch.from_numpy(src))+bias_next[:,None,:]
         f['d2']=(g2-g2.topk(8,dim=2).values[:,:,7:8])*10
     if 'co' in terms:
         pl=torch.zeros(P,m,E); pl.scatter_(2,torch.from_numpy(PK[0:40,t0:t1]),1.0); f['pl']=pl
