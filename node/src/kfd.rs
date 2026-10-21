@@ -333,17 +333,6 @@ pub struct Kfd {
     last_span: Cell<(u64, u64)>, // the launches between the previous two waits
     code: Mem,
     elf: Vec<u8>,
-    /// A second queue at the lowest priority, for work that may run beside the main queue's in the card's idle time
-    /// and that nothing in the main queue waits for (`launch_side`): its packets never hold the main queue's.
-    side: Option<Side>,
-}
-/// A queue of its own beside a card's main queue: its ring, indices, kernarg slots and doorbell.
-struct Side {
-    ring: Mem,
-    queue: Mem,
-    kernargs: Mem,
-    doorbell: *mut u64,
-    write_index: Cell<u64>,
 }
 
 fn sysfs_u64(path: &str) -> u64 {
@@ -421,35 +410,19 @@ impl Kfd {
             last_span: Cell::new((0, 0)),
             code: Mem { va: 0, size: 0, handle: 0 },
             elf: elf.to_vec(),
-            side: None,
         };
-        let (ring, queue, kernargs, doorbell, queue_id) = Self::make_queue(&mut k, &props, &ap, gpu_id, true);
-        (k.ring, k.queue, k.kernargs, k.doorbell) = (ring, queue, kernargs, doorbell);
-        let (ring, queue, kernargs, doorbell, _) = Self::make_queue(&mut k, &props, &ap, gpu_id, false);
-        k.side = Some(Side { ring, queue, kernargs, doorbell, write_index: Cell::new(0) });
-        k.load();
-        println!("gpu      : kfd {}.{}, gpu {gpu_id}, queue {queue_id}, {} MiB of VRAM host-visible", v.major, v.minor, visible_vram >> 20);
-        std::rc::Rc::new(k)
-    }
-
-    /// A queue's memory and the queue itself: the main one (`main`: its wait signal and stamps too, priority 7) or a
-    /// side queue (priority 0). Returns (ring, queue struct, kernarg slots, doorbell, queue id).
-    #[allow(clippy::type_complexity)]
-    fn make_queue(k: &mut Kfd, props: &str, ap: &Apertures, gpu_id: u32, main: bool) -> (Mem, Mem, Mem, *mut u64, u32) {
         // the queue's memory: ring (doubled by KFD so the wrap is contiguous), the queue
         // struct with the indices, the kernarg slots, the wait signal, the EOP buffer in
         // VRAM, and the context-save area the kernel sized for this device
-        let ring = k.alloc(RING_PACKETS * size_of::<Packet>() * 2, MEM_GTT | MEM_AQL_QUEUE | MEM_UNCACHED | MEM_COHERENT | MEM_WRITABLE | MEM_EXECUTABLE, true, RING_PACKETS * size_of::<Packet>());
-        let queue = k.alloc(4096, MEM_GTT | MEM_COHERENT | MEM_WRITABLE, true, 4096); // one page: KFD checks the index words' page is exactly one mapping
-        let kernargs = k.alloc(KERNARG_SLOTS * KERNARG_SLOT, MEM_GTT | MEM_COHERENT | MEM_WRITABLE, true, KERNARG_SLOTS * KERNARG_SLOT);
-        if main {
-            k.signal = k.alloc(4096, MEM_GTT | MEM_COHERENT | MEM_WRITABLE, true, 4096);
-            k.stamps = k.alloc(RING_PACKETS * size_of::<Signal>(), MEM_GTT | MEM_COHERENT | MEM_WRITABLE, true, RING_PACKETS * size_of::<Signal>());
-            unsafe {
-                std::ptr::write_bytes(k.stamps.ptr() as *mut u8, 0, k.stamps.size);
-                for i in 0..RING_PACKETS {
-                    (*(k.stamps.ptr() as *mut Signal).add(i)).kind = SIGNAL_KIND_USER;
-                }
+        k.ring = k.alloc(RING_PACKETS * size_of::<Packet>() * 2, MEM_GTT | MEM_AQL_QUEUE | MEM_UNCACHED | MEM_COHERENT | MEM_WRITABLE | MEM_EXECUTABLE, true, RING_PACKETS * size_of::<Packet>());
+        k.queue = k.alloc(4096, MEM_GTT | MEM_COHERENT | MEM_WRITABLE, true, 4096); // one page: KFD checks the index words' page is exactly one mapping
+        k.kernargs = k.alloc(KERNARG_SLOTS * KERNARG_SLOT, MEM_GTT | MEM_COHERENT | MEM_WRITABLE, true, KERNARG_SLOTS * KERNARG_SLOT);
+        k.signal = k.alloc(4096, MEM_GTT | MEM_COHERENT | MEM_WRITABLE, true, 4096);
+        k.stamps = k.alloc(RING_PACKETS * size_of::<Signal>(), MEM_GTT | MEM_COHERENT | MEM_WRITABLE, true, RING_PACKETS * size_of::<Signal>());
+        unsafe {
+            std::ptr::write_bytes(k.stamps.ptr() as *mut u8, 0, k.stamps.size);
+            for i in 0..RING_PACKETS {
+                (*(k.stamps.ptr() as *mut Signal).add(i)).kind = SIGNAL_KIND_USER;
             }
         }
         let eop = k.alloc(4096, MEM_VRAM | MEM_WRITABLE | MEM_EXECUTABLE, false, 4096);
@@ -467,15 +440,15 @@ impl Kfd {
             std::ptr::write_bytes(cwsr.ptr() as *mut u8, 0, 64);
             *(cwsr.at(16) as *mut u32) = cwsr_size as u32;
             *(cwsr.at(20) as *mut u32) = debug as u32;
-            let rp = ring.ptr() as *mut Packet;
+            let ring = k.ring.ptr() as *mut Packet;
             for i in 0..RING_PACKETS {
-                std::ptr::write_volatile(&mut (*rp.add(i)).header, PACKET_INVALID);
+                std::ptr::write_volatile(&mut (*ring.add(i)).header, PACKET_INVALID);
             }
-            let q = queue.ptr() as *mut AmdQueue;
+            let q = k.queue.ptr() as *mut AmdQueue;
             std::ptr::write_bytes(q as *mut u8, 0, size_of::<AmdQueue>());
             (*q).queue_type = 1; // HSA_QUEUE_TYPE_MULTI
             (*q).features = 1; // KERNEL_DISPATCH
-            (*q).base_address = ring.va as u64;
+            (*q).base_address = k.ring.va as u64;
             (*q).size = RING_PACKETS as u32;
             (*q).group_segment_aperture_base_hi = (ap.lds_base >> 32) as u32;
             (*q).private_segment_aperture_base_hi = (ap.scratch_base >> 32) as u32;
@@ -483,21 +456,19 @@ impl Kfd {
             (*q).max_wave_id = (sysfs_prop(&props, "max_waves_per_simd ") * sysfs_prop(&props, "simd_per_cu ")) as u32 - 1;
             (*q).read_dispatch_id_field_base_byte_offset = 128;
             (*q).queue_properties = QUEUE_PROPERTIES_IS_PTR64 | QUEUE_PROPERTIES_ENABLE_PROFILING;
-            if main {
-                let s = k.signal.ptr() as *mut Signal;
-                std::ptr::write_bytes(s as *mut u8, 0, size_of::<Signal>());
-                (*s).kind = SIGNAL_KIND_USER;
-            }
+            let s = k.signal.ptr() as *mut Signal;
+            std::ptr::write_bytes(s as *mut u8, 0, size_of::<Signal>());
+            (*s).kind = SIGNAL_KIND_USER;
         }
         let mut cq = CreateQueueArgs {
-            ring_base_address: ring.va as u64,
-            write_pointer_address: queue.at(56) as u64,
-            read_pointer_address: queue.at(128) as u64,
+            ring_base_address: k.ring.va as u64,
+            write_pointer_address: k.queue.at(56) as u64,
+            read_pointer_address: k.queue.at(128) as u64,
             ring_size: (RING_PACKETS * size_of::<Packet>()) as u32,
             gpu_id,
             queue_type: QUEUE_TYPE_COMPUTE_AQL,
             queue_percentage: 100,
-            queue_priority: if main { 7 } else { 0 },
+            queue_priority: 7,
             eop_buffer_address: eop.va as u64,
             eop_buffer_size: eop.size as u64,
             ctx_save_restore_address: cwsr.va as u64,
@@ -510,8 +481,10 @@ impl Kfd {
         let page = 1024 * 8;
         let base = unsafe { mmap(std::ptr::null_mut(), page, PROT_RW, MAP_SHARED, k.kfd.as_raw_fd(), (cq.doorbell_offset & !(page as u64 - 1)) as i64) };
         assert!(base != MAP_FAILED, "doorbell mmap");
-        let doorbell = (base as usize + (cq.doorbell_offset & (page as u64 - 1)) as usize) as *mut u64;
-        (ring, queue, kernargs, doorbell, cq.queue_id)
+        k.doorbell = (base as usize + (cq.doorbell_offset & (page as u64 - 1)) as usize) as *mut u64;
+        k.load();
+        println!("gpu      : kfd {}.{}, gpu {gpu_id}, queue {}, {} MiB of VRAM host-visible", v.major, v.minor, cq.queue_id, visible_vram >> 20);
+        std::rc::Rc::new(k)
     }
 
     fn call<T>(fd: &std::fs::File, req: u64, args: &mut T, what: &str) {
@@ -789,33 +762,6 @@ impl Kfd {
         (pkt, PACKET_KERNEL_DISPATCH | (acquire << HEADER_ACQUIRE_SHIFT) | (FENCE_AGENT << HEADER_RELEASE_SHIFT) | if barrier { HEADER_BARRIER } else { 0 })
     }
 
-    /// One dispatch on the side queue (`Side`): in order behind the side queue's own packets, beside the main
-    /// queue's, at the lowest priority. It acquires at system scope (the host writes what it reads just before) and
-    /// releases at agent scope, so the main queue's later launches see its stores; nothing waits for it.
-    pub fn launch_side(&self, k: &Kernel, grid: u32, wg: u32, lds: u32, args: &Args) {
-        let sd = self.side.as_ref().expect("side queue");
-        assert_eq!(args.len as u32, k.kernarg_size, "kernarg size");
-        let idx = sd.write_index.get();
-        let ka = sd.kernargs.at((idx as usize % RING_PACKETS) * KERNARG_SLOT);
-        unsafe { std::ptr::copy_nonoverlapping(args.buf.as_ptr(), ka as *mut u8, args.len) };
-        let pkt = Packet {
-            header: PACKET_INVALID,
-            setup: 1,
-            workgroup_size: [wg as u16, 1, 1],
-            reserved0: 0,
-            grid_size: [grid * wg, 1, 1],
-            private_segment_size: 0,
-            group_segment_size: lds + k.group_segment,
-            kernel_object: k.object,
-            kernarg_address: ka as u64,
-            reserved2: 0,
-            completion_signal: 0,
-        };
-        let header = PACKET_KERNEL_DISPATCH | (FENCE_SYSTEM << HEADER_ACQUIRE_SHIFT) | (FENCE_AGENT << HEADER_RELEASE_SHIFT) | HEADER_BARRIER;
-        Self::post_to(&sd.ring, &sd.queue, sd.doorbell, idx, pkt, header);
-        sd.write_index.set(idx + 1);
-    }
-
     /// Wait for everything posted so far: a barrier packet carrying the
     /// signal, then MWAITX on the signal's line until the CP decrements it.
     pub fn sync(&self) {
@@ -979,14 +925,9 @@ impl Kfd {
     }
 
     fn post(&self, idx: u64, pkt: Packet, header: u16) {
-        Self::post_to(&self.ring, &self.queue, self.doorbell, idx, pkt, header);
-        self.write_index.set(idx + 1);
-    }
-    /// A packet into a queue's ring at `idx`, once the CP has retired the packet the slot held, and the doorbell.
-    fn post_to(ring: &Mem, queue: &Mem, doorbell: *mut u64, idx: u64, pkt: Packet, header: u16) {
-        let ring = ring.ptr() as *mut Packet;
+        let ring = self.ring.ptr() as *mut Packet;
         let slot = unsafe { ring.add((idx as usize) % RING_PACKETS) };
-        let q = queue.ptr() as *const AmdQueue;
+        let q = self.queue.ptr() as *const AmdQueue;
         // the ring is full when the CP has not retired the packet this slot held
         while idx - unsafe { (*q).read_dispatch_id.load(Ordering::Acquire) } >= RING_PACKETS as u64 {
             std::hint::spin_loop();
@@ -1000,8 +941,9 @@ impl Kfd {
             (*hs).store((pkt.setup as u32) << 16 | header as u32, Ordering::Release);
             (*q).write_dispatch_id.store(idx + 1, Ordering::Release);
             fence(Ordering::SeqCst);
-            std::ptr::write_volatile(doorbell, idx);
+            std::ptr::write_volatile(self.doorbell, idx);
         }
+        self.write_index.set(idx + 1);
     }
 }
 

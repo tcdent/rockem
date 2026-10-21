@@ -3,14 +3,14 @@
 //! computes the next layer's route-ahead scores and this layer's picks — in the cards' idle time. The host only reads
 //! the plan: a decode step's best `PLAN` experts for the next layer.
 //!
-//! Two launches a MoE layer l, posted once its picks are in. `pred_step`, in the FFN card's queue behind the resident
-//! experts and ahead of the FFN's output half (which spins on the host's experts): pair l predicts layer l + 1 from the
-//! route-ahead scores, keeping each token's margin `d` for its own update a layer later; a decode step also ranks the
-//! union (Π(1 + eᶻ), the order of Σ softplus) and writes the plan and the host's word. `pred_learn`, in the card's
-//! side queue (`Kfd::launch_side`, beside the main queue at the lowest priority, so its milliseconds of a prefill
-//! chunk hold nothing): pair l − 1 learns from layer l's picks (per-expert BCE, Adam, in batches of `SPEC_TOKENS`
-//! tokens as decode's steps). In the one queue, a prefill chunk's learning held the other chunk's card half: prefill
-//! 1.85 → 2.9 ms a prompt token (2026-10-21). A pair's state and margins live on its layer's FFN card.
+//! `pred_step`, in the FFN card's queue right ahead of a MoE layer's output half (which spins until the host's experts
+//! are in, so it runs in that wait): pair l predicts layer l + 1 from the route-ahead scores, keeping each token's margin
+//! `d` for its own update; a decode step also ranks the union (Π(1 + eᶻ), the order of Σ softplus) and writes the plan
+//! and the host's word. `pred_learn`: per-expert BCE, Adam, in batches of `SPEC_TOKENS` tokens as decode's steps. A
+//! decode step's pair l − 1 learns from layer l's picks right after `pred_step`, in the same wait (the two 56 + 65 µs of
+//! a ~550 µs wait, 2026-10-21). A prefill step's pairs learn once its layers are done, a workgroup a pair, all at once:
+//! a 512-token chunk's learning a layer took 10.6 ms, more than the chunk's wait (the other chunk's card half fills
+//! it): prefill 1.85 → 2.6 ms a prompt token. A pair's state and margins live on its layer's FFN card.
 //!
 //! The pair's state, f32, `STATE` long: the calibration and Adam's terms (`HDR`), the next layer's router bias (`BN`),
 //! the bias and its moments, the co-routing table `[E][E]` (row: an expert picked here) and its moments.
@@ -47,9 +47,13 @@ pub fn init(bias_next: &[f32]) -> Vec<f32> {
     s
 }
 
-/// `pred_learn`'s LDS, in words: the batch's dL/dz and labels `[SPEC_TOKENS][E]` each, its picks, the header, the
-/// reductions.
-pub const LEARN_LDS: u32 = (4 * (2 * SPEC_TOKENS * E + SPEC_TOKENS * TOP_K + 8 + 16)) as u32;
+/// `pred_learn`'s LDS, in words: the batch's dL/dz and labels `[SPEC_TOKENS][E]` each, its picks, its distinct rows
+/// and their token masks, the header, the reductions.
+pub const LEARN_LDS: u32 = (4 * (2 * SPEC_TOKENS * E + 3 * SPEC_TOKENS * TOP_K + 8 + 16)) as u32;
+/// `pred_learn`'s workgroup: a thread an expert.
+pub const LEARN_WG: u32 = E as u32;
+/// `pred_learn`'s table: device addresses a pair.
+pub const LEARN_TAB: usize = 4;
 /// `pred_step`'s: the reductions, a token's scores and the plan's keys `[E]` each.
 pub const PLAN_LDS: u32 = (4 * (16 + 2 * E)) as u32;
 /// Workgroups that predict a long step's tokens, a token a workgroup at a time.
@@ -58,7 +62,7 @@ pub const PLAN_PRED_WGS: usize = 64;
 #[cfg(target_arch = "amdgpu")]
 pub mod gfx11 {
     use super::*;
-    use common::gfx11::{lds, workgroup_sum, workgroup_sync};
+    use common::gfx11::{lds, workgroup_sync};
     use common::math::{exp, sqrt};
     use core::arch::amdgpu::{workgroup_id_x, workitem_id_x};
     use core::sync::atomic::{fence, AtomicU32, Ordering};
@@ -195,129 +199,166 @@ pub mod gfx11 {
         }
     }
 
-    /// Pair l − 1's update over `n` tokens (see the module): its state, its tokens' margins `[n][E]` (kept by its
-    /// prediction), the picks at l − 1 and at l (its labels), `[n][TOP_K]` u32. Grid 1.
+    /// Pairs' updates over the `n` tokens from row `t0` (see the module), a workgroup a pair: workgroup w takes entry
+    /// `first + w` of `tab` (`LEARN_TAB` device addresses a pair: its state, its margins `[STEP][E]` kept by its
+    /// prediction, the picks at its layer and at the next, its labels, each `[STEP][TOP_K]` u32). Workgroups of
+    /// `LEARN_WG`, a thread an expert.
     #[no_mangle]
-    pub extern "gpu-kernel" fn pred_learn(s: *mut f32, d: *const f32, picks: *const u32, labels: *const u32, n: u32) {
+    pub extern "gpu-kernel" fn pred_learn(tab: *const u64, first: u32, t0: u32, n: u32) {
         unsafe {
+            const R: usize = SPEC_TOKENS * TOP_K;
+            const NONE: u32 = u32::MAX;
+            let e = workitem_id_x() as usize;
+            let n = n as usize;
+            let row = tab.add((first as usize + workgroup_id_x() as usize) * LEARN_TAB);
+            let t0 = t0 as usize;
+            let s = *row as *mut f32;
+            let d = (*row.add(1) as *const f32).add(t0 * E);
+            let picks = (*row.add(2) as *const u32).add(t0 * TOP_K);
+            let labels = (*row.add(3) as *const u32).add(t0 * TOP_K);
             let l = lds::<f32>();
             let gz = l; // [SPEC_TOKENS][E]
             let y = gz.add(SPEC_TOKENS * E) as *mut u32; // [SPEC_TOKENS][E]
-            let pk = y.add(SPEC_TOKENS * E); // [SPEC_TOKENS * TOP_K]
-            let cal = pk.add(SPEC_TOKENS * TOP_K) as *mut f32; // [8]
+            let pk = y.add(SPEC_TOKENS * E); // [R] the batch's picks at l − 1
+            let rq = pk.add(R); // [R] a distinct row of the co-routing table, or NONE
+            let rm = rq.add(R); // [R] its tokens, a bit each
+            let cal = rm.add(R) as *mut f32; // [8]
             let red = cal.add(8); // [16]
-            learn_pair(workitem_id_x() as usize, s, d, picks, labels, n as usize, gz, y, pk, cal, red);
-        }
-    }
-
-    /// One pair's update over `n` tokens in batches of `SPEC_TOKENS` (a whole workgroup): each batch's logits from the
-    /// state as it stands, dL/dz = (σ(z) − y) / (batch · PAIRS_SCALE), Adam on the calibration, the bias and the rows of
-    /// the co-routing table the batch picked.
-    #[inline(always)]
-    unsafe fn learn_pair(t: usize, s: *mut f32, d: *const f32, picks: *const u32, labels: *const u32, n: usize, gz: *mut f32, y: *mut u32, pk: *mut u32, cal: *mut f32, red: *mut f32) {
-        if t < 8 {
-            *cal.add(t) = *s.add(HDR + t);
-        }
-        let mut a = 0;
-        while a < n {
-            let m = if n - a < SPEC_TOKENS { n - a } else { SPEC_TOKENS };
-            let mut j = t;
-            while j < m * E {
-                *y.add(j) = 0;
-                j += 256;
+            if e < 8 {
+                *cal.add(e) = *s.add(HDR + e);
             }
-            workgroup_sync();
-            if t < m * TOP_K {
-                let i = t / TOP_K;
-                *y.add(i * E + *labels.add((a + i) * TOP_K + t % TOP_K) as usize) = 1;
-                *pk.add(t) = *picks.add((a + i) * TOP_K + t % TOP_K);
-            }
-            workgroup_sync();
-            let (ca, cc) = (*cal, *cal.add(1));
-            let sc = 1.0 / (m as f32 * PAIRS_SCALE);
-            let (mut gca, mut gcc) = (0f32, 0f32);
-            let (mut gb0, mut gb1) = (0f32, 0f32);
-            let mut k = 0;
-            while k < 2 {
-                let e = t + 256 * k;
-                if e < E {
-                    let mut i = 0;
-                    while i < m {
-                        let dv = *d.add((a + i) * E + e);
-                        let mut z = ca * dv + cc + *s.add(BIAS + e);
-                        let mut q = 0;
-                        while q < TOP_K {
-                            z += *s.add(CO + *pk.add(i * TOP_K + q) as usize * E + e);
-                            q += 1;
-                        }
-                        let g = (sigmoid(z) - *y.add(i * E + e) as f32) * sc;
-                        *gz.add(i * E + e) = g;
-                        if k == 0 {
-                            gb0 += g;
-                        } else {
-                            gb1 += g;
-                        }
-                        gca += g * dv;
-                        gcc += g;
-                        i += 1;
-                    }
+            let mut a = 0;
+            while a < n {
+                let m = if n - a < SPEC_TOKENS { n - a } else { SPEC_TOKENS };
+                let mut i = 0;
+                while i < m {
+                    *y.add(i * E + e) = 0;
+                    i += 1;
                 }
-                k += 1;
-            }
-            let gca = workgroup_sum(t as u32, gca, red);
-            let gcc = workgroup_sum(t as u32, gcc, red);
-            let (b1t, b2t) = (*cal.add(6) * 0.9, *cal.add(7) * 0.999);
-            let (c1, c2) = (1.0 - b1t, sqrt(1.0 - b2t));
-            let mut k = 0;
-            while k < 2 {
-                let e = t + 256 * k;
-                if e < E {
-                    adam(s.add(BIAS + e), s.add(M_BIAS + e), s.add(V_BIAS + e), if k == 0 { gb0 } else { gb1 }, LR_B / c1, c2);
-                    // each row of the co-routing table the batch picked, once: its gradient the sum of its tokens' dL/dz
+                workgroup_sync();
+                if e < m * TOP_K {
+                    let i = e / TOP_K;
+                    *y.add(i * E + *labels.add((a + i) * TOP_K + e % TOP_K) as usize) = 1;
+                    *pk.add(e) = *picks.add((a + i) * TOP_K + e % TOP_K);
+                }
+                workgroup_sync();
+                // the batch's distinct rows (each pick's first place) and the tokens that picked each
+                if e < m * TOP_K {
+                    let q = *pk.add(e);
+                    let mut first = true;
+                    let mut j = 0;
+                    while j < e {
+                        first &= *pk.add(j) != q;
+                        j += 1;
+                    }
+                    let mut mask = 0u32;
                     let mut j = 0;
                     while j < m * TOP_K {
-                        let q = *pk.add(j);
-                        let mut seen = false;
-                        let mut jj = 0;
-                        while jj < j {
-                            seen |= *pk.add(jj) == q;
-                            jj += 1;
+                        mask |= ((*pk.add(j) == q) as u32) << (j / TOP_K);
+                        j += 1;
+                    }
+                    *rq.add(e) = if first { q } else { NONE };
+                    *rm.add(e) = mask;
+                }
+                workgroup_sync();
+                let (ca, cc) = (*cal, *cal.add(1));
+                let sc = 1.0 / (m as f32 * PAIRS_SCALE);
+                let (mut gca, mut gcc, mut gb) = (0f32, 0f32, 0f32);
+                let mut i = 0;
+                while i < m {
+                    let dv = *d.add((a + i) * E + e);
+                    let mut z = ca * dv + cc + *s.add(BIAS + e);
+                    let mut q = 0;
+                    while q < TOP_K {
+                        z += *s.add(CO + *pk.add(i * TOP_K + q) as usize * E + e);
+                        q += 1;
+                    }
+                    let g = (sigmoid(z) - *y.add(i * E + e) as f32) * sc;
+                    *gz.add(i * E + e) = g;
+                    gb += g;
+                    gca += g * dv;
+                    gcc += g;
+                    i += 1;
+                }
+                let gca = learn_sum(e, gca, red);
+                let gcc = learn_sum(e, gcc, red);
+                let (b1t, b2t) = (*cal.add(6) * 0.9, *cal.add(7) * 0.999);
+                let (c1, c2) = (1.0 - b1t, sqrt(1.0 - b2t));
+                adam(s.add(BIAS + e), s.add(M_BIAS + e), s.add(V_BIAS + e), gb, LR_B / c1, c2);
+                // the rows, four at a time: their loads issued together
+                let lr = LR_CO / c1;
+                let mut j = 0;
+                while j < m * TOP_K {
+                    let mut p = [0f32; 4];
+                    let mut mo = [0f32; 4];
+                    let mut vo = [0f32; 4];
+                    let mut at = [0usize; 4];
+                    let mut k = 0;
+                    while k < 4 {
+                        let q = if j + k < m * TOP_K { *rq.add(j + k) } else { NONE };
+                        at[k] = if q == NONE { usize::MAX } else { q as usize * E + e };
+                        if q != NONE {
+                            p[k] = *s.add(CO + at[k]);
+                            mo[k] = *s.add(M_CO + at[k]);
+                            vo[k] = *s.add(V_CO + at[k]);
                         }
-                        if !seen {
+                        k += 1;
+                    }
+                    let mut k = 0;
+                    while k < 4 {
+                        if at[k] != usize::MAX {
+                            let mask = *rm.add(j + k);
                             let mut g = 0f32;
-                            let mut i = j / TOP_K;
+                            let mut i = 0;
                             while i < m {
-                                let mut hit = false;
-                                let mut qq = 0;
-                                while qq < TOP_K {
-                                    hit |= *pk.add(i * TOP_K + qq) == q;
-                                    qq += 1;
-                                }
-                                if hit {
+                                if mask >> i & 1 != 0 {
                                     g += *gz.add(i * E + e);
                                 }
                                 i += 1;
                             }
-                            let r = q as usize * E + e;
-                            adam(s.add(CO + r), s.add(M_CO + r), s.add(V_CO + r), g, LR_CO / c1, c2);
+                            let mm = 0.9 * mo[k] + 0.1 * g;
+                            let vv = 0.999 * vo[k] + 0.001 * g * g;
+                            *s.add(M_CO + at[k]) = mm;
+                            *s.add(V_CO + at[k]) = vv;
+                            *s.add(CO + at[k]) = p[k] - lr * mm / (sqrt(vv) / c2 + 1e-8);
                         }
-                        j += 1;
+                        k += 1;
                     }
+                    j += 4;
                 }
-                k += 1;
+                workgroup_sync();
+                if e == 0 {
+                    adam(cal, cal.add(2), cal.add(4), gca, LR_B / c1, c2);
+                    adam(cal.add(1), cal.add(3), cal.add(5), gcc, LR_B / c1, c2);
+                    *cal.add(6) = b1t;
+                    *cal.add(7) = b2t;
+                }
+                workgroup_sync();
+                a += m;
             }
-            workgroup_sync();
-            if t == 0 {
-                adam(cal, cal.add(2), cal.add(4), gca, LR_B / c1, c2);
-                adam(cal.add(1), cal.add(3), cal.add(5), gcc, LR_B / c1, c2);
-                *cal.add(6) = b1t;
-                *cal.add(7) = b2t;
+            if e < 8 {
+                *s.add(HDR + e) = *cal.add(e);
             }
-            workgroup_sync();
-            a += m;
         }
-        if t < 8 {
-            *s.add(HDR + t) = *cal.add(t);
+    }
+
+    /// Sum of one f32 a thread over `pred_learn`'s `LEARN_WG` threads (nine waves), every thread getting it. Two barriers.
+    #[inline(always)]
+    unsafe fn learn_sum(t: usize, v: f32, red: *mut f32) -> f32 {
+        const WAVES: usize = (LEARN_WG as usize).div_ceil(32);
+        let (lane, wave) = ((t % 32) as u32, t / 32);
+        let w = common::gfx11::wave_sum(lane, v);
+        if lane == 0 {
+            *red.add(wave) = w;
         }
+        workgroup_sync();
+        let mut total = 0f32;
+        let mut k = 0;
+        while k < WAVES {
+            total += *red.add(k);
+            k += 1;
+        }
+        workgroup_sync();
+        total
     }
 }

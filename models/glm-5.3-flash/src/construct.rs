@@ -1213,14 +1213,19 @@ pub trait Placed {
     fn ffn(&mut self, l: usize, n: usize);
     /// A MoE layer's FFN input for every token (`[n][H]`) and the FFN router's logits (`[n][E]`).
     fn ffn_input(&mut self, l: usize, n: usize, xq: &mut [i8], xs: &mut [f32], xg: &mut [i32], picks: &mut [[usize; TOP_K]], wts: &mut [[f32; TOP_K]], pool: &dyn Pool);
-    /// The prefetch predictor's step on the cards (`plan::gfx11::pred_step`), posted once a MoE layer's picks are in:
-    /// pair l − 1 learns from them, pair l predicts the next layer; a decode step's prediction is a plan (`plan`).
+    /// The prefetch predictor's step on the cards (`plan::gfx11`), posted right ahead of a MoE layer's output half: pair
+    /// l predicts the next layer (a decode step's prediction is a plan, `plan`), pair l − 1 learns from the picks.
     fn plan_step(&mut self, l: usize, n: usize, picks: &[[usize; TOP_K]]);
+    /// A prefill step's predictor updates, once its layers are done: every pair over the step's `n` tokens at once.
+    fn plan_learn(&mut self, n: usize);
     /// A decode step's plan for the layer after l, best first (`plan::PLAN` experts), once the card's word says it is in.
     fn plan(&mut self, l: usize, out: &mut [usize]);
     /// Bring-up: a MoE layer's FFN input (`x: [n][H]`) and its router's logits (`[n][ROUTE_ROWS]`) as the card
     /// made them, for forced picks and the traces' edges; serving reads `ffn_input`'s quantized form instead.
     fn ffn_logits(&mut self, l: usize, n: usize, x: &mut [f32], logits: &mut [f32]);
+    /// Lab (`dump-pred`): a MoE layer's shared expert output (`[n][H]`) and its routed experts' rows (`[n][TOP_K][H]`,
+    /// pick order) as the leader card holds them, once the layer's output half is done.
+    fn ffn_parts(&mut self, l: usize, n: usize, shared: &mut [f32], rows: &mut [f32]);
     /// Every routed expert row of the chunk is in the leader's VRAM (the host's run and the residents' join done):
     /// the leader's word, after which it sums the rows in pick order into the streams and forwards the sums (002).
     fn ffn_done(&mut self, l: usize);
@@ -2061,15 +2066,16 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     p.picks += n * TOP_K;
                     jobs_of[ch] = jobs;
                     lap(&mut p.route, "route");
-                    // the prefetch predictor on the FFN card, in its idle time: the pair before learns from these picks, this
-                    // layer's predicts the next (every prompt position a label; a decode step's prediction is the plan)
-                    pl.plan_step(l, n, &s.b_routed[t0..t0 + n]);
                     continue;
                 }
                 // the run: the FFN's output half posted behind the residents' launches (it waits for the host's word)
                 let jobs = jobs_of[ch];
                 let (picks, wts) = (&mut s.b_picks[t0..t0 + n], &mut s.b_wts[t0..t0 + n]);
                 let (xq, xs, xg) = (&s.b_xq[t0 * H..(t0 + n) * H], &s.b_xs[t0 * HG..(t0 + n) * HG], &s.b_xg[t0 * HG..(t0 + n) * HG]);
+                // the prefetch predictor on the cards, right ahead of the FFN's output half, which spins until the host's
+                // experts are in: this layer's pair predicts the next (a decode step's prediction is the plan); a decode
+                // step's pair before learns from these picks (a prefill step's pairs learn at its end)
+                pl.plan_step(l, n, &s.b_routed[t0..t0 + n]);
                 pl.ffn_post(l, n);
                 // the outputs: the layer's leader card's rows in its VRAM (002) — the host's experts write theirs through
                 // the BAR, the cards' jobs theirs directly; the leader sums them
@@ -2140,7 +2146,8 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     #[cfg(feature = "dump-pred")]
                     {
                         pl.ffn_logits(l, n, &mut s.b_x, &mut s.b_score);
-                        dump_pred(l, n, &s.b_routed[t0..t0 + n], &s.b_xq[t0 * H..(t0 + n) * H], &s.b_xs[t0 * HG..(t0 + n) * HG], &s.b_score);
+                        let ahead = more_ahead(&mut **pl, w, l, n, &s.b_x, &s.b_picks[t0..t0 + n], &s.b_wts[t0..t0 + n]);
+                        dump_pred(l, n, &s.b_routed[t0..t0 + n], &s.b_xq[t0 * H..(t0 + n) * H], &s.b_xs[t0 * HG..(t0 + n) * HG], &s.b_score, &ahead);
                     }
                     let z = draft_zone("slot.ahead", z);
                     let ranked: Vec<usize> = pre_next.iter().copied().filter(|&e| !pl.resident(l + 1, e)).take(PREFETCH_CAP).collect();
@@ -2157,6 +2164,9 @@ impl<'p, R: Routed> CpuModel<'p, R> {
         }
         // the head, the draft layer and anything after the layers address the step whole again
         pl.chunk(0, 0);
+        if n > SPEC_TOKENS {
+            pl.plan_learn(n);
+        }
         match logits {
             Logits::None => pl.finish(),
             Logits::Last => pl.logits(n - 1, 1, &mut s.logits[(n - 1) * VOCAB_SIZE..n * VOCAB_SIZE]),
@@ -2255,8 +2265,50 @@ fn mla_rows(a: &weights::Mla, cache: &mut [u16], pools: &mut [u16], pos: usize, 
 /// `dump-pred`: a decode layer's record appended to /tmp/pred.bin — u16 layer, u16 tokens, then per token its picks at
 /// this layer (8 × u16), its quantized FFN input's group scales (H/128 × f32) and values (H × i8), and the next
 /// layer's route-ahead logits (E × f32, before the sigmoid).
+/// The candidate route-ahead inputs the lab dump records beyond the FFN input (`MORE` a token): layer l + 1's router
+/// over layer l's FFN input plus its shared expert's output; plus the resident experts' rows too (what the cards hold
+/// before the host's experts are in); plus every routed row (the layer's whole FFN output, after the host's experts:
+/// the bound). Normed as the route-ahead is (layer l's post-norm). `[n][MORE][E]` logits.
 #[cfg(feature = "dump-pred")]
-fn dump_pred(l: usize, n: usize, picks: &[[usize; TOP_K]], xq: &[i8], xs: &[f32], score: &[f32]) {
+const MORE: usize = 3;
+#[cfg(feature = "dump-pred")]
+fn more_ahead(pl: &mut dyn Placed, w: &Weights, l: usize, n: usize, x: &[f32], marked: &[[usize; TOP_K]], wts: &[[f32; TOP_K]]) -> Vec<f32> {
+    let Ffn::Moe(m2) = &w.layers[l + 1].ffn else { unreachable!() };
+    let (mut shared, mut rows) = (vec![0f32; n * H], vec![0f32; n * TOP_K * H]);
+    pl.ffn_parts(l, n, &mut shared, &mut rows);
+    let mut out = vec![0f32; n * MORE * E];
+    let (mut v, mut vn) = (vec![0f32; H], vec![0f32; H]);
+    for i in 0..n {
+        for c in 0..MORE {
+            for d in 0..H {
+                v[d] = x[i * H + d] + shared[i * H + d];
+            }
+            for k in 0..TOP_K {
+                // the dispatch marks a resident pick `E`
+                if c == 2 || (c == 1 && marked[i][k] == E) {
+                    for d in 0..H {
+                        v[d] += wts[i][k] * rows[(i * TOP_K + k) * H + d];
+                    }
+                }
+            }
+            common::rmsnorm::rmsnorm_tree::<H>(&v, w.layers[l].post_ln, RMS_NORM_EPS, &mut vn);
+            for e in 0..E {
+                let r = &m2.router[e * H..(e + 1) * H];
+                let mut acc = [0f32; 8];
+                for d in (0..H).step_by(8) {
+                    for j in 0..8 {
+                        acc[j] += widen(r[d + j]) * vn[d + j];
+                    }
+                }
+                out[(i * MORE + c) * E + e] = acc.iter().sum();
+            }
+        }
+    }
+    out
+}
+
+#[cfg(feature = "dump-pred")]
+fn dump_pred(l: usize, n: usize, picks: &[[usize; TOP_K]], xq: &[i8], xs: &[f32], score: &[f32], more: &[f32]) {
     use std::io::Write;
     static OUT: std::sync::Mutex<Option<std::io::BufWriter<std::fs::File>>> = std::sync::Mutex::new(None);
     let mut g = OUT.lock().unwrap();
@@ -2277,6 +2329,9 @@ fn dump_pred(l: usize, n: usize, picks: &[[usize; TOP_K]], xq: &[i8], xs: &[f32]
         }
         b.extend(xq[i * H..(i + 1) * H].iter().map(|&v| v as u8));
         for &v in &score[i * ROUTE_ROWS + E..(i + 1) * ROUTE_ROWS] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        for &v in &more[i * MORE * E..(i + 1) * MORE * E] {
             b.extend_from_slice(&v.to_le_bytes());
         }
     }

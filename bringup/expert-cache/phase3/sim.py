@@ -13,10 +13,13 @@ ap.add_argument('--steps',type=int,default=0)
 ap.add_argument('--offline',type=float,default=0) # >0: non-causal ceiling: train on the first frac (epochs), test on the rest
 ap.add_argument('--epochs',type=int,default=3)
 ap.add_argument('--maxrank',type=int,default=0)
+ap.add_argument('--data',default='phase3')   # data/<dir>/: phase3 (the first dump) or phase3b (the extended one)
+ap.add_argument('--lg',default='LG')         # the route-ahead logits the margin d comes from: LG, LG1, LG2, LG3 (phase3b)
+ap.add_argument('--lg2',default='')          # a second margin from these logits, with its own calibration
 a=ap.parse_args()
 torch.set_num_threads(a.threads); torch.manual_seed(0)
-D='/home/slomp/Work/rockem/bringup/expert-cache/data/phase3/'
-X=np.memmap(D+'X.npy',np.int8,'r',offset=128,shape=(41,13729,4096)); SC=np.load(D+'SC.npy'); LG=np.load(D+'LG.npy',mmap_mode='r')
+D='/home/slomp/Work/rockem/bringup/expert-cache/data/'+a.data+'/'
+X=np.load(D+'X.npy',mmap_mode='r'); SC=np.load(D+'SC.npy'); LG=np.load(D+a.lg+'.npy',mmap_mode='r'); LG2=np.load(D+a.lg2+'.npy',mmap_mode='r') if a.lg2 else None
 PK=np.load(D+'PK.npy').astype(np.int64); n=np.load(D+'n.npy'); B=np.load(D+'bias.npy')
 P=40; E=288; H=4096
 S=len(n) if not a.steps else a.steps
@@ -25,6 +28,7 @@ bias_next=torch.from_numpy(B[4:44].copy())            # bias of layer l+1 for pa
 terms=set(a.terms.split(',')) if a.terms else set()
 prm=[];prmb=[]
 ca=torch.full((P,1,1),3.0,requires_grad=True); cc=torch.zeros((P,1,1),requires_grad=True); prmb+=[ca,cc]
+if a.lg2: ca2=torch.zeros((P,1,1),requires_grad=True); prmb.append(ca2)
 learn_cal='cal' in terms or len(terms)>0
 if 'bias' in terms: bb=torch.zeros((P,1,E),requires_grad=True); prmb.append(bb)
 if 'rep' in terms: rho=torch.zeros((P,1,E),requires_grad=True); prmb.append(rho)
@@ -49,6 +53,9 @@ def feats(s):
     thr=g.topk(8,dim=2).values[:,:,7:8]; d=(g-thr)*10
     y=torch.zeros(P,m,E); y.scatter_(2,torch.from_numpy(PK[1:41,t0:t1]),1.0)
     f=dict(d=d,y=y,m=m)
+    if a.lg2:
+        g2=torch.sigmoid(torch.from_numpy(np.ascontiguousarray(LG2[0:40,t0:t1])))+bias_next[:,None,:]
+        f['d2']=(g2-g2.topk(8,dim=2).values[:,:,7:8])*10
     if 'co' in terms:
         pl=torch.zeros(P,m,E); pl.scatter_(2,torch.from_numpy(PK[0:40,t0:t1]),1.0); f['pl']=pl
     if lrk or 'full' in terms:
@@ -58,6 +65,7 @@ def feats(s):
     return f
 def logits(f,prev):
     z=ca*f['d']+cc
+    if a.lg2: z=z+ca2*f['d2']
     if 'bias' in terms: z=z+bb
     if 'rep' in terms: z=z+rho*prev[:,None,:]
     if 'co' in terms: z=z+torch.bmm(f['pl'],C)
