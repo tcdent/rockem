@@ -473,6 +473,14 @@ After the rewrite (2026-10-20), gate/up runs at 68.8 / 76.4 / 74.6 GMAC/s a core
   - the `amd_df` PMC `dram_channel_data_controller_N` counters, which read per-channel skew without a reboot
     (not yet used)
 
+### Decode's L3 prefetch, what it is worth (measured 2026-10-20, `prefetch_use` rows, build pfuse)
+A decode layer run has ~16.6 host experts: 7.2 fully prefetched, 4.5 partly, 4.9 not predicted (30 %); the prefetch
+finishes 69.5 % of its items (the pool's `prefetch_job.done` under-counts: workers report only when they leave) and
+~31 % of the experts it predicts go unused. Each layer's expert time fitted on those counts (6,560 runs, R² 0.67):
+**31.0 µs an expert fully prefetched, 36.4 partly, 42.4 not predicted.** A complete prefetch saves ~27 %, where the
+L3 probes' ~2.3× over DRAM predicts ~18 µs: the prefetched bytes are not delivered at L3 speed when the run reaches
+them (candidates: eviction by the run's own lines, the wrong CCD, the per-socket L3 clock limit — not yet told apart).
+
 ## 8. Open questions
 
 - **The missing ~10–13 % of DRAM.** The box reaches 79–82 % of theoretical against Dell's 90–92 %. Socket 1 and

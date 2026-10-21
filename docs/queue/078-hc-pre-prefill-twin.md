@@ -225,6 +225,10 @@ put it ~11 % fewer cycles a group at 16–32 tokens. On a metatron core it lost:
 GMAC/s at 2 / 4 / 8 / 16 / 32 / 64 tokens against the current 75.6 / 92.0 / 98.4 / 104.4 / 105.6 / 103.0 (its
 permute-setup twin worse at 32–64). The model and the core disagreed; the core decides. Not built.
 
+**The longest-first order measured on its own, and reverted (2026-10-20, build pfuse).** With the fold kept and the
+order reverted: experts lap 17.75 → 16.74 ms a layer-chunk, gate/up 11.41 → 10.68, down 6.36 → 5.98 — the order cost
+both runs; the fold alone is 18.24 → 16.74 (−8 %). Prefill 1.89 ms a prompt token on the warm 18k prompt (36.7 s).
+
 ## Next
 The twin's arithmetic is the step gate's numeric kind (WMMA order) for the coefficients and the router; the act phase
 stays exact. Then the card lanes again: card1's `hc_pre` share and the FFN-input wait.

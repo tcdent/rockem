@@ -623,6 +623,10 @@ pub struct CpuExperts<'a> {
     /// line, so eight cores share a counter and nothing bounces across the box), summed into rows after the run.
     #[cfg(feature = "track-experts")]
     item_acc: Vec<[ItemAcc; BUCKETS]>,
+    /// `track-experts`: the last prefetch — its layer, the experts it predicted, each one's items and how many of them
+    /// finished touching their slices — read when that layer's run starts (`prefetch_use` rows).
+    #[cfg(feature = "track-experts")]
+    pf: std::sync::Mutex<Option<(usize, Vec<usize>, Vec<u16>, std::sync::Arc<Vec<std::sync::atomic::AtomicU16>>)>>,
 }
 #[cfg(feature = "track-experts")]
 const BUCKETS: usize = 8;
@@ -659,7 +663,7 @@ impl<'a> CpuExperts<'a> {
         use common::q4::GROUP;
         #[cfg(feature = "track-experts")]
         let item_acc = (0..SLOTS).map(|_| std::array::from_fn(|_| ItemAcc::default())).collect();
-        let mut this = CpuExperts { #[cfg(feature = "track-experts")] item_acc, stream, pool, slice_node: Vec::new(), slice_slot: Vec::new(), xq: vec![0; STEP * H], xs: vec![0.0; STEP * H / GROUP], xg: vec![0; STEP * H / GROUP], h: vec![0.0; STEP * TOP_K * D_FF], hq: vec![0; STEP * TOP_K * D_FF], hs: vec![0.0; STEP * TOP_K * D_FF / GROUP], hg: vec![0; STEP * TOP_K * D_FF / GROUP], elapsed: 0.0 };
+        let mut this = CpuExperts { #[cfg(feature = "track-experts")] item_acc, #[cfg(feature = "track-experts")] pf: std::sync::Mutex::new(None), stream, pool, slice_node: Vec::new(), slice_slot: Vec::new(), xq: vec![0; STEP * H], xs: vec![0.0; STEP * H / GROUP], xg: vec![0; STEP * H / GROUP], h: vec![0.0; STEP * TOP_K * D_FF], hq: vec![0; STEP * TOP_K * D_FF], hs: vec![0.0; STEP * TOP_K * D_FF / GROUP], hg: vec![0; STEP * TOP_K * D_FF / GROUP], elapsed: 0.0 };
         this.relearn();
         this
     }
@@ -754,6 +758,16 @@ impl Routed for CpuExperts<'_> {
             }
         }
         let n = items.len();
+        #[cfg(feature = "track-experts")]
+        let finished = {
+            let mut per = vec![0u16; idx.len()];
+            for it in &items {
+                per[it.0] += 1;
+            }
+            let fin = std::sync::Arc::new((0..idx.len()).map(|_| std::sync::atomic::AtomicU16::new(0)).collect::<Vec<_>>());
+            *self.pf.lock().unwrap() = Some((l, idx.clone(), per, fin.clone()));
+            fin
+        };
         let items = std::sync::Arc::new(items);
         let (i1, i3) = (items.clone(), items);
         let slot = move |i: usize| i1[i].1;
@@ -778,6 +792,8 @@ impl Routed for CpuExperts<'_> {
                     return;
                 }
             }
+            #[cfg(feature = "track-experts")]
+            finished[it.0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         };
         self.pool.prefetch_slotted(n, Box::new(slot), Box::new(f));
     }
@@ -842,9 +858,29 @@ impl CpuExperts<'_> {
                 }
             }
         }
-        // the experts picked, the most tokens first: each CCD's queue starts with its longest items and ends with short ones
-        let mut experts: Vec<usize> = (0..E).filter(|&e| first[e + 1] > first[e]).collect();
-        experts.sort_by_key(|&e| std::cmp::Reverse(first[e + 1] - first[e]));
+        let experts: Vec<usize> = (0..E).filter(|&e| first[e + 1] > first[e]).collect();
+        // `track-experts`: this run's host experts against the prefetch made for this layer — predicted and every item
+        // touched, predicted but not finished when the run began, not predicted (decode's L3 question, 2026-10-20)
+        #[cfg(feature = "track-experts")]
+        if let Some((pl, pidx, per, fin)) = self.pf.lock().unwrap().take() {
+            if pl == l {
+                let (mut complete, mut partial, mut missed, mut items, mut items_done) = (0usize, 0usize, 0usize, 0usize, 0usize);
+                for &e in &experts {
+                    match pidx.iter().position(|&p| p == e) {
+                        Some(k) => {
+                            let d = fin[k].load(Ordering::Relaxed) as usize;
+                            items += per[k] as usize;
+                            items_done += d;
+                            if d == per[k] as usize { complete += 1 } else { partial += 1 }
+                        }
+                        None => missed += 1,
+                    }
+                }
+                let all_done: usize = fin.iter().map(|f| f.load(Ordering::Relaxed) as usize).sum();
+                let all: usize = per.iter().map(|&x| x as usize).sum();
+                prow::row!("track-experts", "prefetch_use", { "layer" => l, "tokens" => n, "host_experts" => experts.len(), "complete" => complete, "partial" => partial, "missed" => missed, "used_items" => items, "used_items_done" => items_done, "predicted" => pidx.len(), "items" => all, "items_done" => all_done });
+            }
+        }
         let ne = experts.len();
         let uses = |e: usize| &pairs[first[e]..first[e + 1]];
         let stream = self.stream;
