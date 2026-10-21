@@ -525,10 +525,10 @@ layer, 13 items the fullest, 0.7 left unclaimed at the cutoff: the rest were in 
 7.77 → 7.91 a layer, partial experts' L3 share 75.1 → 80.1 %, all host lines 54.3 → 55.4 %, experts lap 24.39 → 23.99
 ms a verify step, verify step 61.50 → 61.33 ms.
 
-**Eight prefetch cores a CCD do not pay** (card16, 2026-10-21): done before the run 64 → 71.4 %, cores 31.6 → 69.9, all
-host lines from L3 55.4 → 56.3 %, but the same 96-token decode's experts lap 23.96 → 25.41 ms a verify step and the
-verify step 54.52 → 56.48 ms. Not traced (the socket's power cap with eight cores streaming, or the run's cores still
-inside prefetch chunks when it starts); `PREFETCH_CORES` stays 4.
+**Eight prefetch cores a CCD: not settled** (card16, 2026-10-21): done before the run 64 → 71.4 %, cores 31.6 → 69.9,
+all host lines from L3 55.4 → 56.3 %. The 96-token decode's experts lap read 25.41 ms against card15's 23.96 — but
+card17, card15's code on another boot, read 25.39 on the same request: one 96-token request varies by ~1.5 ms boot to
+boot, so it decides nothing. Long runs decide (below).
 
 ## 12. Risks, unknowns, and decisions
 
