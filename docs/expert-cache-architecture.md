@@ -393,9 +393,8 @@ Long SCORE bit-identical. Missed experts fall by 7 %. The experts lap does not m
 
 **What this means for phase 4:** the predictor's state lives as long as the node and is not reset per prompt. In the
 402-token decode, its first 10 steps against the rest, missed experts a layer: cap 13 6.04 / 7.17, pred2 5.44 / 6.68.
-The predictor's gain is the same at a request's start as later, so a new prompt does not cost it its fit. Prefill
-labels would only shorten the settling after a boot (~3k decode positions offline; in the boot's first decode, pred2
-6.58 against 6.82, a smaller gain than later).
+A new prompt does not cost the predictor its fit. The case for prefill labels was therefore the settling after a
+boot, but phase 4 measured more than that: training on each prompt lowered misses in every request.
 
 ## Phase 4 in the node (measured 2026-10-21, build pred4 against pred2)
 Prefill trains the predictor. A chunk's `hc_pre` router takes the next layer's rows too (the matrix path, all
