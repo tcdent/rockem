@@ -612,6 +612,10 @@ pub struct CpuExperts<'a> {
     /// complex the slice's hash names — a map, so a run's slotting is a byte a part (tcdent
     /// 2026-10-16: "hold that as a map of offsets in memory for the lookup").
     slice_slot: Vec<u8>,
+    /// Every expert's slices ordered by their queue (`[MOE_LAYERS][E][SLICES]`, slice ids), so a prefetch's items — an
+    /// (expert, queue) and its run of slices — are cut from a table instead of grouped a call (the grouping's
+    /// allocations were ~31 µs of a decode layer's 53 µs `slot` lap, 2026-10-20).
+    slice_order: Vec<u8>,
     /// A step's activations quantized once each (`[STEP][H]` and their groups), the experts' hidden
     /// states (`[STEP][TOP_K][D_FF]`) and those quantized once each for the down rows.
     xq: Vec<i8>,
@@ -681,7 +685,7 @@ impl<'a> CpuExperts<'a> {
         use common::q4::GROUP;
         #[cfg(feature = "track-experts")]
         let item_acc = (0..SLOTS).map(|_| std::array::from_fn(|_| ItemAcc::default())).collect();
-        let mut this = CpuExperts { #[cfg(feature = "track-experts")] item_acc, #[cfg(feature = "track-experts")] pf: std::sync::Mutex::new(None), #[cfg(feature = "track-experts")] pmcs: Vec::new(), #[cfg(feature = "track-experts")] rdpmc: false, #[cfg(feature = "track-experts")] fill_acc: (0..SLOTS).map(|_| FillAcc::default()).collect(), stream, pool, slice_node: Vec::new(), slice_slot: Vec::new(), xq: vec![0; STEP * H], xs: vec![0.0; STEP * H / GROUP], xg: vec![0; STEP * H / GROUP], h: vec![0.0; STEP * TOP_K * D_FF], hq: vec![0; STEP * TOP_K * D_FF], hs: vec![0.0; STEP * TOP_K * D_FF / GROUP], hg: vec![0; STEP * TOP_K * D_FF / GROUP], elapsed: 0.0 };
+        let mut this = CpuExperts { #[cfg(feature = "track-experts")] item_acc, #[cfg(feature = "track-experts")] pf: std::sync::Mutex::new(None), #[cfg(feature = "track-experts")] pmcs: Vec::new(), #[cfg(feature = "track-experts")] rdpmc: false, #[cfg(feature = "track-experts")] fill_acc: (0..SLOTS).map(|_| FillAcc::default()).collect(), stream, pool, slice_node: Vec::new(), slice_slot: Vec::new(), slice_order: Vec::new(), xq: vec![0; STEP * H], xs: vec![0.0; STEP * H / GROUP], xg: vec![0; STEP * H / GROUP], h: vec![0.0; STEP * TOP_K * D_FF], hq: vec![0; STEP * TOP_K * D_FF], hs: vec![0.0; STEP * TOP_K * D_FF / GROUP], hg: vec![0; STEP * TOP_K * D_FF / GROUP], elapsed: 0.0 };
         this.relearn();
         // the fill counters on every core (the NMI watchdog holds a counter on each CPU: off first, 2026-10-20)
         #[cfg(feature = "track-experts")]
@@ -716,6 +720,15 @@ impl<'a> CpuExperts<'a> {
             }
         }
         self.slice_node = slice_node;
+        // each expert's slices in queue order (stable: within a queue, the compute's order)
+        const SLICES: usize = GU_ITEMS + DOWN_ITEMS;
+        let mut order = Vec::with_capacity(slice_slot.len());
+        for rec in slice_slot.chunks(SLICES) {
+            let mut ix: Vec<u8> = (0..SLICES as u8).collect();
+            ix.sort_by_key(|&j| rec[j as usize]);
+            order.extend_from_slice(&ix);
+        }
+        self.slice_order = order;
         self.slice_slot = slice_slot;
     }
 }
@@ -770,17 +783,23 @@ impl Routed for CpuExperts<'_> {
         // compute's order — a slice's node from its rows' page, its CCD from the expert's id and the slice
         let (n_gu, n_down) = (GU_ITEMS, DOWN_ITEMS);
         let idx: Vec<usize> = idx.to_vec();
-        let mut items: Vec<(usize, usize, Vec<u32>)> = Vec::new(); // expert position, the pool's queue, slice ids (gate/up first, then down + n_gu)
-        let mut group = vec![usize::MAX; idx.len() * SLOTS]; // (k, queue) → its item
+        // the items cut from `slice_order` (each expert's slices already in queue order): an item is (expert position,
+        // queue, its run in `slices`), every item's slice ids in one flat copy the job owns
+        let mut items: Vec<(usize, usize, u16, u16)> = Vec::with_capacity(idx.len() * SLOTS);
+        let mut slices: Vec<u8> = Vec::with_capacity(idx.len() * (n_gu + n_down));
         for (k, &e) in idx.iter().enumerate() {
-            for j in 0..n_gu + n_down {
-                let q = self.slice_slot[((l - FIRST_K_DENSE_REPLACE) * E + e) * (n_gu + n_down) + j] as usize;
-                let g = &mut group[k * SLOTS + q];
-                if *g == usize::MAX {
-                    *g = items.len();
-                    items.push((k, q, Vec::with_capacity(16)));
+            let rec = ((l - FIRST_K_DENSE_REPLACE) * E + e) * (n_gu + n_down);
+            let (order, slot_of) = (&self.slice_order[rec..rec + n_gu + n_down], &self.slice_slot[rec..rec + n_gu + n_down]);
+            let mut a = 0;
+            while a < order.len() {
+                let q = slot_of[order[a] as usize];
+                let mut b = a + 1;
+                while b < order.len() && slot_of[order[b] as usize] == q {
+                    b += 1;
                 }
-                items[*g].2.push(j as u32);
+                items.push((k, q as usize, slices.len() as u16, (b - a) as u16));
+                slices.extend_from_slice(&order[a..b]);
+                a = b;
             }
         }
         let n = items.len();
@@ -794,14 +813,14 @@ impl Routed for CpuExperts<'_> {
             *self.pf.lock().unwrap() = Some((l, idx.clone(), per, fin.clone()));
             fin
         };
-        let items = std::sync::Arc::new(items);
+        let items = std::sync::Arc::new((items, slices));
         let (i1, i3) = (items.clone(), items);
-        let slot = move |i: usize| i1[i].1;
+        let slot = move |i: usize| i1.0[i].1;
         // the touching yields between 4 KB chunks once the job is overtaken: the run that overtakes it
         // waits for the items in flight (the run's slotting time was 13 µs with 64 KB chunks, 2026-10-16)
         let pool_s: &'static dyn Pool = unsafe { std::mem::transmute::<&dyn Pool, &'static dyn Pool>(pool) };
         let f = move |i: usize| {
-            let it = &i3[i];
+            let (it, slices) = (&i3.0[i], &i3.1);
             let w = expert::Weights::at(stream, l, idx[it.0]);
             let touch_yielding = |b: &[u8]| -> bool {
                 for chunk in b.chunks(4 << 10) {
@@ -812,7 +831,7 @@ impl Routed for CpuExperts<'_> {
                 }
                 true
             };
-            for &j in &it.2 {
+            for &j in &slices[it.2 as usize..(it.2 + it.3) as usize] {
                 let j = j as usize;
                 if !touch_yielding(if j < n_gu { w.gu_bytes(j) } else { w.down_bytes(j - n_gu) }) {
                     return;
@@ -1305,9 +1324,6 @@ pub struct CpuModel<'p, R: Routed> {
     b_picks: Vec<[usize; TOP_K]>,
     b_wts: Vec<[f32; TOP_K]>,
     b_routed: Vec<[usize; TOP_K]>,
-    /// `track-experts`: each MoE layer's picks in the previous decode step (every token's, in order), for `pred_trace`.
-    #[cfg(feature = "track-experts")]
-    trace_prev: Vec<Vec<usize>>,
     d_x: Vec<f32>,
     d_xn: Vec<f32>,
     d_y: Vec<f32>,
@@ -1387,8 +1403,6 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             b_picks: vec![[0; TOP_K]; STEP],
             b_wts: vec![[0.0; TOP_K]; STEP],
             b_routed: vec![[E; TOP_K]; STEP],
-            #[cfg(feature = "track-experts")]
-            trace_prev: vec![Vec::new(); NUM_HIDDEN_LAYERS + 1],
             d_x: vec![0.0; H],
             d_xn: vec![0.0; H],
             d_y: vec![0.0; H],
@@ -1918,10 +1932,6 @@ impl<'p, R: Routed> CpuModel<'p, R> {
         let p = &mut s.profile;
         p.tokens += n;
         let mut pre_next = [[E; TOP_K]; SPEC_TOKENS];
-        // `track-experts`: the next layer's 16 best candidates a token by its layer-ahead router (score + bias), for
-        // `pred_trace` (which predictor would have named the picks)
-        #[cfg(feature = "track-experts")]
-        let (mut cand, mut cand_layer) = ([[E; 16]; SPEC_TOKENS], usize::MAX);
         let mut pre_picks = [[E; TOP_K]; SPEC_TOKENS];
         // the step as chunks in flight (037), a layer of a chunk in three phases: its card half (the attention and
         // the FFN's card launches, posted), its dispatch (its FFN input waited for, its resident experts launched)
@@ -2044,21 +2054,6 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     // the picks resident on the cards run there, concurrently with the host's (the dispatch marks them
                     // `E` in `picks`); the picks as routed are kept for the accounting
                     s.b_routed[t0..t0 + n].copy_from_slice(&picks[..n]);
-                    // `track-experts`: a decode layer's prediction against what came: each token's 16 layer-ahead
-                    // candidates, its picks, which picks are resident on the cards, and the previous step's picks here
-                    #[cfg(feature = "track-experts")]
-                    if n <= SPEC_TOKENS && cand_layer == l {
-                        let list = |v: &[usize]| v.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(" ");
-                        let cands = (0..n).map(|i| list(&cand[i])).collect::<Vec<_>>().join(";");
-                        let actual = (0..n).map(|i| list(&picks[i])).collect::<Vec<_>>().join(";");
-                        let res = (0..n).map(|i| picks[i].iter().map(|&e| if pl.resident(l, e) { '1' } else { '0' }).collect::<String>()).collect::<Vec<_>>().join(";");
-                        let prev = list(&s.trace_prev[l]);
-                        prow::row!("track-experts", "pred_trace", { "layer" => l, "tokens" => n, "cand" => cands.as_str(), "picks" => actual.as_str(), "resident" => res.as_str(), "prev" => prev.as_str() });
-                    }
-                    #[cfg(feature = "track-experts")]
-                    if n <= SPEC_TOKENS {
-                        s.trace_prev[l] = picks[..n].iter().flatten().copied().collect();
-                    }
                     let jobs = pl.xpt_dispatch(l, n, &mut picks[..n]);
                     p.resident += jobs;
                     p.picks += n * TOP_K;
@@ -2146,15 +2141,6 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     let mut nu = 0;
                     for i in 0..n {
                         pre_next[i] = ffn::picks(m2, &mut s.b_score[i * ROUTE_ROWS + E..(i + 1) * ROUTE_ROWS]);
-                        #[cfg(feature = "track-experts")]
-                        {
-                            // the scores are the sigmoids now (picks applied them in place); rank by score + bias as picks do
-                            let sc = &s.b_score[i * ROUTE_ROWS + E..(i + 1) * ROUTE_ROWS];
-                            let mut ix: Vec<usize> = (0..E).collect();
-                            ix.sort_by(|&a, &b| (sc[b] + m2.bias[b]).partial_cmp(&(sc[a] + m2.bias[a])).unwrap());
-                            cand[i].copy_from_slice(&ix[..16]);
-                            cand_layer = l + 1;
-                        }
                         for (r, &e) in pre_next[i].iter().enumerate() {
                             if pl.resident(l + 1, e) {
                                 continue;

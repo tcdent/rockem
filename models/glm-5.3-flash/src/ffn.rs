@@ -146,20 +146,37 @@ fn scores(logits: &mut [f32]) {
         *v = sigmoid(*v);
     }
 }
-/// The top `TOP_K` scores plus the selection bias, in the order taken.
+/// The top `TOP_K` scores plus the selection bias, in the order taken: the highest first, the lower expert first
+/// between equals — one pass keeping the best `TOP_K` (a value goes after every kept value at least as large), the
+/// same picks in the same order as taking the maximum `TOP_K` times (that was 8 passes over the experts a token).
 #[inline(always)]
 fn top(w: &weights::Moe, score: &[f32]) -> [usize; TOP_K] {
+    top_with(w.bias, score)
+}
+#[inline(always)]
+fn top_with(bias: &[f32], score: &[f32]) -> [usize; TOP_K] {
     let mut idx = [0usize; TOP_K];
-    let mut taken = [false; E];
-    for k in 0..TOP_K {
-        let mut best = usize::MAX;
-        for e in 0..E {
-            if !taken[e] && (best == usize::MAX || score[e] + w.bias[e] > score[best] + w.bias[best]) {
-                best = e;
-            }
+    let mut val = [f32::NEG_INFINITY; TOP_K];
+    let mut kept = 0;
+    for e in 0..E {
+        let v = score[e] + bias[e];
+        if kept == TOP_K && !(v > val[TOP_K - 1]) {
+            continue;
         }
-        taken[best] = true;
-        idx[k] = best;
+        let mut p = kept.min(TOP_K - 1);
+        while p > 0 && v > val[p - 1] {
+            p -= 1;
+        }
+        let end = if kept < TOP_K { kept } else { TOP_K - 1 };
+        let mut q = end;
+        while q > p {
+            val[q] = val[q - 1];
+            idx[q] = idx[q - 1];
+            q -= 1;
+        }
+        val[p] = v;
+        idx[p] = e;
+        kept = (kept + 1).min(TOP_K);
     }
     idx
 }
@@ -294,4 +311,42 @@ pub mod gfx11 {
         }
     }
     const _: () = assert!(INTERMEDIATE_SIZE % 256 == 0 && (N_SHARED_EXPERTS * D_FF) % 256 == 0);
+}
+
+#[cfg(test)]
+mod top_tests {
+    use super::*;
+    /// The repeated maximum `top` replaced (2026-10-20): the reference for the single pass.
+    fn top_ref(bias: &[f32], score: &[f32]) -> [usize; TOP_K] {
+        let mut idx = [0usize; TOP_K];
+        let mut taken = [false; E];
+        for k in 0..TOP_K {
+            let mut best = usize::MAX;
+            for e in 0..E {
+                if !taken[e] && (best == usize::MAX || score[e] + bias[e] > score[best] + bias[best]) {
+                    best = e;
+                }
+            }
+            taken[best] = true;
+            idx[k] = best;
+        }
+        idx
+    }
+    #[test]
+    fn single_pass_top_is_the_repeated_maximum() {
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut r = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 40) as f32 / (1u64 << 24) as f32
+        };
+        for case in 0..2000 {
+            // every fourth case quantized hard, so many exact ties
+            let q = |v: f32| if case % 4 == 0 { (v * 4.0).floor() / 4.0 } else { v };
+            let score: std::vec::Vec<f32> = (0..E).map(|_| q(r())).collect();
+            let bias: std::vec::Vec<f32> = (0..E).map(|_| if case % 3 == 0 { 0.0 } else { q(r()) * 0.1 }).collect();
+            assert_eq!(top_with(&bias, &score), top_ref(&bias, &score), "case {case}");
+        }
+    }
 }
