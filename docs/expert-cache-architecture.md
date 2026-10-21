@@ -339,6 +339,18 @@ verify step from today's per-status costs; inferred); its two queues are not wor
 DRAM (they share the CCD's delivery) — what remains of them is ordering, so the planned items run while their lines
 are still in the L3.
 
+## Phase 1 in the node (measured 2026-10-20/21)
+- **Ranking and a cap** (the step's predicted experts by votes then rank, `PREFETCH_CAP`): uncapped / 13 / 10 →
+  experts lap 25.85 / 25.26 / 26.29 ms a verify step; 13 kept (commit 4da52d7).
+- **The earlier post** (the `slot` lap 53 → 29 µs a layer: items from a precomputed queue order, a one-pass top-8):
+  the verify step −1.2 ms through the main thread's critical path; the prefetch's completeness unchanged — the window is
+  not what binds (commit 63303d2).
+- **Gate/up before down** (every planned expert's gate/up slices first, then the down slices): complete / partial /
+  missed 7.6 / 2.1 / 6.9 → 4.6 / 5.1 / 6.9 experts a layer, all host lines from L3 47.5 %, experts lap 25.58 ms — the
+  same bytes finished, spread differently; reverted.
+- The per-CCD byte budget is not built: with the cap binding near the L3's retention and the order neutral, its
+  expected effect is within noise (inferred).
+
 ## Phase 2 in the node (measured 2026-10-20, build l3split against gemmv2)
 The split at boot (`Threads::new`: the prefetch's 47 cores in a `keep` group with ways 0–11, every other CPU ways
 12–15): completed experts' lines from L3 75.8 → 79.1 %, partial 74 → 80.2 %, all host lines 47 → 49.3 %; the experts
