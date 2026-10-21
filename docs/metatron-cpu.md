@@ -527,6 +527,13 @@ past that a prefetched expert costs a DRAM read and evicts an earlier one. Lever
 cap it near what an L3 retains; better prediction (fewer unused experts, queue 082); the union ranked by agreement
 across tokens. Gated depth 3 (081) widens the union, a cost its measurements did not separate.
 
+**The L3 as a programmable cache (phase 0 of docs/expert-cache-architecture.md, measured 2026-10-20, `bench-l3`).**
+resctrl CAT (16 L3 ways, 12 domains, mountable on the appliance) protects a touched set from other cores' DRAM fills:
+12 MB touched while 8 MB of fresh lines pass through the CCD keeps 70–72.5 % in L3 unsplit, 81.7–82.2 % with 12 ways
+reserved (all 12 CCDs at once); 33 → 66 % for 16 MB under 16 MB of traffic on one CCD. Replacement is not LRU (a set
+smaller than its ways keeps more). A CCD delivers ~60–70 GB/s to its cores from L3 and DRAM together — concurrent
+DRAM traffic halves an L3 read's rate. A `prefetcht0` touch keeps ~9 % (loads ~80 %). A read line stays in L3.
+
 ## 8. Open questions
 
 - **The missing ~10–13 % of DRAM.** The box reaches 79–82 % of theoretical against Dell's 90–92 %. Socket 1 and

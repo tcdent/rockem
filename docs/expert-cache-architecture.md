@@ -306,6 +306,39 @@ against boot, against build 4da52d7 (experts lap 25.26 ms, 26.9 ms an emitted to
 Phase 1 before phase 2 because phase 1 alone separates the window from capacity, and the answer sizes the keep ways.
 Phase 3 can start in parallel with phase 2 on the cards' side: they meet only at `P`.
 
+## Phase 0 results (measured 2026-10-20, `bench-l3`, metatron, beside the serving node)
+Per CCD four keep cores touch X MB of fresh lines, the CCD's other cores read Y MB of fresh DRAM lines, then each keep
+core reads its neighbour's planned slice; fill counters (prefetch hits + demand fills from L3, of all lines) around the
+read. resctrl CAT: the keep cores' group fills ways 0..K, every other CPU ways K..16.
+
+**The split protects the planned set.** One CCD, Y = 16 MB (2 runs each agree within a few points):
+
+| X planned | no split | 12 keep ways (24 MB) |
+|---|---|---|
+| 4 MB | 89 % | 98.5 % |
+| 8 MB | 62 % | 89 % |
+| 12 MB | 46 % | 80 % |
+| 16 MB | 33 % | 66 % |
+
+At production's shape (X = 12 MB, Y = 8 MB), 14 rounds, 3 runs: all 12 CCDs at once **70–72.5 % → 81.7–82.2 %**; one
+CCD 69.5–69.9 % → 78.8–79.8 %. A consistent +10–12 points. Even inside its ways the set is not all kept (16 MB in a
+24 MB partition: ~65 %), so Zen 3's L3 replacement is not LRU; a smaller set relative to its ways keeps more.
+
+**L3 and DRAM do not add on a CCD.** With the stream cores reading DRAM concurrently, the keep cores' planned read
+falls from 17.6 to 9.3–10.0 GB/s a core (its L3 share unchanged at ~80 %), the stream at 6.2–6.5 a core: a CCD
+delivers ~60–70 GB/s to its cores whichever source the bytes come from (as the 2026-10-15 probe's "~60 GB/s from L3 a
+CCD" said). So §5's two-queues upper bound (a CCD's run 0.58 → 0.19 ms) does not hold; the floor for a decode run is
+the CCD's delivery, ~0.29 ms for ~19 MB a CCD.
+
+**The touch must be loads:** a `prefetcht0` touch leaves 8.6–9.2 % of the set in L3 (loads ~80 %).
+
+**A hit leaves the line:** after the keep cores read the planned set, a reread by the stream cores finds 98 % in L3.
+
+**Decision from phase 0:** phase 2's split is worth carrying (+10–12 points at production's shape, est. ~0.5–1 ms a
+verify step from today's per-status costs; inferred); its two queues are not worth building as an overlap of L3 and
+DRAM (they share the CCD's delivery) — what remains of them is ordering, so the planned items run while their lines
+are still in the L3.
+
 ## 12. Risks, unknowns, and decisions
 
 **Unknowns (each has a phase that answers it):**

@@ -49,6 +49,10 @@ name = "bench-reuse"
 path = "src/reuse.rs"
 
 [[bin]]
+name = "bench-l3"
+path = "src/l3.rs"
+
+[[bin]]
 name = "bench-copy"
 path = "src/copy.rs"
 
