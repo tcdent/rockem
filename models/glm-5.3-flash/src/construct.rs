@@ -74,6 +74,9 @@ const MAX_CCDS: usize = 16;
 /// its rows): every worker drains it, last.
 const ANY: usize = MAX_CCDS + MAX_NODES;
 const SLOTS: usize = ANY + 1;
+/// The decode prefetch's experts a layer at most, its best-ranked first (a CCD's L3 retains about this many; see the
+/// prefetch's comment).
+const PREFETCH_CAP: usize = 13;
 struct Job {
     f: *const (dyn Fn(usize) + Sync),
     /// The items in slot order: slot `s`'s are `order[start[s]..start[s + 1]]`.
@@ -1302,6 +1305,9 @@ pub struct CpuModel<'p, R: Routed> {
     b_picks: Vec<[usize; TOP_K]>,
     b_wts: Vec<[f32; TOP_K]>,
     b_routed: Vec<[usize; TOP_K]>,
+    /// `track-experts`: each MoE layer's picks in the previous decode step (every token's, in order), for `pred_trace`.
+    #[cfg(feature = "track-experts")]
+    trace_prev: Vec<Vec<usize>>,
     d_x: Vec<f32>,
     d_xn: Vec<f32>,
     d_y: Vec<f32>,
@@ -1381,6 +1387,8 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             b_picks: vec![[0; TOP_K]; STEP],
             b_wts: vec![[0.0; TOP_K]; STEP],
             b_routed: vec![[E; TOP_K]; STEP],
+            #[cfg(feature = "track-experts")]
+            trace_prev: vec![Vec::new(); NUM_HIDDEN_LAYERS + 1],
             d_x: vec![0.0; H],
             d_xn: vec![0.0; H],
             d_y: vec![0.0; H],
@@ -1910,6 +1918,10 @@ impl<'p, R: Routed> CpuModel<'p, R> {
         let p = &mut s.profile;
         p.tokens += n;
         let mut pre_next = [[E; TOP_K]; SPEC_TOKENS];
+        // `track-experts`: the next layer's 16 best candidates a token by its layer-ahead router (score + bias), for
+        // `pred_trace` (which predictor would have named the picks)
+        #[cfg(feature = "track-experts")]
+        let (mut cand, mut cand_layer) = ([[E; 16]; SPEC_TOKENS], usize::MAX);
         let mut pre_picks = [[E; TOP_K]; SPEC_TOKENS];
         // the step as chunks in flight (037), a layer of a chunk in three phases: its card half (the attention and
         // the FFN's card launches, posted), its dispatch (its FFN input waited for, its resident experts launched)
@@ -2032,6 +2044,21 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     // the picks resident on the cards run there, concurrently with the host's (the dispatch marks them
                     // `E` in `picks`); the picks as routed are kept for the accounting
                     s.b_routed[t0..t0 + n].copy_from_slice(&picks[..n]);
+                    // `track-experts`: a decode layer's prediction against what came: each token's 16 layer-ahead
+                    // candidates, its picks, which picks are resident on the cards, and the previous step's picks here
+                    #[cfg(feature = "track-experts")]
+                    if n <= SPEC_TOKENS && cand_layer == l {
+                        let list = |v: &[usize]| v.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(" ");
+                        let cands = (0..n).map(|i| list(&cand[i])).collect::<Vec<_>>().join(";");
+                        let actual = (0..n).map(|i| list(&picks[i])).collect::<Vec<_>>().join(";");
+                        let res = (0..n).map(|i| picks[i].iter().map(|&e| if pl.resident(l, e) { '1' } else { '0' }).collect::<String>()).collect::<Vec<_>>().join(";");
+                        let prev = list(&s.trace_prev[l]);
+                        prow::row!("track-experts", "pred_trace", { "layer" => l, "tokens" => n, "cand" => cands.as_str(), "picks" => actual.as_str(), "resident" => res.as_str(), "prev" => prev.as_str() });
+                    }
+                    #[cfg(feature = "track-experts")]
+                    if n <= SPEC_TOKENS {
+                        s.trace_prev[l] = picks[..n].iter().flatten().copied().collect();
+                    }
                     let jobs = pl.xpt_dispatch(l, n, &mut picks[..n]);
                     p.resident += jobs;
                     p.picks += n * TOP_K;
@@ -2107,19 +2134,47 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     // the router's logits, the next layer's rows in them the L3 prefetch's predictor (without them the prefetch
                     // pulled the wrong experts and a verify step's items ran at DRAM speed, 12 → 7 GMAC/s a core, 2026-10-19);
                     // `hc_pre` computes those rows after the act phase's word, so this waits for them only here
+                    // inside `slot`: the scores off the card, the picks and their ranking, the prefetch's post
+                    let z = prow::Timestamp::now();
                     pl.ffn_ahead(l, n, &mut s.b_score);
-                    let mut union = [E; SPEC_TOKENS * TOP_K];
+                    let z = draft_zone("slot.ahead", z);
+                    // the step's predicted experts not resident, ranked: picked by more of the step's tokens first, then
+                    // by their ranks in those picks; at most PREFETCH_CAP. A CCD's 32 MiB L3 kept less of a completed
+                    // prefetch the more the layer prefetched (86 % of its lines at <= 10 experts, 56 % at 23+): past what
+                    // the L3 retains a prefetched expert costs a DRAM read and evicts an earlier one (2026-10-20)
+                    let mut union = [(E, 0u32); SPEC_TOKENS * TOP_K];
                     let mut nu = 0;
                     for i in 0..n {
                         pre_next[i] = ffn::picks(m2, &mut s.b_score[i * ROUTE_ROWS + E..(i + 1) * ROUTE_ROWS]);
-                        for &e in &pre_next[i] {
-                            if !union[..nu].contains(&e) && !pl.resident(l + 1, e) {
-                                union[nu] = e;
-                                nu += 1;
+                        #[cfg(feature = "track-experts")]
+                        {
+                            // the scores are the sigmoids now (picks applied them in place); rank by score + bias as picks do
+                            let sc = &s.b_score[i * ROUTE_ROWS + E..(i + 1) * ROUTE_ROWS];
+                            let mut ix: Vec<usize> = (0..E).collect();
+                            ix.sort_by(|&a, &b| (sc[b] + m2.bias[b]).partial_cmp(&(sc[a] + m2.bias[a])).unwrap());
+                            cand[i].copy_from_slice(&ix[..16]);
+                            cand_layer = l + 1;
+                        }
+                        for (r, &e) in pre_next[i].iter().enumerate() {
+                            if pl.resident(l + 1, e) {
+                                continue;
+                            }
+                            // a token's pick weighs more than any ranks' difference: count first, then rank
+                            let w = (TOP_K * SPEC_TOKENS) as u32 + (TOP_K - r) as u32;
+                            match union[..nu].iter_mut().find(|u| u.0 == e) {
+                                Some(u) => u.1 += w,
+                                None => {
+                                    union[nu] = (e, w);
+                                    nu += 1;
+                                }
                             }
                         }
                     }
-                    s.routed.prefetch(l + 1, &union[..nu]);
+                    union[..nu].sort_by_key(|u| std::cmp::Reverse(u.1));
+                    let ranked: Vec<usize> = union[..nu.min(PREFETCH_CAP)].iter().map(|u| u.0).collect();
+                    let z = draft_zone("slot.pick", z);
+                    s.routed.prefetch(l + 1, &ranked);
+                    draft_zone("slot.post", z);
                     lap(&mut p.slot, "slot");
                 }
             }
