@@ -2132,6 +2132,8 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     // inside `slot`: the scores off the card, the picks and their ranking, the prefetch's post
                     let z = prow::Timestamp::now();
                     pl.ffn_ahead(l, n, &mut s.b_score);
+                    #[cfg(feature = "dump-pred")]
+                    dump_pred(l, n, &s.b_routed[t0..t0 + n], &s.b_xq[t0 * H..(t0 + n) * H], &s.b_xs[t0 * HG..(t0 + n) * HG], &s.b_score);
                     let z = draft_zone("slot.ahead", z);
                     // the step's predicted experts not resident, ranked: picked by more of the step's tokens first, then
                     // by their ranks in those picks; at most PREFETCH_CAP. A CCD's 32 MiB L3 kept less of a completed
@@ -2265,3 +2267,35 @@ fn mla_rows(a: &weights::Mla, cache: &mut [u16], pools: &mut [u16], pos: usize, 
     }
 }
 
+
+/// `dump-pred`: a decode layer's record appended to /tmp/pred.bin — u16 layer, u16 tokens, then per token its picks at
+/// this layer (8 × u16), its quantized FFN input's group scales (H/128 × f32) and values (H × i8), and the next
+/// layer's route-ahead logits (E × f32, before the sigmoid).
+#[cfg(feature = "dump-pred")]
+fn dump_pred(l: usize, n: usize, picks: &[[usize; TOP_K]], xq: &[i8], xs: &[f32], score: &[f32]) {
+    use std::io::Write;
+    static OUT: std::sync::Mutex<Option<std::io::BufWriter<std::fs::File>>> = std::sync::Mutex::new(None);
+    let mut g = OUT.lock().unwrap();
+    if g.is_none() {
+        *g = std::fs::File::create("/tmp/pred.bin").ok().map(|f| std::io::BufWriter::with_capacity(1 << 20, f));
+    }
+    let Some(w) = g.as_mut() else { return };
+    const HG: usize = H / common::q4::GROUP;
+    let mut b: Vec<u8> = Vec::with_capacity(4 + n * (16 + HG * 4 + H + E * 4));
+    b.extend_from_slice(&(l as u16).to_le_bytes());
+    b.extend_from_slice(&(n as u16).to_le_bytes());
+    for i in 0..n {
+        for &e in &picks[i] {
+            b.extend_from_slice(&(e as u16).to_le_bytes());
+        }
+        for &v in &xs[i * HG..(i + 1) * HG] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b.extend(xq[i * H..(i + 1) * H].iter().map(|&v| v as u8));
+        for &v in &score[i * ROUTE_ROWS + E..(i + 1) * ROUTE_ROWS] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    let _ = w.write_all(&b);
+    let _ = w.flush();
+}

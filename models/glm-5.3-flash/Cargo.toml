@@ -14,6 +14,10 @@ track-zones = []
 # The CPU expert phase's items: a row a pool run a token-count bucket (items, their summed time, the
 # bytes they streamed, the (token, expert) pairs they served) — what bounds the phase, by the items' shape.
 track-experts = []
+# Not a prow category: each decode layer's predictor inputs and labels appended to /tmp/pred.bin (layer, tokens; a
+# token's picks at the layer, its quantized FFN input and scales, the next layer's route-ahead logits) for offline
+# predictor experiments (docs/expert-cache-architecture.md, phase 3). A lab build only: ~5 KB a token-layer.
+dump-pred = []
 
 [dependencies]
 common = { path = "../../common" }

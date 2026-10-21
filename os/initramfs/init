@@ -6,6 +6,8 @@
 mount -t devtmpfs devtmpfs /dev 2>/dev/null
 mount -t proc     proc     /proc
 mount -t sysfs    sysfs    /sys
+# resctrl: the node splits each CCD's L3 ways between the prefetch's cores and the rest (docs/expert-cache-architecture.md)
+mount -t resctrl  resctrl  /sys/fs/resctrl 2>/dev/null
 mkdir -p /dev/hugepages /dev/shm /dev/pts /tmp /bundle
 mount -t devpts devpts /dev/pts
 mount -t hugetlbfs -o pagesize=2M hugetlbfs /dev/hugepages 2>/dev/null || mount -t hugetlbfs hugetlbfs /dev/hugepages 2>/dev/null

@@ -339,6 +339,17 @@ verify step from today's per-status costs; inferred); its two queues are not wor
 DRAM (they share the CCD's delivery) — what remains of them is ordering, so the planned items run while their lines
 are still in the L3.
 
+## Phase 2 in the node (measured 2026-10-20, build l3split against gemmv2)
+The split at boot (`Threads::new`: the prefetch's 47 cores in a `keep` group with ways 0–11, every other CPU ways
+12–15): completed experts' lines from L3 75.8 → 79.1 %, partial 74 → 80.2 %, all host lines 47 → 49.3 %; the experts
+lap 25.5 → 25.41 ms a verify step, 26.6/27.0 → 26.7/27.2 ms an emitted token, prefill 1.85 → 1.84 ms a prompt token —
+not a measurable gain, and short of the phase's gate (planned lines ≥ 90 %). The keep cores also run ordinary DRAM-bound
+items, so their own fills land in the keep ways (the bench's keep cores only read the planned set: +10–12 points
+there). Reverted; the resctrl mount stays in the image (tcdent: "resctrl stays around because it's valuable"). What
+phases 0–2 show together: the L3 can be steered a few points at a time, but decode's time answers weakly at the margin
+— capacity caps how many experts can be complete, and a CCD's shared ~65 GB/s delivery caps how fast even L3 bytes
+arrive. The term that still moves time is which ~13 experts are prefetched: phase 3.
+
 ## 12. Risks, unknowns, and decisions
 
 **Unknowns (each has a phase that answers it):**

@@ -36,3 +36,5 @@ track-boot = []
 track-zones = ["glm_5_3_flash/track-zones"]
 # GLM: the CPU expert phase's items by token-count bucket a pool run (`expert_items` rows: queue 021)
 track-experts = ["glm_5_3_flash/track-experts"]
+# a lab build: the decode predictor experiment's data (glm_5_3_flash's dump-pred)
+dump-pred = ["glm_5_3_flash/dump-pred"]
