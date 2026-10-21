@@ -481,6 +481,13 @@ finishes 69.5 % of its items (the pool's `prefetch_job.done` under-counts: worke
 L3 probes' ~2.3× over DRAM predicts ~18 µs: the prefetched bytes are not delivered at L3 speed when the run reaches
 them (candidates: eviction by the run's own lines, the wrong CCD, the per-socket L3 clock limit — not yet told apart).
 
+**Delivery is not the problem (measured 2026-10-20, `bench-reuse`, 1.5 MB a core, 30 rounds of fresh regions):** the
+decode `gemv` over a region its CCD neighbour just touched runs as fast as over one it touched itself — on 92 cores at
+once 8.7 vs 8.7 GB/s a core (802 vs 805 summed), warm 9.1 (861), cold from DRAM 3.8 (361): L3-served is 2.2× DRAM at
+full load. So the production 31-vs-42 µs (1.37×) says the prefetched lines are mostly not in L3 when the run reads
+them (eviction or timing), not that L3 is slow to deliver. At full load an L3-served `gemv` gets ~9 GB/s a core (~70 a
+CCD), far under a bare load loop's L3 rate — the one-token kernel from L3 is its own question.
+
 ## 8. Open questions
 
 - **The missing ~10–13 % of DRAM.** The box reaches 79–82 % of theoretical against Dell's 90–92 %. Socket 1 and

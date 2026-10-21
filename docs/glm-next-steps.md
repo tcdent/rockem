@@ -149,6 +149,7 @@ the index. Reorganized 2026-10-18 from the single-page version (in git history b
 | [079](queue/079-mla-o-rate.md) | The MLA output projection's rate in prefill | Open — 4.6 ms a 512-token launch, est. well under 1 ms | prefill |
 | [080](queue/080-launch-granularity.md) | Launch and timeline granularity: steps cut too fine | Open — noted (`rows_d2`'s 32-token passes, ~530 launches a card a prefill step) | prefill, profiling |
 | [081](queue/081-confidence-gated-draft-depth.md) | Draft depth chosen a step by the draft's confidence | Deployed — gated depth 3: 18k 26.6–27.2 → 24.8–25.0 ms an emitted token; the draft instrumented | decode |
+| [082](queue/082-card-side-expert-prediction.md) | Expert prediction on the cards' idle time | Open — proposed; prefetch yield measured: 31 / 36 / 42 µs an expert complete / partial / missed | decode, prefill |
 
 ## Order (2026-10-18, evening — the 20 ms path)
 
