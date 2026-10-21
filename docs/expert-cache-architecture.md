@@ -516,6 +516,15 @@ against card10, eight time buckets (bringup/reads/prefetch_trend.sh): completed 
 the verify step 61.79 → 61.50 ms. The predictor does not drift over the 10.8k tokens: missed follows the content
 (5.54–6.21 a bucket), the same in both builds. Next on this line: queue 090, the prefetch streamed into the run.
 
+**A prefetch's items stay on their CCD** (card15, 2026-10-21): the pool's workers drained their own CCD's queue, then
+their node's other CCDs' — right for a run, wrong for a prefetch: a line lands in the toucher's L3, so an item touched
+by another CCD's core was wasted and counted done. Now a prefetch's worker takes only its own CCD's items. Deploy
+workload: done before the run 48.6 → 64 % of the posted items, takers 23 → 31.6 cores; the queues are even (12 a
+layer, 13 items the fullest, 0.7 left unclaimed at the cutoff: the rest were in flight). ~142 MB in the ~607 µs window,
+~234 GB/s, ~20 GB/s a CCD against the ~26 measured when every CCD pulls. Long decode run against card14: complete
+7.77 → 7.91 a layer, partial experts' L3 share 75.1 → 80.1 %, all host lines 54.3 → 55.4 %, experts lap 24.39 → 23.99
+ms a verify step, verify step 61.50 → 61.33 ms.
+
 ## 12. Risks, unknowns, and decisions
 
 **Unknowns (each has a phase that answers it):**
