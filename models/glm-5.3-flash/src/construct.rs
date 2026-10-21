@@ -616,6 +616,9 @@ pub struct CpuExperts<'a> {
     /// (expert, queue) and its run of slices — are cut from a table instead of grouped a call (the grouping's
     /// allocations were ~31 µs of a decode layer's 53 µs `slot` lap, 2026-10-20).
     slice_order: Vec<u8>,
+    /// The last prefetch's plan: its layer and experts in the order posted, so that layer's run takes them in the order
+    /// they arrive (the planned first, then the rest).
+    planned: std::sync::Mutex<(usize, Vec<usize>)>,
     /// A step's activations quantized once each (`[STEP][H]` and their groups), the experts' hidden
     /// states (`[STEP][TOP_K][D_FF]`) and those quantized once each for the down rows.
     xq: Vec<i8>,
@@ -685,7 +688,7 @@ impl<'a> CpuExperts<'a> {
         use common::q4::GROUP;
         #[cfg(feature = "track-experts")]
         let item_acc = (0..SLOTS).map(|_| std::array::from_fn(|_| ItemAcc::default())).collect();
-        let mut this = CpuExperts { #[cfg(feature = "track-experts")] item_acc, #[cfg(feature = "track-experts")] pf: std::sync::Mutex::new(None), #[cfg(feature = "track-experts")] pmcs: Vec::new(), #[cfg(feature = "track-experts")] rdpmc: false, #[cfg(feature = "track-experts")] fill_acc: (0..SLOTS).map(|_| FillAcc::default()).collect(), stream, pool, slice_node: Vec::new(), slice_slot: Vec::new(), slice_order: Vec::new(), xq: vec![0; STEP * H], xs: vec![0.0; STEP * H / GROUP], xg: vec![0; STEP * H / GROUP], h: vec![0.0; STEP * TOP_K * D_FF], hq: vec![0; STEP * TOP_K * D_FF], hs: vec![0.0; STEP * TOP_K * D_FF / GROUP], hg: vec![0; STEP * TOP_K * D_FF / GROUP], elapsed: 0.0 };
+        let mut this = CpuExperts { #[cfg(feature = "track-experts")] item_acc, #[cfg(feature = "track-experts")] pf: std::sync::Mutex::new(None), #[cfg(feature = "track-experts")] pmcs: Vec::new(), #[cfg(feature = "track-experts")] rdpmc: false, #[cfg(feature = "track-experts")] fill_acc: (0..SLOTS).map(|_| FillAcc::default()).collect(), stream, pool, slice_node: Vec::new(), slice_slot: Vec::new(), slice_order: Vec::new(), planned: std::sync::Mutex::new((usize::MAX, Vec::new())), xq: vec![0; STEP * H], xs: vec![0.0; STEP * H / GROUP], xg: vec![0; STEP * H / GROUP], h: vec![0.0; STEP * TOP_K * D_FF], hq: vec![0; STEP * TOP_K * D_FF], hs: vec![0.0; STEP * TOP_K * D_FF / GROUP], hg: vec![0; STEP * TOP_K * D_FF / GROUP], elapsed: 0.0 };
         this.relearn();
         // the fill counters on every core (the NMI watchdog holds a counter on each CPU: off first, 2026-10-20)
         #[cfg(feature = "track-experts")]
@@ -775,6 +778,12 @@ impl Routed for CpuExperts<'_> {
         std::mem::take(&mut self.elapsed)
     }
     fn prefetch(&self, l: usize, idx: &[usize]) {
+        {
+            let mut p = self.planned.lock().unwrap();
+            p.0 = l;
+            p.1.clear();
+            p.1.extend_from_slice(idx);
+        }
         // the stream lives as long as the process (the node leaks it; the gate's outlives every token):
         // the job that owns these closures is gone within the token
         let stream: &'static expert::Stream<'static> = unsafe { std::mem::transmute::<&expert::Stream, &'static expert::Stream<'static>>(self.stream) };
@@ -903,7 +912,19 @@ impl CpuExperts<'_> {
                 }
             }
         }
-        let experts: Vec<usize> = (0..E).filter(|&e| first[e + 1] > first[e]).collect();
+        // the run's experts in the order the prefetch posted them (its plan for this layer), then the rest by id: each
+        // CCD's queue takes its items in this order, so the run reads first what arrived first, and the experts it streams
+        // from DRAM come after the prefetched ones are read (in id order, the run streamed a high-id unplanned expert
+        // between planned ones). The outputs land in fixed rows: the order changes no bits.
+        let mut experts: Vec<usize> = (0..E).filter(|&e| first[e + 1] > first[e]).collect();
+        {
+            let mut p = self.planned.lock().unwrap();
+            if p.0 == l {
+                let rank = |e: &usize| p.1.iter().position(|q| q == e).unwrap_or(E + *e);
+                experts.sort_by_key(rank);
+                p.0 = usize::MAX;
+            }
+        }
         // `track-experts`: this run's host experts against the prefetch made for this layer — predicted and every item
         // touched, predicted but not finished when the run began, not predicted (decode's L3 question, 2026-10-20)
         #[cfg(feature = "track-experts")]

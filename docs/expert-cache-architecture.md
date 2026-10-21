@@ -507,6 +507,15 @@ are not done by the run. More accuracy pays only with more completion (an earlie
 ordering the run so a partly prefetched expert's lines are still in the L3). The predictor's updates are queued behind
 the logits read: the cards run them while the host samples (`head` 1.91 ms, as without them).
 
+**The run takes its experts in the plan's order** (card14, 2026-10-21; tcdent: "an ordered problem … as sequential as
+possible based on how it's actually going to be used"). The run had built each layer's expert list in id order, so every
+CCD's queue read a planned expert between unplanned ones it streamed from DRAM; now the plan's experts come first, in
+the order posted, then the rest. Same plans (missed equal bucket by bucket), outputs bit-identical. Long decode run
+against card10, eight time buckets (bringup/reads/prefetch_trend.sh): completed experts' lines from L3 74.6–75.5 →
+82.9–83.4 % in every bucket, all host lines 49.0–50.7 → 53.4–55.0 %; the experts lap 24.62 → 24.39 ms a verify step,
+the verify step 61.79 → 61.50 ms. The predictor does not drift over the 10.8k tokens: missed follows the content
+(5.54–6.21 a bucket), the same in both builds. Next on this line: queue 090, the prefetch streamed into the run.
+
 ## 12. Risks, unknowns, and decisions
 
 **Unknowns (each has a phase that answers it):**
