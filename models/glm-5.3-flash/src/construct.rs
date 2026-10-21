@@ -194,6 +194,9 @@ macro_rules! cpu_zone {
 }
 unsafe fn work(job: *const Job, order: &[usize], node: usize, who: usize) {
     let j = &*job;
+    // a prefetch's items only from this core's own CCD: a line touched here lands in this CCD's L3, so another CCD's item
+    // done here is wasted for its run and evicts this CCD's own (the steal was counted done, 2026-10-21)
+    let order = if j.light { &order[..1] } else { order };
     let f = &*j.f;
     INSIDE.with(|c| c.set(job));
     let (mut mine, mut local) = (0, 0);
@@ -439,7 +442,17 @@ impl Threads {
                     let at = |ns: u64| prow::Timestamp::from_unix_nanos(c.ts0.unix_nanos() + ns as i64);
                     prow::zone_at!("track-experts", "prefetch", "cpu", at(first), at(c.last.load(Ordering::Relaxed).max(first)));
                 }
-                prow::row!("track-experts", "prefetch_job", { "items" => c.n, "done" => c.done.0.load(Ordering::Relaxed), "window_us" => window as f64 / 1e3, "first_us" => if first == u64::MAX { -1.0 } else { first as f64 / 1e3 }, "busy_us" => c.busy_ns.load(Ordering::Relaxed) as f64 / 1e3, "cores" => c.takers.load(Ordering::Relaxed) });
+                // its queues: how many had items, the fullest, and the most items a queue still held when overtaken
+                let (mut q_used, mut q_max, mut q_left) = (0usize, 0usize, 0usize);
+                for q in 0..SLOTS {
+                    let len = c.start[q + 1] - c.start[q];
+                    if len > 0 {
+                        q_used += 1;
+                        q_max = q_max.max(len);
+                        q_left = q_left.max(c.start[q + 1].saturating_sub(c.next[q].0.load(Ordering::Relaxed)));
+                    }
+                }
+                prow::row!("track-experts", "prefetch_job", { "q_used" => q_used, "q_max" => q_max, "q_left" => q_left, "items" => c.n, "done" => c.done.0.load(Ordering::Relaxed), "window_us" => window as f64 / 1e3, "first_us" => if first == u64::MAX { -1.0 } else { first as f64 / 1e3 }, "busy_us" => c.busy_ns.load(Ordering::Relaxed) as f64 / 1e3, "cores" => c.takers.load(Ordering::Relaxed) });
             }
         }
         let fp: *const (dyn Fn(usize) + Sync) = unsafe { std::mem::transmute(f) };
