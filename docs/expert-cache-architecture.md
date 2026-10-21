@@ -391,6 +391,12 @@ runs on core 120, the loader's SMT sibling, one job a layer through a channel. L
 Long SCORE bit-identical. Missed experts fall by 7 %. The experts lap does not move measurably, and the step gains
 ~1 ms. Kept.
 
+**What this means for phase 4:** the predictor's state lives as long as the node and is not reset per prompt. In the
+402-token decode, its first 10 steps against the rest, missed experts a layer: cap 13 6.04 / 7.17, pred2 5.44 / 6.68.
+The predictor's gain is the same at a request's start as later, so a new prompt does not cost it its fit. Prefill
+labels would only shorten the settling after a boot (~3k decode positions offline; in the boot's first decode, pred2
+6.58 against 6.82, a smaller gain than later).
+
 ## 12. Risks, unknowns, and decisions
 
 **Unknowns (each has a phase that answers it):**
