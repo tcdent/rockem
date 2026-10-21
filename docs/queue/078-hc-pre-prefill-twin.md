@@ -184,6 +184,32 @@ prefill items live (9–64 tokens), and a stored layout would also change the ca
 prefill run it gets 55–62. That ~25–30 % lost to 92 cores running at once (the activations' L3 traffic is the
 quantified part) is the larger gap.
 
+**The expert gemm rewritten (2026-10-20, run of build gemmh; tcdent: "being diligent about understanding what's
+actually happening").** The release build's disassembly (unstripped, same codegen) through llvm-mca for Zen 3: per
+group of 8 rows × 128 k, the dot loop ~71 % of an item at 32 tokens, bound by the four FP pipes — 100 µops per 1024
+MACs, 32 of them the token quads' `vpbroadcastd` (one per `vpmaddubsw`), 36 accumulation; the flush ~13 %, the
+activation slicing ~8 %, the setup (four `transpose8`) ~7 %. Four sub-agents explored in parallel (accumulation,
+layout, flush/setup, a survey with the queue's history). The kernel adopted is the layout agent's: a weight vector
+holds two rows' 16 k in its 128-bit halves, a token's 16 k is one `vbroadcasti128` feeding four multiplies, each i16
+accumulator spans the whole group (≤ 30480, exact), reduced by unpacks; no transposes; token pointers once a call.
+Bit-identical to `gemv` for every n 1..64 at both expert widths, the saturating case included. On a metatron core
+1.77 / 1.53 / 1.40 / 1.35 / 1.25 / 1.30× the old kernel at 2 / 4 / 8 / 16 / 32 / 64 tokens (75–106 GMAC/s). Two 16-row
+passes of the old shape (`gemm2`, 1.11–1.21× from 16 tokens, slower below) were measured on the way (prefill 2.15)
+and dropped for it.
+
+| prefill at 18k | before (1M baseline) | gemmh |
+|---|---|---|
+| experts lap a layer-chunk | 21.35 ms | 18.24 |
+| `experts.gu` / `experts.down` run | 12.25 / 6.82 | 10.57 / 5.78 |
+| gate/up a core at 9–16 / 17–32 / 33–64 tokens | 56 / 62 / 63 GMAC/s | 68.8 / 76.4 / 74.6 |
+| ms a prompt token | 2.25–2.27 | 2.02 |
+| cold 18k prompt | 44.7 s | 39.7 |
+
+Long SCORE bit-identical, the decode's tokens and acceptance unchanged; decode's experts stay at the DRAM ceiling (a
+verify step 59.0 ms, within the 58.2–59.9 band). Not yet taken, from the flush/setup agent on the old layout: the bias
+folded into the accumulator's start value and the flush straight from registers (both exact); and an unexplained
+13–17 % per-core drop with all 92 cores busy on cache-resident work (cause not established).
+
 ## Next
 The twin's arithmetic is the step gate's numeric kind (WMMA order) for the coefficients and the router; the act phase
 stays exact. Then the card lanes again: card1's `hc_pre` share and the FFN-input wait.
