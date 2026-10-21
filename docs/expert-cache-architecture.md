@@ -329,16 +329,26 @@ Phase 3 can start in parallel with phase 2 on the cards' side: they meet only at
 - The predictor's launch delays the residents' jobs by its duration on the FFN card's queue (µs; they finish well
   inside the host's ~580 µs run).
 
-**Decisions for tcdent:**
-1. **The low-rank term first.** The replay measured repetition and every reordering of today's candidates at
-   ~+.01 recall; bias and co-routing, by inference, act on the same candidates. The term that can add information is
-   the low-rank projection of the FFN input (a learned estimate of what the next layer's attention adds). Order the
-   correction's terms low-rank first, its rank spent on the weakest layers (4–5, 8–9, 14, 18, 25, 27–28)?
-2. **Which card.** The predictor of layer `l` on that layer's FFN card (both cards host predictors for their own
-   layers; inputs never move), or on card0 for every layer as 082 says (card1's layers ship ~16 KB of inputs a
-   token-layer across the link)? The design takes the former.
-3. **The way split's existence.** One static keep/stream split for decode and prefill is one more piece of boot
-   configuration, a resctrl mount and two groups; the alternative is no split and a budget held at the no-split knee.
-   Phase 0 prices it; the choice to carry resctrl in the appliance is yours.
-4. **Prefill labels (phase 4).** Train the predictor on prompt positions, which costs a route-ahead launch a chunk
-   in prefill and makes the predictor settle before decode, or train on decode tokens only?
+**Decisions (tcdent, 2026-10-20):**
+1. **No per-layer targeting.** The correction is uniform across layers; spending rank on the weak layers waits for
+   data that shows a measurable gain.
+   > "I don't see why ... we would add complexity by targeting specific layers, unless you see that there's a
+   > measurable gain from that ... that is an intellectual application of premature optimization. So by all means,
+   > make the case for that later when you collect more data, but that doesn't necessarily feel like the highest
+   > priority to me."
+2. **Which card: whichever runs the predictor earliest with the best data.** Not fixed to card0 or to the FFN card:
+   the choice weighs how early the inputs exist against their quality, and the gaps each card has.
+   > "card one, while the FFN is running, comes a little bit earlier and has certainly more time available, but card
+   > zero after the FFN has time available as well. So it just comes down to what data we need and how much time we
+   > need to be able to process it. Card one also has an HC post and a word wait or two ... gaps to fill. And so I
+   > just want us to pick the best candidate in terms of being able to run this as early as possible with the data
+   > that we have available, balancing that with the quality of the data that is then available at the time."
+3. **resctrl stays in the appliance** ("I don't mind if resctrl stays around because it's valuable for us"); the
+   split is carried if phase 0 shows it holds.
+4. **Prefill labels: weigh accuracy; time is the only constraint.** A more capable model is taken wherever it fits
+   the time available.
+   > "the real only constraint that we have is time, and so if we can do a more intelligent model in the time
+   > available, there's no reason not to do it."
+
+The plan as a whole (tcdent, 2026-10-20): "I think that this is a pretty novel and significant improvement, and I see
+no reason for us to not diligently research this and push through all of the steps that we have presented."
