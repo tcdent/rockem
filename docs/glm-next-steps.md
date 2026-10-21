@@ -155,6 +155,7 @@ the index. Reorganized 2026-10-18 from the single-page version (in git history b
 | [085](queue/085-pool-core-quiet.md) | The pool's cores kept quiet | Open — 1 kHz idle wakes, ticks on busy cores, the NMI watchdog | decode, prefill |
 | [086](queue/086-predictor-input-map.md) | The prefetch predictor's input map | Quantified, on the shelf — +.007 recall@13 offline for 195 ms a step dense | decode |
 | [087](queue/087-predictor-on-the-main-thread.md) | The prefetch predictor's main-thread time | Open — slot lap +0.35 ms a verify step | decode |
+| [088](queue/088-prefill-labels-off-the-main-thread.md) | Prefill's predictor labels off the main thread | Open — 0.03 ms a prompt token | prefill |
 
 ## Order (2026-10-18, evening — the 20 ms path)
 

@@ -397,6 +397,26 @@ The predictor's gain is the same at a request's start as later, so a new prompt 
 labels would only shorten the settling after a boot (~3k decode positions offline; in the boot's first decode, pred2
 6.58 against 6.82, a smaller gain than later).
 
+## Phase 4 in the node (measured 2026-10-21, build pred4 against pred2)
+Prefill trains the predictor. A chunk's `hc_pre` router takes the next layer's rows too (the matrix path, all
+`ROUTE_ROWS`, the same launch). At its dispatch the main thread reads that half (`ffn_ahead`, `[n][E]`) and sends it
+with the chunk's picks to the learner (`Lesson::Chunk`). The learner trains pair l − 1 once layer l's picks come
+(`Predictor::train`): every prompt position is a label, in batches of `SPEC_TOKENS` the way decode's steps learn.
+
+| | pred2 (b210fa5f) | pred4 (13421e6e) |
+|---|---|---|
+| Host experts a layer, complete / partial / missed | 7.68 / 2.48 / 6.45 | 7.90 / 2.62 / 6.10 |
+| Missed in the boot's first decode (first 10 steps) | 6.58 | 6.17 (pred3) |
+| Decode, 402 tokens | 62.4 ms a step, 26.1 an emitted token | 61.6, 25.7 |
+| Decode, 96 tokens | 63.6, 26.5 | 62.9, 26.2 |
+| Experts lap (a verify step) | 26.13 ms | 25.76 |
+| Prefill | 1.84 ms a prompt token, cold 18k 36.5 s | 1.87, 37.0 s |
+
+Long SCORE bit-identical. Every request misses fewer experts, not only the first one after boot. Decode gains
+~0.35 ms an emitted token, and prefill pays 0.03 ms a prompt token. That cost is the main thread reading the next
+layer's scores out of host memory: the prefill `slot` lap is 0.03 ms a prompt token, 0.04 when they were read and
+copied twice (pred3). Queue 088 moves that read off the main thread. Kept.
+
 ## 12. Risks, unknowns, and decisions
 
 **Unknowns (each has a phase that answers it):**

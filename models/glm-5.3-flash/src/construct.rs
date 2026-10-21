@@ -135,8 +135,15 @@ extern "C" {
 /// number, the tokens, the next layer's picks) off the decode step; `seq` the last prediction's number a layer.
 pub struct Learner {
     pub p: std::sync::Arc<predict::Predictor>,
-    pub tx: std::sync::mpsc::SyncSender<(usize, u64, usize, [[usize; TOP_K]; SPEC_TOKENS])>,
+    pub tx: std::sync::mpsc::SyncSender<Lesson>,
     pub seq: Vec<u64>,
+}
+/// A learning job: a decode step's update of pair l (its prediction's number, the tokens, the next layer's picks), or a
+/// prefill chunk's layer (`Chunk`: the chunk, the layer, its picks and the next layer's route-ahead logits `[n][E]`,
+/// empty where the next layer is dense) — the learner trains pair l − 1 when layer l's picks arrive.
+pub enum Lesson {
+    Step(usize, u64, usize, [[usize; TOP_K]; SPEC_TOKENS]),
+    Chunk(usize, usize, Vec<[usize; TOP_K]>, Vec<f32>),
 }
 /// The learner's core: the SMT sibling of the expert loader's core 24, a housekeeping core on the main thread's socket
 /// (the loader is paced; `dev.cmdline` leaves 0/24/48/72 and their siblings to the kernel).
@@ -145,14 +152,26 @@ impl Learner {
     pub fn new(router_bias: Vec<Vec<f32>>) -> Self {
         let layers = router_bias.len();
         let p = std::sync::Arc::new(predict::Predictor::new(router_bias));
-        let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize, [[usize; TOP_K]; SPEC_TOKENS])>(2 * NUM_HIDDEN_LAYERS);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Lesson>(4 * NUM_HIDDEN_LAYERS);
         let q = p.clone();
         std::thread::Builder::new()
             .name("learn".into())
             .spawn(move || {
                 pin(LEARN_CORE);
-                while let Ok((l, seq, n, labels)) = rx.recv() {
-                    q.learn(l, seq, &labels[..n]);
+                // each chunk's last layer: (layer, picks, the next layer's logits)
+                let mut prev: [Option<(usize, Vec<[usize; TOP_K]>, Vec<f32>)>; crate::CHUNKS] = std::array::from_fn(|_| None);
+                while let Ok(job) = rx.recv() {
+                    match job {
+                        Lesson::Step(l, seq, n, labels) => q.learn(l, seq, &labels[..n]),
+                        Lesson::Chunk(ch, l, picks, logits) => {
+                            if let Some((pl, pp, plg)) = prev[ch].take() {
+                                if pl + 1 == l && pp.len() == picks.len() && !plg.is_empty() {
+                                    q.train(pl, pp.len(), &plg, &pp, &picks, SPEC_TOKENS);
+                                }
+                            }
+                            prev[ch] = Some((l, picks, logits));
+                        }
+                    }
                 }
             })
             .unwrap();
@@ -1241,8 +1260,8 @@ pub trait Placed {
     fn ffn(&mut self, l: usize, n: usize);
     /// A MoE layer's FFN input for every token (`[n][H]`) and the FFN router's logits (`[n][E]`).
     fn ffn_input(&mut self, l: usize, n: usize, xq: &mut [i8], xs: &mut [f32], xg: &mut [i32], picks: &mut [[usize; TOP_K]], wts: &mut [[f32; TOP_K]], pool: &dyn Pool);
-    /// The FFN router's logits `[n][ROUTE_ROWS]` once the next layer's rows are in too (they follow the act phase's
-    /// word, off its path): the second half is the prefetch's predictor (005).
+    /// The next MoE layer's router logits `[n][E]` (the second half of the FFN router's rows) once they are in (they
+    /// follow the act phase's word, off its path): the prefetch's predictor (005).
     fn ffn_ahead(&mut self, l: usize, n: usize, logits: &mut [f32]);
     /// Bring-up: a MoE layer's FFN input (`x: [n][H]`) and its router's logits (`[n][ROUTE_ROWS]`) as the card
     /// made them, for forced picks and the traces' edges; serving reads `ffn_input`'s quantized form instead.
@@ -2093,6 +2112,21 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     p.picks += n * TOP_K;
                     jobs_of[ch] = jobs;
                     lap(&mut p.route, "route");
+                    // a chunk past SPEC_TOKENS: its picks and the next layer's route-ahead logits to the prefetch predictor's
+                    // learner (phase 4), every position a label
+                    if n > SPEC_TOKENS {
+                        let pr = s.pred.get_or_insert_with(|| Learner::new(w.layers.iter().map(|lw| match &lw.ffn {
+                            Ffn::Moe(m) => m.bias.to_vec(),
+                            Ffn::Dense(_) => Vec::new(),
+                        }).collect()));
+                        let mut logits = Vec::new();
+                        if let Some(Ffn::Moe(_)) = w.layers.get(l + 1).map(|lw| &lw.ffn) {
+                            logits.resize(n * E, 0.0);
+                            pl.ffn_ahead(l, n, &mut logits);
+                        }
+                        let _ = pr.tx.send(Lesson::Chunk(ch, l, s.b_routed[t0..t0 + n].to_vec(), logits));
+                        lap(&mut p.slot, "ahead");
+                    }
                     continue;
                 }
                 // the run: the FFN's output half posted behind the residents' launches (it waits for the host's word)
@@ -2178,9 +2212,9 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                         Ffn::Dense(_) => Vec::new(),
                     }).collect()));
                     for i in 0..n {
-                        pre_next[i] = ffn::picks(m2, &mut s.b_score[i * ROUTE_ROWS + E..(i + 1) * ROUTE_ROWS]);
+                        pre_next[i] = ffn::picks(m2, &mut s.b_score[i * E..(i + 1) * E]);
                     }
-                    pr.seq[l] = pr.p.predict(l, n, &s.b_score[E..], ROUTE_ROWS, &pre_next, &s.b_routed[t0..t0 + n], &mut s.b_pz);
+                    pr.seq[l] = pr.p.predict(l, n, &s.b_score, E, &pre_next, &s.b_routed[t0..t0 + n], &mut s.b_pz);
                     let mut ranked = Vec::with_capacity(PREFETCH_CAP);
                     predict::rank(&s.b_pz, n, &|e| pl.resident(l + 1, e), PREFETCH_CAP, &mut ranked);
                     let z = draft_zone("slot.pick", z);
@@ -2193,7 +2227,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     if l > 0 && pr.p.has(l - 1) {
                         let mut labels = [[E; TOP_K]; SPEC_TOKENS];
                         labels[..n].copy_from_slice(&s.b_routed[t0..t0 + n]);
-                        let _ = pr.tx.send((l - 1, pr.seq[l - 1], n, labels));
+                        let _ = pr.tx.send(Lesson::Step(l - 1, pr.seq[l - 1], n, labels));
                     }
                 }
             }
@@ -2323,7 +2357,7 @@ fn dump_pred(l: usize, n: usize, picks: &[[usize; TOP_K]], xq: &[i8], xs: &[f32]
             b.extend_from_slice(&v.to_le_bytes());
         }
         b.extend(xq[i * H..(i + 1) * H].iter().map(|&v| v as u8));
-        for &v in &score[i * ROUTE_ROWS + E..(i + 1) * ROUTE_ROWS] {
+        for &v in &score[i * E..(i + 1) * E] {
             b.extend_from_slice(&v.to_le_bytes());
         }
     }

@@ -22,6 +22,7 @@
 //! The decode slot predicts on the main thread from the router's scores `ffn::picks` already made (no exponentials
 //! there), and a housekeeping core learns: on the main thread the learning cost 50 µs a layer, the verify step
 //! 56.3 → 59.7 ms (2026-10-21). Each pair is behind its own lock, and a learning job names the prediction it is for.
+//! Prefill trains it too (`train`, phase 4): every prompt position is a label, in decode-sized batches.
 
 use crate::{E, TOP_K};
 use std::sync::Mutex;
@@ -205,6 +206,47 @@ impl Predictor {
             for e in 0..E {
                 adam(&mut co[e], &mut m[e], &mut v[e], g[e], LR_CO / c1, c2);
             }
+        }
+    }
+}
+
+impl Predictor {
+    /// Pair l trained on a prefill chunk's `n` tokens: layer l + 1's route-ahead logits (`logits` [n][E], before the
+    /// sigmoid), the picks at l and at l + 1 (`labels`), in batches of `batch` tokens as decode's steps learn — a
+    /// prediction and its update a batch, nothing ranked.
+    pub fn train(&self, l: usize, n: usize, logits: &[f32], picks: &[[usize; TOP_K]], labels: &[[usize; TOP_K]], batch: usize) {
+        if !self.has(l) {
+            return;
+        }
+        let bias_next = &self.router_bias[l + 1][..E];
+        let mut sc = vec![0f32; batch * E];
+        let mut z = vec![0f32; batch * E];
+        let mut ahead = vec![[0usize; TOP_K]; batch];
+        let mut a = 0;
+        while a < n {
+            let m = batch.min(n - a);
+            for i in 0..m {
+                let (lg, s) = (&logits[(a + i) * E..(a + i + 1) * E], &mut sc[i * E..(i + 1) * E]);
+                let (mut idx, mut val) = ([0usize; TOP_K], [f32::NEG_INFINITY; TOP_K]);
+                for e in 0..E {
+                    s[e] = 1.0 / (1.0 + (-lg[e]).exp());
+                    let v = s[e] + bias_next[e];
+                    if v > val[TOP_K - 1] {
+                        let mut j = TOP_K - 1;
+                        while j > 0 && v > val[j - 1] {
+                            val[j] = val[j - 1];
+                            idx[j] = idx[j - 1];
+                            j -= 1;
+                        }
+                        val[j] = v;
+                        idx[j] = e;
+                    }
+                }
+                ahead[i] = idx;
+            }
+            let seq = self.predict(l, m, &sc, E, &ahead[..m], &picks[a..a + m], &mut z);
+            self.learn(l, seq, &labels[a..a + m]);
+            a += m;
         }
     }
 }
