@@ -362,6 +362,35 @@ phases 0–2 show together: the L3 can be steered a few points at a time, but de
 — capacity caps how many experts can be complete, and a CCD's shared ~65 GB/s delivery caps how fast even L3 bytes
 arrive. The term that still moves time is which ~13 experts are prefetched: phase 3.
 
+## Phase 3 (measured 2026-10-21, build pred2 against cap 13)
+**Offline** (bringup/expert-cache/phase3: the causal simulation over the decode dump, 4,986 steps at 18k; settled
+recall@13 of the next layer's picks): route-ahead alone .585; + bias .608; + co-routing from the picks here .621; + a
+rank-64 map of the token's input .628; a full-rank map .632. Online beats a frozen fit; it settles in ~3k positions.
+
+**What ships** (`models/glm-5.3-flash/src/predict.rs`): calibration, bias and co-routing. Updating the rank-64 map
+dense (~14M parameters a step, ~330 MB of memory traffic) took 195 ms a step on one core against a ~25 ms step, for
++.007 recall. Only the co-routing rows the step picked have a gradient, so only they are updated. `bench-pred` replays
+the dump through the Rust predictor: recall@8/13/16 .4226 / .6126 / .6917 against the simulation's .4231 / .6135 /
+.6927. It costs, a layer pair, 6.0 µs to predict, 4.8 µs to rank (Π(1 + eᶻ), the same order as Σ softplus without a
+logarithm) and 34 µs to learn.
+
+**Placement:** the prediction runs on the main thread in the slot, from the scores `ffn::picks` already made. Learning
+runs on core 120, the loader's SMT sibling, one job a layer through a channel. Learning on the main thread cost
+50 µs a layer: the verify step went 56.3 → 59.7 ms (build pred1).
+
+**In the node** (the deploy workload, the same 9,471 decode layer runs as the cap-13 runs):
+
+| | cap 13 (a68fe017 / 2fce7061) | pred2 (b210fa5f) |
+|---|---|---|
+| Host experts a layer, complete / partial / missed | 7.57 / 2.13 / 6.91, 7.45 / 2.25 / 6.91 | 7.68 / 2.48 / 6.45 |
+| Experts lap | 25.87 / 26.2 ms a verify step | 26.13 |
+| `slot` lap | 1.31 / 1.35 ms a verify step | 1.67 |
+| Decode, 96 tokens | 64.3–65.3 ms a step (four runs) | 63.5, 63.6 |
+| Decode, 402 tokens | 63.4–63.9 ms a step | 62.4 (26.1 ms an emitted token, was 26.5–26.7) |
+
+Long SCORE bit-identical. Missed experts fall by 7 %. The experts lap does not move measurably, and the step gains
+~1 ms. Kept.
+
 ## 12. Risks, unknowns, and decisions
 
 **Unknowns (each has a phase that answers it):**

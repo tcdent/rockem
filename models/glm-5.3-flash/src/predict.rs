@@ -18,8 +18,13 @@
 //! picked rows of `co` have a gradient, and only they are updated (Adam's moments with the pair's step count); the
 //! rest is the simulation's math in f32: the loss summed over a step's tokens divided by tokens × `PAIRS_SCALE`,
 //! torch's Adam (β 0.9 / 0.999, ε 1e-8). The prediction changes only which bytes the prefetch warms, never the output.
+//!
+//! The decode slot predicts on the main thread from the router's scores `ffn::picks` already made (no exponentials
+//! there), and a housekeeping core learns: on the main thread the learning cost 50 µs a layer, the verify step
+//! 56.3 → 59.7 ms (2026-10-21). Each pair is behind its own lock, and a learning job names the prediction it is for.
 
 use crate::{E, TOP_K};
+use std::sync::Mutex;
 
 /// Adam's learning rates: the co-routing table; the calibration (ca, cc) and the bias.
 pub const LR_CO: f32 = 3e-3;
@@ -47,6 +52,7 @@ struct Pair {
     m_co: Vec<f32>,
     v_co: Vec<f32>,
     t: i32,
+    seq: u64,
     n: usize,
     d: Vec<f32>, // [n][E] the route-ahead margin
     z: Vec<f32>, // [n][E] the logits
@@ -55,7 +61,7 @@ struct Pair {
 
 /// Every MoE layer pair's predictor and the layers' router biases.
 pub struct Predictor {
-    pairs: Vec<Option<Box<Pair>>>, // indexed by layer l (the pair l → l + 1)
+    pairs: Vec<Option<Mutex<Box<Pair>>>>, // indexed by layer l (the pair l → l + 1)
     router_bias: Vec<Vec<f32>>,    // indexed by layer: the router's selection bias (empty where dense)
 }
 
@@ -67,7 +73,7 @@ impl Predictor {
         let pairs = (0..layers)
             .map(|l| {
                 (l + 1 < layers && !router_bias[l].is_empty() && !router_bias[l + 1].is_empty()).then(|| {
-                    Box::new(Pair {
+                    Mutex::new(Box::new(Pair {
                         cal: [3.0, 0.0],
                         bias: [0.0; E],
                         co: vec![0.0; E * E],
@@ -78,11 +84,12 @@ impl Predictor {
                         m_co: vec![0.0; E * E],
                         v_co: vec![0.0; E * E],
                         t: 0,
+                        seq: 0,
                         n: 0,
                         d: Vec::new(),
                         z: Vec::new(),
                         picks: Vec::new(),
-                    })
+                    }))
                 })
             })
             .collect();
@@ -94,36 +101,28 @@ impl Predictor {
         self.pairs.get(l).is_some_and(|p| p.is_some())
     }
 
-    /// Layer l + 1's logits for the step's `n` tokens into `z` ([n][E]), from layer l + 1's route-ahead logits (`ahead`
-    /// [n][E], before the sigmoid) and each token's picks at l; kept for `learn`.
-    pub fn predict(&mut self, l: usize, n: usize, ahead: &[f32], picks: &[[usize; TOP_K]], z: &mut [f32]) {
-        let bias_next = &self.router_bias[l + 1];
-        let p = self.pairs[l].as_mut().expect("no predictor for this layer");
+    /// Layer l + 1's logits for the step's `n` tokens into `z` ([n][E]), from layer l + 1's route-ahead scores (token
+    /// i's E sigmoids at `scores[i * stride..]`), the router's picks over them (`ahead`, best first: the 8th is the
+    /// margin's threshold) and each token's picks at l; kept for `learn`. Returns the prediction's number for `learn`.
+    pub fn predict(&self, l: usize, n: usize, scores: &[f32], stride: usize, ahead: &[[usize; TOP_K]], picks: &[[usize; TOP_K]], z: &mut [f32]) -> u64 {
+        let bias_next = &self.router_bias[l + 1][..E];
+        let mut g = self.pairs[l].as_ref().expect("no predictor for this layer").lock().unwrap();
+        let p = &mut **g;
+        p.seq += 1;
         p.n = n;
         p.d.resize(n * E, 0.0);
         p.z.resize(n * E, 0.0);
         p.picks.clear();
         p.picks.extend_from_slice(&picks[..n]);
+        let (ca, cc) = (p.cal[0], p.cal[1]);
         for i in 0..n {
-            let (lg, d) = (&ahead[i * E..(i + 1) * E], &mut p.d[i * E..(i + 1) * E]);
+            let sc = &scores[i * stride..i * stride + E];
+            let k = ahead[i][TOP_K - 1];
+            let thr = sc[k] + bias_next[k];
+            let (d, zt, bias) = (&mut p.d[i * E..(i + 1) * E], &mut p.z[i * E..(i + 1) * E], &p.bias);
             for e in 0..E {
-                d[e] = 1.0 / (1.0 + (-lg[e]).exp()) + bias_next[e];
-            }
-            let mut top = [f32::NEG_INFINITY; TOP_K];
-            for &g in d.iter() {
-                if g > top[TOP_K - 1] {
-                    let mut j = TOP_K - 1;
-                    while j > 0 && g > top[j - 1] {
-                        top[j] = top[j - 1];
-                        j -= 1;
-                    }
-                    top[j] = g;
-                }
-            }
-            let zt = &mut p.z[i * E..(i + 1) * E];
-            for e in 0..E {
-                d[e] = (d[e] - top[TOP_K - 1]) * 10.0;
-                zt[e] = p.cal[0] * d[e] + p.cal[1] + p.bias[e];
+                d[e] = (sc[e] + bias_next[e] - thr) * 10.0;
+                zt[e] = ca * d[e] + cc + bias[e];
             }
             for &q in &picks[i] {
                 let row = &p.co[q * E..(q + 1) * E];
@@ -133,11 +132,18 @@ impl Predictor {
             }
         }
         z[..n * E].copy_from_slice(&p.z[..n * E]);
+        p.seq
     }
 
-    /// Pair l's update from its last prediction and the next layer's picks (`labels`, a token's 8 at l + 1).
-    pub fn learn(&mut self, l: usize, labels: &[[usize; TOP_K]]) {
-        let Some(p) = self.pairs.get_mut(l).and_then(|p| p.as_mut()) else { return };
+    /// Pair l's update from its prediction number `seq` and the next layer's picks (`labels`, a token's 8 at l + 1);
+    /// nothing when a later prediction has replaced it.
+    pub fn learn(&self, l: usize, seq: u64, labels: &[[usize; TOP_K]]) {
+        let Some(m) = self.pairs.get(l).and_then(|p| p.as_ref()) else { return };
+        let mut g = m.lock().unwrap();
+        let p = &mut **g;
+        if p.seq != seq {
+            return;
+        }
         let n = std::mem::take(&mut p.n);
         if n == 0 || labels.len() < n {
             return;
@@ -203,18 +209,54 @@ impl Predictor {
     }
 }
 
-/// The step's experts ranked from its tokens' logits ([n][E]): by Σ softplus(z) (the union's −log Π(1 − p)), best
-/// first, `skip`ped experts left out, at most `cap`.
+/// The step's experts ranked from its tokens' logits ([n][E]) by Σ softplus(z) (the union's −log Π(1 − p)), best
+/// first, `skip`ped experts left out, at most `cap`: as Π(1 + eᶻ), the same order without a logarithm (z clamped to
+/// 20 so four tokens' product stays finite), eᶻ to ~1e-4 relative.
 pub fn rank(z: &[f32], n: usize, skip: &dyn Fn(usize) -> bool, cap: usize, out: &mut Vec<usize>) {
-    let mut score = [0f32; E];
+    let mut score = [1f32; E];
     for i in 0..n {
+        let zt = &z[i * E..(i + 1) * E];
         for e in 0..E {
-            let v = z[i * E + e];
-            score[e] += if v > 20.0 { v } else { (1.0 + v.exp()).ln() };
+            score[e] *= 1.0 + exp(zt[e].min(20.0));
         }
     }
+    // one pass keeping the best `cap` (an expert goes after every kept one at least as large: the lower id first
+    // between equals)
     out.clear();
-    let mut ix: Vec<usize> = (0..E).filter(|&e| !skip(e)).collect();
-    ix.sort_by(|&a, &b| score[b].partial_cmp(&score[a]).unwrap());
-    out.extend_from_slice(&ix[..cap.min(ix.len())]);
+    let k = cap.min(E);
+    if k == 0 {
+        return;
+    }
+    let mut val: [f32; E] = [0.0; E];
+    for e in 0..E {
+        let v = score[e];
+        if (out.len() == k && !(v > val[k - 1])) || skip(e) {
+            continue;
+        }
+        let mut j = out.len().min(k - 1);
+        if out.len() < k {
+            out.push(e);
+        }
+        while j > 0 && v > val[j - 1] {
+            val[j] = val[j - 1];
+            out[j] = out[j - 1];
+            j -= 1;
+        }
+        val[j] = v;
+        out[j] = e;
+    }
+}
+
+/// eˣ for x in [−87, 20]: 2^(x log2 e) as an exponent and a degree-5 polynomial over [0, 1) (~1e-4 relative; a branchless
+/// loop the compiler vectorizes).
+#[inline(always)]
+fn exp(x: f32) -> f32 {
+    // floor without a call (the crates build for baseline x86-64, where `floor` is libm's): truncate, then one down
+    // where that rounded up
+    let t = x.max(-87.0) * std::f32::consts::LOG2_E;
+    let i = t as i32;
+    let i = i - (t < i as f32) as i32;
+    let r = t - i as f32;
+    let p = 1.0 + r * (0.693_147_2 + r * (0.240_226_5 + r * (0.055_504_11 + r * (0.009_618_129 + r * 0.001_333_355_8))));
+    f32::from_bits(((i + 127) << 23) as u32) * p
 }

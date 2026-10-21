@@ -131,6 +131,34 @@ struct Shared {
 extern "C" {
     fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
 }
+/// The prefetch predictor's learner: a thread on `LEARN_CORE` that takes each pair's update (the pair, its prediction's
+/// number, the tokens, the next layer's picks) off the decode step; `seq` the last prediction's number a layer.
+pub struct Learner {
+    pub p: std::sync::Arc<predict::Predictor>,
+    pub tx: std::sync::mpsc::SyncSender<(usize, u64, usize, [[usize; TOP_K]; SPEC_TOKENS])>,
+    pub seq: Vec<u64>,
+}
+/// The learner's core: the SMT sibling of the expert loader's core 24, a housekeeping core on the main thread's socket
+/// (the loader is paced; `dev.cmdline` leaves 0/24/48/72 and their siblings to the kernel).
+const LEARN_CORE: usize = 120;
+impl Learner {
+    pub fn new(router_bias: Vec<Vec<f32>>) -> Self {
+        let layers = router_bias.len();
+        let p = std::sync::Arc::new(predict::Predictor::new(router_bias));
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize, [[usize; TOP_K]; SPEC_TOKENS])>(2 * NUM_HIDDEN_LAYERS);
+        let q = p.clone();
+        std::thread::Builder::new()
+            .name("learn".into())
+            .spawn(move || {
+                pin(LEARN_CORE);
+                while let Ok((l, seq, n, labels)) = rx.recv() {
+                    q.learn(l, seq, &labels[..n]);
+                }
+            })
+            .unwrap();
+        Learner { p, tx, seq: vec![0; layers] }
+    }
+}
 pub fn pin(core: usize) {
     let mut mask = [0u64; 16];
     mask[core / 64] |= 1 << (core % 64);
@@ -1324,10 +1352,9 @@ pub struct CpuModel<'p, R: Routed> {
     b_picks: Vec<[usize; TOP_K]>,
     b_wts: Vec<[f32; TOP_K]>,
     b_routed: Vec<[usize; TOP_K]>,
-    /// The prefetch's predictor (made at the first decode step, from the weights' router biases), a step's
-    /// route-ahead logits (`[SPEC_TOKENS][E]`) and its logits for the next layer's experts.
-    pred: Option<predict::Predictor>,
-    b_ahead: Vec<f32>,
+    /// The prefetch's predictor and its learner (made at the first decode step, from the weights' router biases), and
+    /// a step's logits for the next layer's experts (`[SPEC_TOKENS][E]`).
+    pred: Option<Learner>,
     b_pz: Vec<f32>,
     d_x: Vec<f32>,
     d_xn: Vec<f32>,
@@ -1409,7 +1436,6 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             b_wts: vec![[0.0; TOP_K]; STEP],
             b_routed: vec![[E; TOP_K]; STEP],
             pred: None,
-            b_ahead: vec![0.0; SPEC_TOKENS * E],
             b_pz: vec![0.0; SPEC_TOKENS * E],
             d_x: vec![0.0; H],
             d_xn: vec![0.0; H],
@@ -2147,17 +2173,14 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     // corrected by a bias and the picks here, learned online), at most PREFETCH_CAP. A CCD's 32 MiB L3 kept
                     // less of a completed prefetch the more the layer prefetched (86 % of its lines at <= 10 experts, 56 % at
                     // 23+): past what the L3 retains a prefetched expert costs a DRAM read and evicts an earlier one (2026-10-20)
-                    let pr = s.pred.get_or_insert_with(|| predict::Predictor::new(w.layers.iter().map(|lw| match &lw.ffn {
+                    let pr = s.pred.get_or_insert_with(|| Learner::new(w.layers.iter().map(|lw| match &lw.ffn {
                         Ffn::Moe(m) => m.bias.to_vec(),
                         Ffn::Dense(_) => Vec::new(),
                     }).collect()));
                     for i in 0..n {
-                        s.b_ahead[i * E..(i + 1) * E].copy_from_slice(&s.b_score[i * ROUTE_ROWS + E..(i + 1) * ROUTE_ROWS]);
-                    }
-                    pr.predict(l, n, &s.b_ahead, &s.b_routed[t0..t0 + n], &mut s.b_pz);
-                    for i in 0..n {
                         pre_next[i] = ffn::picks(m2, &mut s.b_score[i * ROUTE_ROWS + E..(i + 1) * ROUTE_ROWS]);
                     }
+                    pr.seq[l] = pr.p.predict(l, n, &s.b_score[E..], ROUTE_ROWS, &pre_next, &s.b_routed[t0..t0 + n], &mut s.b_pz);
                     let mut ranked = Vec::with_capacity(PREFETCH_CAP);
                     predict::rank(&s.b_pz, n, &|e| pl.resident(l + 1, e), PREFETCH_CAP, &mut ranked);
                     let z = draft_zone("slot.pick", z);
@@ -2165,11 +2188,13 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     draft_zone("slot.post", z);
                     lap(&mut p.slot, "slot");
                 }
-                // the pair before learns from this layer's picks, under the prefetch it no longer feeds
-                if let (true, Some(pr)) = (n <= SPEC_TOKENS, s.pred.as_mut()) {
-                    let z = prow::Timestamp::now();
-                    pr.learn(l.wrapping_sub(1), &s.b_routed[t0..t0 + n]);
-                    draft_zone("slot.learn", z);
+                // the pair before learns from this layer's picks, on the learner's core
+                if let (true, Some(pr)) = (n <= SPEC_TOKENS, s.pred.as_ref()) {
+                    if l > 0 && pr.p.has(l - 1) {
+                        let mut labels = [[E; TOP_K]; SPEC_TOKENS];
+                        labels[..n].copy_from_slice(&s.b_routed[t0..t0 + n]);
+                        let _ = pr.tx.send((l - 1, pr.seq[l - 1], n, labels));
+                    }
                 }
             }
             if tr.wants_edges() && n == 1 {

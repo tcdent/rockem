@@ -41,12 +41,15 @@ fn main() {
     assert_eq!(lg.len(), L * t_all * E);
     // the router bias by layer, layers 3..=43 (the dump's), empty elsewhere
     let rb: Vec<Vec<f32>> = (0..44).map(|l| if l >= 3 { bias[l * E..(l + 1) * E].to_vec() } else { Vec::new() }).collect();
-    let mut p = Predictor::new(rb);
+    let p = Predictor::new(rb.clone());
+    // the router's scores and picks over the route-ahead logits, as `ffn::picks` makes them in the node
+    let mut sc = vec![0f32; 64 * E];
+    let mut ahead_picks = vec![[0usize; TOP_K]; 64];
     const KS: [usize; 3] = [8, 13, 16];
     let (mut hits, mut tot) = ([0f64; 3], 0f64);
     let mut z = vec![0f32; 64 * E];
     let mut out = Vec::new();
-    let (mut t_pred, mut t_learn) = (0f64, 0f64);
+    let (mut t_pred, mut t_learn, mut t_rank) = (0f64, 0f64, 0f64);
     let mut t0 = 0usize;
     for s in 0..steps {
         let m = ns[s] as usize;
@@ -55,18 +58,29 @@ fn main() {
             let l = 3 + j;
             let ahead = &lg[(j * t_all + t0) * E..(j * t_all + t0 + m) * E];
             let (here, next) = (picks(j), picks(j + 1));
+            for i in 0..m {
+                let (lgi, sci) = (&ahead[i * E..(i + 1) * E], &mut sc[i * E..(i + 1) * E]);
+                for e in 0..E {
+                    sci[e] = 1.0 / (1.0 + (-lgi[e]).exp());
+                }
+                let mut ix: Vec<usize> = (0..E).collect();
+                ix.sort_by(|&a, &b| (sci[b] + rb[l + 1][b]).partial_cmp(&(sci[a] + rb[l + 1][a])).unwrap().then(a.cmp(&b)));
+                ahead_picks[i].copy_from_slice(&ix[..TOP_K]);
+            }
             let c = std::time::Instant::now();
-            p.predict(l, m, ahead, &here, &mut z);
+            let seq = p.predict(l, m, &sc, E, &ahead_picks, &here, &mut z);
             t_pred += c.elapsed().as_secs_f64();
             let mut y = [false; E];
             next.iter().flatten().for_each(|&e| y[e] = true);
             tot += y.iter().filter(|&&v| v).count() as f64;
             for (k, &cap) in KS.iter().enumerate() {
+                let c = std::time::Instant::now();
                 rank(&z, m, &|_| false, cap, &mut out);
+                t_rank += c.elapsed().as_secs_f64();
                 hits[k] += out.iter().filter(|&&e| y[e]).count() as f64;
             }
             let c = std::time::Instant::now();
-            p.learn(l, &next);
+            p.learn(l, seq, &next);
             t_learn += c.elapsed().as_secs_f64();
         }
         t0 += m;
@@ -74,5 +88,5 @@ fn main() {
             println!("step {s}: recall@8/13/16 {:.4} {:.4} {:.4}", hits[0] / tot, hits[1] / tot, hits[2] / tot);
         }
     }
-    println!("steps {steps}: recall@8/13/16 {:.4} {:.4} {:.4}; a step (40 pairs, one thread) predict {:.2} ms, learn {:.2} ms", hits[0] / tot, hits[1] / tot, hits[2] / tot, t_pred / steps as f64 * 1e3, t_learn / steps as f64 * 1e3);
+    println!("steps {steps}: recall@8/13/16 {:.4} {:.4} {:.4}; a step (40 pairs, one thread) predict {:.1} µs a pair, rank {:.1}, learn {:.1}", hits[0] / tot, hits[1] / tot, hits[2] / tot, t_pred / steps as f64 / 40.0 * 1e6, t_rank / steps as f64 / 120.0 * 1e6, t_learn / steps as f64 / 40.0 * 1e6);
 }
