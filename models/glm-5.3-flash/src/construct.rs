@@ -131,58 +131,6 @@ struct Shared {
 extern "C" {
     fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
 }
-/// The prefetch predictor's learner: a thread on `LEARN_CORE` that takes each pair's update (the pair, its prediction's
-/// number, the tokens, the next layer's picks) off the decode step; `seq` the last prediction's number a layer.
-pub struct Learner {
-    pub p: std::sync::Arc<predict::Predictor>,
-    pub tx: std::sync::mpsc::SyncSender<Lesson>,
-    pub seq: Vec<u64>,
-    /// The chunk lessons' buffers back from the learner, reused (a fresh 590 KB buffer a layer-chunk is a map and its
-    /// page faults on the main thread)
-    pub spare: std::sync::mpsc::Receiver<(Vec<[usize; TOP_K]>, Vec<f32>)>,
-}
-/// A learning job: a decode step's update of pair l (its prediction's number, the tokens, the next layer's picks), or a
-/// prefill chunk's layer (`Chunk`: the chunk, the layer, its picks and the next layer's route-ahead logits `[n][E]`,
-/// empty where the next layer is dense) — the learner trains pair l − 1 when layer l's picks arrive.
-pub enum Lesson {
-    Step(usize, u64, usize, [[usize; TOP_K]; SPEC_TOKENS]),
-    Chunk(usize, usize, Vec<[usize; TOP_K]>, Vec<f32>),
-}
-/// The learner's core: the SMT sibling of the expert loader's core 24, a housekeeping core on the main thread's socket
-/// (the loader is paced; `dev.cmdline` leaves 0/24/48/72 and their siblings to the kernel).
-const LEARN_CORE: usize = 120;
-impl Learner {
-    pub fn new(router_bias: Vec<Vec<f32>>) -> Self {
-        let layers = router_bias.len();
-        let p = std::sync::Arc::new(predict::Predictor::new(router_bias));
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Lesson>(4 * NUM_HIDDEN_LAYERS);
-        let (back, spare) = std::sync::mpsc::channel();
-        let q = p.clone();
-        std::thread::Builder::new()
-            .name("learn".into())
-            .spawn(move || {
-                pin(LEARN_CORE);
-                // each chunk's last layer: (layer, picks, the next layer's logits)
-                let mut prev: [Option<(usize, Vec<[usize; TOP_K]>, Vec<f32>)>; crate::CHUNKS] = std::array::from_fn(|_| None);
-                while let Ok(job) = rx.recv() {
-                    match job {
-                        Lesson::Step(l, seq, n, labels) => q.learn(l, seq, &labels[..n]),
-                        Lesson::Chunk(ch, l, picks, logits) => {
-                            if let Some((pl, pp, plg)) = prev[ch].take() {
-                                if pl + 1 == l && pp.len() == picks.len() && !plg.is_empty() {
-                                    q.train(pl, pp.len(), &plg, &pp, &picks, SPEC_TOKENS);
-                                }
-                                let _ = back.send((pp, plg));
-                            }
-                            prev[ch] = Some((l, picks, logits));
-                        }
-                    }
-                }
-            })
-            .unwrap();
-        Learner { p, tx, seq: vec![0; layers], spare }
-    }
-}
 pub fn pin(core: usize) {
     let mut mask = [0u64; 16];
     mask[core / 64] |= 1 << (core % 64);
@@ -1265,9 +1213,11 @@ pub trait Placed {
     fn ffn(&mut self, l: usize, n: usize);
     /// A MoE layer's FFN input for every token (`[n][H]`) and the FFN router's logits (`[n][E]`).
     fn ffn_input(&mut self, l: usize, n: usize, xq: &mut [i8], xs: &mut [f32], xg: &mut [i32], picks: &mut [[usize; TOP_K]], wts: &mut [[f32; TOP_K]], pool: &dyn Pool);
-    /// The next MoE layer's router logits `[n][E]` (the second half of the FFN router's rows) once they are in (they
-    /// follow the act phase's word, off its path): the prefetch's predictor (005).
-    fn ffn_ahead(&mut self, l: usize, n: usize, logits: &mut [f32], pool: &dyn Pool);
+    /// The prefetch predictor's step on the cards (`plan::gfx11::pred_step`), posted once a MoE layer's picks are in:
+    /// pair l − 1 learns from them, pair l predicts the next layer; a decode step's prediction is a plan (`plan`).
+    fn plan_step(&mut self, l: usize, n: usize, picks: &[[usize; TOP_K]]);
+    /// A decode step's plan for the layer after l, best first (`plan::PLAN` experts), once the card's word says it is in.
+    fn plan(&mut self, l: usize, out: &mut [usize]);
     /// Bring-up: a MoE layer's FFN input (`x: [n][H]`) and its router's logits (`[n][ROUTE_ROWS]`) as the card
     /// made them, for forced picks and the traces' edges; serving reads `ffn_input`'s quantized form instead.
     fn ffn_logits(&mut self, l: usize, n: usize, x: &mut [f32], logits: &mut [f32]);
@@ -1326,7 +1276,8 @@ pub struct Profile {
     /// Expert items (gate/up and down) that ran on their preferred CCD, and all of them.
     pub local_items: usize,
     pub items: usize,
-    /// How many of a layer's picks the router already names on the attention block's input (the prefetch's predictor).
+    /// How many of a decode layer's picks the plan for it named (the prefetch predictor's `plan::PLAN` experts, the
+    /// resident ones among them).
     pub pre_agree: usize,
     /// Prefetch slices done before the router's run overtook the prefetch, and the slices asked for.
     pub prefetched: usize,
@@ -1376,10 +1327,6 @@ pub struct CpuModel<'p, R: Routed> {
     b_picks: Vec<[usize; TOP_K]>,
     b_wts: Vec<[f32; TOP_K]>,
     b_routed: Vec<[usize; TOP_K]>,
-    /// The prefetch's predictor and its learner (made at the first decode step, from the weights' router biases), and
-    /// a step's logits for the next layer's experts (`[SPEC_TOKENS][E]`).
-    pred: Option<Learner>,
-    b_pz: Vec<f32>,
     d_x: Vec<f32>,
     d_xn: Vec<f32>,
     d_y: Vec<f32>,
@@ -1459,8 +1406,6 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             b_picks: vec![[0; TOP_K]; STEP],
             b_wts: vec![[0.0; TOP_K]; STEP],
             b_routed: vec![[E; TOP_K]; STEP],
-            pred: None,
-            b_pz: vec![0.0; SPEC_TOKENS * E],
             d_x: vec![0.0; H],
             d_xn: vec![0.0; H],
             d_y: vec![0.0; H],
@@ -1907,7 +1852,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 }
                 Ffn::Moe(m) => {
                     let picks = ffn::moe_routed(l, m, &s.xn, &mut fs, s.pool, &mut s.routed, forced.map(|f| &f[l - FIRST_K_DENSE_REPLACE]), tr, &mut s.y);
-                    account(p, &mut s.last_picks, &mut s.freq, s.pool, l, picks, [E; TOP_K]);
+                    account(p, &mut s.last_picks, &mut s.freq, s.pool, l, picks, &[]);
                     let e = s.routed.elapsed();
                     p.experts += e;
                     lap(&mut p.route, "route");
@@ -1989,8 +1934,8 @@ impl<'p, R: Routed> CpuModel<'p, R> {
         };
         let p = &mut s.profile;
         p.tokens += n;
-        let mut pre_next = [[E; TOP_K]; SPEC_TOKENS];
-        let mut pre_picks = [[E; TOP_K]; SPEC_TOKENS];
+        let mut pre_next = [E; plan::PLAN];
+        let mut pre_picks = [E; plan::PLAN];
         // the step as chunks in flight (037), a layer of a chunk in three phases: its card half (the attention and
         // the FFN's card launches, posted), its dispatch (its FFN input waited for, its resident experts launched)
         // and its run (the FFN's output half posted, the host's experts, the join, the sum and the handoff). The
@@ -2038,9 +1983,8 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     pl.attention(l, n);
                 }
                 lap(&mut p.hc, "hc");
-                // the prefetch's predictor for this layer: the layer before named its picks over its own FFN
-                // input (the next layer's router rows ride in that router launch); `pre_picks` scores it
-                pre_picks = std::mem::replace(&mut pre_next, [[E; TOP_K]; SPEC_TOKENS]);
+                // the plan for this layer, made by the layer before (the prefetch predictor on the cards); `pre_picks` scores it
+                pre_picks = std::mem::replace(&mut pre_next, [E; plan::PLAN]);
                 if let (Attn::Mla(a), LayerState::Mla { cache, pools }) = (&lw.attn, &mut s.layers[l]) {
                     // every token's projections off the card into its cache row, its indexer query and head
                     // weights kept; the pools completed along the way gain their keys
@@ -2117,28 +2061,9 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     p.picks += n * TOP_K;
                     jobs_of[ch] = jobs;
                     lap(&mut p.route, "route");
-                    // a chunk past SPEC_TOKENS: its picks and the next layer's route-ahead logits to the prefetch predictor's
-                    // learner (phase 4), every position a label
-                    if n > SPEC_TOKENS {
-                        let pr = s.pred.get_or_insert_with(|| Learner::new(w.layers.iter().map(|lw| match &lw.ffn {
-                            Ffn::Moe(m) => m.bias.to_vec(),
-                            Ffn::Dense(_) => Vec::new(),
-                        }).collect()));
-                        let (mut picks, mut logits) = pr.spare.try_recv().unwrap_or_default();
-                        picks.clear();
-                        picks.extend_from_slice(&s.b_routed[t0..t0 + n]);
-                        if let Some(Ffn::Moe(_)) = w.layers.get(l + 1).map(|lw| &lw.ffn) {
-                            // a reused buffer keeps its length: no 590 KB of zeros a layer-chunk
-                            logits.resize(n * E, 0.0);
-                            prow::zone!("track-zones", "ahead.read");
-                            pl.ffn_ahead(l, n, &mut logits, s.pool);
-                        } else {
-                            logits.clear();
-                        }
-                        prow::zone!("track-zones", "ahead.send");
-                        let _ = pr.tx.send(Lesson::Chunk(ch, l, picks, logits));
-                        lap(&mut p.slot, "ahead");
-                    }
+                    // the prefetch predictor on the FFN card, in its idle time: the pair before learns from these picks, this
+                    // layer's predicts the next (every prompt position a label; a decode step's prediction is the plan)
+                    pl.plan_step(l, n, &s.b_routed[t0..t0 + n]);
                     continue;
                 }
                 // the run: the FFN's output half posted behind the residents' launches (it waits for the host's word)
@@ -2198,49 +2123,31 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 {
                     prow::zone!("track-zones", "done.account");
                     for i in 0..n {
-                        account(p, &mut s.last_picks, &mut s.freq, s.pool, l, s.b_routed[t0 + i], if n <= SPEC_TOKENS { pre_picks[i] } else { [E; TOP_K] });
+                        account(p, &mut s.last_picks, &mut s.freq, s.pool, l, s.b_routed[t0 + i], if n <= SPEC_TOKENS { &pre_picks[..] } else { &[] });
                     }
                 }
                 lap(&mut p.route, "done");
                 // the next MoE layer's picks, predicted by its router over this layer's FFN input (the second
                 // half of each token's scores), prefetched now that this layer's run is done (a run abandons
                 // the prefetches in flight); a step of many tokens names most experts and runs none
-                if let (true, Some(Ffn::Moe(m2))) = (n <= SPEC_TOKENS, w.layers.get(l + 1).map(|lw| &lw.ffn)) {
-                    // the router's logits, the next layer's rows in them the L3 prefetch's predictor (without them the prefetch
-                    // pulled the wrong experts and a verify step's items ran at DRAM speed, 12 → 7 GMAC/s a core, 2026-10-19);
-                    // `hc_pre` computes those rows after the act phase's word, so this waits for them only here
-                    // inside `slot`: the scores off the card, the picks and their ranking, the prefetch's post
+                if let (true, Some(Ffn::Moe(_))) = (n <= SPEC_TOKENS, w.layers.get(l + 1).map(|lw| &lw.ffn)) {
+                    // inside `slot`: the plan off the card (the learned predictor, `plan.rs`), its experts not resident, the
+                    // prefetch's post. At most PREFETCH_CAP: a CCD's 32 MiB L3 kept less of a completed prefetch the more the
+                    // layer prefetched (86 % of its lines at <= 10 experts, 56 % at 23+): past what the L3 retains a
+                    // prefetched expert costs a DRAM read and evicts an earlier one (2026-10-20)
                     let z = prow::Timestamp::now();
-                    pl.ffn_ahead(l, n, &mut s.b_score, s.pool);
+                    pl.plan(l, &mut pre_next);
                     #[cfg(feature = "dump-pred")]
-                    dump_pred(l, n, &s.b_routed[t0..t0 + n], &s.b_xq[t0 * H..(t0 + n) * H], &s.b_xs[t0 * HG..(t0 + n) * HG], &s.b_score);
-                    let z = draft_zone("slot.ahead", z);
-                    // the step's experts not resident, ranked by the learned predictor (`predict`: the route-ahead logits
-                    // corrected by a bias and the picks here, learned online), at most PREFETCH_CAP. A CCD's 32 MiB L3 kept
-                    // less of a completed prefetch the more the layer prefetched (86 % of its lines at <= 10 experts, 56 % at
-                    // 23+): past what the L3 retains a prefetched expert costs a DRAM read and evicts an earlier one (2026-10-20)
-                    let pr = s.pred.get_or_insert_with(|| Learner::new(w.layers.iter().map(|lw| match &lw.ffn {
-                        Ffn::Moe(m) => m.bias.to_vec(),
-                        Ffn::Dense(_) => Vec::new(),
-                    }).collect()));
-                    for i in 0..n {
-                        pre_next[i] = ffn::picks(m2, &mut s.b_score[i * E..(i + 1) * E]);
+                    {
+                        pl.ffn_logits(l, n, &mut s.b_x, &mut s.b_score);
+                        dump_pred(l, n, &s.b_routed[t0..t0 + n], &s.b_xq[t0 * H..(t0 + n) * H], &s.b_xs[t0 * HG..(t0 + n) * HG], &s.b_score);
                     }
-                    pr.seq[l] = pr.p.predict(l, n, &s.b_score, E, &pre_next, &s.b_routed[t0..t0 + n], &mut s.b_pz);
-                    let mut ranked = Vec::with_capacity(PREFETCH_CAP);
-                    predict::rank(&s.b_pz, n, &|e| pl.resident(l + 1, e), PREFETCH_CAP, &mut ranked);
+                    let z = draft_zone("slot.ahead", z);
+                    let ranked: Vec<usize> = pre_next.iter().copied().filter(|&e| !pl.resident(l + 1, e)).take(PREFETCH_CAP).collect();
                     let z = draft_zone("slot.pick", z);
                     s.routed.prefetch(l + 1, &ranked);
                     draft_zone("slot.post", z);
                     lap(&mut p.slot, "slot");
-                }
-                // the pair before learns from this layer's picks, on the learner's core
-                if let (true, Some(pr)) = (n <= SPEC_TOKENS, s.pred.as_ref()) {
-                    if l > 0 && pr.p.has(l - 1) {
-                        let mut labels = [[E; TOP_K]; SPEC_TOKENS];
-                        labels[..n].copy_from_slice(&s.b_routed[t0..t0 + n]);
-                        let _ = pr.tx.send(Lesson::Step(l - 1, pr.seq[l - 1], n, labels));
-                    }
                 }
             }
             if tr.wants_edges() && n == 1 {
@@ -2274,7 +2181,7 @@ pub enum Logits {
 
 /// A MoE layer's bookkeeping after its experts ran: the picks against the previous token's and the
 /// early router's, their frequencies, the pool's locality and the prefetch's yield.
-fn account(p: &mut Profile, last_picks: &mut [[usize; TOP_K]], freq: &mut [u32], pool: &dyn Pool, l: usize, picks: [usize; TOP_K], pre_picks: [usize; TOP_K]) {
+fn account(p: &mut Profile, last_picks: &mut [[usize; TOP_K]], freq: &mut [u32], pool: &dyn Pool, l: usize, picks: [usize; TOP_K], pre_picks: &[usize]) {
     p.reuse += picks.iter().filter(|e| last_picks[l].contains(e)).count();
     p.pre_agree += picks.iter().filter(|e| pre_picks.contains(e)).count();
     p.moe_layers += 1;
@@ -2369,7 +2276,7 @@ fn dump_pred(l: usize, n: usize, picks: &[[usize; TOP_K]], xq: &[i8], xs: &[f32]
             b.extend_from_slice(&v.to_le_bytes());
         }
         b.extend(xq[i * H..(i + 1) * H].iter().map(|&v| v as u8));
-        for &v in &score[i * E..(i + 1) * E] {
+        for &v in &score[i * ROUTE_ROWS + E..(i + 1) * ROUTE_ROWS] {
             b.extend_from_slice(&v.to_le_bytes());
         }
     }

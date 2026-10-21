@@ -177,6 +177,9 @@ struct Card {
     mla_o: crate::kfd::Kernel,
     hc_pre: crate::kfd::Kernel,
     hc_route_ahead: crate::kfd::Kernel,
+    /// The prefetch predictor's prediction (main queue) and update (side queue), `plan::gfx11`.
+    pred_step: crate::kfd::Kernel,
+    pred_learn: crate::kfd::Kernel,
     mla_sel_split: crate::kfd::Kernel,
     mla_two_merge: crate::kfd::Kernel,
     word_wait: crate::kfd::Kernel,
@@ -247,6 +250,8 @@ struct Shared {
     xh: Mem,       // [STEP][H] f32: a MoE layer's FFN input for the host
     xact: Mem,     // the FFN input's quantized activations [STEP][H] i8 | [STEP][HG] f32 | [STEP][HG] i32, then the picks [STEP][TOP_K] u32 and weights f32: `hc_pre`'s act phase, for the host (XA_*)
     scores_ffn: Mem, // [STEP][ROUTE_ROWS] f32: the FFN half's router over its input (this layer's rows, then the next layer's: the prefetch's predictor), for the host's picks
+    labels: Mem,   // [NUM_HIDDEN_LAYERS][STEP][TOP_K] u32: each MoE layer's picks, for the prefetch predictor's pairs on the cards
+    plan: Mem,     // [plan::PLAN] u32: a decode step's plan for the next layer, best first (`pred_step`)
     words: Mem,    // the handoff words, a cache line each: `word()`
 }
 /// A handoff word's byte offset in `Shared::words`: the kind, and the card for a block output.
@@ -281,7 +286,9 @@ const W_MQA: usize = 7;
 const W_HD: usize = 8;
 /// The FFN card's quantized FFN input is in the other card's receiving buffers, for its resident experts.
 const W_XQ: usize = 9;
-const W_KINDS: usize = 10;
+/// A decode step's prefetch plan is in (the FFN card's `pred_step`, for the host).
+const W_PLAN: usize = 10;
+const W_KINDS: usize = 11;
 /// The resident experts' completion line (`Kfd::fence_line`): a prefill chunk's residents are waited for after the
 /// other chunk's card half has posted and waited for its own fences (037).
 const XPT_LINE: usize = 1;
@@ -334,6 +341,10 @@ struct FfnOn {
     /// A MoE layer's post-norm weights (f32), the router's selection bias (f32) and `hc_pre`'s act table
     /// (`ACT_SLOTS` device addresses) on its FFN card.
     act: Option<(Mem, Mem, Mem)>,
+    /// The prefetch predictor's pair (this layer → the next MoE layer) on this card: its state (`plan::STATE` f32) and
+    /// its tokens' margins `[STEP][E]` f32, kept from its prediction for its update a layer later (the pair's own: the
+    /// side queue's update may lag the main queue's predictions).
+    pred: Option<(Mem, Mem)>,
 }
 
 /// An MLA layer's projections on a card: q_a and kv_a (FP8, over the input-normed
@@ -508,6 +519,8 @@ impl Cards {
                     mla_o: k.kernel("mla_o"),
                     hc_pre: k.kernel("hc_pre"),
                     hc_route_ahead: k.kernel("hc_route_ahead"),
+                    pred_step: k.kernel("pred_step"),
+                    pred_learn: k.kernel("pred_learn"),
                     mla_sel_split: k.kernel("mla_sel_split"),
                     mla_two_merge: k.kernel("mla_two_merge"),
                     word_wait: k.kernel("word_wait"),
@@ -601,6 +614,8 @@ impl Cards {
                 xh: buf(),
                 xact: k0.host_shared(XA_END, &others),
                 scores_ffn: k0.host_shared(STEP * ROUTE_ROWS * 4, &others),
+                labels: k0.host_shared(NUM_HIDDEN_LAYERS * STEP * TOP_K * 4, &others),
+                plan: k0.host_shared(glm_5_3_flash::plan::PLAN * 4, &others),
                 words: {
                     let m = k0.host_shared(CHUNKS * WORD_SET, &others);
                     unsafe { std::ptr::write_bytes(m.ptr() as *mut u8, 0, m.size) };
@@ -760,7 +775,19 @@ impl Cards {
                 })
                 .collect();
             bytes += hc.iter().flatten().map(|(f, b, sc)| f.size + b.size + sc.size).sum::<usize>();
-            ffns.push(Some(FfnOn { card, dense: is_dense, ln, hc, gu_w, gu_s, down_w, down_s, router, act }));
+            // the prefetch predictor's pair where the next layer is MoE too: its state from the next layer's router bias
+            let pred = match (&w.layers[l].ffn, w.layers.get(l + 1).map(|lw| &lw.ffn)) {
+                (Ffn::Moe(_), Some(Ffn::Moe(m2))) => {
+                    let k = &cards[card].k;
+                    let st = k.vram_visible(glm_5_3_flash::plan::STATE * 4);
+                    k.upload(&st, 0, raw(&glm_5_3_flash::plan::init(m2.bias)));
+                    let d = k.vram(STEP * glm_5_3_flash::E * 4);
+                    bytes += st.size + d.size;
+                    Some((st, d))
+                }
+                _ => None,
+            };
+            ffns.push(Some(FfnOn { card, dense: is_dense, ln, hc, gu_w, gu_s, down_w, down_s, router, act, pred }));
         }
         // the MLA layers' projections
         let mut mlas: Vec<Option<MlaOn>> = (0..NUM_HIDDEN_LAYERS).map(|_| None).collect();
@@ -1859,26 +1886,48 @@ impl Placed for Cards {
             }
         }
     }
-    fn ffn_ahead(&mut self, l: usize, n: usize, logits: &mut [f32], pool: &dyn common::pool::Pool) {
-        // the router's word follows the next layer's rows, which `hc_pre` computes after the act phase's word
-        let f = self.ffns[l].as_ref().unwrap();
-        crate::kfd::wait_word(self.word_ptr(W_X, f.card), self.half_seq[l][self.ch][1]);
-        // each token's second half, streamed (the buffer is write-combining: plain loads cost the prefill `slot` lap
-        // 0.03 ms a prompt token, 2026-10-21); a long step's over the pool in pieces of 32 tokens, a few tokens' inline
+    fn plan_step(&mut self, l: usize, n: usize, picks: &[[usize; TOP_K]]) {
+        use glm_5_3_flash::plan::{LEARN_LDS, PLAN_LDS, PLAN_PRED_WGS};
         const E: usize = glm_5_3_flash::E;
-        const PIECE: usize = 32;
-        let (src, dst) = (self.shared.scores_ffn.at(self.t0 * ROUTE_ROWS * 4), logits.as_mut_ptr() as usize);
-        let rows = move |i: usize| {
-            for t in i * PIECE..((i + 1) * PIECE).min(n) {
-                let s = unsafe { std::slice::from_raw_parts((src + (t * ROUTE_ROWS + E) * 4) as *const u8, E * 4) };
-                let d = unsafe { std::slice::from_raw_parts_mut((dst + t * E * 4) as *mut u8, E * 4) };
-                common::copy::stream_read(d, s);
+        // this layer's picks into its label slot: pair l − 1's labels, pair l's co-routing input
+        let slot = |l: usize| self.shared.labels.at((l * STEP + self.t0) * TOP_K * 4);
+        let lab = unsafe { std::slice::from_raw_parts_mut(slot(l) as *mut u32, n * TOP_K) };
+        for (i, p) in picks[..n].iter().enumerate() {
+            for k in 0..TOP_K {
+                lab[i * TOP_K + k] = p[k] as u32;
             }
-        };
-        if n > PIECE {
-            pool.run(n.div_ceil(PIECE), &rows);
-        } else {
-            rows(0);
+        }
+        let decode = n <= SPEC_TOKENS;
+        // pair l predicts the next layer, in the main queue (a decode step's plan and word for the host)
+        if let Some(f) = self.ffns[l].as_ref().filter(|f| f.pred.is_some()) {
+            let (st, d) = f.pred.as_ref().unwrap();
+            let c = &self.cards[f.card];
+            let mut a = Args::new();
+            a.ptr(st.va).ptr(self.tok(&c.scores_v, ROUTE_ROWS)).ptr(d.at(self.t0 * E * 4)).ptr(slot(l));
+            if decode {
+                a.ptr(self.shared.plan.va).ptr(self.shared.words.at(self.wd(W_PLAN, f.card)));
+            } else {
+                a.ptr(0).ptr(0);
+            }
+            a.u32(self.half_seq[l][self.ch][1]).u32(n as u32);
+            c.k.launch(&c.pred_step, if decode { 1 } else { PLAN_PRED_WGS as u32 }, g::WG, PLAN_LDS, &a);
+        }
+        // pair l − 1 learns from these picks, in its card's side queue
+        if let Some(f) = l.checked_sub(1).and_then(|lp| self.ffns[lp].as_ref()).filter(|f| f.pred.is_some()) {
+            let (st, d) = f.pred.as_ref().unwrap();
+            let c = &self.cards[f.card];
+            let mut a = Args::new();
+            a.ptr(st.va).ptr(d.at(self.t0 * E * 4)).ptr(slot(l - 1)).ptr(slot(l)).u32(n as u32);
+            c.k.launch_side(&c.pred_learn, 1, g::WG, LEARN_LDS, &a);
+        }
+    }
+    fn plan(&mut self, l: usize, out: &mut [usize]) {
+        let f = self.ffns[l].as_ref().unwrap();
+        crate::kfd::wait_word(self.word_ptr(W_PLAN, f.card), self.half_seq[l][self.ch][1]);
+        let mut p = [0u32; glm_5_3_flash::plan::PLAN];
+        read(&self.shared.plan, 0, &mut p);
+        for (o, &e) in out.iter_mut().zip(&p) {
+            *o = e as usize;
         }
     }
     fn ffn_logits(&mut self, l: usize, n: usize, x: &mut [f32], logits: &mut [f32]) {

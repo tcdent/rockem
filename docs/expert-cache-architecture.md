@@ -422,7 +422,36 @@ tokens and 26.3 at 96; prefill 1.85 ms a prompt token, 1.83 / 1.89 by band, agai
 
 **The architecture as landed:** phases 0, 1, 3 and 4 in the node; phase 2's split reverted, with the resctrl mount
 kept. Against the start (build 4da52d7, 26.9 ms an emitted token), decode is 25.7–25.9 ms an emitted token at 18k
-from the cap, the earlier post, the learned predictor and prefill's labels. Open levers: queues 086 and 087.
+from the cap, the earlier post, the learned predictor and prefill's labels, and 25.4 with the predictor on the cards
+(below). Open lever: queue 086.
+
+## The predictor on the cards (measured 2026-10-21, build card2 against pred7)
+tcdent: the learner needs no host threads or host RAM, since its inputs are already on the FFN card. It runs there in
+the cards' idle time, and the host only reads the plan. `models/glm-5.3-flash/src/plan.rs` is `predict.rs`'s model
+and update as two kernels, and `predict.rs` stays as the replay reference (`bench-pred`):
+- **`pred_step`**, in the FFN card's main queue at the layer's dispatch, behind the resident experts and ahead of
+  the FFN's output half. Pair l predicts the next layer from the route-ahead scores in VRAM and keeps each token's
+  margin. A decode step's run also ranks the union and writes the 24-expert plan and the host's word (`W_PLAN`);
+  a prefill chunk's run uses 64 workgroups.
+- **`pred_learn`**, in a second queue per card (`Kfd::launch_side`, priority 0). Pair l − 1 learns from this layer's
+  picks, which the host writes to a per-layer label slot. In the main queue (build card1), a prefill chunk's
+  learning (128 sequential batches in one workgroup) held the other chunk's card half: prefill 1.85 → 2.9 ms a
+  prompt token. The side queue runs it beside the main queue's work instead. Each pair keeps its own margins
+  buffer, so the side queue may lag.
+- **The host** writes the label slot, posts the two launches, and at the slot waits for the word, reads the plan,
+  drops the experts resident on the cards and keeps 13. Its learner thread, `ffn_ahead` and the score reads are gone.
+
+| | host predictor (pred7, 68ef7287) | cards (card2, 6d5737a8) |
+|---|---|---|
+| Host experts a layer, complete / partial / missed | 7.90 / 2.61 / 6.10 | 7.82 / 2.70 / 6.10 |
+| `slot` lap, `hc` lap (a verify step) | 1.67, 0.70 ms (pred2) | 0.93, 0.46 |
+| Verify step | 56.15 ms (pred4) | 55.07 |
+| Decode, 402 / 96 tokens | 25.9 / 26.3 ms an emitted token | 25.4 / 25.7 |
+| Prefill | 1.85 ms a prompt token, cold 18k 36.8 s | 1.84, 36.6 s |
+
+Long SCORE bit-identical. The cards' predictor misses the same number of experts, so the model is intact. The
+host's main thread gets back ~0.7 ms a verify step (`slot` below the cap-13 build's 1.31: the plan replaces the
+host's top-8 and union too). Queue 087 is closed by this.
 
 ## 12. Risks, unknowns, and decisions
 

@@ -119,6 +119,7 @@ pub mod hc;
 pub mod kda;
 pub mod layout;
 pub mod mla;
+pub mod plan;
 pub mod probe;
 #[cfg(feature = "std")]
 pub mod construct;

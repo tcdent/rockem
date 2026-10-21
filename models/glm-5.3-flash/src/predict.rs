@@ -27,11 +27,7 @@
 use crate::{E, TOP_K};
 use std::sync::Mutex;
 
-/// Adam's learning rates: the co-routing table; the calibration (ca, cc) and the bias.
-pub const LR_CO: f32 = 3e-3;
-pub const LR_B: f32 = 1e-2;
-/// The simulation's loss divided by the 40 layer pairs it trained together; kept so its learning rates carry over.
-const PAIRS_SCALE: f32 = 40.0;
+use crate::plan::{LR_B, LR_CO, PAIRS_SCALE};
 
 /// torch.optim.Adam's step on one parameter: p −= lr / (1 − β1ᵗ) · m / (√v / √(1 − β2ᵗ) + ε).
 #[inline(always)]

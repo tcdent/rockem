@@ -1,6 +1,6 @@
 # 087 — The prefetch predictor's main-thread time
 
-**Status:** Open — measured
+**Status:** Done 2026-10-21 — the predictor moved to the cards (docs/expert-cache-architecture.md "The predictor on the cards")
 **Area:** decode
 **Gain:** up to ~0.35 ms a verify step (the `slot` lap 1.31 → 1.67 ms with phase 3)
 
@@ -17,3 +17,8 @@ docs/expert-cache-architecture.md "Phase 3"; bringup/reads/laps.sh b210fa5f vs a
 ## Next
 Trace why `hc` rose: the channel send, or the learner core's traffic on the main thread's socket. Then the rank's
 vector form.
+
+## Result
+The prediction, the ranking and the learning moved to the FFN cards (`plan.rs`: `pred_step` in the main queue,
+`pred_learn` in a side queue). The host reads a 24-expert plan. `slot` 1.67 → 0.93 ms a verify step, `hc` 0.70 →
+0.46, decode 25.9 → 25.4 ms an emitted token at 402 tokens (build card2, 6d5737a8).
