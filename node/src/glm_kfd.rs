@@ -1859,12 +1859,26 @@ impl Placed for Cards {
             }
         }
     }
-    fn ffn_ahead(&mut self, l: usize, n: usize, logits: &mut [f32]) {
+    fn ffn_ahead(&mut self, l: usize, n: usize, logits: &mut [f32], pool: &dyn common::pool::Pool) {
         // the router's word follows the next layer's rows, which `hc_pre` computes after the act phase's word
         let f = self.ffns[l].as_ref().unwrap();
         crate::kfd::wait_word(self.word_ptr(W_X, f.card), self.half_seq[l][self.ch][1]);
-        for i in 0..n {
-            read(&self.shared.scores_ffn, ((self.t0 + i) * ROUTE_ROWS + glm_5_3_flash::E) * 4, &mut logits[i * glm_5_3_flash::E..(i + 1) * glm_5_3_flash::E]);
+        // each token's second half, streamed (the buffer is write-combining: plain loads cost the prefill `slot` lap
+        // 0.03 ms a prompt token, 2026-10-21); a long step's over the pool in pieces of 32 tokens, a few tokens' inline
+        const E: usize = glm_5_3_flash::E;
+        const PIECE: usize = 32;
+        let (src, dst) = (self.shared.scores_ffn.at(self.t0 * ROUTE_ROWS * 4), logits.as_mut_ptr() as usize);
+        let rows = move |i: usize| {
+            for t in i * PIECE..((i + 1) * PIECE).min(n) {
+                let s = unsafe { std::slice::from_raw_parts((src + (t * ROUTE_ROWS + E) * 4) as *const u8, E * 4) };
+                let d = unsafe { std::slice::from_raw_parts_mut((dst + t * E * 4) as *mut u8, E * 4) };
+                common::copy::stream_read(d, s);
+            }
+        };
+        if n > PIECE {
+            pool.run(n.div_ceil(PIECE), &rows);
+        } else {
+            rows(0);
         }
     }
     fn ffn_logits(&mut self, l: usize, n: usize, x: &mut [f32], logits: &mut [f32]) {

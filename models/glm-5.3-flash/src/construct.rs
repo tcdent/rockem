@@ -137,6 +137,9 @@ pub struct Learner {
     pub p: std::sync::Arc<predict::Predictor>,
     pub tx: std::sync::mpsc::SyncSender<Lesson>,
     pub seq: Vec<u64>,
+    /// The chunk lessons' buffers back from the learner, reused (a fresh 590 KB buffer a layer-chunk is a map and its
+    /// page faults on the main thread)
+    pub spare: std::sync::mpsc::Receiver<(Vec<[usize; TOP_K]>, Vec<f32>)>,
 }
 /// A learning job: a decode step's update of pair l (its prediction's number, the tokens, the next layer's picks), or a
 /// prefill chunk's layer (`Chunk`: the chunk, the layer, its picks and the next layer's route-ahead logits `[n][E]`,
@@ -153,6 +156,7 @@ impl Learner {
         let layers = router_bias.len();
         let p = std::sync::Arc::new(predict::Predictor::new(router_bias));
         let (tx, rx) = std::sync::mpsc::sync_channel::<Lesson>(4 * NUM_HIDDEN_LAYERS);
+        let (back, spare) = std::sync::mpsc::channel();
         let q = p.clone();
         std::thread::Builder::new()
             .name("learn".into())
@@ -168,6 +172,7 @@ impl Learner {
                                 if pl + 1 == l && pp.len() == picks.len() && !plg.is_empty() {
                                     q.train(pl, pp.len(), &plg, &pp, &picks, SPEC_TOKENS);
                                 }
+                                let _ = back.send((pp, plg));
                             }
                             prev[ch] = Some((l, picks, logits));
                         }
@@ -175,7 +180,7 @@ impl Learner {
                 }
             })
             .unwrap();
-        Learner { p, tx, seq: vec![0; layers] }
+        Learner { p, tx, seq: vec![0; layers], spare }
     }
 }
 pub fn pin(core: usize) {
@@ -1262,7 +1267,7 @@ pub trait Placed {
     fn ffn_input(&mut self, l: usize, n: usize, xq: &mut [i8], xs: &mut [f32], xg: &mut [i32], picks: &mut [[usize; TOP_K]], wts: &mut [[f32; TOP_K]], pool: &dyn Pool);
     /// The next MoE layer's router logits `[n][E]` (the second half of the FFN router's rows) once they are in (they
     /// follow the act phase's word, off its path): the prefetch's predictor (005).
-    fn ffn_ahead(&mut self, l: usize, n: usize, logits: &mut [f32]);
+    fn ffn_ahead(&mut self, l: usize, n: usize, logits: &mut [f32], pool: &dyn Pool);
     /// Bring-up: a MoE layer's FFN input (`x: [n][H]`) and its router's logits (`[n][ROUTE_ROWS]`) as the card
     /// made them, for forced picks and the traces' edges; serving reads `ffn_input`'s quantized form instead.
     fn ffn_logits(&mut self, l: usize, n: usize, x: &mut [f32], logits: &mut [f32]);
@@ -2119,12 +2124,19 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                             Ffn::Moe(m) => m.bias.to_vec(),
                             Ffn::Dense(_) => Vec::new(),
                         }).collect()));
-                        let mut logits = Vec::new();
+                        let (mut picks, mut logits) = pr.spare.try_recv().unwrap_or_default();
+                        picks.clear();
+                        picks.extend_from_slice(&s.b_routed[t0..t0 + n]);
                         if let Some(Ffn::Moe(_)) = w.layers.get(l + 1).map(|lw| &lw.ffn) {
+                            // a reused buffer keeps its length: no 590 KB of zeros a layer-chunk
                             logits.resize(n * E, 0.0);
-                            pl.ffn_ahead(l, n, &mut logits);
+                            prow::zone!("track-zones", "ahead.read");
+                            pl.ffn_ahead(l, n, &mut logits, s.pool);
+                        } else {
+                            logits.clear();
                         }
-                        let _ = pr.tx.send(Lesson::Chunk(ch, l, s.b_routed[t0..t0 + n].to_vec(), logits));
+                        prow::zone!("track-zones", "ahead.send");
+                        let _ = pr.tx.send(Lesson::Chunk(ch, l, picks, logits));
                         lap(&mut p.slot, "ahead");
                     }
                     continue;
@@ -2199,7 +2211,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     // `hc_pre` computes those rows after the act phase's word, so this waits for them only here
                     // inside `slot`: the scores off the card, the picks and their ranking, the prefetch's post
                     let z = prow::Timestamp::now();
-                    pl.ffn_ahead(l, n, &mut s.b_score);
+                    pl.ffn_ahead(l, n, &mut s.b_score, s.pool);
                     #[cfg(feature = "dump-pred")]
                     dump_pred(l, n, &s.b_routed[t0..t0 + n], &s.b_xq[t0 * H..(t0 + n) * H], &s.b_xs[t0 * HG..(t0 + n) * HG], &s.b_score);
                     let z = draft_zone("slot.ahead", z);

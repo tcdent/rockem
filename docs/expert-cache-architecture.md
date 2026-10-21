@@ -411,10 +411,18 @@ with the chunk's picks to the learner (`Lesson::Chunk`). The learner trains pair
 | Experts lap (a verify step) | 26.13 ms | 25.76 |
 | Prefill | 1.84 ms a prompt token, cold 18k 36.5 s | 1.87, 37.0 s |
 
-Long SCORE bit-identical. Every request misses fewer experts, not only the first one after boot. Decode gains
-~0.35 ms an emitted token, and prefill pays 0.03 ms a prompt token. That cost is the main thread reading the next
-layer's scores out of host memory: the prefill `slot` lap is 0.03 ms a prompt token, 0.04 when they were read and
-copied twice (pred3). Queue 088 moves that read off the main thread. Kept.
+Long SCORE bit-identical. Every request misses fewer experts, not only the first one after boot. In pred4, prefill
+paid 0.03 ms a prompt token on the main thread. It was not the read: streaming the read over the pool (pred5) left it
+unchanged. It was a fresh 590 KB buffer a layer-chunk, with its page faults and zeroing. The learner now hands each
+lesson's buffers back for reuse.
+
+**Final (pred7, 68ef7287):** complete / partial / missed 7.90 / 2.61 / 6.10; decode 25.9 ms an emitted token at 402
+tokens and 26.3 at 96; prefill 1.85 ms a prompt token, 1.83 / 1.89 by band, against pred2's 1.84, 1.82 / 1.88. The
+`ahead` zone is 0.05 ms a layer-chunk, of which 0.04 is the pooled read. The cost to prefill is within noise.
+
+**The architecture as landed:** phases 0, 1, 3 and 4 in the node; phase 2's split reverted, with the resctrl mount
+kept. Against the start (build 4da52d7, 26.9 ms an emitted token), decode is 25.7–25.9 ms an emitted token at 18k
+from the cap, the earlier post, the learned predictor and prefill's labels. Open levers: queues 086 and 087.
 
 ## 12. Risks, unknowns, and decisions
 
