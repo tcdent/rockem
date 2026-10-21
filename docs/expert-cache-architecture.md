@@ -453,6 +453,28 @@ Long SCORE bit-identical. The cards' predictor misses the same number of experts
 host's main thread gets back ~0.7 ms a verify step (`slot` below the cap-13 build's 1.31: the plan replaces the
 host's top-8 and union too). Queue 087 is closed by this.
 
+## One queue, and more of the layer's data (measured 2026-10-21)
+**One queue is enough** (tcdent: `hc_post`'s spin is the card's idle time; place the predictor serially ahead of it).
+Kernel durations (lab build, track-launches): in decode, `pred_step` takes 56 µs and `pred_learn` 65 µs of a ~550 µs
+wait. In prefill, a 512-token chunk's learning took 10.6 ms a layer, and the wait was not that long (the other
+chunk's card half fills it): prefill 1.84 → 2.57 ms a prompt token (card3). A prefill step's pairs now learn once its
+layers are done, a workgroup a pair. card4: decode 25.3 ms an emitted token, verify 54.99 ms, prefill 1.84, missed
+6.10 — the side queue's numbers (card2) without it, and the side queue is removed.
+
+**More data** (bringup/expert-cache/phase3b: the lab dump with layer l + 1's router over three more inputs; settled
+recall@13 over steps 2000+, the deployed model with a second margin, each with its own learned weight):
+
+| Second margin: layer l + 1's router over… | On the card before `hc_post`? | alone (no learning) | deployed + margin | + rank-64 input map |
+|---|---|---|---|---|
+| — (the FFN input: what ships) | yes | .585 | .6205 | .6261 |
+| FFN input + shared expert output | yes, the FFN card's | .383 | .6255 | .6305 |
+| + the resident experts' rows | the other card's need a sync (the host's join) | .395 | .6295 | .6342 |
+| + every routed row (the FFN output) | no: the host's rows arrive as `hc_post` starts | .438 | .6471 | .6516 |
+
+The sums are crude (FFN input plus output, normed with layer l's post-norm), not the hyper-connection's collapse. Alone
+they rank worse than the FFN input; beside it they add. The data available before `hc_post` adds at most +.010–.014;
+the routed rows add +.027, and they exist only once the host's experts are in.
+
 ## 12. Risks, unknowns, and decisions
 
 **Unknowns (each has a phase that answers it):**
