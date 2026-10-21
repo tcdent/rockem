@@ -405,6 +405,7 @@ After the rewrite (2026-10-20), gate/up runs at 68.8 / 76.4 / 74.6 GMAC/s a core
 | Per-node activation copies | 2026-10-20 | moved item rates or nothing, never the wall (no number recorded) | `cpu-expert-bandwidth` memory |
 | `gemm2` (two 16-row passes of the old shape) | 2026-10-20 | 1.11–1.21× from 16 tokens, slower below; dropped for the rewrite | 078 |
 | LUT GEMM at 4 bits | 2026-09-20 | set aside by reasoning (DRAM-bound decode; prefill recheck deferred) | 054, 056 |
+| the new gemm's flush/setup reworked (4-token blocks, flush from registers, tables) | 2026-10-20 | llvm-mca −11 % a group; on a metatron core 5–10 % slower at 16–64 tokens | 078 |
 
 ## 7. How to measure
 

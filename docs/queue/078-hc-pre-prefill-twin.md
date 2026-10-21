@@ -219,6 +219,12 @@ layer-chunk: experts lap 18.24 → 17.75 ms — gate/up 10.57 → 11.41 (now wit
 0.58 ms slower (the fold or the order; both shipped in one build) — the suspect, inferred, is `hq` now written on the
 expert's node and read by down items wherever they run.
 
+**The new gemm's flush and setup reworked, measured and not taken (2026-10-20; a sub-agent's variant).** Tokens in
+blocks of four with the flush straight from registers, per-call bias/scale tables, `vinserti128` setup: llvm-mca (znver3)
+put it ~11 % fewer cycles a group at 16–32 tokens. On a metatron core it lost: 65.5 / 90.0 / 101.2 / 100.0 / 95.5 / 95.0
+GMAC/s at 2 / 4 / 8 / 16 / 32 / 64 tokens against the current 75.6 / 92.0 / 98.4 / 104.4 / 105.6 / 103.0 (its
+permute-setup twin worse at 32–64). The model and the core disagreed; the core decides. Not built.
+
 ## Next
 The twin's arithmetic is the step gate's numeric kind (WMMA order) for the coefficients and the router; the act phase
 stays exact. Then the card lanes again: card1's `hc_pre` share and the FFN-input wait.
