@@ -1,0 +1,24 @@
+Write a Python function that parses the API's SSE stream and yields tool calls; include tests.
+Explain, step by step, how the speculative decoding verify step keeps the output distribution exact.
+List every file touched in this session with a one-line description of each change.
+Write a Rust struct and impl for a ring buffer of f32 with push, pop and iteration; explain the design.
+What are the riskiest parts of this change set? Rank them and explain why.
+Draft a commit message for the work so far, with a summary line and a bulleted body.
+Write a bash script that runs the integration tests against localhost:8765 and reports failures.
+Explain the difference between the OpenAI and Anthropic adapters as implemented here.
+Write a TypeScript client for the /rockem/v1/generate endpoint with streaming support.
+Suggest five follow-up improvements to the API service and estimate the effort of each.
+Rewrite the session summary as a status update for a team channel, about 200 words.
+Write unit tests in pytest for the stop-sequence handling described in the session.
+Describe how you would add rate limiting to this API, with code.
+Explain the scheduler's role and how one request per node is enforced.
+Write SQL to store request logs from this API in Postgres, with indexes, and explain them.
+What questions would you ask the user before continuing? List ten.
+Write a README section documenting the generate endpoint's parameters and responses.
+Implement a small CLI in Go that sends a prompt to the API and prints the streamed reply.
+Explain how the chat template is applied and where tool definitions enter the prompt.
+Write a design note for adding authentication tokens to the API.
+Review the error handling in the session's code and propose concrete fixes with diffs.
+Write a haiku sequence about debugging inference servers, then explain each haiku.
+Translate the session summary into Spanish and French.
+Write a C function computing a numerically stable softmax over a float array, with comments.

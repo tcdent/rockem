@@ -1,0 +1,6 @@
+exec(open('replay.py').read())
+o=run(topk_votes(8),13)
+use=np.array([r['use'] for r in R])
+print('replay recall',o[:,1].sum()/o[:,0].sum(),'pred',o[:,3].mean(),'host',o[:,0].mean())
+print('use recall',(use[:,0]+use[:,1]).sum()/use[:,:3].sum(),'pred',use[:,3].mean(),'host',use[:,:3].sum(1).mean())
+print('row agreement host', np.mean(o[:,0]==use[:,:3].sum(1)), 'pred', np.mean(o[:,3]==use[:,3]), 'hit',np.mean(o[:,1]==use[:,0]+use[:,1]))
