@@ -7,7 +7,7 @@ set -u; V=$1; ROOT=/home/slomp/Work/rockem; BOX=$ROOT/bringup/box; LOG=$BOX/logs
 SHORT=${2:-}
 cd /home/slomp/Work/rockem
 /usr/bin/grep -E "kernels" bundles/glm-5.3-flash-q4rtn/manifest.toml | cut -c1-100
-timeout 500 make initramfs NODE_FEATURES="${NODE_FEATURES:-}" 2>&1 | tail -n 2 | cut -c1-100
+timeout 500 make initramfs NODE_FEATURES="${NODE_FEATURES---features track-launches}" 2>&1 | tail -n 2 | cut -c1-100
 timeout 180 make publish 2>&1 | /usr/bin/grep -E 'pushed|error|missing'
 : > $LOG/metatron-console.log
 (sleep 1; printf 'echo b > /proc/sysrq-trigger\r\n'; sleep 2) | timeout 8 nc 192.168.88.6 23 >/dev/null 2>&1

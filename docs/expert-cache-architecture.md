@@ -475,6 +475,18 @@ The sums are crude (FFN input plus output, normed with layer l's post-norm), not
 they rank worse than the FFN input; beside it they add. The data available before `hc_post` adds at most +.010–.014;
 the routed rows add +.027, and they exist only once the host's experts are in.
 
+**The second margin, built** (card6, 5c8083b1, 2026-10-21): layer l + 1's router over the FFN input plus the shared
+expert's output, on the FFN card ahead of `hc_post` (`pred_input`, the route-ahead's few-token kernel over it, the
+matrix path in prefill), its own learned weight in `pred_step`/`pred_learn`. Missed experts 6.10 → 6.00 a layer,
+complete 7.85 → 8.07 (offline: +.005 recall@13). The predictor's card time a verify step, ~2.6 ms a card (`pred_step`
+1.3, the second router 0.6, `pred_learn` 0.45, the add 0.2), all inside `hc_post`'s wait: `slot` 0.36 ms a verify step
+(0.31 before). The first build ran the second router through the matrix kernel at 4 tokens: ~300 µs a layer, 6 ms a
+step, and the host waited for the plan (`slot` 1.92). Deploys build with `track-launches` again (the card lanes in
+prow, tcdent), so the step times (decode 26.2 ms an emitted token, prefill 1.88–1.94) carry its ~3 % and compare only
+with tracked builds; the gain expected from −0.1 missed (~0.15 ms a verify step, inferred) is below one run's noise.
+What `pred_step`'s time is: mostly the two 8th-best selections (each thread compares its value with all 288, a token
+and a margin at a time) — LDS and ALU work, not bytes, so bf16 state would not shorten it.
+
 ## 12. Risks, unknowns, and decisions
 
 **Unknowns (each has a phase that answers it):**

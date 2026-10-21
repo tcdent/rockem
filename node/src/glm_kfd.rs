@@ -177,9 +177,15 @@ struct Card {
     mla_o: crate::kfd::Kernel,
     hc_pre: crate::kfd::Kernel,
     hc_route_ahead: crate::kfd::Kernel,
-    /// The prefetch predictor's prediction and update, `plan::gfx11`.
+    /// The prefetch predictor's prediction and update, `plan::gfx11`; its second margin's input (the FFN input plus the
+    /// shared expert's output, `[STEP][H]` f32), the router's logits over it (`[STEP][ROUTE_ROWS]` f32, layer l + 1's
+    /// from `E`, as `scores_v`) and the few-token router's word (unread).
     pred_step: crate::kfd::Kernel,
     pred_learn: crate::kfd::Kernel,
+    pred_input: crate::kfd::Kernel,
+    pred_x: Mem,
+    pred_s2: Mem,
+    pred_word: Mem,
     mla_sel_split: crate::kfd::Kernel,
     mla_two_merge: crate::kfd::Kernel,
     word_wait: crate::kfd::Kernel,
@@ -342,8 +348,8 @@ struct FfnOn {
     /// (`ACT_SLOTS` device addresses) on its FFN card.
     act: Option<(Mem, Mem, Mem)>,
     /// The prefetch predictor's pair (this layer → the next MoE layer) on this card: its state (`plan::STATE` f32) and
-    /// its tokens' margins `[STEP][E]` f32, kept from its prediction for its update a layer later.
-    pred: Option<(Mem, Mem)>,
+    /// its tokens' two margins `[STEP][E]` f32 each, kept from its prediction for its update.
+    pred: Option<(Mem, Mem, Mem)>,
 }
 
 /// An MLA layer's projections on a card: q_a and kv_a (FP8, over the input-normed
@@ -524,6 +530,10 @@ impl Cards {
                     hc_route_ahead: k.kernel("hc_route_ahead"),
                     pred_step: k.kernel("pred_step"),
                     pred_learn: k.kernel("pred_learn"),
+                    pred_input: k.kernel("pred_input"),
+                    pred_x: k.vram(STEP * H * 4),
+                    pred_s2: k.vram(STEP * ROUTE_ROWS * 4),
+                    pred_word: k.vram(64),
                     mla_sel_split: k.kernel("mla_sel_split"),
                     mla_two_merge: k.kernel("mla_two_merge"),
                     word_wait: k.kernel("word_wait"),
@@ -784,9 +794,9 @@ impl Cards {
                     let k = &cards[card].k;
                     let st = k.vram_visible(glm_5_3_flash::plan::STATE * 4);
                     k.upload(&st, 0, raw(&glm_5_3_flash::plan::init(m2.bias)));
-                    let d = k.vram(STEP * glm_5_3_flash::E * 4);
-                    bytes += st.size + d.size;
-                    Some((st, d))
+                    let (d, d2) = (k.vram(STEP * glm_5_3_flash::E * 4), k.vram(STEP * glm_5_3_flash::E * 4));
+                    bytes += st.size + d.size + d2.size;
+                    Some((st, d, d2))
                 }
                 _ => None,
             };
@@ -905,10 +915,10 @@ impl Cards {
             .map(|c| {
                 let mut t: Vec<u64> = Vec::new();
                 for (l, f) in ffns.iter().enumerate() {
-                    if let Some((st, d)) = f.as_ref().filter(|f| f.card == c.k.index).and_then(|f| f.pred.as_ref()) {
+                    if let Some((st, d, d2)) = f.as_ref().filter(|f| f.card == c.k.index).and_then(|f| f.pred.as_ref()) {
                         pred_at[l] = Some((c.k.index, t.len() / glm_5_3_flash::plan::LEARN_TAB));
                         let slot = |l: usize| shared.labels.at(l * STEP * TOP_K * 4) as u64;
-                        t.extend_from_slice(&[st.va as u64, d.va as u64, slot(l), slot(l + 1)]);
+                        t.extend_from_slice(&[st.va as u64, d.va as u64, slot(l), slot(l + 1), d2.va as u64]);
                     }
                 }
                 let m = c.k.vram_visible((t.len() * 8).max(8));
@@ -1921,10 +1931,26 @@ impl Placed for Cards {
         let decode = n <= SPEC_TOKENS;
         // pair l predicts the next layer, in the main queue (a decode step's plan and word for the host)
         if let Some(f) = self.ffns[l].as_ref().filter(|f| f.pred.is_some()) {
-            let (st, d) = f.pred.as_ref().unwrap();
+            let (st, d, d2) = f.pred.as_ref().unwrap();
             let c = &self.cards[f.card];
+            // the second margin's logits: layer l + 1's router rows over the FFN input plus the shared expert's output
+            // (a few tokens through the route-ahead's own kernel: the matrix path took ~300 µs a layer at 4 tokens; a long
+            // step's on the matrix path, every router row, so both leave layer l + 1's logits from `E` of `ROUTE_ROWS`)
+            let (px, ps2) = (self.tok(&c.pred_x, H), self.tok(&c.pred_s2, ROUTE_ROWS));
             let mut a = Args::new();
-            a.ptr(st.va).ptr(self.tok(&c.scores_v, ROUTE_ROWS)).ptr(d.at(self.t0 * E * 4)).ptr(slot(l));
+            a.ptr(px).ptr(self.tok(&c.x, H)).ptr(self.tok(&c.fyv, H)).u32((n * H) as u32);
+            c.k.launch(&c.pred_input, (n * H).div_ceil(256) as u32, g::WG, 0, &a);
+            let router = f.router.as_ref().unwrap().va;
+            let mut a = Args::new();
+            if decode {
+                a.ptr(px).ptr(f.ln.va).ptr(router).ptr(ps2).ptr(ps2).ptr(c.pred_word.va).ptr(c.count.va).u32(0).u32(n as u32);
+                c.k.launch(&c.hc_route_ahead, PRE_GRID, g::WG, 64, &a);
+            } else {
+                a.ptr(px).ptr(f.ln.va).ptr(router).ptr(ps2).u32(ROUTE_ROWS as u32).u32(n as u32);
+                c.k.launch(&c.rows_h_w, g::wmma_grid(ROUTE_ROWS, n), g::WG, g::WMMA_LDS, &a);
+            }
+            let mut a = Args::new();
+            a.ptr(st.va).ptr(self.tok(&c.scores_v, ROUTE_ROWS)).ptr(ps2).ptr(d.at(self.t0 * E * 4)).ptr(d2.at(self.t0 * E * 4)).ptr(slot(l));
             if decode {
                 a.ptr(self.shared.plan.va).ptr(self.shared.words.at(self.wd(W_PLAN, f.card)));
             } else {
