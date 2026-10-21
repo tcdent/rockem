@@ -156,6 +156,7 @@ the index. Reorganized 2026-10-18 from the single-page version (in git history b
 | [086](queue/086-predictor-input-map.md) | The prefetch predictor's input map | Quantified, on the shelf — on the cards −0.1 missed a layer for +1.2 ms a verify step | decode |
 | [087](queue/087-predictor-on-the-main-thread.md) | The prefetch predictor's main-thread time | Done — the predictor on the cards, slot 1.67 → 0.93 ms, 25.4 ms an emitted token | decode |
 | [088](queue/088-prefill-labels-off-the-main-thread.md) | Prefill's predictor labels off the main thread | Done — lesson buffers reused, prefill 1.87 → 1.85 | prefill |
+| [089](queue/089-mla-o-in-the-verify-step.md) | The MLA output projection in a verify step | Open — ~142 µs a launch, ~1.6 ms a verify step on the critical path | decode |
 
 ## Order (2026-10-18, evening — the 20 ms path)
 
