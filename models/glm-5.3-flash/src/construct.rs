@@ -117,7 +117,8 @@ struct Job {
     light: bool,
 }
 /// Cores a CCD lends a prefetch (of its eight): a CCD's L3 fills at ~60 GB/s and four cores
-/// stream ~22 GB/s from DRAM, enough to pull a layer's share in the attention window.
+/// stream ~22 GB/s from DRAM, enough to pull a layer's share in the attention window. Eight did 71 % of the posted
+/// items before the run against four's 64 %, and the run was slower: experts 23.96 → 25.41 ms a verify step (2026-10-21).
 const PREFETCH_CORES: usize = 4;
 /// A counter on its own cache line: a node's cores share its `next`, nothing else bounces with it.
 #[repr(align(64))]
