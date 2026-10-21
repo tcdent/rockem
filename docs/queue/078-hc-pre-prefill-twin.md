@@ -210,6 +210,15 @@ verify step 59.0 ms, within the 58.2–59.9 band). Not yet taken, from the flush
 folded into the accumulator's start value and the flush straight from registers (both exact); and an unexplained
 13–17 % per-core drop with all 92 cores busy on cache-resident work (cause not established).
 
+**The quantize folded into gate/up, the experts longest-first (2026-10-20, build foldq; from the prefill agent's ranked
+list).** Past `SPEC_TOKENS` a gate/up part covers a quantize group's 128 channels (two bundle items, adjacent in one run,
+so one node's) and quantizes it for its tokens right after SwiGLU; the separate quantize run is gone. Each CCD's queue
+takes the experts with the most tokens first. Exact (long SCORE bit-identical, the decode's tokens unchanged). A
+layer-chunk: experts lap 18.24 → 17.75 ms — gate/up 10.57 → 11.41 (now with the quantize), quantize ~2.06 → 0, down
+5.78 → 6.36; pool tail 5.4 → 3.4 %; prefill 2.02 → 1.97 ms a prompt token, cold 18k 39.7 → 39.0 s. Open: why down got
+0.58 ms slower (the fold or the order; both shipped in one build) — the suspect, inferred, is `hq` now written on the
+expert's node and read by down items wherever they run.
+
 ## Next
 The twin's arithmetic is the step gate's numeric kind (WMMA order) for the coefficients and the router; the act phase
 stays exact. Then the card lanes again: card1's `hc_pre` share and the FFN-input wait.

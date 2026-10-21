@@ -651,7 +651,7 @@ struct ItemAcc {
     pairs: std::sync::atomic::AtomicU64,
 }
 /// An item is the record's (`layout::gu_item`, `layout::down_item`): 32 gate/up items and 20 down items an expert.
-use crate::layout::{DOWN_ITEMS, GU_ITEMS};
+use crate::layout::{DOWN_ITEMS, GU_ITEMS, GU_PER_RUN};
 use crate::STEP;
 
 impl<'a> CpuExperts<'a> {
@@ -842,7 +842,9 @@ impl CpuExperts<'_> {
                 }
             }
         }
-        let experts: Vec<usize> = (0..E).filter(|&e| first[e + 1] > first[e]).collect();
+        // the experts picked, the most tokens first: each CCD's queue starts with its longest items and ends with short ones
+        let mut experts: Vec<usize> = (0..E).filter(|&e| first[e + 1] > first[e]).collect();
+        experts.sort_by_key(|&e| std::cmp::Reverse(first[e + 1] - first[e]));
         let ne = experts.len();
         let uses = |e: usize| &pairs[first[e]..first[e + 1]];
         let stream = self.stream;
@@ -854,19 +856,30 @@ impl CpuExperts<'_> {
         // blocks of GEMM_TOKENS
         let uses_r = &uses;
         let experts_r = &experts;
-        let gate_slot = move |i: usize| slot_of(experts_r[i / GU_PARTS], i % GU_PARTS / SUB);
+        // a step past SPEC_TOKENS: a part is a quantize group's channels (QP parts: two bundle items, adjacent in one
+        // run, so one node's), and quantizes the group for its tokens right after SwiGLU — the separate quantize run read
+        // `h` lines every CCD of both sockets had written (~2 ms a 512-token layer-chunk, 2026-10-20). A few tokens keep
+        // the fine parts (a decode step's few experts need many items) and the quantize below.
+        const QP: usize = GROUP / GU_ROWS;
+        const { assert!(GROUP % GU_ROWS == 0 && GU_PARTS % QP == 0 && GU_PER_RUN % (QP / SUB) == 0) };
+        let fold = n > SPEC_TOKENS;
+        let parts = if fold { GU_PARTS / QP } else { GU_PARTS };
+        let first_c = move |p: usize| if fold { p * QP } else { p };
+        let gate_slot = move |i: usize| slot_of(experts_r[i / parts], first_c(i % parts) / SUB);
+        let (hq_p, hs_p, hg_p) = (self.hq.as_mut_ptr() as usize, self.hs.as_mut_ptr() as usize, self.hg.as_mut_ptr() as usize);
         #[cfg(feature = "track-experts")]
         let acc = &self.item_acc;
         {
             cpu_zone!("experts.gu");
-            self.pool.run_slotted(ne * GU_PARTS, &gate_slot, &move |i| {
+            self.pool.run_slotted(ne * parts, &gate_slot, &move |i| {
             #[cfg(feature = "track-experts")]
             let t_item = std::time::Instant::now();
-            let (j, c) = (i / GU_PARTS, i % GU_PARTS);
+            let (j, p) = (i / parts, i % parts);
             let e = experts_r[j];
             let w = expert::Weights::at(stream, l, e);
-            let (gw, uw, gs, usc) = w.gu(c);
             let pairs = uses_r(e);
+            for c in first_c(p)..first_c(p) + if fold { QP } else { 1 } {
+            let (gw, uw, gs, usc) = w.gu(c);
             let mut b0 = 0;
             while b0 < pairs.len() {
                 let blk = &pairs[b0..(b0 + GEMM_TOKENS).min(pairs.len())];
@@ -884,27 +897,44 @@ impl CpuExperts<'_> {
                 }
                 b0 += GEMM_TOKENS;
             }
+            }
+            if fold {
+                // this part's group of every token's hidden state, quantized as the whole vector's would be (per group)
+                for &(t, k) in pairs {
+                    let s = t as usize * TOP_K + k as usize;
+                    let (x, q, sc, g) = unsafe {
+                        (
+                            std::slice::from_raw_parts((h_p as *const f32).add(s * D_FF + p * GROUP), GROUP),
+                            std::slice::from_raw_parts_mut((hq_p as *mut i8).add(s * D_FF + p * GROUP), GROUP),
+                            std::slice::from_raw_parts_mut((hs_p as *mut f32).add(s * DG + p), 1),
+                            std::slice::from_raw_parts_mut((hg_p as *mut i32).add(s * DG + p), 1),
+                        )
+                    };
+                    QAct { q, scale: sc, gsum: g }.quantize(x);
+                }
+            }
             #[cfg(feature = "track-experts")]
             acc[gate_slot(i)][bucket_of(pairs.len())].add(t_item.elapsed().as_nanos() as u64, pairs.len());
             });
         }
         #[cfg(feature = "track-experts")]
-        self.item_rows(l, "gu", 2 * GU_ROWS * H / 2 + 2 * GU_ROWS * HG * 4);
-        // every (token, slot)'s hidden state quantized once: here for a token (2 µs each, less than a
-        // pool run's posting), over the pool for a step
-        let (hq_p, hs_p, hg_p) = (self.hq.as_mut_ptr() as usize, self.hs.as_mut_ptr() as usize, self.hg.as_mut_ptr() as usize);
+        self.item_rows(l, "gu", (2 * GU_ROWS * H / 2 + 2 * GU_ROWS * HG * 4) * if fold { QP } else { 1 });
+        // a few tokens: every (token, slot)'s hidden state quantized once, here for a token (2 µs each, less than a
+        // pool run's posting), over the pool otherwise
         let h = &self.h;
         let quantize_h = move |i: usize| {
             let (q, sc, g) = unsafe { (std::slice::from_raw_parts_mut((hq_p as *mut i8).add(i * D_FF), D_FF), std::slice::from_raw_parts_mut((hs_p as *mut f32).add(i * DG), DG), std::slice::from_raw_parts_mut((hg_p as *mut i32).add(i * DG), DG)) };
             QAct { q, scale: sc, gsum: g }.quantize(&h[i * D_FF..(i + 1) * D_FF]);
         };
-        if n * TOP_K <= 16 {
-            for i in 0..n * TOP_K {
-                quantize_h(i);
+        if !fold {
+            if n * TOP_K <= 16 {
+                for i in 0..n * TOP_K {
+                    quantize_h(i);
+                }
+            } else {
+                cpu_zone!("experts.quant");
+                self.pool.run(n * TOP_K, &quantize_h);
             }
-        } else {
-            cpu_zone!("experts.quant");
-            self.pool.run(n * TOP_K, &quantize_h);
         }
         // the down rows: part (j, c) owns rows c·DOWN_ROWS.. of expert experts[j]'s output, for all of its tokens, likewise
         let (hq, hs, hg) = (&self.hq, &self.hs, &self.hg);
