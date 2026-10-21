@@ -487,6 +487,12 @@ with tracked builds; the gain expected from −0.1 missed (~0.15 ms a verify ste
 What `pred_step`'s time is: mostly the two 8th-best selections (each thread compares its value with all 288, a token
 and a margin at a time) — LDS and ALU work, not bytes, so bf16 state would not shorten it.
 
+**The budget is the wait, ~180 µs** (2026-10-21): the rank-64 input map on the cards (queue 086) missed 0.10–0.15
+fewer experts a layer on the long decode run and cost 1.2 ms a verify step. `hc_post`'s spin is ~180 µs at the median,
+not the host experts' 550 (the card runs the residents and the shared FFN first), and the chain was ~220 µs a layer.
+Without the map it is ~135 µs (`pred_step` 66, the second router 35, `pred_learn` 23, the add 10). More model needs
+a shorter chain first; the map is reverted.
+
 ## 12. Risks, unknowns, and decisions
 
 **Unknowns (each has a phase that answers it):**

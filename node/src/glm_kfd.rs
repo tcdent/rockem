@@ -183,10 +183,6 @@ struct Card {
     pred_step: crate::kfd::Kernel,
     pred_learn: crate::kfd::Kernel,
     pred_input: crate::kfd::Kernel,
-    pred_map: crate::kfd::Kernel,
-    pred_h: crate::kfd::Kernel,
-    /// `pred_h`'s partials (`plan::MAP_PART` f32).
-    pred_part: Mem,
     pred_x: Mem,
     pred_s2: Mem,
     pred_word: Mem,
@@ -352,9 +348,8 @@ struct FfnOn {
     /// (`ACT_SLOTS` device addresses) on its FFN card.
     act: Option<(Mem, Mem, Mem)>,
     /// The prefetch predictor's pair (this layer → the next MoE layer) on this card: its state (`plan::STATE` f32) and
-    /// its tokens' two margins `[STEP][E]` f32 each, kept from its prediction for its update, and its input-map store
-    /// (`plan::MS_LEN` f32).
-    pred: Option<(Mem, Mem, Mem, Mem)>,
+    /// its tokens' two margins `[STEP][E]` f32 each, kept from its prediction for its update.
+    pred: Option<(Mem, Mem, Mem)>,
 }
 
 /// An MLA layer's projections on a card: q_a and kv_a (FP8, over the input-normed
@@ -536,9 +531,6 @@ impl Cards {
                     pred_step: k.kernel("pred_step"),
                     pred_learn: k.kernel("pred_learn"),
                     pred_input: k.kernel("pred_input"),
-                    pred_map: k.kernel("pred_map"),
-                    pred_h: k.kernel("pred_h"),
-                    pred_part: k.vram(glm_5_3_flash::plan::MAP_PART * 4),
                     pred_x: k.vram(STEP * H * 4),
                     pred_s2: k.vram(STEP * ROUTE_ROWS * 4),
                     pred_word: k.vram(64),
@@ -801,11 +793,10 @@ impl Cards {
                 (Ffn::Moe(_), Some(Ffn::Moe(m2))) => {
                     let k = &cards[card].k;
                     let st = k.vram_visible(glm_5_3_flash::plan::STATE * 4);
-                    k.upload(&st, 0, raw(&glm_5_3_flash::plan::init(m2.bias, l as u64)));
+                    k.upload(&st, 0, raw(&glm_5_3_flash::plan::init(m2.bias)));
                     let (d, d2) = (k.vram(STEP * glm_5_3_flash::E * 4), k.vram(STEP * glm_5_3_flash::E * 4));
-                    let ms = k.vram(glm_5_3_flash::plan::MS_LEN * 4);
-                    bytes += st.size + d.size + d2.size + ms.size;
-                    Some((st, d, d2, ms))
+                    bytes += st.size + d.size + d2.size;
+                    Some((st, d, d2))
                 }
                 _ => None,
             };
@@ -924,10 +915,10 @@ impl Cards {
             .map(|c| {
                 let mut t: Vec<u64> = Vec::new();
                 for (l, f) in ffns.iter().enumerate() {
-                    if let Some((st, d, d2, ms)) = f.as_ref().filter(|f| f.card == c.k.index).and_then(|f| f.pred.as_ref()) {
+                    if let Some((st, d, d2)) = f.as_ref().filter(|f| f.card == c.k.index).and_then(|f| f.pred.as_ref()) {
                         pred_at[l] = Some((c.k.index, t.len() / glm_5_3_flash::plan::LEARN_TAB));
                         let slot = |l: usize| shared.labels.at(l * STEP * TOP_K * 4) as u64;
-                        t.extend_from_slice(&[st.va as u64, d.va as u64, slot(l), slot(l + 1), d2.va as u64, ms.va as u64]);
+                        t.extend_from_slice(&[st.va as u64, d.va as u64, slot(l), slot(l + 1), d2.va as u64]);
                     }
                 }
                 let m = c.k.vram_visible((t.len() * 8).max(8));
@@ -1940,7 +1931,7 @@ impl Placed for Cards {
         let decode = n <= SPEC_TOKENS;
         // pair l predicts the next layer, in the main queue (a decode step's plan and word for the host)
         if let Some(f) = self.ffns[l].as_ref().filter(|f| f.pred.is_some()) {
-            let (st, d, d2, ms) = f.pred.as_ref().unwrap();
+            let (st, d, d2) = f.pred.as_ref().unwrap();
             let c = &self.cards[f.card];
             // the second margin's logits: layer l + 1's router rows over the FFN input plus the shared expert's output
             // (a few tokens through the route-ahead's own kernel: the matrix path took ~300 µs a layer at 4 tokens; a long
@@ -1958,12 +1949,8 @@ impl Placed for Cards {
                 a.ptr(px).ptr(f.ln.va).ptr(router).ptr(ps2).u32(ROUTE_ROWS as u32).u32(n as u32);
                 c.k.launch(&c.rows_h_w, g::wmma_grid(ROUTE_ROWS, n), g::WG, g::WMMA_LDS, &a);
             }
-            // the input map's x · U, a slice of the input a workgroup
             let mut a = Args::new();
-            a.ptr(self.tok(&c.x, H)).ptr(st.va).ptr(ms.va).ptr(c.pred_part.va).u32(self.t0 as u32).u32(n as u32);
-            c.k.launch(&c.pred_h, glm_5_3_flash::plan::MAP_HWGS as u32, g::WG, glm_5_3_flash::plan::MAP_H_LDS, &a);
-            let mut a = Args::new();
-            a.ptr(st.va).ptr(self.tok(&c.scores_v, ROUTE_ROWS)).ptr(ps2).ptr(c.pred_part.va).ptr(ms.va).u32(self.t0 as u32).ptr(d.at(self.t0 * E * 4)).ptr(d2.at(self.t0 * E * 4)).ptr(slot(l));
+            a.ptr(st.va).ptr(self.tok(&c.scores_v, ROUTE_ROWS)).ptr(ps2).ptr(d.at(self.t0 * E * 4)).ptr(d2.at(self.t0 * E * 4)).ptr(slot(l));
             if decode {
                 a.ptr(self.shared.plan.va).ptr(self.shared.words.at(self.wd(W_PLAN, f.card)));
             } else {
@@ -1976,12 +1963,8 @@ impl Placed for Cards {
         if let (true, Some((card, entry))) = (decode, l.checked_sub(1).and_then(|lp| self.pred_at[lp])) {
             let c = &self.cards[card];
             let mut a = Args::new();
-            a.ptr(self.pred_tab[card].0.va).u32(entry as u32).u32(self.t0 as u32).u32(n as u32).u32(1);
+            a.ptr(self.pred_tab[card].0.va).u32(entry as u32).u32(self.t0 as u32).u32(n as u32);
             c.k.launch(&c.pred_learn, 1, LEARN_WG, LEARN_LDS, &a);
-            // its input map's U, over the card
-            let mut a = Args::new();
-            a.ptr(self.pred_tab[card].0.va).u32(entry as u32).u32(n as u32);
-            c.k.launch(&c.pred_map, glm_5_3_flash::plan::MAP_WGS as u32, g::WG, 0, &a);
         }
     }
     fn plan_learn(&mut self, n: usize) {
@@ -1990,7 +1973,7 @@ impl Placed for Cards {
             if *pairs > 0 {
                 let c = &self.cards[card];
                 let mut a = Args::new();
-                a.ptr(tab.va).u32(0).u32(0).u32(n as u32).u32(0);
+                a.ptr(tab.va).u32(0).u32(0).u32(n as u32);
                 c.k.launch(&c.pred_learn, *pairs as u32, LEARN_WG, LEARN_LDS, &a);
             }
         }
