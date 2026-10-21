@@ -296,6 +296,20 @@ What it says:
 - Anomaly, not explained: the L1 loop's per-core rate on 23 cores spread 110–197 GB/s at full clock (one core alone
   198).
 
+The L2/L3 clock limit is per socket (measured 2026-10-20, `bench-power --mode l3`, 2 MB a core):
+
+| L3 loads on | clock | socket W | GB/s a core (median) |
+|---|---|---|---|
+| 23 cores, all on socket 0 | 3.18 GHz | 233 / 95 | 55.5 |
+| the same 23 split 12 + 11 across the sockets | 3.44 | 203 / 198 | 72.3 |
+| 46 cores, 23 a socket | 3.18 | 234 / 238 | 55.4 |
+| 8 cores, mostly one CCD (cores 1–8) | 3.44 | 163 | 71.4 |
+| 8 cores, 4 + 4 on two CCDs | 3.44 | 173 | 82.5 |
+
+So the limit binds on how much L3 traffic one socket carries, near 233 W — below the 280 W power cap (inferred: a
+socket current limit; no telemetry names it). Separately, one CCD's L3 has a delivery ceiling: eight cores sharing it
+get 71 GB/s each, 82.5 when the same eight are split over two CCDs.
+
 ## 5. The expert kernels on this CPU
 
 **The format** (`common/src/q4.rs`, `q4g128-a8`):
