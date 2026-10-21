@@ -426,16 +426,46 @@ pub mod avx2 {
 
     use super::GEMM_TOKENS as TOKENS;
 
-    /// `gemv` over `n ≤ TOKENS` activations, a pair of tiles (eight rows) and a group at a time. A 32-byte
-    /// weight vector holds two rows' 16 k in its 128-bit halves (row v | row v+4), unpacked from the stored
-    /// nibbles by masks and one lane permute (no transposes); a token's operand is its 16 k broadcast to both
-    /// halves, one `vbroadcasti128` feeding four `vpmaddubsw`. Each i16 accumulator spans the whole group (8
-    /// multiplies of pair sums ≤ 3840: ≤ 30720, exact), widened once a group and reduced by unpacks and adds
-    /// into the eight rows' sums in `gemv`'s lane order; the flush is `gemv`'s expression, groups in order:
-    /// `gemv`'s bits for every token. Two tokens at a time (8 accumulators, 4 weights, 2 operands); every
-    /// token's pointers resolved once a call. On a Zen 3 core 1.25–1.77× the earlier transpose-and-broadcast
-    /// kernel at 2–64 tokens (75–106 GMAC/s; the loop had been bound by its quad broadcasts on the FP pipes),
-    /// found by a sub-agent's register-shape study with llvm-mca, 2026-10-20.
+    /// Groups a tile pair unpacks before its token pairs walk them (8 KB of scratch). Fewer cost the
+    /// many-token rates (4: 113 GMAC/s at 32 tokens), more cost the few-token ones (16: 67 at 2 tokens).
+    const BLOCK: usize = 8;
+
+    /// `gemv` over `n ≤ TOKENS` activations, a pair of tiles (eight rows) at a time. A 32-byte weight vector
+    /// holds two rows' 16 k in its 128-bit halves (row v | row v+4), unpacked from the stored nibbles by masks
+    /// and one lane permute (no transposes) into a scratch of 32 vectors a group; a token's operand is its 16 k
+    /// broadcast to both halves, one `vbroadcasti128` feeding four `vpmaddubsw`. Each i16 accumulator spans the
+    /// whole group (8 multiplies of pair sums ≤ 3810: ≤ 30480, exact), widened once a group and reduced by
+    /// unpacks and adds into the eight rows' sums in `gemv`'s lane order; the flush is `gemv`'s expression,
+    /// groups in order: `gemv`'s bits for every token.
+    ///
+    /// A tile pair unpacks `BLOCK` groups, then each token pair walks those groups with its two f32 sums in
+    /// registers (`dots2`, fixed registers), the token pointers taken once a block; the last block writes the
+    /// sums straight to `out`. Per 1024 MACs (a token and a group) that is 26.5 loads and no stores in the pair
+    /// loop (16 scratch weights, 8 broadcasts, the group's Σa and scale, half a weight-scale vector), plus the
+    /// unpack's 52 a group shared by the `n` tokens, against 37.5 + 54/n for the compiler-scheduled kernel
+    /// before it (its 5 spills and a 7-op flush a token and group: the sum loaded and stored, three pointers
+    /// reloaded). Loads and stores are what costs power on this core (docs/metatron-cpu.md §4: an L1 load loop
+    /// draws as much as the whole gemm, the multiplies alone ~60 % of it), and a full socket runs under its
+    /// 280 W cap, so fewer of them buy clock back.
+    ///
+    /// Measured 2026-10-20 on metatron (32 rows × 4096, cache-resident), GMAC/s a core at 2/4/8/16/32/64 tokens:
+    ///
+    /// | | loads+stores per 1024 MACs (4/16/32/64 tokens) | 2 | 4 | 8 | 16 | 32 | 64 |
+    /// |---|---|---|---|---|---|---|---|
+    /// | compiler-scheduled, a group at a time (before) | 51.0 / 40.9 / 39.2 / 38.3 | 75.7 | 90.4 | 97.7 | 103.3 | 105.8 | 106.9 |
+    /// | blocks of 4, compiler-scheduled | ~49 / 39.3 / 37.6 / 36.8 | 71.7 | 88.9 | 97.8 | 105.9 | 108.9 | 107.9 |
+    /// | blocks of 4, `dots2` | 39.8 / 30.0 / 28.4 / 27.6 | 73.2 | 91.2 | 101.2 | 109.9 | 113.3 | 113.3 |
+    /// | **blocks of 8, `dots2` (this)** | the same | 72.1 | 89.9 | 102.2 | 110.9 | 114.7 | 116.5 |
+    /// | blocks of 16, `dots2` | the same | 67.4 | 86.3 | 100.7 | 109.9 | 115.5 | 118.2 |
+    /// | scratch kept packed, unmasked a token pair | 31.0 / 24.3 / 23.1 / 22.6 | 69.4 | 78.4 | 83.6 | 87.0 | 88.3 | 83.5 |
+    ///
+    /// The packed scratch halves the scratch loads but its three ALU ops a vector land on the FP pipes the
+    /// multiplies need: fewest memory ops, 17–22 % slower. llvm-mca (znver3) rates `dots2`'s loop 29.1 cycles a
+    /// 1024 MACs against 25.6 for the compiler's: it has the direction wrong on this loop. The prefill slab
+    /// shape (2,048 slabs of 32 rows, each its own tokens): 98.1 / 112.0 at 16 / 64 tokens against 92.7 / 99.8;
+    /// 33.6 MB from DRAM at 32 tokens 111.0 against 99.9. Under the power cap at 32 tokens (`bench-power`, both
+    /// sockets at 280 W): 92 cores cache-resident 92.0 → 104.2 a core at 3.04 → 3.18 GHz, from DRAM 85.6 → 93.1
+    /// at 3.00 → 3.07 GHz; 46 cores 94.0 → 105.4 at 3.07 → 3.17 GHz.
     #[target_feature(enable = "avx2")]
     pub unsafe fn gemm<'a, const K: usize>(m: usize, w: *const u8, ws: *const f32, n: usize, act: impl Fn(usize) -> Act<'a>, out: impl Fn(usize) -> *mut f32) {
         const { assert!(K % GROUP == 0) };
@@ -445,94 +475,355 @@ pub mod avx2 {
         }
         let ngroups = K / GROUP;
         let mask = _mm256_set1_epi8(0x0F);
-        // pointers a token, once a call (not a group)
+        // pointers a token, once a call
         let mut aq = [core::ptr::null::<i8>(); TOKENS];
         let mut asc = [core::ptr::null::<f32>(); TOKENS];
         let mut ags = [core::ptr::null::<i32>(); TOKENS];
+        let mut op = [core::ptr::null_mut::<f32>(); TOKENS];
         for i in 0..n {
             let a = act(i);
             aq[i] = a.q.as_ptr();
             asc[i] = a.scale.as_ptr();
             ags[i] = a.gsum.as_ptr();
+            op[i] = out(i);
         }
-        // chunk ch of 16 k, vector v: [row v's 16 k | row v+4's 16 k]
-        let mut blk = [_mm256_setzero_si256(); 32];
+        let mut blk = [[_mm256_setzero_si256(); 32]; BLOCK];
+        let mut scw = [_mm256_setzero_ps(); BLOCK];
+        // a token's sums between blocks (when the groups take more than one)
         let mut y = [_mm256_setzero_ps(); TOKENS];
         let mut tp = 0;
         while tp < m / TILE {
-            for i in 0..n {
-                y[i] = _mm256_setzero_ps();
-            }
             let (w0, w1) = (w.add(tp * K * 2), w.add((tp + 1) * K * 2));
             let (s0, s1) = (ws.add(tp * ngroups * TILE), ws.add((tp + 1) * ngroups * TILE));
-            for g in 0..ngroups {
-                let (g0, g1) = (w0.add(g * (GROUP / 2) * TILE), w1.add(g * (GROUP / 2) * TILE));
-                for c in 0..2 {
-                    for v in 0..4 {
-                        let pa = _mm256_loadu_si256(g0.add(v * (GROUP / 2) + c * 32) as *const __m256i);
-                        let pb = _mm256_loadu_si256(g1.add(v * (GROUP / 2) + c * 32) as *const __m256i);
-                        let (la, lb) = (_mm256_and_si256(pa, mask), _mm256_and_si256(pb, mask));
-                        let (ha, hb) = (_mm256_and_si256(_mm256_srli_epi16::<4>(pa), mask), _mm256_and_si256(_mm256_srli_epi16::<4>(pb), mask));
-                        // lo nibbles: k c·64 + 0..31 = chunks c·4, c·4+1; hi: c·4+2, c·4+3
-                        blk[(c * 4) * 4 + v] = _mm256_permute2x128_si256::<0x20>(la, lb);
-                        blk[(c * 4 + 1) * 4 + v] = _mm256_permute2x128_si256::<0x31>(la, lb);
-                        blk[(c * 4 + 2) * 4 + v] = _mm256_permute2x128_si256::<0x20>(ha, hb);
-                        blk[(c * 4 + 3) * 4 + v] = _mm256_permute2x128_si256::<0x31>(ha, hb);
-                    }
+            let mut gb = 0;
+            while gb < ngroups {
+                let nb = (ngroups - gb).min(BLOCK);
+                for j in 0..nb {
+                    let g = gb + j;
+                    unpack(w0.add(g * (GROUP / 2) * TILE), w1.add(g * (GROUP / 2) * TILE), mask, &mut blk[j]);
+                    scw[j] = _mm256_set_m128(_mm_loadu_ps(s1.add(g * TILE)), _mm_loadu_ps(s0.add(g * TILE)));
                 }
-                let sc_w = _mm256_set_m128(_mm_loadu_ps(s1.add(g * TILE)), _mm_loadu_ps(s0.add(g * TILE)));
+                let (first, last) = (gb == 0, gb + nb == ngroups);
                 let mut i = 0;
-                while i < n {
-                    let nt = (n - i).min(2);
-                    let acc = if nt == 2 { dots::<2>(&blk, g, &aq, i) } else { dots::<1>(&blk, g, &aq, i) };
-                    for t in 0..nt {
-                        let bias = _mm256_set1_epi32(WBIAS * *ags[i + t].add(g));
-                        let sum = _mm256_cvtepi32_ps(_mm256_sub_epi32(acc[t], bias));
-                        let sc = _mm256_mul_ps(sc_w, _mm256_set1_ps(*asc[i + t].add(g)));
-                        y[i + t] = _mm256_add_ps(y[i + t], _mm256_mul_ps(sum, sc));
+                while i + 2 <= n {
+                    let mut y0 = if first { _mm256_setzero_ps() } else { y[i] };
+                    let mut y1 = if first { _mm256_setzero_ps() } else { y[i + 1] };
+                    let (a0, a1) = (aq[i].add(gb * GROUP), aq[i + 1].add(gb * GROUP));
+                    let (c0, c1) = (asc[i].add(gb), asc[i + 1].add(gb));
+                    let (b0, b1) = (ags[i].add(gb), ags[i + 1].add(gb));
+                    for j in 0..nb {
+                        let (d0, d1) = dots2(&blk[j], a0.add(j * GROUP), a1.add(j * GROUP));
+                        y0 = flush(y0, d0, scw[j], *b0.add(j), *c0.add(j));
+                        y1 = flush(y1, d1, scw[j], *b1.add(j), *c1.add(j));
                     }
-                    i += nt;
+                    if last {
+                        _mm256_storeu_ps(op[i].add(tp * TILE), y0);
+                        _mm256_storeu_ps(op[i + 1].add(tp * TILE), y1);
+                    } else {
+                        y[i] = y0;
+                        y[i + 1] = y1;
+                    }
+                    i += 2;
                 }
-            }
-            for i in 0..n {
-                _mm256_storeu_ps(out(i).add(tp * TILE), y[i]);
+                if i < n {
+                    // an odd count's last token
+                    let mut y0 = if first { _mm256_setzero_ps() } else { y[i] };
+                    let a0 = aq[i].add(gb * GROUP);
+                    let (c0, b0) = (asc[i].add(gb), ags[i].add(gb));
+                    for j in 0..nb {
+                        y0 = flush(y0, dot1(&blk[j], a0.add(j * GROUP)), scw[j], *b0.add(j), *c0.add(j));
+                    }
+                    if last {
+                        _mm256_storeu_ps(op[i].add(tp * TILE), y0);
+                    } else {
+                        y[i] = y0;
+                    }
+                }
+                gb += nb;
             }
             tp += 2;
         }
     }
 
-    /// `NT ≤ 2` tokens over a group in `gemm`'s layout: eight rows' integer sums a token, `gemv`'s lane order.
+    /// One group of a tile pair (`g0`, `g1`: the two tiles' 256 bytes of the group) into `gemm`'s 32 vectors:
+    /// chunk ch of 16 k, vector v at ch·4 + v = [row v's 16 k | row v+4's 16 k].
     #[inline(always)]
-    unsafe fn dots<const NT: usize>(blk: &[__m256i; 32], g: usize, aq: &[*const i8; TOKENS], i0: usize) -> [__m256i; 2] {
-        let mut s16 = [[_mm256_setzero_si256(); 4]; NT];
-        let mut ap = [core::ptr::null::<i8>(); NT];
-        for t in 0..NT {
-            ap[t] = aq[i0 + t].add(g * GROUP);
-        }
-        for ch in 0..8 {
-            let mut a = [_mm256_setzero_si256(); NT];
-            for t in 0..NT {
-                a[t] = _mm256_broadcastsi128_si256(_mm_loadu_si128(ap[t].add(ch * 16) as *const __m128i));
-            }
+    unsafe fn unpack(g0: *const u8, g1: *const u8, mask: __m256i, blk: &mut [__m256i; 32]) {
+        for c in 0..2 {
             for v in 0..4 {
-                let wv = blk[ch * 4 + v];
-                for t in 0..NT {
-                    let p = _mm256_maddubs_epi16(wv, a[t]);
-                    s16[t][v] = if ch == 0 { p } else { _mm256_add_epi16(s16[t][v], p) };
-                }
+                let pa = _mm256_loadu_si256(g0.add(v * (GROUP / 2) + c * 32) as *const __m256i);
+                let pb = _mm256_loadu_si256(g1.add(v * (GROUP / 2) + c * 32) as *const __m256i);
+                let (la, lb) = (_mm256_and_si256(pa, mask), _mm256_and_si256(pb, mask));
+                let (ha, hb) = (_mm256_and_si256(_mm256_srli_epi16::<4>(pa), mask), _mm256_and_si256(_mm256_srli_epi16::<4>(pb), mask));
+                // lo nibbles: k c·64 + 0..31 = chunks c·4, c·4+1; hi: c·4+2, c·4+3
+                blk[(c * 4) * 4 + v] = _mm256_permute2x128_si256::<0x20>(la, lb);
+                blk[(c * 4 + 1) * 4 + v] = _mm256_permute2x128_si256::<0x31>(la, lb);
+                blk[(c * 4 + 2) * 4 + v] = _mm256_permute2x128_si256::<0x20>(ha, hb);
+                blk[(c * 4 + 3) * 4 + v] = _mm256_permute2x128_si256::<0x31>(ha, hb);
+            }
+        }
+    }
+
+    /// The per-token flush, `gemv`'s expression: y + cvt(Σ − 8·Σa) · (w_scale · a_scale).
+    #[inline(always)]
+    unsafe fn flush(y: __m256, sums: __m256i, sc_w: __m256, gsum: i32, ascale: f32) -> __m256 {
+        let bias = _mm256_set1_epi32(WBIAS * gsum);
+        let s = _mm256_cvtepi32_ps(_mm256_sub_epi32(sums, bias));
+        let sc = _mm256_mul_ps(sc_w, _mm256_set1_ps(ascale));
+        _mm256_add_ps(y, _mm256_mul_ps(s, sc))
+    }
+
+    /// Eight i32 lanes [row v (4 lanes) | row v+4] a v into [r0 r1 r2 r3 | r4 r5 r6 r7]: a 4×4 transpose-add a
+    /// half (shuffles on the two shuffle pipes, not `vphaddd`'s multiply-pipe time).
+    #[inline(always)]
+    unsafe fn rows8(d: [__m256i; 4]) -> __m256i {
+        let s01 = _mm256_add_epi32(_mm256_unpacklo_epi32(d[0], d[1]), _mm256_unpackhi_epi32(d[0], d[1]));
+        let s23 = _mm256_add_epi32(_mm256_unpacklo_epi32(d[2], d[3]), _mm256_unpackhi_epi32(d[2], d[3]));
+        _mm256_add_epi32(_mm256_unpacklo_epi64(s01, s23), _mm256_unpackhi_epi64(s01, s23))
+    }
+
+    /// One token (`a`: its 128 k of the group) over a group in `gemm`'s layout: the eight rows' integer sums in
+    /// `gemv`'s lane order. Only an odd token count's last token takes it.
+    #[inline(always)]
+    unsafe fn dot1(blk: &[__m256i; 32], a: *const i8) -> __m256i {
+        let mut s16 = [_mm256_setzero_si256(); 4];
+        for ch in 0..8 {
+            let x = _mm256_broadcastsi128_si256(_mm_loadu_si128(a.add(ch * 16) as *const __m128i));
+            for v in 0..4 {
+                let p = _mm256_maddubs_epi16(blk[ch * 4 + v], x);
+                s16[v] = if ch == 0 { p } else { _mm256_add_epi16(s16[v], p) };
             }
         }
         let ones = _mm256_set1_epi16(1);
-        let mut acc = [_mm256_setzero_si256(); 2];
-        for t in 0..NT {
-            let d = [0, 1, 2, 3].map(|v| _mm256_madd_epi16(s16[t][v], ones));
-            // [row v (4 lanes) | row v+4] each; a 4×4 transpose-add a half gives [r0 r1 r2 r3 | r4 r5 r6 r7]
-            // (shuffles on the two shuffle pipes, not `vphaddd`'s multiply-pipe time)
-            let s01 = _mm256_add_epi32(_mm256_unpacklo_epi32(d[0], d[1]), _mm256_unpackhi_epi32(d[0], d[1]));
-            let s23 = _mm256_add_epi32(_mm256_unpacklo_epi32(d[2], d[3]), _mm256_unpackhi_epi32(d[2], d[3]));
-            acc[t] = _mm256_add_epi32(_mm256_unpacklo_epi64(s01, s23), _mm256_unpackhi_epi64(s01, s23));
-        }
-        acc
+        rows8(s16.map(|s| _mm256_madd_epi16(s, ones)))
+    }
+
+    /// `dot1` for two tokens at once, its registers fixed so nothing spills: ymm2–5 token 0's i16 sums for
+    /// v = 0..3, ymm6–9 token 1's, ymm10 / ymm11 the two tokens' broadcast 16 k of the chunk, ymm12 the
+    /// chunk's weight vector v (loaded once, used by both tokens, the second product written over it), ymm13
+    /// the first product. Twelve registers; the caller's two f32 sums keep theirs (ymm14 / ymm15 in practice)
+    /// across the call. Left to the compiler, the same loop kept six scratch vectors in registers across token
+    /// pairs and spilled five accumulators a group for it (5 loads + 5 stores a 2048 MACs), and kept the sums in
+    /// memory. After the chunks: ymm10 = 1 in every i16 (`vpcmpeqw` + `vpsrlw`, no load), `vpmaddwd` widens
+    /// each sum to i32 pairs, and `rows8`'s unpack-add transpose (ymm11 its temporary) leaves token 0's eight
+    /// rows in ymm0 and token 1's in ymm1. Same integer sums as `dot1`, so the same bits.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn dots2(blk: &[__m256i; 32], a0: *const i8, a1: *const i8) -> (__m256i, __m256i) {
+        let (r0, r1): (__m256i, __m256i);
+        core::arch::asm!(
+            // chunk 0: k 0..15, the sums start from the products
+            "vbroadcasti128 ymm10, xmmword ptr [{a0} + 0]",
+            "vbroadcasti128 ymm11, xmmword ptr [{a1} + 0]",
+            "vmovdqa ymm12, ymmword ptr [{b} + 0]",
+            "vpmaddubsw ymm2, ymm12, ymm10",
+            "vpmaddubsw ymm6, ymm12, ymm11",
+            "vmovdqa ymm12, ymmword ptr [{b} + 32]",
+            "vpmaddubsw ymm3, ymm12, ymm10",
+            "vpmaddubsw ymm7, ymm12, ymm11",
+            "vmovdqa ymm12, ymmword ptr [{b} + 64]",
+            "vpmaddubsw ymm4, ymm12, ymm10",
+            "vpmaddubsw ymm8, ymm12, ymm11",
+            "vmovdqa ymm12, ymmword ptr [{b} + 96]",
+            "vpmaddubsw ymm5, ymm12, ymm10",
+            "vpmaddubsw ymm9, ymm12, ymm11",
+            // chunk 1: k 16..31
+            "vbroadcasti128 ymm10, xmmword ptr [{a0} + 16]",
+            "vbroadcasti128 ymm11, xmmword ptr [{a1} + 16]",
+            "vmovdqa ymm12, ymmword ptr [{b} + 128]",
+            "vpmaddubsw ymm13, ymm12, ymm10",
+            "vpaddw ymm2, ymm2, ymm13",
+            "vpmaddubsw ymm12, ymm12, ymm11",
+            "vpaddw ymm6, ymm6, ymm12",
+            "vmovdqa ymm12, ymmword ptr [{b} + 160]",
+            "vpmaddubsw ymm13, ymm12, ymm10",
+            "vpaddw ymm3, ymm3, ymm13",
+            "vpmaddubsw ymm12, ymm12, ymm11",
+            "vpaddw ymm7, ymm7, ymm12",
+            "vmovdqa ymm12, ymmword ptr [{b} + 192]",
+            "vpmaddubsw ymm13, ymm12, ymm10",
+            "vpaddw ymm4, ymm4, ymm13",
+            "vpmaddubsw ymm12, ymm12, ymm11",
+            "vpaddw ymm8, ymm8, ymm12",
+            "vmovdqa ymm12, ymmword ptr [{b} + 224]",
+            "vpmaddubsw ymm13, ymm12, ymm10",
+            "vpaddw ymm5, ymm5, ymm13",
+            "vpmaddubsw ymm12, ymm12, ymm11",
+            "vpaddw ymm9, ymm9, ymm12",
+            // chunk 2: k 32..47
+            "vbroadcasti128 ymm10, xmmword ptr [{a0} + 32]",
+            "vbroadcasti128 ymm11, xmmword ptr [{a1} + 32]",
+            "vmovdqa ymm12, ymmword ptr [{b} + 256]",
+            "vpmaddubsw ymm13, ymm12, ymm10",
+            "vpaddw ymm2, ymm2, ymm13",
+            "vpmaddubsw ymm12, ymm12, ymm11",
+            "vpaddw ymm6, ymm6, ymm12",
+            "vmovdqa ymm12, ymmword ptr [{b} + 288]",
+            "vpmaddubsw ymm13, ymm12, ymm10",
+            "vpaddw ymm3, ymm3, ymm13",
+            "vpmaddubsw ymm12, ymm12, ymm11",
+            "vpaddw ymm7, ymm7, ymm12",
+            "vmovdqa ymm12, ymmword ptr [{b} + 320]",
+            "vpmaddubsw ymm13, ymm12, ymm10",
+            "vpaddw ymm4, ymm4, ymm13",
+            "vpmaddubsw ymm12, ymm12, ymm11",
+            "vpaddw ymm8, ymm8, ymm12",
+            "vmovdqa ymm12, ymmword ptr [{b} + 352]",
+            "vpmaddubsw ymm13, ymm12, ymm10",
+            "vpaddw ymm5, ymm5, ymm13",
+            "vpmaddubsw ymm12, ymm12, ymm11",
+            "vpaddw ymm9, ymm9, ymm12",
+            // chunk 3: k 48..63
+            "vbroadcasti128 ymm10, xmmword ptr [{a0} + 48]",
+            "vbroadcasti128 ymm11, xmmword ptr [{a1} + 48]",
+            "vmovdqa ymm12, ymmword ptr [{b} + 384]",
+            "vpmaddubsw ymm13, ymm12, ymm10",
+            "vpaddw ymm2, ymm2, ymm13",
+            "vpmaddubsw ymm12, ymm12, ymm11",
+            "vpaddw ymm6, ymm6, ymm12",
+            "vmovdqa ymm12, ymmword ptr [{b} + 416]",
+            "vpmaddubsw ymm13, ymm12, ymm10",
+            "vpaddw ymm3, ymm3, ymm13",
+            "vpmaddubsw ymm12, ymm12, ymm11",
+            "vpaddw ymm7, ymm7, ymm12",
+            "vmovdqa ymm12, ymmword ptr [{b} + 448]",
+            "vpmaddubsw ymm13, ymm12, ymm10",
+            "vpaddw ymm4, ymm4, ymm13",
+            "vpmaddubsw ymm12, ymm12, ymm11",
+            "vpaddw ymm8, ymm8, ymm12",
+            "vmovdqa ymm12, ymmword ptr [{b} + 480]",
+            "vpmaddubsw ymm13, ymm12, ymm10",
+            "vpaddw ymm5, ymm5, ymm13",
+            "vpmaddubsw ymm12, ymm12, ymm11",
+            "vpaddw ymm9, ymm9, ymm12",
+            // chunk 4: k 64..79
+            "vbroadcasti128 ymm10, xmmword ptr [{a0} + 64]",
+            "vbroadcasti128 ymm11, xmmword ptr [{a1} + 64]",
+            "vmovdqa ymm12, ymmword ptr [{b} + 512]",
+            "vpmaddubsw ymm13, ymm12, ymm10",
+            "vpaddw ymm2, ymm2, ymm13",
+            "vpmaddubsw ymm12, ymm12, ymm11",
+            "vpaddw ymm6, ymm6, ymm12",
+            "vmovdqa ymm12, ymmword ptr [{b} + 544]",
+            "vpmaddubsw ymm13, ymm12, ymm10",
+            "vpaddw ymm3, ymm3, ymm13",
+            "vpmaddubsw ymm12, ymm12, ymm11",
+            "vpaddw ymm7, ymm7, ymm12",
+            "vmovdqa ymm12, ymmword ptr [{b} + 576]",
+            "vpmaddubsw ymm13, ymm12, ymm10",
+            "vpaddw ymm4, ymm4, ymm13",
+            "vpmaddubsw ymm12, ymm12, ymm11",
+            "vpaddw ymm8, ymm8, ymm12",
+            "vmovdqa ymm12, ymmword ptr [{b} + 608]",
+            "vpmaddubsw ymm13, ymm12, ymm10",
+            "vpaddw ymm5, ymm5, ymm13",
+            "vpmaddubsw ymm12, ymm12, ymm11",
+            "vpaddw ymm9, ymm9, ymm12",
+            // chunk 5: k 80..95
+            "vbroadcasti128 ymm10, xmmword ptr [{a0} + 80]",
+            "vbroadcasti128 ymm11, xmmword ptr [{a1} + 80]",
+            "vmovdqa ymm12, ymmword ptr [{b} + 640]",
+            "vpmaddubsw ymm13, ymm12, ymm10",
+            "vpaddw ymm2, ymm2, ymm13",
+            "vpmaddubsw ymm12, ymm12, ymm11",
+            "vpaddw ymm6, ymm6, ymm12",
+            "vmovdqa ymm12, ymmword ptr [{b} + 672]",
+            "vpmaddubsw ymm13, ymm12, ymm10",
+            "vpaddw ymm3, ymm3, ymm13",
+            "vpmaddubsw ymm12, ymm12, ymm11",
+            "vpaddw ymm7, ymm7, ymm12",
+            "vmovdqa ymm12, ymmword ptr [{b} + 704]",
+            "vpmaddubsw ymm13, ymm12, ymm10",
+            "vpaddw ymm4, ymm4, ymm13",
+            "vpmaddubsw ymm12, ymm12, ymm11",
+            "vpaddw ymm8, ymm8, ymm12",
+            "vmovdqa ymm12, ymmword ptr [{b} + 736]",
+            "vpmaddubsw ymm13, ymm12, ymm10",
+            "vpaddw ymm5, ymm5, ymm13",
+            "vpmaddubsw ymm12, ymm12, ymm11",
+            "vpaddw ymm9, ymm9, ymm12",
+            // chunk 6: k 96..111
+            "vbroadcasti128 ymm10, xmmword ptr [{a0} + 96]",
+            "vbroadcasti128 ymm11, xmmword ptr [{a1} + 96]",
+            "vmovdqa ymm12, ymmword ptr [{b} + 768]",
+            "vpmaddubsw ymm13, ymm12, ymm10",
+            "vpaddw ymm2, ymm2, ymm13",
+            "vpmaddubsw ymm12, ymm12, ymm11",
+            "vpaddw ymm6, ymm6, ymm12",
+            "vmovdqa ymm12, ymmword ptr [{b} + 800]",
+            "vpmaddubsw ymm13, ymm12, ymm10",
+            "vpaddw ymm3, ymm3, ymm13",
+            "vpmaddubsw ymm12, ymm12, ymm11",
+            "vpaddw ymm7, ymm7, ymm12",
+            "vmovdqa ymm12, ymmword ptr [{b} + 832]",
+            "vpmaddubsw ymm13, ymm12, ymm10",
+            "vpaddw ymm4, ymm4, ymm13",
+            "vpmaddubsw ymm12, ymm12, ymm11",
+            "vpaddw ymm8, ymm8, ymm12",
+            "vmovdqa ymm12, ymmword ptr [{b} + 864]",
+            "vpmaddubsw ymm13, ymm12, ymm10",
+            "vpaddw ymm5, ymm5, ymm13",
+            "vpmaddubsw ymm12, ymm12, ymm11",
+            "vpaddw ymm9, ymm9, ymm12",
+            // chunk 7: k 112..127
+            "vbroadcasti128 ymm10, xmmword ptr [{a0} + 112]",
+            "vbroadcasti128 ymm11, xmmword ptr [{a1} + 112]",
+            "vmovdqa ymm12, ymmword ptr [{b} + 896]",
+            "vpmaddubsw ymm13, ymm12, ymm10",
+            "vpaddw ymm2, ymm2, ymm13",
+            "vpmaddubsw ymm12, ymm12, ymm11",
+            "vpaddw ymm6, ymm6, ymm12",
+            "vmovdqa ymm12, ymmword ptr [{b} + 928]",
+            "vpmaddubsw ymm13, ymm12, ymm10",
+            "vpaddw ymm3, ymm3, ymm13",
+            "vpmaddubsw ymm12, ymm12, ymm11",
+            "vpaddw ymm7, ymm7, ymm12",
+            "vmovdqa ymm12, ymmword ptr [{b} + 960]",
+            "vpmaddubsw ymm13, ymm12, ymm10",
+            "vpaddw ymm4, ymm4, ymm13",
+            "vpmaddubsw ymm12, ymm12, ymm11",
+            "vpaddw ymm8, ymm8, ymm12",
+            "vmovdqa ymm12, ymmword ptr [{b} + 992]",
+            "vpmaddubsw ymm13, ymm12, ymm10",
+            "vpaddw ymm5, ymm5, ymm13",
+            "vpmaddubsw ymm12, ymm12, ymm11",
+            "vpaddw ymm9, ymm9, ymm12",
+            // widen (i16 pairs -> i32) and reduce each token's four vectors to its eight rows
+            "vpcmpeqw ymm10, ymm10, ymm10",
+            "vpsrlw ymm10, ymm10, 15",
+            "vpmaddwd ymm2, ymm2, ymm10",
+            "vpmaddwd ymm3, ymm3, ymm10",
+            "vpmaddwd ymm4, ymm4, ymm10",
+            "vpmaddwd ymm5, ymm5, ymm10",
+            "vpunpckldq ymm11, ymm2, ymm3",
+            "vpunpckhdq ymm2, ymm2, ymm3",
+            "vpaddd ymm2, ymm11, ymm2",
+            "vpunpckldq ymm11, ymm4, ymm5",
+            "vpunpckhdq ymm4, ymm4, ymm5",
+            "vpaddd ymm4, ymm11, ymm4",
+            "vpunpcklqdq ymm11, ymm2, ymm4",
+            "vpunpckhqdq ymm2, ymm2, ymm4",
+            "vpaddd ymm0, ymm11, ymm2",
+            "vpmaddwd ymm6, ymm6, ymm10",
+            "vpmaddwd ymm7, ymm7, ymm10",
+            "vpmaddwd ymm8, ymm8, ymm10",
+            "vpmaddwd ymm9, ymm9, ymm10",
+            "vpunpckldq ymm11, ymm6, ymm7",
+            "vpunpckhdq ymm6, ymm6, ymm7",
+            "vpaddd ymm6, ymm11, ymm6",
+            "vpunpckldq ymm11, ymm8, ymm9",
+            "vpunpckhdq ymm8, ymm8, ymm9",
+            "vpaddd ymm8, ymm11, ymm8",
+            "vpunpcklqdq ymm11, ymm6, ymm8",
+            "vpunpckhqdq ymm6, ymm6, ymm8",
+            "vpaddd ymm1, ymm11, ymm6",
+            b = in(reg) blk.as_ptr(), a0 = in(reg) a0, a1 = in(reg) a1,
+            out("ymm0") r0, out("ymm1") r1,
+            out("ymm2") _, out("ymm3") _, out("ymm4") _, out("ymm5") _, out("ymm6") _, out("ymm7") _,
+            out("ymm8") _, out("ymm9") _, out("ymm10") _, out("ymm11") _, out("ymm12") _, out("ymm13") _,
+            options(nostack, readonly, preserves_flags),
+        );
+        (r0, r1)
     }
 
 }
