@@ -422,9 +422,8 @@ pub struct Cards {
     mtp: Option<MtpOn>,
     resident: Resident,
     /// The prefetch predictor's pairs for `pred_learn`: each card's table (`plan::LEARN_TAB` addresses a pair) and its
-    /// pair count; each layer's (card, entry) where it starts a pair.
+    /// pair count.
     pred_tab: Vec<(Mem, usize)>,
-    pred_at: Vec<Option<(usize, usize)>>,
     /// The handoff sequence: a value a half of a layer's words carry, and each layer's (attention, FFN) values this
     /// step, a pair a chunk.
     seq: u32,
@@ -909,14 +908,12 @@ impl Cards {
             Resident { table: std::sync::Arc::new((0..moe * glm_5_3_flash::E).map(|_| AtomicU32::new(NONE)).collect()), loader: None, inflight: Default::default(), allowed: Default::default(), issued: Default::default(), steps: 0, prefill: false, count: vec![0; moe * glm_5_3_flash::E], turn: 0, owner: counts.iter().map(|&k| vec![(NONE, NONE); k]).collect(), free: counts.iter().map(|&k| (0..k as u32).rev().collect()).collect(), held: (0..n).map(|_| vec![0; moe]).collect(), per_layer, slots, jobs: (0..n).map(|_| Vec::new()).collect(), uploads: 0 }
         };
         // the prefetch predictor's pairs, a table a card
-        let mut pred_at = vec![None; NUM_HIDDEN_LAYERS];
         let pred_tab: Vec<(Mem, usize)> = cards
             .iter()
             .map(|c| {
                 let mut t: Vec<u64> = Vec::new();
                 for (l, f) in ffns.iter().enumerate() {
                     if let Some((st, d, d2)) = f.as_ref().filter(|f| f.card == c.k.index).and_then(|f| f.pred.as_ref()) {
-                        pred_at[l] = Some((c.k.index, t.len() / glm_5_3_flash::plan::LEARN_TAB));
                         let slot = |l: usize| shared.labels.at(l * STEP * TOP_K * 4) as u64;
                         t.extend_from_slice(&[st.va as u64, d.va as u64, slot(l), slot(l + 1), d2.va as u64]);
                     }
@@ -926,7 +923,7 @@ impl Cards {
                 (m, t.len() / glm_5_3_flash::plan::LEARN_TAB)
             })
             .collect();
-        Cards { cards, peers, shared, layers, ffns, mlas, head, head_card, mtp, resident, pred_tab, pred_at, seq: 0, half_seq: vec![[[0; 2]; CHUNKS]; NUM_HIDDEN_LAYERS], ch: 0, t0: 0, chunks: 1, mla_value: 0, token_from: vec![0; n], npools: max_ctx.div_ceil(INDEX_KPOOL) }
+        Cards { cards, peers, shared, layers, ffns, mlas, head, head_card, mtp, resident, pred_tab, seq: 0, half_seq: vec![[[0; 2]; CHUNKS]; NUM_HIDDEN_LAYERS], ch: 0, t0: 0, chunks: 1, mla_value: 0, token_from: vec![0; n], npools: max_ctx.div_ceil(INDEX_KPOOL) }
     }
 
     /// With the launches stamped (`track-launches`): the step's launches on every card as zones on
@@ -1918,7 +1915,7 @@ impl Placed for Cards {
         }
     }
     fn plan_step(&mut self, l: usize, n: usize, picks: &[[usize; TOP_K]]) {
-        use glm_5_3_flash::plan::{LEARN_LDS, LEARN_WG, PLAN_LDS, PLAN_PRED_WGS};
+        use glm_5_3_flash::plan::{PLAN_LDS, PLAN_PRED_WGS, PLAN_WG};
         const E: usize = glm_5_3_flash::E;
         // this layer's picks into its label slot: pair l − 1's labels, pair l's co-routing input
         let slot = |l: usize| self.shared.labels.at((l * STEP + self.t0) * TOP_K * 4);
@@ -1957,15 +1954,9 @@ impl Placed for Cards {
                 a.ptr(0).ptr(0);
             }
             a.u32(self.half_seq[l][self.ch][1]).u32(n as u32);
-            c.k.launch(&c.pred_step, if decode { 1 } else { PLAN_PRED_WGS as u32 }, g::WG, PLAN_LDS, &a);
+            c.k.launch(&c.pred_step, if decode { 1 } else { PLAN_PRED_WGS as u32 }, PLAN_WG, PLAN_LDS, &a);
         }
-        // a decode step's pair l − 1 learns from these picks, in the same wait; a prefill step's pairs at its end (`plan_learn`)
-        if let (true, Some((card, entry))) = (decode, l.checked_sub(1).and_then(|lp| self.pred_at[lp])) {
-            let c = &self.cards[card];
-            let mut a = Args::new();
-            a.ptr(self.pred_tab[card].0.va).u32(entry as u32).u32(self.t0 as u32).u32(n as u32);
-            c.k.launch(&c.pred_learn, 1, LEARN_WG, LEARN_LDS, &a);
-        }
+        // the pairs learn at the step's end (`plan_learn`), before any of them predicts again
     }
     fn plan_learn(&mut self, n: usize) {
         use glm_5_3_flash::plan::{LEARN_LDS, LEARN_WG};

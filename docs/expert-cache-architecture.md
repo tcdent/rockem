@@ -493,6 +493,13 @@ not the host experts' 550 (the card runs the residents and the shared FFN first)
 Without the map it is ~135 µs (`pred_step` 66, the second router 35, `pred_learn` 23, the add 10). More model needs
 a shorter chain first; the map is reverted.
 
+**A shorter chain** (card10, 2026-10-21): every pair learns at the step's end (one launch a card, a workgroup a pair;
+a pair predicts again only next step, so the update is as fresh), and `pred_step` runs a thread an expert with the 8th
+best by wave maxima (each thread had compared its value with all 288). `pred_step` 66 → 52 µs a layer; the learning
+~35 µs a step instead of 23 µs a layer; the chain in the wait ~135 → ~100 µs a layer. Long decode run against card6:
+missed 5.81 / 5.80 (the same plans: the first 82 layer runs match exactly), verify step 62.03 → 61.79 ms (`kda_card`
+20.82 → 20.57).
+
 ## 12. Risks, unknowns, and decisions
 
 **Unknowns (each has a phase that answers it):**

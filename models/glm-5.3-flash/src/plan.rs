@@ -4,13 +4,13 @@
 //! the plan: a decode step's best `PLAN` experts for the next layer.
 //!
 //! `pred_step`, in the FFN card's queue right ahead of a MoE layer's output half (which spins until the host's experts
-//! are in, so it runs in that wait): pair l predicts layer l + 1 from the route-ahead scores, keeping each token's margin
-//! `d` for its own update; a decode step also ranks the union (Π(1 + eᶻ), the order of Σ softplus) and writes the plan
-//! and the host's word. `pred_learn`: per-expert BCE, Adam, in batches of `SPEC_TOKENS` tokens as decode's steps. A
-//! decode step's pair l − 1 learns from layer l's picks right after `pred_step`, in the same wait (the two 56 + 65 µs of
-//! a ~550 µs wait, 2026-10-21). A prefill step's pairs learn once its layers are done, a workgroup a pair, all at once:
-//! a 512-token chunk's learning a layer took 10.6 ms, more than the chunk's wait (the other chunk's card half fills
-//! it): prefill 1.85 → 2.6 ms a prompt token. A pair's state and margins live on its layer's FFN card.
+//! are in, ~180 µs at the median, so it runs in that wait): pair l predicts layer l + 1 from the route-ahead scores,
+//! keeping each token's margins for its own update; a decode step also ranks the union (Π(1 + eᶻ), the order of
+//! Σ softplus) and writes the plan and the host's word. `pred_learn`, once a step's layers are done, a workgroup a pair,
+//! every pair at once: per-expert BCE, Adam, in batches of `SPEC_TOKENS` tokens as decode's steps. A pair predicts
+//! again only in the next step, so its update at the step's end is as fresh as one a layer after its prediction; in the
+//! layers' waits a decode step's update took 23 µs a layer, and a 512-token chunk's 10.6 ms (prefill 1.85 → 2.6 ms a
+//! prompt token). A pair's state and margins live on its layer's FFN card.
 //!
 //! The pair's state, f32, `STATE` long: the calibration and Adam's terms (`HDR`), the next layer's router bias (`BN`),
 //! the bias and its moments, the co-routing table `[E][E]` (row: an expert picked here) and its moments.
@@ -65,15 +65,17 @@ pub const LEARN_LDS: u32 = (4 * (2 * SPEC_TOKENS * E + 3 * SPEC_TOKENS * TOP_K +
 pub const LEARN_WG: u32 = E as u32;
 /// `pred_learn`'s table: device addresses a pair.
 pub const LEARN_TAB: usize = 5;
-/// `pred_step`'s: the reductions, a token's scores and the plan's keys `[E]` each.
-pub const PLAN_LDS: u32 = (4 * (16 + 2 * E)) as u32;
+/// `pred_step`'s: the reductions, the waves' best 8, the plan's keys `[E]`.
+pub const PLAN_LDS: u32 = (4 * (16 + E / 32 * TOP_K + E)) as u32;
+/// `pred_step`'s workgroup: a thread an expert.
+pub const PLAN_WG: u32 = E as u32;
 /// Workgroups that predict a long step's tokens, a token a workgroup at a time.
 pub const PLAN_PRED_WGS: usize = 64;
 
 #[cfg(target_arch = "amdgpu")]
 pub mod gfx11 {
     use super::*;
-    use common::gfx11::{lds, workgroup_sync};
+    use common::gfx11::{ballot, lds, wave_max, workgroup_sync};
     use common::math::{exp, sqrt};
     use core::arch::amdgpu::{workgroup_id_x, workitem_id_x};
     use core::sync::atomic::{fence, AtomicU32, Ordering};
@@ -104,94 +106,96 @@ pub mod gfx11 {
         }
     }
 
-    /// A token's margins from one set of layer l + 1's router logits (token `i`'s E at `src`): σ + the router's bias,
-    /// less the 8th best of those, × 10 — this thread's experts t and t + 256 into `m0`, `m1`.
+    /// The 8th best of the workgroup's `E` values, one a thread (with multiplicity: the value with at most 7 above it
+    /// and at least 8 at or above it): each wave's best 8 by eight wave maxima, then the best 8 of those 72 in wave 0.
+    /// Every thread gets it. Three barriers. (Each thread comparing its value with all 288 took most of `pred_step`'s
+    /// 66 µs a layer, 2026-10-21.)
     #[inline(always)]
-    unsafe fn margins(t: usize, src: *const f32, bn: *const f32, gv: *mut f32, red: *mut f32) -> (f32, f32) {
-        let mut k = 0;
-        while k < 2 {
-            let e = t + 256 * k;
-            if e < E {
-                *gv.add(e) = sigmoid(*src.add(e)) + *bn.add(e);
+    unsafe fn eighth(v: f32, lane: u32, wave: usize, cand: *mut f32, red: *mut f32) -> f32 {
+        const NONE: f32 = f32::NEG_INFINITY;
+        let mut cur = v;
+        let mut j = 0;
+        while j < TOP_K {
+            let m = wave_max(lane, cur);
+            if lane == ballot(cur == m).trailing_zeros() {
+                cur = NONE;
             }
-            k += 1;
+            if lane == 0 {
+                *cand.add(wave * TOP_K + j) = m;
+            }
+            j += 1;
         }
         workgroup_sync();
-        // the 8th best: the value with at most 7 above it and at least 8 at or above it
-        let mut k = 0;
-        while k < 2 {
-            let e = t + 256 * k;
-            if e < E {
-                let v = *gv.add(e);
-                let (mut above, mut at) = (0u32, 0u32);
-                let mut j = 0;
-                while j < E {
-                    let w = *gv.add(j);
-                    above += (w > v) as u32;
-                    at += (w >= v) as u32;
-                    j += 1;
+        if wave == 0 {
+            const C: usize = E / 32 * TOP_K;
+            let (mut a, mut b) = (*cand.add(lane as usize), *cand.add(lane as usize + 32));
+            let mut c = if (lane as usize) + 64 < C { *cand.add(lane as usize + 64) } else { NONE };
+            let mut m = NONE;
+            let mut j = 0;
+            while j < TOP_K {
+                let loc = if a >= b && a >= c { a } else if b >= c { b } else { c };
+                m = wave_max(lane, loc);
+                if lane == ballot(loc == m).trailing_zeros() {
+                    if a == m {
+                        a = NONE;
+                    } else if b == m {
+                        b = NONE;
+                    } else {
+                        c = NONE;
+                    }
                 }
-                if above < TOP_K as u32 && at >= TOP_K as u32 {
-                    *red = v;
-                }
+                j += 1;
             }
-            k += 1;
+            if lane == 0 {
+                *red = m;
+            }
         }
         workgroup_sync();
         let thr = *red;
-        let m0 = (*gv.add(t) - thr) * 10.0;
-        let m1 = if t + 256 < E { (*gv.add(t + 256) - thr) * 10.0 } else { 0.0 };
         workgroup_sync();
-        (m0, m1)
+        thr
     }
 
     /// Pair l's prediction (see the module): its state, the route-ahead scores (`[n][ROUTE_ROWS]`, the next layer's
     /// from `E`), the second margin's (likewise), the margins it keeps `[n][E]` each, the picks at l `[n][TOP_K]`
-    /// u32. `plan` (null in a long step): the decode plan and the host's `word`. Grid: 1 for a decode step,
-    /// `PLAN_PRED_WGS` for a long one.
+    /// u32. `plan` (null in a long step): the decode plan and the host's `word`. Workgroups of `PLAN_WG`, a thread an
+    /// expert; grid 1 for a decode step, `PLAN_PRED_WGS` for a long one.
     #[no_mangle]
     pub extern "gpu-kernel" fn pred_step(pred: *const f32, scores: *const f32, scores2: *const f32, p_d: *mut f32, p_d2: *mut f32, p_picks: *const u32, plan: *mut u32, word: *mut u32, value: u32, n: u32) {
         unsafe {
-            let t = workitem_id_x() as usize;
+            const RR: usize = crate::hc::gfx11_consts::ROUTE_ROWS;
+            let e = workitem_id_x() as usize;
+            let (lane, wave) = ((e % 32) as u32, e / 32);
             let wg = workgroup_id_x() as usize;
             let n = n as usize;
             let decode = n <= SPEC_TOKENS;
             let l = lds::<f32>();
             let red = l; // [16]
-            let gv = red.add(16); // [E]
-            let sk = gv.add(E); // [E]
+            let cand = red.add(16); // [E / 32 · TOP_K]
+            let sk = cand.add(E / 32 * TOP_K); // [E]
             // the tokens this workgroup predicts: a decode step's all in one, a long step's striped
             let (first, stride) = if decode { (0, 1) } else { (wg, PLAN_PRED_WGS) };
             let (ca, cc, ca2) = (*pred.add(HDR), *pred.add(HDR + 1), *pred.add(HDR + 2));
-            // the plan's key of this thread's experts t and t + 256 (scalars: an array across the barriers is scratch)
-            let (mut s0, mut s1) = (1f32, 1f32);
+            let (bn, bias) = (*pred.add(BN + e), *pred.add(BIAS + e));
+            // the plan's key of this thread's expert
+            let mut key = 1f32;
             let mut i = first;
             while i < n {
-                let (a0, a1) = margins(t, scores.add(i * crate::hc::gfx11_consts::ROUTE_ROWS + E), pred.add(BN), gv, red);
-                let (b0, b1) = margins(t, scores2.add(i * crate::hc::gfx11_consts::ROUTE_ROWS + E), pred.add(BN), gv, red);
-                let mut k = 0;
-                while k < 2 {
-                    let e = t + 256 * k;
-                    if e < E {
-                        let (d, d2) = if k == 0 { (a0, b0) } else { (a1, b1) };
-                        *p_d.add(i * E + e) = d;
-                        *p_d2.add(i * E + e) = d2;
-                        if decode {
-                            let mut z = ca * d + ca2 * d2 + cc + *pred.add(BIAS + e);
-                            let mut q = 0;
-                            while q < TOP_K {
-                                z += *pred.add(CO + *p_picks.add(i * TOP_K + q) as usize * E + e);
-                                q += 1;
-                            }
-                            let f = 1.0 + exp(if z < 20.0 { z } else { 20.0 });
-                            if k == 0 {
-                                s0 *= f;
-                            } else {
-                                s1 *= f;
-                            }
-                        }
+                let g1 = sigmoid(*scores.add(i * RR + E + e)) + bn;
+                let t1 = eighth(g1, lane, wave, cand, red);
+                let g2 = sigmoid(*scores2.add(i * RR + E + e)) + bn;
+                let t2 = eighth(g2, lane, wave, cand, red);
+                let (d, d2) = ((g1 - t1) * 10.0, (g2 - t2) * 10.0);
+                *p_d.add(i * E + e) = d;
+                *p_d2.add(i * E + e) = d2;
+                if decode {
+                    let mut z = ca * d + ca2 * d2 + cc + bias;
+                    let mut q = 0;
+                    while q < TOP_K {
+                        z += *pred.add(CO + *p_picks.add(i * TOP_K + q) as usize * E + e);
+                        q += 1;
                     }
-                    k += 1;
+                    key *= 1.0 + exp(if z < 20.0 { z } else { 20.0 });
                 }
                 i += stride;
             }
@@ -199,36 +203,21 @@ pub mod gfx11 {
                 return;
             }
             // the plan: each expert's place among the keys (the greater first, between equals the lower expert)
-            let mut k = 0;
-            while k < 2 {
-                let e = t + 256 * k;
-                if e < E {
-                    *sk.add(e) = if k == 0 { s0 } else { s1 };
-                }
-                k += 1;
-            }
+            *sk.add(e) = key;
             workgroup_sync();
-            let mut k = 0;
-            while k < 2 {
-                let e = t + 256 * k;
-                if e < E {
-                    let v = *sk.add(e);
-                    let mut r = 0usize;
-                    let mut j = 0;
-                    while j < E {
-                        let w = *sk.add(j);
-                        r += (w > v || (w == v && j < e)) as usize;
-                        j += 1;
-                    }
-                    if r < PLAN {
-                        *plan.add(r) = e as u32;
-                    }
-                }
-                k += 1;
+            let mut r = 0usize;
+            let mut j = 0;
+            while j < E {
+                let w = *sk.add(j);
+                r += (w > key || (w == key && j < e)) as usize;
+                j += 1;
+            }
+            if r < PLAN {
+                *plan.add(r) = e as u32;
             }
             fence(Ordering::Release);
             workgroup_sync();
-            if t == 0 && !word.is_null() {
+            if e == 0 && !word.is_null() {
                 AtomicU32::from_ptr(word).store(value, Ordering::Release);
             }
         }

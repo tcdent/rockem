@@ -1216,7 +1216,8 @@ pub trait Placed {
     /// The prefetch predictor's step on the cards (`plan::gfx11`), posted right ahead of a MoE layer's output half: pair
     /// l predicts the next layer (a decode step's prediction is a plan, `plan`), pair l − 1 learns from the picks.
     fn plan_step(&mut self, l: usize, n: usize, picks: &[[usize; TOP_K]]);
-    /// A prefill step's predictor updates, once its layers are done: every pair over the step's `n` tokens at once.
+    /// The step's predictor updates, once its layers are done: every pair over the step's `n` tokens at once, a
+    /// workgroup a pair (in the layers' waits a decode step's took 23 µs a layer of a ~180 µs wait, 2026-10-21).
     fn plan_learn(&mut self, n: usize);
     /// A decode step's plan for the layer after l, best first (`plan::PLAN` experts), once the card's word says it is in.
     fn plan(&mut self, l: usize, out: &mut [usize]);
@@ -2073,8 +2074,8 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 let (picks, wts) = (&mut s.b_picks[t0..t0 + n], &mut s.b_wts[t0..t0 + n]);
                 let (xq, xs, xg) = (&s.b_xq[t0 * H..(t0 + n) * H], &s.b_xs[t0 * HG..(t0 + n) * HG], &s.b_xg[t0 * HG..(t0 + n) * HG]);
                 // the prefetch predictor on the cards, right ahead of the FFN's output half, which spins until the host's
-                // experts are in: this layer's pair predicts the next (a decode step's prediction is the plan); a decode
-                // step's pair before learns from these picks (a prefill step's pairs learn at its end)
+                // experts are in: this layer's pair predicts the next (a decode step's prediction is the plan); the pairs
+                // learn from the picks at the step's end
                 pl.plan_step(l, n, &s.b_routed[t0..t0 + n]);
                 pl.ffn_post(l, n);
                 // the outputs: the layer's leader card's rows in its VRAM (002) — the host's experts write theirs through
@@ -2164,9 +2165,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
         }
         // the head, the draft layer and anything after the layers address the step whole again
         pl.chunk(0, 0);
-        if n > SPEC_TOKENS {
-            pl.plan_learn(n);
-        }
+        pl.plan_learn(n);
         match logits {
             Logits::None => pl.finish(),
             Logits::Last => pl.logits(n - 1, 1, &mut s.logits[(n - 1) * VOCAB_SIZE..n * VOCAB_SIZE]),
