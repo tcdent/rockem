@@ -1,0 +1,6 @@
+--name lrs32_03 --terms lrs32 --lr 3e-4
+--name lrs32_01 --terms lrs32 --lr 1e-4
+--name lr16_03 --terms lr16 --lr 3e-4
+--name lr64_01 --terms lr64 --lr 1e-4
+--name b_co_rep_lrs32_03 --terms bias,co,rep,lrs32 --lr 3e-4
+--name b_co_rep_lr16_03 --terms bias,co,rep,lr16 --lr 3e-4

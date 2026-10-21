@@ -1,0 +1,24 @@
+--name base0
+--name basemax --maxrank 1
+--name cal --terms cal
+--name cal_b3 --terms cal --lrb 3e-3
+--name cal_b30 --terms cal --lrb 3e-2
+--name bias --terms bias
+--name bias_b3 --terms bias --lrb 3e-3
+--name bias_b30 --terms bias --lrb 3e-2
+--name rep --terms rep
+--name co --terms co --lr 1e-3
+--name co_3 --terms co --lr 3e-3
+--name co_10 --terms co --lr 1e-2
+--name lr16 --terms lr16
+--name lr32 --terms lr32
+--name lr64 --terms lr64
+--name lr64_3 --terms lr64 --lr 3e-3
+--name lr64_03 --terms lr64 --lr 3e-4
+--name lrs16 --terms lrs16
+--name lrs32 --terms lrs32
+--name lrs64 --terms lrs64
+--name lrn64 --terms lrn64
+--name full --terms full --lr 1e-4
+--name full_3 --terms full --lr 3e-4
+--name full_1k --terms full --lr 1e-3

@@ -1,0 +1,8 @@
+b_lrs32 recall@8/13/16 [0.4237 0.6136 0.6922] time 294s
+b_co recall@8/13/16 [0.4231 0.6135 0.6927] time 523s
+b_co_lrs32 recall@8/13/16 [0.4246 0.6158 0.6949] time 742s
+b_co_rep_lrs32_lr3 recall@8/13/16 [0.4201 0.602  0.6767] time 781s
+b_co_rep_lrs32 recall@8/13/16 [0.4249 0.6165 0.6957] time 782s
+off_b_co_lrs32 recall@8/13/16 [0.4245 0.6118 0.6884] time 1171s
+b_co_rep_lr64 recall@8/13/16 [0.4232 0.6105 0.6874] time 1878s
+off_full recall@8/13/16 [0.4294 0.625  0.7056] time 5890s

@@ -1,0 +1,8 @@
+--name b_co --terms bias,co
+--name b_lrs32 --terms bias,lrs32
+--name b_co_lrs32 --terms bias,co,lrs32
+--name b_co_rep_lrs32 --terms bias,co,rep,lrs32
+--name b_co_rep_lrs32_lr3 --terms bias,co,rep,lrs32 --lr 3e-3
+--name b_co_rep_lr64 --terms bias,co,rep,lr64
+--name off_b_co_lrs32 --terms bias,co,lrs32 --offline 0.6
+--name off_full --terms bias,full --lr 1e-4 --offline 0.6
