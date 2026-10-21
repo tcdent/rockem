@@ -24,6 +24,10 @@ approximated), a wider candidate list ranked by confidence, learned co-routing, 
 - `bench-reuse` on 92 cores: an L3-served (neighbour-touched) gemv runs 2.2× a cold one, so a prefetched expert
   could be ~19 µs if its lines survived to the run; today they mostly do not (docs/metatron-cpu.md, §5).
 
+- 2026-10-20, build fills2 (per-item fill counters by prefetch status): complete experts' lines 71.5 % from L3, partial
+  51 %, not predicted 6.9 %. Estimated worth a verify step: ~2.5 ms if the 30 % unpredicted experts were predicted and
+  completed (this entry), ~3.6 ms if completed prefetches kept their lines (the L3's own question), ~1 ms partial.
+
 ## Next
 First make a completed prefetch worth its 2.2× (why the lines are gone by the run: eviction or timing), since better
 prediction multiplies that worth; then the predictor's precision against the `prefetch_use` rows.

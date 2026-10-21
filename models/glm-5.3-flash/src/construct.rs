@@ -627,7 +627,22 @@ pub struct CpuExperts<'a> {
     /// finished touching their slices — read when that layer's run starts (`prefetch_use` rows).
     #[cfg(feature = "track-experts")]
     pf: std::sync::Mutex<Option<(usize, Vec<usize>, Vec<u16>, std::sync::Arc<Vec<std::sync::atomic::AtomicU16>>)>>,
+    /// `track-experts`: every core's performance counters, programmed once with `pmc::FILLS` (where a run's bytes come
+    /// from); the items read them themselves (`rdpmc`).
+    #[cfg(feature = "track-experts")]
+    pmcs: Vec<common::pmc::Pmc>,
+    /// `track-experts`: whether items read their core's fill counters (`rdpmc` allowed and the counters programmed),
+    /// and those counts a pool slot, by the item's expert's prefetch status (complete, partial, missed) — the L2
+    /// prefetcher's lines that hit L3 and that missed it.
+    #[cfg(feature = "track-experts")]
+    rdpmc: bool,
+    #[cfg(feature = "track-experts")]
+    fill_acc: Vec<FillAcc>,
 }
+#[cfg(feature = "track-experts")]
+#[repr(align(64))]
+#[derive(Default)]
+struct FillAcc([std::sync::atomic::AtomicU64; 6]);
 #[cfg(feature = "track-experts")]
 const BUCKETS: usize = 8;
 /// The token-count buckets of an item: 1, 2, 3–4, 5–8, 9–16, 17–32, 33–64, 65+.
@@ -663,8 +678,16 @@ impl<'a> CpuExperts<'a> {
         use common::q4::GROUP;
         #[cfg(feature = "track-experts")]
         let item_acc = (0..SLOTS).map(|_| std::array::from_fn(|_| ItemAcc::default())).collect();
-        let mut this = CpuExperts { #[cfg(feature = "track-experts")] item_acc, #[cfg(feature = "track-experts")] pf: std::sync::Mutex::new(None), stream, pool, slice_node: Vec::new(), slice_slot: Vec::new(), xq: vec![0; STEP * H], xs: vec![0.0; STEP * H / GROUP], xg: vec![0; STEP * H / GROUP], h: vec![0.0; STEP * TOP_K * D_FF], hq: vec![0; STEP * TOP_K * D_FF], hs: vec![0.0; STEP * TOP_K * D_FF / GROUP], hg: vec![0; STEP * TOP_K * D_FF / GROUP], elapsed: 0.0 };
+        let mut this = CpuExperts { #[cfg(feature = "track-experts")] item_acc, #[cfg(feature = "track-experts")] pf: std::sync::Mutex::new(None), #[cfg(feature = "track-experts")] pmcs: Vec::new(), #[cfg(feature = "track-experts")] rdpmc: false, #[cfg(feature = "track-experts")] fill_acc: (0..SLOTS).map(|_| FillAcc::default()).collect(), stream, pool, slice_node: Vec::new(), slice_slot: Vec::new(), xq: vec![0; STEP * H], xs: vec![0.0; STEP * H / GROUP], xg: vec![0; STEP * H / GROUP], h: vec![0.0; STEP * TOP_K * D_FF], hq: vec![0; STEP * TOP_K * D_FF], hs: vec![0.0; STEP * TOP_K * D_FF / GROUP], hg: vec![0; STEP * TOP_K * D_FF / GROUP], elapsed: 0.0 };
         this.relearn();
+        // the fill counters on every core (the NMI watchdog holds a counter on each CPU: off first, 2026-10-20)
+        #[cfg(feature = "track-experts")]
+        {
+            let _ = std::fs::write("/proc/sys/kernel/nmi_watchdog", "0");
+            this.pmcs = (0..crate::construct::physical_cores().len()).filter_map(common::pmc::Pmc::open).filter(|p| p.program(&common::pmc::FILLS)).collect();
+            // read by the items themselves with `rdpmc` (reading 96 cores' counters through msr took ~8.5 ms a run)
+            this.rdpmc = !this.pmcs.is_empty() && common::pmc::allow_rdpmc();
+        }
         this
     }
     /// The slices' nodes read again from the placement: after the stream's items were re-placed.
@@ -862,6 +885,11 @@ impl CpuExperts<'_> {
         // `track-experts`: this run's host experts against the prefetch made for this layer — predicted and every item
         // touched, predicted but not finished when the run began, not predicted (decode's L3 question, 2026-10-20)
         #[cfg(feature = "track-experts")]
+        let mut pf_use: Option<[usize; 8]> = None;
+        // each expert's prefetch status for the items' fill counts: 0 complete, 1 partial, 2 missed
+        #[cfg(feature = "track-experts")]
+        let mut status = [2u8; E];
+        #[cfg(feature = "track-experts")]
         if let Some((pl, pidx, per, fin)) = self.pf.lock().unwrap().take() {
             if pl == l {
                 let (mut complete, mut partial, mut missed, mut items, mut items_done) = (0usize, 0usize, 0usize, 0usize, 0usize);
@@ -871,16 +899,36 @@ impl CpuExperts<'_> {
                             let d = fin[k].load(Ordering::Relaxed) as usize;
                             items += per[k] as usize;
                             items_done += d;
-                            if d == per[k] as usize { complete += 1 } else { partial += 1 }
+                            if d == per[k] as usize {
+                                complete += 1;
+                                status[e] = 0;
+                            } else {
+                                partial += 1;
+                                status[e] = 1;
+                            }
                         }
                         None => missed += 1,
                     }
                 }
                 let all_done: usize = fin.iter().map(|f| f.load(Ordering::Relaxed) as usize).sum();
                 let all: usize = per.iter().map(|&x| x as usize).sum();
-                prow::row!("track-experts", "prefetch_use", { "layer" => l, "tokens" => n, "host_experts" => experts.len(), "complete" => complete, "partial" => partial, "missed" => missed, "used_items" => items, "used_items_done" => items_done, "predicted" => pidx.len(), "items" => all, "items_done" => all_done });
+                pf_use = Some([experts.len(), complete, partial, missed, items, items_done, pidx.len(), all * 1_000_000 + all_done]);
             }
         }
+        // an item's L3 hits and misses (its core's counters around it), to its expert's status, when this run is counted
+        #[cfg(feature = "track-experts")]
+        let (counted, fill_acc, status) = (pf_use.is_some() && self.rdpmc, &self.fill_acc, &status);
+        #[cfg(feature = "track-experts")]
+        let fill = move |slot: usize, e: usize, c0: (u64, u64)| {
+            if counted {
+                let (h, m) = (common::pmc::rdpmc(4).wrapping_sub(c0.0), common::pmc::rdpmc(5).wrapping_sub(c0.1));
+                let s = status[e] as usize;
+                fill_acc[slot].0[2 * s].fetch_add(h & ((1 << 48) - 1), Ordering::Relaxed);
+                fill_acc[slot].0[2 * s + 1].fetch_add(m & ((1 << 48) - 1), Ordering::Relaxed);
+            }
+        };
+        #[cfg(feature = "track-experts")]
+        let fill0 = move || if counted { (common::pmc::rdpmc(4), common::pmc::rdpmc(5)) } else { (0, 0) };
         let ne = experts.len();
         let uses = |e: usize| &pairs[first[e]..first[e + 1]];
         let stream = self.stream;
@@ -912,6 +960,8 @@ impl CpuExperts<'_> {
             let t_item = std::time::Instant::now();
             let (j, p) = (i / parts, i % parts);
             let e = experts_r[j];
+            #[cfg(feature = "track-experts")]
+            let c0 = fill0();
             let w = expert::Weights::at(stream, l, e);
             let pairs = uses_r(e);
             for c in first_c(p)..first_c(p) + if fold { QP } else { 1 } {
@@ -951,6 +1001,8 @@ impl CpuExperts<'_> {
             }
             #[cfg(feature = "track-experts")]
             acc[gate_slot(i)][bucket_of(pairs.len())].add(t_item.elapsed().as_nanos() as u64, pairs.len());
+            #[cfg(feature = "track-experts")]
+            fill(gate_slot(i), e, c0);
             });
         }
         #[cfg(feature = "track-experts")]
@@ -983,6 +1035,8 @@ impl CpuExperts<'_> {
             let t_item = std::time::Instant::now();
             let (j, c) = (i / DOWN_PARTS, i % DOWN_PARTS);
             let e = experts_r[j];
+            #[cfg(feature = "track-experts")]
+            let c0 = fill0();
             let w = expert::Weights::at(stream, l, e);
             let (dw, ds) = w.down(c);
             let r0 = c * DOWN_ROWS;
@@ -1003,11 +1057,24 @@ impl CpuExperts<'_> {
             unsafe { core::arch::x86_64::_mm_sfence() };
             #[cfg(feature = "track-experts")]
             acc[down_slot(i)][bucket_of(pairs.len())].add(t_item.elapsed().as_nanos() as u64, pairs.len());
+            #[cfg(feature = "track-experts")]
+            fill(down_slot(i), e, c0);
             });
         }
         #[cfg(feature = "track-experts")]
         self.item_rows(l, "down", DOWN_ROWS * D_FF / 2 + DOWN_ROWS * DG * 4);
         self.elapsed += t0.elapsed().as_secs_f64();
+        #[cfg(feature = "track-experts")]
+        if let Some(u) = pf_use {
+            // the items' fills by status, summed over the slots and cleared
+            let mut f = [0u64; 6];
+            for a in self.fill_acc.iter() {
+                for (i, x) in a.0.iter().enumerate() {
+                    f[i] += x.swap(0, Ordering::Relaxed);
+                }
+            }
+            prow::row!("track-experts", "prefetch_use", { "layer" => l, "tokens" => n, "host_experts" => u[0], "complete" => u[1], "partial" => u[2], "missed" => u[3], "used_items" => u[4], "used_items_done" => u[5], "predicted" => u[6], "items" => u[7] / 1_000_000, "items_done" => u[7] % 1_000_000, "counted" => self.rdpmc as u8, "c_hit" => f[0], "c_miss" => f[1], "p_hit" => f[2], "p_miss" => f[3], "m_hit" => f[4], "m_miss" => f[5], "run_us" => t0.elapsed().as_secs_f64() * 1e6 });
+        }
     }
 }
 #[cfg(feature = "track-experts")]

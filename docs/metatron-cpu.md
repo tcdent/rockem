@@ -488,6 +488,25 @@ full load. So the production 31-vs-42 µs (1.37×) says the prefetched lines are
 them (eviction or timing), not that L3 is slow to deliver. At full load an L3-served `gemv` gets ~9 GB/s a core (~70 a
 CCD), far under a bare load loop's L3 rate — the one-token kernel from L3 is its own question.
 
+**Where a decode run's bytes come from (measured 2026-10-20, build fills2, `prefetch_use` rows: each pool item reads its
+core's fill counters with `rdpmc` and adds them to its expert's prefetch status; 9,471 decode layer runs at 18k).** Of
+the L2 prefetcher's line requests:
+
+| expert's prefetch | experts a run | from L3 | from DRAM |
+|---|---|---|---|
+| complete | 7.2 of 16.6 | 71.5 % | 28.5 % |
+| partial | 4.5 | 51 % | 49 % |
+| not predicted | 4.9 | 6.9 % | 93 % |
+
+So the decode prefetch's shortfall is three measured parts: a completed prefetch still loses 28.5 % of its lines to DRAM
+by the time the run reads them; 30 % of the host experts are not predicted; 27 % are partly touched when the run
+overtakes the prefetch. Estimated worth a verify step, from these rates (inferred): ~3.6 ms if completed prefetches
+stayed in L3, ~2.5 ms if the missed experts were predicted and completed, ~1 ms for the partial ones. Demand fills are
+~2 % of the lines in every class: the hardware L2 prefetcher brings nearly everything. Instrument cost: none measured
+(27.3 ms an emitted token, as without it). The counters need the NMI watchdog off (the node writes
+`/proc/sys/kernel/nmi_watchdog` 0) and `rdpmc` allowed (`/sys/devices/cpu/rdpmc` 2); reading them through
+`/dev/cpu/N/msr` from one thread costs ~8.5 ms for 96 cores and is unusable inside a run.
+
 ## 8. Open questions
 
 - **The missing ~10–13 % of DRAM.** The box reaches 79–82 % of theoretical against Dell's 90–92 %. Socket 1 and

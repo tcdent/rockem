@@ -49,6 +49,8 @@ pub mod gemv;
 #[cfg(any(test, feature = "std"))]
 pub mod linalg;
 pub mod math;
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+pub mod pmc;
 pub mod pool;
 #[cfg(any(test, feature = "std"))]
 pub mod testing;
