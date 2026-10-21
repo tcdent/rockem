@@ -2165,11 +2165,19 @@ impl<'p, R: Routed> CpuModel<'p, R> {
         }
         // the head, the draft layer and anything after the layers address the step whole again
         pl.chunk(0, 0);
-        pl.plan_learn(n);
+        // the predictor's updates (`plan_learn`): queued behind the head once its logits are read, so the cards run them
+        // while the host samples and drafts (~1 ms they idle there); queued ahead of the head they held the logits,
+        // `head` 1.93 → 2.31 ms a verify step (2026-10-21). A step without logits learns before its finish.
         match logits {
-            Logits::None => pl.finish(),
+            Logits::None => {
+                pl.plan_learn(n);
+                pl.finish()
+            }
             Logits::Last => pl.logits(n - 1, 1, &mut s.logits[(n - 1) * VOCAB_SIZE..n * VOCAB_SIZE]),
             Logits::All => pl.logits(0, n, &mut s.logits[..n * VOCAB_SIZE]),
+        }
+        if !matches!(logits, Logits::None) {
+            pl.plan_learn(n);
         }
         if n == 1 && !matches!(logits, Logits::None) {
             tr.edge(NONE, "logits", &s.logits[..VOCAB_SIZE]);

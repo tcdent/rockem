@@ -500,6 +500,13 @@ best by wave maxima (each thread had compared its value with all 288). `pred_ste
 missed 5.81 / 5.80 (the same plans: the first 82 layer runs match exactly), verify step 62.03 → 61.79 ms (`kda_card`
 20.82 → 20.57).
 
+**Prediction is no longer the bound** (2026-10-21): the input map, with its learning at the step's end, missed 0.10
+fewer experts a layer on the long decode run (5.81 → 5.71), and every one of them became a partial expert (2.51 →
+2.60), not a complete one (7.75 → 7.74): the experts lap did not move. The extra right experts rank low in the 13 and
+are not done by the run. More accuracy pays only with more completion (an earlier post, faster prefetch delivery, or
+ordering the run so a partly prefetched expert's lines are still in the L3). The predictor's updates are queued behind
+the logits read: the cards run them while the host samples (`head` 1.91 ms, as without them).
+
 ## 12. Risks, unknowns, and decisions
 
 **Unknowns (each has a phase that answers it):**
