@@ -28,6 +28,10 @@ approximated), a wider candidate list ranked by confidence, learned co-routing, 
   51 %, not predicted 6.9 %. Estimated worth a verify step: ~2.5 ms if the 30 % unpredicted experts were predicted and
   completed (this entry), ~3.6 ms if completed prefetches kept their lines (the L3's own question), ~1 ms partial.
 
+- 2026-10-20, builds sets: the L3 keeps less of a completed prefetch the more the layer prefetches (86 % at ≤ 10 experts,
+  56 % at 23+; 87 / 81 / 71 / 62 % at 1 / 2 / 3 / 4 tokens) — capacity, not set conflicts (1.2 % of lines past 16 in
+  their set). So precision is worth more than its share of picks: every unused prefetched expert also evicts used ones.
+
 ## Next
 First make a completed prefetch worth its 2.2× (why the lines are gone by the run: eviction or timing), since better
 prediction multiplies that worth; then the predictor's precision against the `prefetch_use` rows.

@@ -2223,3 +2223,4 @@ fn mla_rows(a: &weights::Mla, cache: &mut [u16], pools: &mut [u16], pos: usize, 
         mla::pool_done(a, cache, pools, pos + i);
     }
 }
+

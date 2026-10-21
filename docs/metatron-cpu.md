@@ -507,6 +507,26 @@ stayed in L3, ~2.5 ms if the missed experts were predicted and completed, ~1 ms 
 `/proc/sys/kernel/nmi_watchdog` 0) and `rdpmc` allowed (`/sys/devices/cpu/rdpmc` 2); reading them through
 `/dev/cpu/N/msr` from one thread costs ~8.5 ms for 96 cores and is unusable inside a run.
 
+**Why a completed prefetch loses lines: L3 capacity (measured 2026-10-20, builds fills2 and sets).** Set conflicts are
+not it: histogramming sampled decode prefetches by L3 set (the weights sit on 2 MiB hugetlbfs pages, so an address
+modulo 2 MiB is physical; Zen 3's slice hash not modeled), a CCD's prefetch spreads over 32,745 of 32,768 sets, 9.1 lines
+a used set, and only 1.2 % of its lines are past 16 in their set. The volume is the problem: a CCD prefetches ~19 MB a
+layer (297k lines) into its 32 MB L3. Completed experts' L3 share falls with the layer's prefetch size:
+
+| experts the layer prefetched | completed experts' lines from L3 |
+|---|---|
+| ≤ 10 (avg 8.9) | 85.9 % |
+| 11–14 | 80.0 % |
+| 15–18 | 73.2 % |
+| 19–22 | 65.2 % |
+| 23+ (avg 25.5) | 56.3 % |
+
+and with the verify step's width (the prefetch is the union of the tokens' picks): 87 / 81 / 71 / 62 % at 1 / 2 / 3 / 4
+tokens. Completed-and-retained experts are roughly flat beyond ~13 prefetched (6.6 × 80 % at 12.7, 7.9 × 65 % at 20.5):
+past that a prefetched expert costs a DRAM read and evicts an earlier one. Levers: rank the prefetch by confidence and
+cap it near what an L3 retains; better prediction (fewer unused experts, queue 082); the union ranked by agreement
+across tokens. Gated depth 3 (081) widens the union, a cost its measurements did not separate.
+
 ## 8. Open questions
 
 - **The missing ~10–13 % of DRAM.** The box reaches 79–82 % of theoretical against Dell's 90–92 %. Socket 1 and
