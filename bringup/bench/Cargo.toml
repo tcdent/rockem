@@ -13,6 +13,10 @@ memmap2 = "0.9"
 # the card clock behind node/src/kfd.rs's `utc` (included by #[path])
 prow = { path = "../../../prow" }
 
+[features]
+# bench-alloc with common::alloc as the global allocator (the node's)
+own-alloc = []
+
 [[bin]]
 name = "bench-experts"
 path = "src/experts.rs"

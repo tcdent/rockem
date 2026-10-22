@@ -47,11 +47,11 @@ pub trait Pool: Sync {
     fn prepares(&self) -> bool {
         false
     }
-    /// A run's job built — items sorted into their queues, the job allocated — but not announced: `run_prepared` runs it.
-    /// The closure is the job's own. Returns a handle (0: not supported).
+    /// A run's job built — items sorted into their queues (`slots[i]`, from `Pool::slot`), the job allocated — but not
+    /// announced: `run_prepared` runs it. The closure is the job's own. Returns a handle (0: not supported).
     #[cfg(feature = "std")]
-    fn prepare_slotted(&self, n: usize, slot: &(dyn Fn(usize) -> usize + Sync), f: std::boxed::Box<dyn Fn(usize) + Send + Sync>) -> usize {
-        let _ = (n, slot, f);
+    fn prepare_slotted(&self, slots: &[u8], f: std::boxed::Box<dyn Fn(usize) + Send + Sync>) -> usize {
+        let _ = (slots, f);
         0
     }
     /// Announce a job `prepare_slotted` built, work on it with this thread too, and return when it is done.

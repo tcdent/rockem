@@ -900,3 +900,8 @@ fn main() {
         println!("[{} prompt tokens in {:.2}s ({} cached), {n} generated at {:.2} tok/s]", ids.len(), t_prefill.as_secs_f32(), session.hits, n as f32 / t_gen.as_secs_f32());
     }
 }
+
+/// The node's allocator (`common::alloc`): size classes and thread magazines over slabs never unmapped. musl's own cost
+/// the main thread 77 µs a CPU layer of page faults, 3.5 ms a verify step (bench-alloc, 2026-10-22).
+#[global_allocator]
+static ALLOC: common::alloc::Classes = common::alloc::Classes;

@@ -2,6 +2,10 @@
 //! and the prefetch allocate every CPU layer (construct.rs: `plan_run`, `Threads::build`, `prefetch`), allocated and
 //! freed in a loop, on one thread and across two (built on one, freed on another, as a builder-core plan is).
 //! Build for `x86_64-unknown-linux-musl` (the node's target) and for gnu to compare.
+#[cfg(feature = "own-alloc")]
+#[global_allocator]
+static ALLOC: common::alloc::Classes = common::alloc::Classes;
+
 use std::hint::black_box;
 use std::sync::atomic::AtomicU8;
 use std::time::Instant;
@@ -38,7 +42,7 @@ fn time<T>(name: &str, iters: usize, f: impl Fn() -> T) {
 }
 
 fn main() {
-    let libc = if cfg!(target_env = "musl") { "musl" } else { "gnu" };
+    let libc = if cfg!(feature = "own-alloc") { "own classes" } else if cfg!(target_env = "musl") { "musl" } else { "gnu" };
     println!("bench-alloc ({libc}), ns an alloc+free of each shape");
     let n = 20000;
     time("job (4 KB + 4 small)", n, || drop(job()));

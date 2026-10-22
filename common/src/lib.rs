@@ -44,6 +44,8 @@ extern crate std;
 
 #[cfg(target_arch = "amdgpu")]
 pub mod gfx11;
+#[cfg(all(feature = "std", target_os = "linux"))]
+pub mod alloc;
 pub mod copy;
 pub mod gemv;
 #[cfg(any(test, feature = "std"))]
