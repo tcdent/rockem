@@ -601,6 +601,15 @@ the pool's runs 22.19 → 20.97 ms a verify step, but quant 45 and route/dispatc
 2.43 → 4.26 ms: the step 63.17 → 63.79. aff5 (fold without pairing): completed 59.5 %, gate/up 516 — a folded item's
 second slice on another CCD. aff7 (fold with pairing): 86.9 %, quant gone, gate/up 371. aff8 (small job): overhead 2.24.
 
+**Rule 5 — the main thread writes little, and into lines it owns (built 2026-10-22, aff18–aff30).** The ~3.5 ms a
+verify step the main thread spent outside the pool's runs was, in order: musl's malloc (77 µs a layer of page faults
+for ~20 blocks; `common::alloc` replaces it), the run's accounting rows (35 µs a layer of atomics on lines dirty in 88
+caches; per-item words now, rows written by the builder core), and the plan's own stores — ~25 KB a layer at ~35 ns a
+line whether the lines were last read by the workers or long evicted. A warm second plan of the same layer cost the
+same as the cold one: the price is the store, not the load. The builder core and the main thread now write their next
+blocks while they idle (`prewarm`), so the plan's and the prefetch's stores land in lines their own L2 holds modified.
+The plan 46 → 17.8 µs, the overhead 3.5 → ~1.0 ms a verify step, the step 55.75 → 53.0 ms (queue 083 has the chain).
+
 ## 12. Risks, unknowns, and decisions
 
 **Unknowns (each has a phase that answers it):**

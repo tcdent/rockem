@@ -391,6 +391,28 @@ window does not have. So a touch-based prefetch into this L3 keeps ~90 % of its 
 85 % is that plus its run's own installs, and the last five points cost more than the ~0.3–0.4 ms a verify step they
 would return (CAT with cores split by item kind, or a partial second pass).
 
+### What a store costs, and musl's malloc (measured 2026-10-22, the node's planner on core 7)
+
+A store into a line this core does not own costs ~35 ns, and it costs the same whether the line was last *read* by
+the pool's 88 workers (shared in their caches: an invalidation across the box) or evicted long ago (a fetch). The
+node's run plan — ~25 KB of fresh data a layer that every worker then reads — took 31 µs on the builder core, every
+stage's time proportional to the bytes it wrote, and a second, warm plan of the same layer the same 27 µs (the reads
+were warm; the stores were not). Reuse order did not matter: last-in-first-out blocks (hot but shared) and
+first-in-first-out blocks a megabyte deep (cold) both cost ~35 ns a line. What does: writing the blocks ahead of
+time, while the core idles, so the plan's stores find the lines modified in its own L2 (`common::alloc::prewarm`) —
+the plan 31 → 17.8 µs, the remainder its loops (two counting sorts at ~4 ns an item) and its reads of lines the
+workers wrote (the prefetch's takers).
+
+musl's malloc (mallocng, the static node's libc) hands a freed medium block (1–8 KB) back to the kernel and page-faults
+it in at the next allocation. The node's per-layer allocation set — two pool jobs, a run plan, a prefetch's items,
+~20 blocks — cost 77 µs an iteration on the host under musl against 1.9 under glibc and 1.5 under `common::alloc`
+(`bench-alloc`, bringup/bench; build it for both targets). On the box that was a third of the main thread's 3.5 ms a
+verify step. `common::alloc` (common/src/alloc.rs) is the node's allocator now: power-of-two classes from 16 B to 1 MiB,
+a magazine a class a thread, a central list a class, 2 MiB slabs mapped populated and never unmapped.
+
+How it was found: stage stamps inside the plan (`plan_build` rows: cumulative µs after each stage), then the same plan
+built twice with the second timed — if warm is not faster, the cost is not what the code reads.
+
 ## 4. Clocks and power
 
 **The power cap sets the all-core clock** (2026-10-20, APERF/MPERF through `/dev/cpu/N/msr`, power through the
@@ -573,6 +595,8 @@ After the rewrite (2026-10-20), gate/up runs at 68.8 / 76.4 / 74.6 GMAC/s a core
 | `gemm2` (two 16-row passes of the old shape) | 2026-10-20 | 1.11–1.21× from 16 tokens, slower below; dropped for the rewrite | 078 |
 | LUT GEMM at 4 bits | 2026-09-20 | set aside by reasoning (DRAM-bound decode; prefill recheck deferred) | 054, 056 |
 | the new gemm's flush/setup reworked (4-token blocks, flush from registers, tables) | 2026-10-20 | llvm-mca −11 % a group; on a metatron core 5–10 % slower at 16–64 tokens | 078 |
+| Zeroed arrays, u16 indices, no per-item closures in the planner | 2026-10-22 | the stage stamps did not move: the plan's time was its bytes written, not its instructions | §3, what a store costs |
+| First-in-first-out block reuse (`common::alloc`, 1 MiB deep) against last-in-first-out | 2026-10-22 | the same ~35 ns a written line: cold lines and shared lines cost alike; kept (no worse, and what `prewarm` walks) | §3 |
 
 ## 7. How to measure
 

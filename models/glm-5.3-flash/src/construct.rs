@@ -1107,6 +1107,7 @@ impl<'a> CpuExperts<'a> {
                             if !f.is_null() {
                                 run_rows(unsafe { Box::from_raw(f) });
                                 // the next plan's blocks into this core's cache while it idles (~400 µs a layer)
+                                cpu_zone!("prewarm");
                                 common::alloc::prewarm(32 << 10);
                             } else {
                                 std::hint::spin_loop();
@@ -1478,7 +1479,7 @@ impl Routed for CpuExperts<'_> {
         let tables = self.tables.read().unwrap();
         // the items cut from `slice_order` (each expert's slices already in queue order): an item is (expert position,
         // queue, its run in `slices`), every item's slice ids in one flat copy the job owns
-        let mut items: Vec<(usize, usize, u16, u16)> = Vec::with_capacity(idx.len() * (n_gu + n_down));
+        let mut items: Vec<(usize, usize, u16, u16)> = Vec::with_capacity(idx.len() * 16);
         let mut slices: Vec<u8> = Vec::with_capacity(idx.len() * (n_gu + n_down));
         let mut item_of = vec![u16::MAX; idx.len() * (n_gu + n_down)];
         for (k, &e) in idx.iter().enumerate() {
@@ -2647,6 +2648,12 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 // router's picks and weights — the host's norm, quantize and routing moved to the FFN card's `hc_pre`
                 const HG: usize = H / common::q4::GROUP;
                 if phase == DISPATCH {
+                    // the slot lap's blocks (the prefetch's items, its job) into this core's cache while the card is still
+                    // on its half (their stores into cold or shared lines were ~35 ns each, 2026-10-22)
+                    {
+                        cpu_zone!("prewarm");
+                        common::alloc::prewarm(16 << 10);
+                    }
                     pl.ffn_input(l, n, &mut s.b_xq[t0 * H..(t0 + n) * H], &mut s.b_xs[t0 * HG..(t0 + n) * HG], &mut s.b_xg[t0 * HG..(t0 + n) * HG], &mut s.b_picks[t0..t0 + n], &mut s.b_wts[t0..t0 + n], s.pool);
                     lap(&mut p.kda_card, "kda_card");
                     let (picks, wts) = (&mut s.b_picks[t0..t0 + n], &mut s.b_wts[t0..t0 + n]);
