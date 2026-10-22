@@ -73,7 +73,15 @@ const MAX_CCDS: usize = 16;
 /// rows' node only), slot `ANY` is for an item nothing places (no placed region holds
 /// its rows): every worker drains it, last.
 const ANY: usize = MAX_CCDS + MAX_NODES;
-const SLOTS: usize = ANY + 1;
+/// Slot `CORE + w` is worker `w`'s own: items whose lines that worker's core already holds — a planned expert's
+/// slices, read by the core that touched them. A line in another core's L2 is not in the L3 (a victim cache), and
+/// for local-homed memory the CCX refetches it from DRAM rather than forwarding it: a completed prefetched expert
+/// read by other cores got 83 % of its lines from L3, the same lines read by the toucher ~98 % (metatron-cpu §3,
+/// 2026-10-22). A worker drains its own slot, then its CCD's queue, then its CCD-mates' own slots (a steal costs
+/// the L2-held share, less than idling), then the node's and the rest.
+const CORE: usize = ANY + 1;
+const MAX_WORKERS: usize = 128;
+const SLOTS: usize = CORE + MAX_WORKERS;
 /// The decode prefetch's experts a layer at most, its best-ranked first (a CCD's L3 retains about this many; see the
 /// prefetch's comment).
 const PREFETCH_CAP: usize = 13;
@@ -89,6 +97,8 @@ struct Job {
     /// Set when the job is abandoned (a prefetch the next run overtakes): no more items are claimed.
     stop: std::sync::atomic::AtomicBool,
     n: usize,
+    /// A prefetch: which worker took each item (`u8::MAX`: none yet), for the run that reads those lines; empty otherwise.
+    taker: std::sync::Arc<Vec<std::sync::atomic::AtomicU8>>,
     /// Per node: items its workers completed, and when the last of them finished (ns after the
     /// job was posted) — the run's end on each node, the measurement the placement is tuned by.
     node_done: [Counter; MAX_NODES],
@@ -166,8 +176,10 @@ thread_local! {
 /// the cross-node rate (metatron: 165 GB/s for the box against 326 node-local), so idle cores
 /// stealing a straggling node's items slowed the run they meant to finish (NPS2, 2026-10-15:
 /// experts 30.5 → 23.1 ms a token without it). Work lands where its pages are.
-fn slot_order(node: usize, ccd: usize, node_ccds: &[Vec<usize>]) -> Vec<usize> {
-    let mut o = vec![ccd, MAX_CCDS + node];
+fn slot_order(node: usize, ccd: usize, node_ccds: &[Vec<usize>], who: usize, mates: &[usize]) -> Vec<usize> {
+    let mut o = vec![CORE + who, ccd];
+    o.extend(mates.iter().filter(|&&w| w != who).map(|&w| CORE + w));
+    o.push(MAX_CCDS + node);
     o.extend(node_ccds[node].iter().filter(|&&c| c != ccd));
     o.push(ANY);
     o
@@ -195,9 +207,9 @@ macro_rules! cpu_zone {
 }
 unsafe fn work(job: *const Job, order: &[usize], node: usize, who: usize) {
     let j = &*job;
-    // a prefetch's items only from this core's own CCD: a line touched here lands in this CCD's L3, so another CCD's item
-    // done here is wasted for its run and evicts this CCD's own (the steal was counted done, 2026-10-21)
-    let order = if j.light { &order[..1] } else { order };
+    // a prefetch's items only from this core's own CCD's queue (`order[1]`): a line touched here lands in this core's
+    // caches, so another CCD's item done here is wasted for its run and evicts this CCD's own (2026-10-21)
+    let order = if j.light { &order[1..2] } else { order };
     let f = &*j.f;
     INSIDE.with(|c| c.set(job));
     let (mut mine, mut local) = (0, 0);
@@ -219,6 +231,10 @@ unsafe fn work(job: *const Job, order: &[usize], node: usize, who: usize) {
                 if j.light {
                     (taken, busy0) = (true, std::time::Instant::now());
                 }
+            }
+            if j.light {
+                // by item id (`i` is the item's place in the slot order)
+                j.taker[j.order[i] as usize].store(who as u8, Ordering::Relaxed);
             }
             f(j.order[i] as usize);
             mine += 1;
@@ -263,12 +279,18 @@ impl Threads {
             }
         }
         let shared = std::sync::Arc::new(Shared { job: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()), active: AtomicUsize::new(0), busy: std::sync::atomic::AtomicBool::new(false), quit: std::sync::atomic::AtomicBool::new(false) });
+        assert!(cores.len() <= MAX_WORKERS, "{} workers: the pool slots {MAX_WORKERS}", cores.len());
+        // each CCD's workers (by index), for the slot orders
+        let mut mates: Vec<Vec<usize>> = vec![Vec::new(); ccd_keys.len()];
+        for (who, &c) in cores.iter().enumerate() {
+            mates[ccd_of(c)].push(who);
+        }
         let mut seen_in_ccd = vec![0usize; ccd_keys.len()];
         seen_in_ccd[ccd_of(cores[0])] += 1;
         for (who, &core) in cores.iter().enumerate().skip(1) {
             let sh = shared.clone();
             let node = node_of_core(core);
-            let order = slot_order(node, ccd_of(core), &node_ccds);
+            let order = slot_order(node, ccd_of(core), &node_ccds, who, &mates[ccd_of(core)]);
             let rank = seen_in_ccd[ccd_of(core)];
             seen_in_ccd[ccd_of(core)] += 1;
             std::thread::spawn(move || {
@@ -300,7 +322,7 @@ impl Threads {
             });
         }
         let node = node_of_core(cores[0]);
-        let order = slot_order(node, ccd_of(cores[0]), &node_ccds);
+        let order = slot_order(node, ccd_of(cores[0]), &node_ccds, 0, &mates[ccd_of(cores[0])]);
         Threads { workers: cores.len(), shared, retired: std::sync::Mutex::new(Vec::new()), order, node_ccds, placed: std::sync::Mutex::new(Vec::new()), locality: std::sync::Mutex::new((0, 0)), prefetched: std::sync::Mutex::new((0, 0)), node, node_stats: std::sync::Mutex::new(([0; MAX_NODES], [0.0; MAX_NODES])), overheads: std::sync::Mutex::new((0.0, 0.0, 0.0, 0)), last_ends: std::sync::Mutex::new(0.0), post_stats: std::sync::Mutex::new((0.0, 0.0, 0.0)) }
     }
     /// Tell the pool where a region's memory lives: `nodes[p]` is the node of its `p`th `PAGE`.
@@ -458,7 +480,8 @@ impl Threads {
         }
         let fp: *const (dyn Fn(usize) + Sync) = unsafe { std::mem::transmute(f) };
         let light = owned.is_some();
-        let job = Box::into_raw(Box::new(Job { f: fp, order, next: std::array::from_fn(|s| Counter(AtomicUsize::new(start[s]))), start, done: Counter(AtomicUsize::new(0)), local: Counter(AtomicUsize::new(0)), stop: std::sync::atomic::AtomicBool::new(false), n, node_done: std::array::from_fn(|_| Counter(AtomicUsize::new(0))), node_end: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)), #[cfg(feature = "track-experts")] core_end: (0..self.workers).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(), #[cfg(feature = "track-experts")] busy_ns: std::sync::atomic::AtomicU64::new(0), #[cfg(feature = "track-experts")] takers: AtomicUsize::new(0), #[cfg(feature = "track-experts")] ts0: prow::Timestamp::now(), #[cfg(feature = "track-experts")] last: std::sync::atomic::AtomicU64::new(0), first: std::sync::atomic::AtomicU64::new(u64::MAX), t0: std::time::Instant::now(), _owned: owned, light }));
+        let taker = std::sync::Arc::new(if light { (0..n).map(|_| std::sync::atomic::AtomicU8::new(u8::MAX)).collect() } else { Vec::new() });
+        let job = Box::into_raw(Box::new(Job { f: fp, order, next: std::array::from_fn(|s| Counter(AtomicUsize::new(start[s]))), start, done: Counter(AtomicUsize::new(0)), local: Counter(AtomicUsize::new(0)), stop: std::sync::atomic::AtomicBool::new(false), n, taker, node_done: std::array::from_fn(|_| Counter(AtomicUsize::new(0))), node_end: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)), #[cfg(feature = "track-experts")] core_end: (0..self.workers).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(), #[cfg(feature = "track-experts")] busy_ns: std::sync::atomic::AtomicU64::new(0), #[cfg(feature = "track-experts")] takers: AtomicUsize::new(0), #[cfg(feature = "track-experts")] ts0: prow::Timestamp::now(), #[cfg(feature = "track-experts")] last: std::sync::atomic::AtomicU64::new(0), first: std::sync::atomic::AtomicU64::new(u64::MAX), t0: std::time::Instant::now(), _owned: owned, light }));
         let old = sh.job.swap(job, Ordering::AcqRel);
         if !old.is_null() {
             self.retired.lock().unwrap().push(old as usize);
@@ -493,10 +516,13 @@ impl Pool for Threads {
     fn run_slotted(&self, n: usize, slot: &(dyn Fn(usize) -> usize + Sync), f: &(dyn Fn(usize) + Sync)) {
         self.publish(n, None, None, None, Some(slot), f)
     }
-    fn prefetch_slotted(&self, n: usize, slot: Box<dyn Fn(usize) -> usize + Send + Sync>, f: Box<dyn Fn(usize) + Send + Sync>) {
+    fn prefetch_slotted(&self, n: usize, slot: Box<dyn Fn(usize) -> usize + Send + Sync>, f: Box<dyn Fn(usize) + Send + Sync>) -> Option<std::sync::Arc<Vec<std::sync::atomic::AtomicU8>>> {
         if n > 1 {
             let fr: &(dyn Fn(usize) + Sync) = unsafe { &*(&*f as *const (dyn Fn(usize) + Send + Sync)) };
-            self.post(n, None, None, None, Some(&*slot), fr, Some(f));
+            let job = self.post(n, None, None, None, Some(&*slot), fr, Some(f));
+            Some(unsafe { (*job).taker.clone() })
+        } else {
+            None
         }
     }
     fn prefetch_on(&self, n: usize, node: Box<dyn Fn(usize) -> usize + Send + Sync>, ccd: Box<dyn Fn(usize) -> usize + Send + Sync>, f: Box<dyn Fn(usize) + Send + Sync>) {
@@ -630,9 +656,9 @@ pub struct CpuExperts<'a> {
     /// (expert, queue) and its run of slices — are cut from a table instead of grouped a call (the grouping's
     /// allocations were ~31 µs of a decode layer's 53 µs `slot` lap, 2026-10-20).
     slice_order: Vec<u8>,
-    /// The last prefetch's plan: its layer and experts in the order posted, so that layer's run takes them in the order
-    /// they arrive (the planned first, then the rest).
-    planned: std::sync::Mutex<(usize, Vec<usize>)>,
+    /// The last prefetch's plan, for that layer's run: the experts in the order posted (the run takes them in the order
+    /// they arrive, the planned first), each slice's prefetch item and the item's taker (the run reads the slice there).
+    planned: std::sync::Mutex<Option<Planned>>,
     /// A step's activations quantized once each (`[STEP][H]` and their groups), the experts' hidden
     /// states (`[STEP][TOP_K][D_FF]`) and those quantized once each for the down rows.
     xq: Vec<i8>,
@@ -702,7 +728,7 @@ impl<'a> CpuExperts<'a> {
         use common::q4::GROUP;
         #[cfg(feature = "track-experts")]
         let item_acc = (0..SLOTS).map(|_| std::array::from_fn(|_| ItemAcc::default())).collect();
-        let mut this = CpuExperts { #[cfg(feature = "track-experts")] item_acc, #[cfg(feature = "track-experts")] pf: std::sync::Mutex::new(None), #[cfg(feature = "track-experts")] pmcs: Vec::new(), #[cfg(feature = "track-experts")] rdpmc: false, #[cfg(feature = "track-experts")] fill_acc: (0..SLOTS).map(|_| FillAcc::default()).collect(), stream, pool, slice_node: Vec::new(), slice_slot: Vec::new(), slice_order: Vec::new(), planned: std::sync::Mutex::new((usize::MAX, Vec::new())), xq: vec![0; STEP * H], xs: vec![0.0; STEP * H / GROUP], xg: vec![0; STEP * H / GROUP], h: vec![0.0; STEP * TOP_K * D_FF], hq: vec![0; STEP * TOP_K * D_FF], hs: vec![0.0; STEP * TOP_K * D_FF / GROUP], hg: vec![0; STEP * TOP_K * D_FF / GROUP], elapsed: 0.0 };
+        let mut this = CpuExperts { #[cfg(feature = "track-experts")] item_acc, #[cfg(feature = "track-experts")] pf: std::sync::Mutex::new(None), #[cfg(feature = "track-experts")] pmcs: Vec::new(), #[cfg(feature = "track-experts")] rdpmc: false, #[cfg(feature = "track-experts")] fill_acc: (0..SLOTS).map(|_| FillAcc::default()).collect(), stream, pool, slice_node: Vec::new(), slice_slot: Vec::new(), slice_order: Vec::new(), planned: std::sync::Mutex::new(None), xq: vec![0; STEP * H], xs: vec![0.0; STEP * H / GROUP], xg: vec![0; STEP * H / GROUP], h: vec![0.0; STEP * TOP_K * D_FF], hq: vec![0; STEP * TOP_K * D_FF], hs: vec![0.0; STEP * TOP_K * D_FF / GROUP], hg: vec![0; STEP * TOP_K * D_FF / GROUP], elapsed: 0.0 };
         this.relearn();
         // the fill counters on every core (the NMI watchdog holds a counter on each CPU: off first, 2026-10-20)
         #[cfg(feature = "track-experts")]
@@ -787,17 +813,21 @@ unsafe fn touch_avx2(p: *const u8, len: usize) {
     }
     std::hint::black_box(_mm256_xor_si256(_mm256_xor_si256(a, b), _mm256_xor_si256(c, d)));
 }
+/// A decode layer's prefetch as its run sees it (`CpuExperts::planned`).
+struct Planned {
+    l: usize,
+    /// The experts posted, in order.
+    idx: Vec<usize>,
+    /// Each slice's prefetch item, `[k][GU_ITEMS + DOWN_ITEMS]` (`u16::MAX`: none).
+    item_of: Vec<u16>,
+    /// Each item's taker (the pool's worker index; `u8::MAX`: not taken), filled in as the prefetch runs.
+    takers: Option<std::sync::Arc<Vec<std::sync::atomic::AtomicU8>>>,
+}
 impl Routed for CpuExperts<'_> {
     fn elapsed(&mut self) -> f64 {
         std::mem::take(&mut self.elapsed)
     }
     fn prefetch(&self, l: usize, idx: &[usize]) {
-        {
-            let mut p = self.planned.lock().unwrap();
-            p.0 = l;
-            p.1.clear();
-            p.1.extend_from_slice(idx);
-        }
         // the stream lives as long as the process (the node leaks it; the gate's outlives every token):
         // the job that owns these closures is gone within the token
         let stream: &'static expert::Stream<'static> = unsafe { std::mem::transmute::<&expert::Stream, &'static expert::Stream<'static>>(self.stream) };
@@ -806,10 +836,12 @@ impl Routed for CpuExperts<'_> {
         // compute's order — a slice's node from its rows' page, its CCD from the expert's id and the slice
         let (n_gu, n_down) = (GU_ITEMS, DOWN_ITEMS);
         let idx: Vec<usize> = idx.to_vec();
+        let idx_plan = idx.clone();
         // the items cut from `slice_order` (each expert's slices already in queue order): an item is (expert position,
         // queue, its run in `slices`), every item's slice ids in one flat copy the job owns
-        let mut items: Vec<(usize, usize, u16, u16)> = Vec::with_capacity(idx.len() * SLOTS);
+        let mut items: Vec<(usize, usize, u16, u16)> = Vec::with_capacity(idx.len() * MAX_CCDS);
         let mut slices: Vec<u8> = Vec::with_capacity(idx.len() * (n_gu + n_down));
+        let mut item_of = vec![u16::MAX; idx.len() * (n_gu + n_down)];
         for (k, &e) in idx.iter().enumerate() {
             let rec = ((l - FIRST_K_DENSE_REPLACE) * E + e) * (n_gu + n_down);
             let (order, slot_of) = (&self.slice_order[rec..rec + n_gu + n_down], &self.slice_slot[rec..rec + n_gu + n_down]);
@@ -819,6 +851,9 @@ impl Routed for CpuExperts<'_> {
                 let mut b = a + 1;
                 while b < order.len() && slot_of[order[b] as usize] == q {
                     b += 1;
+                }
+                for &j in &order[a..b] {
+                    item_of[k * (n_gu + n_down) + j as usize] = items.len() as u16;
                 }
                 items.push((k, q as usize, slices.len() as u16, (b - a) as u16));
                 slices.extend_from_slice(&order[a..b]);
@@ -863,7 +898,8 @@ impl Routed for CpuExperts<'_> {
             #[cfg(feature = "track-experts")]
             finished[it.0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         };
-        self.pool.prefetch_slotted(n, Box::new(slot), Box::new(f));
+        let takers = self.pool.prefetch_slotted(n, Box::new(slot), Box::new(f));
+        *self.planned.lock().unwrap() = Some(Planned { l, idx: idx_plan, item_of, takers });
     }
     fn run(&mut self, l: usize, idx: &[usize; TOP_K], x: &[f32], out: &mut [f32]) {
         self.run_batch(l, std::slice::from_ref(idx), x, out)
@@ -931,13 +967,17 @@ impl CpuExperts<'_> {
         // from DRAM come after the prefetched ones are read (in id order, the run streamed a high-id unplanned expert
         // between planned ones). The outputs land in fixed rows: the order changes no bits.
         let mut experts: Vec<usize> = (0..E).filter(|&e| first[e + 1] > first[e]).collect();
-        {
+        let planned = {
             let mut p = self.planned.lock().unwrap();
-            if p.0 == l {
-                let rank = |e: &usize| p.1.iter().position(|q| q == e).unwrap_or(E + *e);
-                experts.sort_by_key(rank);
-                p.0 = usize::MAX;
+            if p.as_ref().is_some_and(|p| p.l == l) { p.take() } else { None }
+        };
+        // each expert's position in the plan (`u16::MAX`: unplanned)
+        let mut pos_of = [u16::MAX; E];
+        if let Some(p) = &planned {
+            for (k, &e) in p.idx.iter().enumerate() {
+                pos_of[e] = k as u16;
             }
+            experts.sort_by_key(|&e| if pos_of[e] != u16::MAX { pos_of[e] as usize } else { E + e });
         }
         // `track-experts`: this run's host experts against the prefetch made for this layer — predicted and every item
         // touched, predicted but not finished when the run began, not predicted (decode's L3 question, 2026-10-20)
@@ -991,6 +1031,25 @@ impl CpuExperts<'_> {
         let stream = self.stream;
         let slice_slot = &self.slice_slot;
         let slot_of = |e: usize, j: usize| slice_slot[((l - FIRST_K_DENSE_REPLACE) * E + e) * (GU_ITEMS + DOWN_ITEMS) + j] as usize;
+        // a planned slice to the worker that touched it (its core's own slot, `CORE`), else to its CCD's queue
+        let planned_r = &planned;
+        let pslot = move |e: usize, j: usize| -> usize {
+            if let Some(p) = planned_r {
+                let k = pos_of[e];
+                if k != u16::MAX {
+                    let t = p.item_of[k as usize * (GU_ITEMS + DOWN_ITEMS) + j];
+                    if t != u16::MAX {
+                        if let Some(tk) = &p.takers {
+                            let w = tk[t as usize].load(Ordering::Relaxed);
+                            if w != u8::MAX {
+                                return CORE + w as usize;
+                            }
+                        }
+                    }
+                }
+            }
+            slot_of(e, j)
+        };
         let h_p = self.h.as_mut_ptr() as usize;
         // the gate/up rows: part (j, c) owns expert experts[j]'s hidden channels c·GU_ROWS.., for all of
         // its tokens at once (`q4::gemm`: the part's bytes read once, every token's dot on them), in
@@ -1006,7 +1065,7 @@ impl CpuExperts<'_> {
         let fold = n > SPEC_TOKENS;
         let parts = if fold { GU_PARTS / QP } else { GU_PARTS };
         let first_c = move |p: usize| if fold { p * QP } else { p };
-        let gate_slot = move |i: usize| slot_of(experts_r[i / parts], first_c(i % parts) / SUB);
+        let gate_slot = move |i: usize| pslot(experts_r[i / parts], first_c(i % parts) / SUB);
         let (hq_p, hs_p, hg_p) = (self.hq.as_mut_ptr() as usize, self.hs.as_mut_ptr() as usize, self.hg.as_mut_ptr() as usize);
         #[cfg(feature = "track-experts")]
         let acc = &self.item_acc;
@@ -1084,7 +1143,7 @@ impl CpuExperts<'_> {
         // the down rows: part (j, c) owns rows c·DOWN_ROWS.. of expert experts[j]'s output, for all of its tokens, likewise
         let (hq, hs, hg) = (&self.hq, &self.hs, &self.hg);
         let out_p = out.as_mut_ptr() as usize;
-        let down_slot = move |i: usize| slot_of(experts_r[i / DOWN_PARTS], GU_ITEMS + i % DOWN_PARTS / SUB);
+        let down_slot = move |i: usize| pslot(experts_r[i / DOWN_PARTS], GU_ITEMS + i % DOWN_PARTS / SUB);
         {
             cpu_zone!("experts.down");
             self.pool.run_slotted(ne * DOWN_PARTS, &down_slot, &move |i| {
