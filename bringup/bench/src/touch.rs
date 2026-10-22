@@ -9,11 +9,22 @@
 //!   probe     the boot probe's `stream_sum`: every 32 B loaded, four accumulators, over the whole buffer (metatron-cpu §2:
 //!             326 GB/s box-wide, 2026-10-15)
 //!   touch     the node's `touch_avx2`: one 32 B load a 64 B line, `--inflight` lines in flight, over the whole buffer
+//!   touch2    both 32 B halves of every line loaded (the probe's pattern at the touch's structure)
+//!   pf        the touch with a software prefetch `--ahead` lines ahead of each load
 //!   chunks    the touch in `--chunk`-byte pieces with an atomic flag read between pieces (the node's abandon check)
 //!   items     production items: a CCD's 13 items a round, each four 272 KB slices at four places in the buffer, the
 //!             cores of the CCD claiming items off one shared counter (the pool's queue), the touch in chunks
 //!   static    the same items assigned statically, no shared counter
 //!   slices    items of one slice (272 KB), claimed off the CCD's counter
+//!   runs      a CCD's 13 experts' bytes (52 slices) as contiguous runs of `--run` bytes each, claimed off the CCD's
+//!             counter: the rate against the run's length (the node's items are runs of 272–544 KB, 2026-10-22)
+//!   share     runs, and a core that finds the queue empty helps finish the runs still in progress: the owner takes
+//!             `--piece`-byte pieces from the run's front, helpers from its back (two sequential streams meeting), so no
+//!             core idles at the tail
+//!
+//! A round's rate is every core's bytes over the round's wall (the slowest core's); the best round is printed, with
+//! that round's CCD and core rates. (A first form kept each core's best round and summed those: a mode whose cores
+//! did different work each round summed rates no round had, 2026-10-22.)
 //!
 //! Prints, per mode: GB/s box-wide, then a CCD (min/med/max over CCDs), then a core (min/med/max).
 
@@ -81,8 +92,47 @@ unsafe fn touch_n(inflight: usize, p: *const u8, len: usize) {
         8 => touch::<8>(p, len),
         16 => touch::<16>(p, len),
         32 => touch::<32>(p, len),
+        64 => touch::<64>(p, len),
         _ => touch::<4>(p, len),
     }
+}
+/// Both halves of every line loaded, `K` lines in flight.
+#[target_feature(enable = "avx2")]
+unsafe fn touch2<const K: usize>(p: *const u8, len: usize) {
+    use core::arch::x86_64::*;
+    let mut acc = [_mm256_setzero_si256(); K];
+    let mut i = 0;
+    while i + 64 * K <= len {
+        for k in 0..K {
+            acc[k] = _mm256_xor_si256(acc[k], _mm256_loadu_si256(p.add(i + 64 * k) as *const __m256i));
+            acc[k] = _mm256_xor_si256(acc[k], _mm256_loadu_si256(p.add(i + 64 * k + 32) as *const __m256i));
+        }
+        i += 64 * K;
+    }
+    let mut s = acc[0];
+    for k in 1..K {
+        s = _mm256_xor_si256(s, acc[k]);
+    }
+    std::hint::black_box(s);
+}
+/// The touch with a software prefetch `ahead` lines ahead of each load.
+#[target_feature(enable = "avx2")]
+unsafe fn touch_pf<const K: usize>(p: *const u8, len: usize, ahead: usize) {
+    use core::arch::x86_64::*;
+    let mut acc = [_mm256_setzero_si256(); K];
+    let mut i = 0;
+    while i + 64 * K <= len {
+        for k in 0..K {
+            _mm_prefetch(p.add(i + 64 * (k + ahead)) as *const i8, _MM_HINT_T0);
+            acc[k] = _mm256_xor_si256(acc[k], _mm256_loadu_si256(p.add(i + 64 * k) as *const __m256i));
+        }
+        i += 64 * K;
+    }
+    let mut s = acc[0];
+    for k in 1..K {
+        s = _mm256_xor_si256(s, acc[k]);
+    }
+    std::hint::black_box(s);
 }
 /// The touch in chunks with the node's abandon check between them.
 unsafe fn touch_chunks(inflight: usize, chunk: usize, p: *const u8, len: usize, stop: &AtomicBool) {
@@ -98,6 +148,22 @@ unsafe fn touch_chunks(inflight: usize, chunk: usize, p: *const u8, len: usize, 
 
 const SLICE: usize = 278_528; // a bundle item: 64 rows of gate + up, int4, with their scales (layout::GU_ITEM)
 const SLICES_PER_ITEM: usize = 4; // a CCD's share of one expert
+/// A piece of a run claimed: the owner's from the front (forward), a helper's from the back (backward), the two counts
+/// packed in one word; `None` once they meet.
+fn claim_piece(c: &std::sync::atomic::AtomicU64, n: usize, owner: bool) -> Option<usize> {
+    let mut v = c.load(Ordering::Acquire);
+    loop {
+        let (front, back) = ((v & 0xffff_ffff) as usize, (v >> 32) as usize);
+        if front + back >= n {
+            return None;
+        }
+        let (nv, i) = if owner { (v + 1, front) } else { (v + (1 << 32), n - 1 - back) };
+        match c.compare_exchange_weak(v, nv, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Some(i),
+            Err(cur) => v = cur,
+        }
+    }
+}
 const ITEMS_PER_CCD: usize = 13; // the plan's cap
 
 fn main() {
@@ -107,6 +173,9 @@ fn main() {
     let rounds = num("--rounds", 8);
     let inflight = num("--inflight", 4);
     let chunk = num("--chunk", 4096);
+    let run_len = num("--run", 544 << 10);
+    let piece = num("--piece", 64 << 10);
+    let ahead = num("--ahead", 32);
     let n = list.len();
     let ccd_of = |cpu: usize| cpu / 8;
     let ccds: Vec<usize> = {
@@ -121,6 +190,14 @@ fn main() {
     let bytes = mb << 20;
     let per_ccd_items = ITEMS_PER_CCD;
     let queues: Vec<AtomicUsize> = (0..16).map(|_| AtomicUsize::new(0)).collect();
+    // the runs' cursors a CCD (share mode): pieces claimed, the owner's count in the low word, the helpers' in the high
+    let cursors: Vec<Vec<std::sync::atomic::AtomicU64>> = (0..16).map(|_| (0..256).map(|_| std::sync::atomic::AtomicU64::new(0)).collect()).collect();
+    // each core's bytes this round, for the round's rate
+    let round_done: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+    // each core's own time this round (ns), for the round's busy share: Σ core time / (cores × wall) — a tail is idle cores
+    let round_ns: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+    let summed = Barrier::new(n);
+    let best_round = std::sync::Mutex::new((0f64, vec![0f64; 16], vec![0f64; n], 0f64));
     let stop = AtomicBool::new(false);
     let start = Barrier::new(n);
     let round_end = Barrier::new(n);
@@ -129,7 +206,8 @@ fn main() {
     let ready = Barrier::new(n);
     std::thread::scope(|sc| {
         for (t, &cpu) in list.iter().enumerate() {
-            let (start, round_end, ready, per_core, queues, stop, bufs, mode, list) = (&start, &round_end, &ready, &per_core, &queues, &stop, &bufs, mode.as_str(), &list);
+            let (start, round_end, ready, per_core, queues, stop, bufs, mode, list, cursors, round_done, summed, best_round) = (&start, &round_end, &ready, &per_core, &queues, &stop, &bufs, mode.as_str(), &list, &cursors, &round_done, &summed, &best_round);
+            let round_ns = &round_ns;
             sc.spawn(move || {
                 harness::bench::pin(cpu);
                 let mut buf = vec![0u8; bytes + (2 << 20)];
@@ -144,9 +222,13 @@ fn main() {
                 let my_rank = mates.iter().position(|&u| u == t).unwrap();
                 let ccd_q = &queues[ccd_of(cpu) % 16];
                 let mut best = 0f64;
+                let curs = &cursors[ccd_of(cpu) % 16];
                 for r in 0..rounds {
                     if my_rank == 0 {
                         ccd_q.store(0, Ordering::Relaxed);
+                        for c in curs {
+                            c.store(0, Ordering::Relaxed);
+                        }
                     }
                     start.wait();
                     let t0 = std::time::Instant::now();
@@ -158,6 +240,24 @@ fn main() {
                         }
                         "touch" => {
                             unsafe { touch_n(inflight, base as *const u8, bytes) };
+                            done = bytes;
+                        }
+                        "touch2" => {
+                            unsafe {
+                                match inflight {
+                                    32 => touch2::<32>(base as *const u8, bytes),
+                                    _ => touch2::<16>(base as *const u8, bytes),
+                                }
+                            };
+                            done = bytes;
+                        }
+                        "pf" => {
+                            unsafe {
+                                match inflight {
+                                    32 => touch_pf::<32>(base as *const u8, bytes, ahead),
+                                    _ => touch_pf::<16>(base as *const u8, bytes, ahead),
+                                }
+                            };
                             done = bytes;
                         }
                         "chunks" => {
@@ -188,35 +288,86 @@ fn main() {
                                 done += item_slices * SLICE;
                             }
                         }
-                        _ => panic!("mode {mode}: probe, touch, chunks, items, static, slices"),
+                        "runs" | "share" => {
+                            // the CCD's bytes a round as runs of `run_len`, run g in mate g % mates' buffer, each round in a
+                            // fresh slab
+                            let total = per_ccd_items * SLICES_PER_ITEM * SLICE;
+                            let n_runs = total / run_len;
+                            assert!(n_runs <= 256 && n_runs >= 1, "--run: 1..=256 runs a CCD");
+                            let slab = n_runs.div_ceil(mates.len()) * run_len;
+                            assert!((r + 1) * slab <= bytes, "--mb too small for {} rounds of fresh memory", rounds);
+                            let at = |g: usize| (bufs[mates[g % mates.len()]].load(Ordering::Relaxed) + r * slab + (g / mates.len()) * run_len) as *const u8;
+                            loop {
+                                let k = ccd_q.fetch_add(1, Ordering::AcqRel);
+                                if k >= n_runs {
+                                    break;
+                                }
+                                if mode == "runs" {
+                                    unsafe { touch_chunks(inflight, chunk, at(k), run_len, stop) };
+                                    done += run_len;
+                                } else {
+                                    // this run in pieces from its front (the owner alone until a helper comes from the back)
+                                    let n_pieces = run_len.div_ceil(piece);
+                                    while let Some(i) = claim_piece(&curs[k], n_pieces, true) {
+                                        let o = i * piece;
+                                        unsafe { touch_chunks(inflight, chunk, at(k).add(o), piece.min(run_len - o), stop) };
+                                        done += piece.min(run_len - o);
+                                    }
+                                }
+                            }
+                            if mode == "share" {
+                                // the queue is empty: help the runs still in progress from their backs, the last-claimed first
+                                let n_pieces = run_len.div_ceil(piece);
+                                for k in (0..n_runs).rev() {
+                                    while let Some(i) = claim_piece(&curs[k], n_pieces, false) {
+                                        let o = i * piece;
+                                        unsafe { touch_chunks(inflight, chunk, at(k).add(o), piece.min(run_len - o), stop) };
+                                        done += piece.min(run_len - o);
+                                    }
+                                }
+                            }
+                        }
+                        _ => panic!("mode {mode}: probe, touch, touch2, pf, chunks, items, static, slices, runs, share"),
                     }
-                    let dt = t0.elapsed().as_secs_f64();
+                    round_done[t].store(done, Ordering::Relaxed);
+                    round_ns[t].store(t0.elapsed().as_nanos() as usize, Ordering::Relaxed);
                     round_end.wait();
-                    // the round's rate for this core: its bytes over the round's wall (the slowest core's time: all wait)
+                    // the round's wall is the slowest core's (all wait); thread 0 sums the round
                     let wall = t0.elapsed().as_secs_f64();
-                    let _ = dt;
-                    if r > 0 {
-                        best = best.max(done as f64 / wall / 1e9);
+                    if t == 0 && r > 0 {
+                        let per: Vec<f64> = (0..n).map(|u| round_done[u].load(Ordering::Relaxed) as f64 / wall / 1e9).collect();
+                        let box_rate: f64 = per.iter().sum();
+                        let mut b = best_round.lock().unwrap();
+                        if box_rate > b.0 {
+                            let mut by_ccd = vec![0f64; 16];
+                            for (u, g) in per.iter().enumerate() {
+                                by_ccd[ccd_of(list[u])] += g;
+                            }
+                            let busy = (0..n).map(|u| round_ns[u].load(Ordering::Relaxed) as f64).sum::<f64>() / (n as f64 * wall * 1e9);
+                            *b = (box_rate, by_ccd, per, busy);
+                        }
                     }
+                    summed.wait();
+                    best = best.max(done as f64 / wall / 1e9);
                 }
                 per_core.lock().unwrap()[t] = (cpu, best);
             });
         }
     });
-    let pc = per_core.into_inner().unwrap();
-    let mut by_ccd = vec![0f64; 16];
-    for &(cpu, g) in &pc {
-        by_ccd[ccd_of(cpu)] += g;
-    }
+    let _ = per_core.into_inner().unwrap();
+    let (box_rate, by_ccd, per, busy) = best_round.into_inner().unwrap();
     let mut ccd_rates: Vec<f64> = ccds.iter().map(|&c| by_ccd[c]).collect();
     ccd_rates.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let mut core_rates: Vec<f64> = pc.iter().map(|x| x.1).collect();
+    let mut core_rates: Vec<f64> = per.clone();
     core_rates.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let med = |v: &Vec<f64>| v[v.len() / 2];
     println!(
-        "mode {mode} cores {n} ccds {} mb {mb} inflight {inflight} chunk {chunk}: {:.0} GB/s box; a CCD {:.1}/{:.1}/{:.1}; a core {:.2}/{:.2}/{:.2} (min/med/max)",
+        "mode {mode} cores {n} ccds {} mb {mb} inflight {inflight} chunk {chunk} run {}K piece {}K: {:.0} GB/s box, cores busy {:.0} %; a CCD {:.1}/{:.1}/{:.1}; a core {:.2}/{:.2}/{:.2} (min/med/max)",
         ccds.len(),
-        core_rates.iter().sum::<f64>(),
+        run_len >> 10,
+        piece >> 10,
+        box_rate,
+        busy * 100.0,
         ccd_rates[0], med(&ccd_rates), ccd_rates[ccd_rates.len() - 1],
         core_rates[0], med(&core_rates), core_rates[core_rates.len() - 1]
     );
