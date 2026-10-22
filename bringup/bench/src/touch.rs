@@ -9,6 +9,12 @@
 //!   probe     the boot probe's `stream_sum`: every 32 B loaded, four accumulators, over the whole buffer (metatron-cpu §2:
 //!             326 GB/s box-wide, 2026-10-15)
 //!   touch     the node's `touch_avx2`: one 32 B load a 64 B line, `--inflight` lines in flight, over the whole buffer
+//!   fresh     the touch over `--round-mb` MB a core of memory no round has read before (round r at r × round-mb): DRAM
+//!             only. `touch`/`probe`/`chunks` re-read one buffer every round, and the L3 keeps a protected share of it
+//!             between rounds — at two cores a CCD a 20 MB buffer read 600 GB/s box-wide, 40 MB 383, 72 MB 318 (2026-10-22)
+//!   probe-fresh  the probe's loop likewise on fresh memory
+//!   triad     STREAM's Triad, a[i] = b[i] + s·c[i] over three arrays of `--round-mb`/3 MB a core, fresh each round; the
+//!             rate counts 24 bytes an element as STREAM does (Dell's Milan figure, 378 GB/s, is this number)
 //!   touch2    both 32 B halves of every line loaded (the probe's pattern at the touch's structure)
 //!   pf        the touch with a software prefetch `--ahead` lines ahead of each load
 //!   chunks    the touch in `--chunk`-byte pieces with an atomic flag read between pieces (the node's abandon check)
@@ -16,14 +22,21 @@
 //!             cores of the CCD claiming items off one shared counter (the pool's queue), the touch in chunks
 //!   static    the same items assigned statically, no shared counter
 //!   slices    items of one slice (272 KB), claimed off the CCD's counter
+//!   ranges    the same bytes as `runs`, statically mine (every mates-th run), each in my own buffer: the stream cut into
+//!             runs with a reduction each, nothing else changed
+//!   alt       `ranges`, but run k in buffer (k / mates + my rank) % mates: the address alternates between the CCD's cores'
+//!             buffers from run to run, still static
 //!   runs      a CCD's 13 experts' bytes (52 slices) as contiguous runs of `--run` bytes each, claimed off the CCD's
 //!             counter: the rate against the run's length (the node's items are runs of 272–544 KB, 2026-10-22)
 //!   share     runs, and a core that finds the queue empty helps finish the runs still in progress: the owner takes
 //!             `--piece`-byte pieces from the run's front, helpers from its back (two sequential streams meeting), so no
 //!             core idles at the tail
 //!
-//! A round's rate is every core's bytes over the round's wall (the slowest core's); the best round is printed, with
-//! that round's CCD and core rates. (A first form kept each core's best round and summed those: a mode whose cores
+//! A round's rate is every core's bytes over the round's wall (the slowest core's); the median round (by box rate) is
+//! printed, with that round's CCD and core rates — not the best: the kernel zeroes a buffer as it is first touched and
+//! the last ~32 MB a CCD of that sit in its L3, so with one or two cores a CCD the last rounds' "fresh" memory reads
+//! from L3 (Triad at one core a CCD read 496 GB/s, 2026-10-22). Each core also streams a 64 MB scratch after its
+//! allocation to push the zeroed lines out before the rounds start. (A first form kept each core's best round and summed those: a mode whose cores
 //! did different work each round summed rates no round had, 2026-10-22.)
 //!
 //! Prints, per mode: GB/s box-wide, then a CCD (min/med/max over CCDs), then a core (min/med/max).
@@ -62,6 +75,21 @@ unsafe fn stream_sum(p: *const u8, len: usize) -> u64 {
     let mut o = [0u64; 4];
     _mm256_storeu_si256(o.as_mut_ptr() as *mut __m256i, s);
     o.iter().sum()
+}
+/// STREAM Triad over `n` doubles: a = b + s·c.
+#[target_feature(enable = "avx2")]
+unsafe fn triad(a: *mut f64, b: *const f64, c: *const f64, n: usize, s: f64) {
+    use core::arch::x86_64::*;
+    let sv = _mm256_set1_pd(s);
+    let mut i = 0;
+    while i + 16 <= n {
+        for k in 0..4 {
+            let bv = _mm256_loadu_pd(b.add(i + 4 * k));
+            let cv = _mm256_loadu_pd(c.add(i + 4 * k));
+            _mm256_storeu_pd(a.add(i + 4 * k), _mm256_add_pd(bv, _mm256_mul_pd(sv, cv)));
+        }
+        i += 16;
+    }
 }
 /// The node's touch: one 32 B load a line, `K` lines in flight (K = 4 is `construct::touch_avx2`).
 #[target_feature(enable = "avx2")]
@@ -206,6 +234,7 @@ fn main() {
     let run_len = num("--run", 544 << 10);
     let piece = num("--piece", 64 << 10);
     let ahead = num("--ahead", 32);
+    let round_mb = num("--round-mb", 14);
     let n = list.len();
     let ccd_of = |cpu: usize| cpu / 8;
     let ccds: Vec<usize> = {
@@ -227,7 +256,7 @@ fn main() {
     // each core's own time this round (ns), for the round's busy share: Σ core time / (cores × wall) — a tail is idle cores
     let round_ns: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
     let summed = Barrier::new(n);
-    let best_round = std::sync::Mutex::new((0f64, vec![0f64; 16], vec![0f64; n], 0f64));
+    let all_rounds = std::sync::Mutex::new(Vec::<(f64, Vec<f64>, Vec<f64>, f64)>::new());
     let stop = AtomicBool::new(false);
     let start = Barrier::new(n);
     let round_end = Barrier::new(n);
@@ -236,7 +265,7 @@ fn main() {
     let ready = Barrier::new(n);
     std::thread::scope(|sc| {
         for (t, &cpu) in list.iter().enumerate() {
-            let (start, round_end, ready, per_core, queues, stop, bufs, mode, list, cursors, round_done, summed, best_round) = (&start, &round_end, &ready, &per_core, &queues, &stop, &bufs, mode.as_str(), &list, &cursors, &round_done, &summed, &best_round);
+            let (start, round_end, ready, per_core, queues, stop, bufs, mode, list, cursors, round_done, summed, best_round) = (&start, &round_end, &ready, &per_core, &queues, &stop, &bufs, mode.as_str(), &list, &cursors, &round_done, &summed, &all_rounds);
             let round_ns = &round_ns;
             sc.spawn(move || {
                 harness::bench::pin(cpu);
@@ -246,6 +275,14 @@ fn main() {
                 }
                 let base = (buf.as_ptr() as usize + (2 << 20) - 1) & !((2 << 20) - 1);
                 bufs[t].store(base, Ordering::Release);
+                // the L3 cleared of this buffer's zeroing: a scratch of 64 MB streamed twice (its own zeroing lands in
+                // the L3 instead, and the scratch is never read again)
+                {
+                    let scratch = vec![1u8; 64 << 20];
+                    for _ in 0..2 {
+                        unsafe { touch::<16>(scratch.as_ptr(), scratch.len()) };
+                    }
+                }
                 ready.wait();
                 // this CCD's cores (indices into the list), for items
                 let mates: Vec<usize> = (0..list.len()).filter(|&u| ccd_of(list[u]) == ccd_of(cpu)).collect();
@@ -271,6 +308,26 @@ fn main() {
                         "touch" => {
                             unsafe { touch_n(inflight, base as *const u8, bytes) };
                             done = bytes;
+                        }
+                        "triad" => {
+                            let per = round_mb << 20;
+                            assert!((r + 1) * per <= bytes, "--mb too small for {} rounds of fresh memory", rounds);
+                            let third = per / 3 / 64 * 64;
+                            let n = third / 8;
+                            let p = base + r * per;
+                            unsafe { triad(p as *mut f64, (p + third) as *const f64, (p + 2 * third) as *const f64, n, 3.0) };
+                            done = 3 * third;
+                        }
+                        "fresh" | "probe-fresh" => {
+                            let per = round_mb << 20;
+                            assert!((r + 1) * per <= bytes, "--mb too small for {} rounds of fresh memory", rounds);
+                            let p = (base + r * per) as *const u8;
+                            if mode == "fresh" {
+                                unsafe { touch_n(inflight, p, per) };
+                            } else {
+                                std::hint::black_box(unsafe { stream_sum(p, per) });
+                            }
+                            done = per;
                         }
                         "touch2" => {
                             unsafe {
@@ -318,6 +375,20 @@ fn main() {
                                 done += item_slices * SLICE;
                             }
                         }
+                        "ranges" | "alt" => {
+                            let total = per_ccd_items * SLICES_PER_ITEM * SLICE;
+                            let n_runs = total / run_len;
+                            let slab = n_runs.div_ceil(mates.len()) * run_len;
+                            assert!((r + 1) * slab <= bytes, "--mb too small for {} rounds of fresh memory", rounds);
+                            let mut k = my_rank;
+                            while k < n_runs {
+                                let m = if mode == "alt" { mates[(k / mates.len() + my_rank) % mates.len()] } else { t };
+                                let p = (bufs[m].load(Ordering::Relaxed) + r * slab + (k / mates.len()) * run_len) as *const u8;
+                                unsafe { touch_n(inflight, p, run_len) };
+                                done += run_len;
+                                k += mates.len();
+                            }
+                        }
                         "runs" | "share" => {
                             // the CCD's bytes a round as runs of `run_len`, run g in mate g % mates' buffer, each round in a
                             // fresh slab
@@ -357,7 +428,7 @@ fn main() {
                                 }
                             }
                         }
-                        _ => panic!("mode {mode}: probe, touch, touch2, pf, chunks, items, static, slices, runs, share"),
+                        _ => panic!("mode {mode}: probe, touch, fresh, probe-fresh, triad, touch2, pf, chunks, items, static, slices, ranges, alt, runs, share"),
                     }
                     round_done[t].store(done, Ordering::Relaxed);
                     round_ns[t].store(t0.elapsed().as_nanos() as usize, Ordering::Relaxed);
@@ -367,15 +438,12 @@ fn main() {
                     if t == 0 && r > 0 {
                         let per: Vec<f64> = (0..n).map(|u| round_done[u].load(Ordering::Relaxed) as f64 / wall / 1e9).collect();
                         let box_rate: f64 = per.iter().sum();
-                        let mut b = best_round.lock().unwrap();
-                        if box_rate > b.0 {
-                            let mut by_ccd = vec![0f64; 16];
-                            for (u, g) in per.iter().enumerate() {
-                                by_ccd[ccd_of(list[u])] += g;
-                            }
-                            let busy = (0..n).map(|u| round_ns[u].load(Ordering::Relaxed) as f64).sum::<f64>() / (n as f64 * wall * 1e9);
-                            *b = (box_rate, by_ccd, per, busy);
+                        let mut by_ccd = vec![0f64; 16];
+                        for (u, g) in per.iter().enumerate() {
+                            by_ccd[ccd_of(list[u])] += g;
                         }
+                        let busy = (0..n).map(|u| round_ns[u].load(Ordering::Relaxed) as f64).sum::<f64>() / (n as f64 * wall * 1e9);
+                        all_rounds.lock().unwrap().push((box_rate, by_ccd, per, busy));
                     }
                     summed.wait();
                     best = best.max(done as f64 / wall / 1e9);
@@ -385,18 +453,23 @@ fn main() {
         }
     });
     let _ = per_core.into_inner().unwrap();
-    let (box_rate, by_ccd, per, busy) = best_round.into_inner().unwrap();
+    let mut rounds_v = all_rounds.into_inner().unwrap();
+    rounds_v.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    let (lo, hi) = (rounds_v[0].0, rounds_v[rounds_v.len() - 1].0);
+    let (box_rate, by_ccd, per, busy) = rounds_v.swap_remove(rounds_v.len() / 2);
     let mut ccd_rates: Vec<f64> = ccds.iter().map(|&c| by_ccd[c]).collect();
     ccd_rates.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let mut core_rates: Vec<f64> = per.clone();
     core_rates.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let med = |v: &Vec<f64>| v[v.len() / 2];
     println!(
-        "mode {mode} cores {n} ccds {} mb {mb} inflight {inflight} chunk {chunk} run {}K piece {}K: {:.0} GB/s box, cores busy {:.0} %; a CCD {:.1}/{:.1}/{:.1}; a core {:.2}/{:.2}/{:.2} (min/med/max)",
+        "mode {mode} cores {n} ccds {} mb {mb} inflight {inflight} chunk {chunk} run {}K piece {}K: {:.0} GB/s box (rounds {:.0}–{:.0}), cores busy {:.0} %; a CCD {:.1}/{:.1}/{:.1}; a core {:.2}/{:.2}/{:.2} (min/med/max)",
         ccds.len(),
         run_len >> 10,
         piece >> 10,
         box_rate,
+        lo,
+        hi,
         busy * 100.0,
         ccd_rates[0], med(&ccd_rates), ccd_rates[ccd_rates.len() - 1],
         core_rates[0], med(&core_rates), core_rates[core_rates.len() - 1]

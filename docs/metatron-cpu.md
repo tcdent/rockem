@@ -129,29 +129,46 @@ start together. The table reports the best of 3 runs.
 | 2026-10-15 19:35 (NPS2) | node 0, 3 CCDs | 66 | 79 | **85** | 84 | 82 | 82 |
 | 2026-10-16 12:35 (NPS2 + APBDIS) | node 0 | 64 | 78 | 83 | 83 | | |
 
-Four cores a CCD saturate one node's channels, and eight cost nothing — **when one node streams alone**. The rows
-above are one node (socket 0, or node 0) with the rest of the box idle, and that is why they disagreed with Dell's
-one-core-a-CCD Triad: Dell streamed the whole box. Box-wide the picture inverts (2026-10-22, probe boot, `bench-touch`
-on every CCD's cores at once, node-local 40 MB a core, 10 rounds, the probe's idle pool resident):
+Four cores a CCD saturate one node's channels, and eight cost nothing. Dell's one-core-a-CCD result is the same
+2–4 % here: STREAM Triad below reads 290–296 at 12 or 24 threads against 283 at 92.
 
-| cores a CCD, box-wide (12 CCDs) | lines in flight a core | GB/s box | a CCD | a core |
+### The box's STREAM figure (measured 2026-10-22, probe boot, `bench-stream`)
+
+STREAM as Dell ran it for the Milan 378 GB/s Triad figure: three arrays a thread, far larger than any cache (64 MB each,
+192 MB a thread), re-read every iteration, non-temporal stores for the result (the vendor compilers' codegen; a plain
+store costs a read for ownership and prints a quarter less), bytes counted STREAM's way, best of 10. Threads pinned
+one a CCD and up; the probe's idle pool resident.
+
+| threads | Copy | Scale | Add | Triad |
 |---|---|---|---|---|
-| 8 (92 cores) — the touch, the probe loop, 16/32/64 in flight alike | 16–64 | 289–291 | 25.1 | 3.1 |
-| 8, a software prefetch 32 lines ahead | 16 | 308 | 26.8 | 3.4 |
-| 4 (48 cores) | 32 / 64 | 332 | 27.7 | 6.9 |
-| 3 (36 cores) | 64 | 350 | 29.1 | 9.7 |
-| **2 (24 cores)** | 32 / 64 | **373 / 383** | 31.1 / 31.9 | 15.5 / 16.0 |
-| 2, a software prefetch 32 lines ahead | 16 | **405** | 33.8 | 16.9 |
+| 12 (one a CCD) | 267 | 268 | 295 | **290–293** |
+| 24 | 276 | 278 | 296 | **296** |
+| 48 | 282 | 283 | 290 | 290 |
+| 92 | 277 | 280 | 282 | 283 |
+| 12, 256 MB arrays | 265 | 267 | 278 | 280 |
+| 12, 16 MB arrays (48 MB a CCD: partly L3) | 263 | 265 | 348 | 358 |
+| 12, plain stores | 215 | 204 | 236 | 228 |
+| socket 0 alone / socket 1 alone (6 threads each) | 152 / 133 | 156 / 139 | 165 / 140 | **169 / 147** |
+| node 0 alone / node 2 alone (3 threads) | 75 / 56 | 79 / 71 | 81 / 62 | 83 / 75 |
 
-**The rule: two cores a CCD, deep, read the box's ceiling; eight read three quarters of it.** The total concurrency is
-the same (8 × 16 = 2 × 64 lines a CCD), so it is not latency coverage that is lost, it is the number of concurrent
-streams the sixteen memory controllers see — 96 against 24, six a channel against one and a half — and their
-row-buffer locality with it. One core a CCD is latency-bound (a core streams ~14–17 GB/s at most: `runs 14144K`, one
-core a CCD, 13.7 a core); two are enough. One node alone never showed it because its three CCDs put 24 streams on
-four channels either way. A box-wide design that streams from every core — the decode prefetch ran 8 touchers a CCD at
-16 in flight — leaves 25 % of the box on the table; the compute runs stream from every core too (the expert kernels'
-DRAM phase), which this says is worth measuring against four and two. SMT siblings and 2 MiB pages do not raise the
-ceiling.
+**The box's Triad is ~293 GB/s, 72 % of 409.6; pure reads run a few % above it (the decode prefetch reads 316 on
+fresh bytes, `prefetch_job` rows).** The 23 % to Dell's 378 is the box, not software: socket 1 reads 13 % less than
+socket 0 alone (node 2 is the weak node in every measurement since 2026-10-16); both sockets together lose 8 % more
+(316 alone → 290); socket 0 alone is 11 % under Dell's per-socket 189, the NPS2-against-NPS4 band (Rome: NPS2 = 0.92
+of NPS4) plus interleave. The 7R13 cannot do NPS4 ([[epyc-7r13-topology]]); the socket-1 deficit and the fabric pin
+are firmware or hardware (§1). A STREAM run with default-sized arrays (15 MB a thread at 16 threads) fits this box's
+L3s and would print ~358 here — any 378 quoted for a Milan box needs its array size.
+
+**How to read a streaming bench on this box (learned the hard way, 2026-10-22):** (1) a buffer re-read every round
+is partly served from L3 whenever the per-CCD footprint is within a few × 32 MB — the L3 keeps a protected share of
+what hit before (§3) — and the fewer cores a CCD, the smaller the footprint: `bench-touch touch` at two cores a CCD
+read 383 GB/s with 40 MB a core, 608 with 20 MB, 318 with 72 MB; at eight cores a CCD (320 MB a CCD) it was honest
+within 1 %. (2) The kernel zeroes a buffer as it is first touched and the last ~32 MB a CCD of that sit in its L3 —
+so even memory "no round has read" reads from cache in the last rounds at one or two cores a CCD (Triad read 496 at
+one a CCD). Stream a scratch after allocating, and report the median round, never the best. (3) A rule derived at a
+small footprint — "two cores a CCD read the ceiling" was written here this morning from (1) — is an artifact; the
+fresh-memory rows read 247 / 259 / 286 / 290 GB/s at 1 / 2 / 4 / 8 cores a CCD. (4) `bench-touch` on a probe boot
+reads 5–10 % under a serving boot's production rows (the halted pool stays resident); compare modes within one run.
 
 ### What places memory, and why it matters
 
