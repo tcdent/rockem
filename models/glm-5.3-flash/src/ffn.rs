@@ -38,6 +38,10 @@ pub trait Routed {
     /// `run_batch` over activations already quantized (`xq: [n][H]` i8, `xs`/`xg: [n][H/GROUP]`, as `QAct`
     /// makes them): the cards quantize a step's FFN input once for both tiers (queue 001/064). The shipped
     /// INT4×INT8 realization takes this form; the others take `run_batch`.
+    /// A later `run_batch_act` of the same layer and picks, planned ahead where the realization can (083).
+    fn prepare_batch_act(&mut self, l: usize, idx: &[[usize; TOP_K]], xq: &[i8], xs: &[f32], xg: &[i32]) {
+        let _ = (l, idx, xq, xs, xg);
+    }
     fn run_batch_act(&mut self, l: usize, idx: &[[usize; TOP_K]], xq: &[i8], xs: &[f32], xg: &[i32], out: &mut [f32]) {
         let _ = (l, idx, xq, xs, xg, out);
         unimplemented!("run_batch_act: this realization takes f32 activations (run_batch)");
@@ -59,6 +63,9 @@ impl<R: Routed + ?Sized> Routed for Box<R> {
     }
     fn run_batch(&mut self, l: usize, idx: &[[usize; TOP_K]], x: &[f32], out: &mut [f32]) {
         (**self).run_batch(l, idx, x, out)
+    }
+    fn prepare_batch_act(&mut self, l: usize, idx: &[[usize; TOP_K]], xq: &[i8], xs: &[f32], xg: &[i32]) {
+        (**self).prepare_batch_act(l, idx, xq, xs, xg)
     }
     fn run_batch_act(&mut self, l: usize, idx: &[[usize; TOP_K]], xq: &[i8], xs: &[f32], xg: &[i32], out: &mut [f32]) {
         (**self).run_batch_act(l, idx, xq, xs, xg, out)

@@ -42,6 +42,24 @@ pub trait Pool: Sync {
         let _ = slot;
         self.run(n, f)
     }
+    /// Whether the pool can build a run's job ahead (`prepare_slotted`) and announce it later (`run_prepared`).
+    #[cfg(feature = "std")]
+    fn prepares(&self) -> bool {
+        false
+    }
+    /// A run's job built — items sorted into their queues, the job allocated — but not announced: `run_prepared` runs it.
+    /// The closure is the job's own. Returns a handle (0: not supported).
+    #[cfg(feature = "std")]
+    fn prepare_slotted(&self, n: usize, slot: &(dyn Fn(usize) -> usize + Sync), f: std::boxed::Box<dyn Fn(usize) + Send + Sync>) -> usize {
+        let _ = (n, slot, f);
+        0
+    }
+    /// Announce a job `prepare_slotted` built, work on it with this thread too, and return when it is done.
+    #[cfg(feature = "std")]
+    fn run_prepared(&self, job: usize) {
+        let _ = job;
+        unreachable!("run_prepared: this pool does not prepare jobs");
+    }
     /// `prefetch_on` with each item's queue given outright. Returns, for a pool that records it, which worker took each
     /// item (`u8::MAX`: not taken), filled in as the items are claimed: a later run can send the item's bytes to the
     /// core whose caches hold them.

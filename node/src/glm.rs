@@ -76,7 +76,11 @@ impl Glm {
         let (p, prefix, q) = unsafe { prefix_b.align_to::<f32>() };
         assert!(p.is_empty() && q.is_empty() && prefix.len() == layout::PREFIX_LEN, "prefix file");
         // the pool: a thread per physical core, every socket, told where every page of the weights lives
-        let cores = physical_cores();
+        // the run builder's core (083): the last core of the main thread's CCD, out of the pool (its CCD's cores past
+        // three do not touch anyway); a box with one CCD keeps every core in the pool and plans inline
+        let mut cores = physical_cores();
+        let main_ccd = glm_5_3_flash::construct::ccd_key(cores[0]);
+        let builder = if cores.len() > 16 { cores.iter().rposition(|&c| glm_5_3_flash::construct::ccd_key(c) == main_ccd).filter(|&i| i > 0).map(|i| cores.remove(i)) } else { None };
         let pool: &'static Threads = Box::leak(Box::new(Threads::new(&cores)));
         let mut by_node = [0usize; 8];
         for buf in [dense, stream.bytes] {
@@ -96,7 +100,11 @@ impl Glm {
             let r = place(experts, &rates, None);
             println!("placement: at start, {r}");
         }
-        let mut model = CpuModel::new(CpuExperts::new(experts, pool), pool, max_ctx);
+        let mut cpu = CpuExperts::new(experts, pool);
+        if let Some(b) = builder {
+            cpu = cpu.with_builder(b);
+        }
+        let mut model = CpuModel::new(cpu, pool, max_ctx);
         if gpu {
             // the KDA layers on the cards, split by layer order between them; everything else here
             let elf = loader::load(&bundle.join(layout::KERNELS_FILE), loader::Mem::Anon);

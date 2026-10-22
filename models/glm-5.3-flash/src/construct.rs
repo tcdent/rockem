@@ -93,8 +93,8 @@ const PREFETCH_CORES: usize = 8;
 const PREFETCH_CORES_MAIN: usize = 4;
 
 struct Job {
-    /// The generation that announced it.
-    gen: u64,
+    /// The generation that announced it (0 until announced).
+    gen: std::sync::atomic::AtomicU64,
     f: *const (dyn Fn(usize) + Sync),
     /// The items in slot order: slot `s`'s are `order[start[s]..start[s + 1]]`.
     order: Vec<u32>,
@@ -332,7 +332,7 @@ impl Threads {
                     sh.active.fetch_add(1, Ordering::AcqRel);
                     let job = sh.job.load(Ordering::Acquire);
                     if !job.is_null() {
-                        seen = unsafe { (*job).gen };
+                        seen = unsafe { (*job).gen.load(Ordering::Acquire) };
                         if !(unsafe { (*job).light } && !touches) {
                             unsafe { work(job, &order, node, who) };
                         }
@@ -460,14 +460,20 @@ impl Threads {
         }
         cpu_zone!("pool.run");
         let entered = std::time::Instant::now();
-        let job = self.post(n, at, node, ccd, slot, f, None);
+        let job = self.build(n, at, node, ccd, slot, f, None, false);
+        self.announce(job, true);
+        self.finish(job, entered, ccd.is_some() || slot.is_some());
+    }
+    /// Work on an announced job with this thread, wait for it to be done, and account for it.
+    fn finish(&self, job: *mut Job, entered: std::time::Instant, placed: bool) {
+        let n = unsafe { (*job).n };
         unsafe { work(job, &self.order, self.node, 0) };
         while unsafe { (*job).done.0.load(Ordering::Acquire) } != n {
             std::hint::spin_loop();
         }
         let j = unsafe { &*job };
         #[cfg(feature = "track-experts")]
-        if slot.is_some() {
+        if placed {
             // the run's tail by core: when each worker finished, against the run's wall (074)
             let total = j.t0.elapsed().as_nanos() as u64;
             let mut ends: Vec<u64> = j.core_end.iter().map(|e| e.load(Ordering::Relaxed)).filter(|&e| e > 0).collect();
@@ -480,7 +486,7 @@ impl Threads {
                 "node0_us" => ne(0), "node1_us" => ne(1), "node2_us" => ne(2), "node3_us" => ne(3),
             });
         }
-        if ccd.is_some() || slot.is_some() {
+        if placed {
             *self.locality.lock().unwrap() = (j.local.0.load(Ordering::Relaxed), n);
             let mut st = self.node_stats.lock().unwrap();
             let mut end_max = 0u64;
@@ -505,6 +511,14 @@ impl Threads {
     /// The job slotted and announced: the workers take it up; the job before it is stopped (a prefetch still running
     /// gives up its unclaimed items) and freed at `idle`.
     fn post(&self, n: usize, at: Option<&(dyn Fn(usize) -> *const u8 + Sync)>, node: Option<&(dyn Fn(usize) -> usize + Sync)>, ccd: Option<&(dyn Fn(usize) -> usize + Sync)>, given: Option<&(dyn Fn(usize) -> usize + Sync)>, f: &(dyn Fn(usize) + Sync), owned: Option<Box<dyn Fn(usize) + Send + Sync>>) -> *mut Job {
+        let light = owned.is_some();
+        let job = self.build(n, at, node, ccd, given, f, owned, light);
+        self.announce(job, false);
+        job
+    }
+    /// The job slotted and allocated, not announced: a run's can be built ahead of its moment, off the main thread.
+    #[allow(clippy::too_many_arguments)]
+    fn build(&self, n: usize, at: Option<&(dyn Fn(usize) -> *const u8 + Sync)>, node: Option<&(dyn Fn(usize) -> usize + Sync)>, ccd: Option<&(dyn Fn(usize) -> usize + Sync)>, given: Option<&(dyn Fn(usize) -> usize + Sync)>, f: &(dyn Fn(usize) + Sync), owned: Option<Box<dyn Fn(usize) + Send + Sync>>, light: bool) -> *mut Job {
         let entered = std::time::Instant::now();
         let mut start = [0u32; SLOTS + 1];
         let mut order = vec![0u32; n];
@@ -545,35 +559,10 @@ impl Threads {
             order[fill[s] as usize] = i as u32;
             fill[s] += 1;
         }
-        let sh = &*self.shared;
-        sh.busy.store(true, Ordering::Relaxed);
         let sorted = std::time::Instant::now();
-        // the job before this one stops handing out items (it finished, or it was a prefetch); a worker still inside it
-        // finishes or abandons its item on the job's own memory, which lives until `idle`
-        let current = sh.job.load(Ordering::Acquire);
-        if !current.is_null() {
-            let c = unsafe { &*current };
-            c.stop.store(true, Ordering::Relaxed);
-            c.stopped.store(c.t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            if c.light {
-                // a prefetch it overtook: what it managed so far, and its row once its workers have left it
-                *self.prefetched.lock().unwrap() = (c.done.0.load(Ordering::Relaxed), c.n);
-                #[cfg(feature = "track-experts")]
-                self.pending.lock().unwrap().push(current as usize);
-                #[cfg(not(feature = "track-experts"))]
-                self.retired.lock().unwrap().push(current as usize);
-            } else {
-                self.retired.lock().unwrap().push(current as usize);
-            }
-        }
-        #[cfg(feature = "track-experts")]
-        self.settle_pending();
-        let stopped = std::time::Instant::now();
         let fp: *const (dyn Fn(usize) + Sync) = unsafe { std::mem::transmute(f) };
-        let light = owned.is_some();
-        let gen = sh.gen.0.load(Ordering::Relaxed) + 1;
         let job = Box::into_raw(Box::new(Job {
-            gen,
+            gen: std::sync::atomic::AtomicU64::new(0),
             f: fp,
             order,
             start,
@@ -597,17 +586,52 @@ impl Threads {
             #[cfg(feature = "track-experts")]
             ts0: prow::Timestamp::now(),
         }));
-        // the pointer first, then the generation the workers watch: a worker that wakes to the new generation reads
-        // this job or a later one
-        sh.job.store(job, Ordering::Release);
-        sh.gen.0.store(gen, Ordering::Release);
         if !light {
             let mut ps = self.post_stats.lock().unwrap();
             ps.0 += (sorted - entered).as_secs_f64();
-            ps.1 += (stopped - sorted).as_secs_f64();
-            ps.2 += stopped.elapsed().as_secs_f64();
+            ps.2 += sorted.elapsed().as_secs_f64();
         }
         job
+    }
+    /// A built job announced: the job before it stopped (a prefetch still running gives up its unclaimed items) and
+    /// retired, the pointer stored, then the generation the workers watch (a worker that wakes to the new generation
+    /// reads this job or a later one). `run`: the announcing thread will work on it too.
+    fn announce(&self, job: *mut Job, run: bool) {
+        let entered = std::time::Instant::now();
+        let sh = &*self.shared;
+        sh.busy.store(true, Ordering::Relaxed);
+        let current = sh.job.load(Ordering::Acquire);
+        if !current.is_null() {
+            let c = unsafe { &*current };
+            c.stop.store(true, Ordering::Relaxed);
+            c.stopped.store(c.t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            if c.light {
+                // a prefetch it overtook: what it managed so far, and its row once its workers have left it
+                *self.prefetched.lock().unwrap() = (c.done.0.load(Ordering::Relaxed), c.n);
+                #[cfg(feature = "track-experts")]
+                self.pending.lock().unwrap().push(current as usize);
+                #[cfg(not(feature = "track-experts"))]
+                self.retired.lock().unwrap().push(current as usize);
+            } else {
+                self.retired.lock().unwrap().push(current as usize);
+            }
+        }
+        #[cfg(feature = "track-experts")]
+        self.settle_pending();
+        let gen = sh.gen.0.load(Ordering::Relaxed) + 1;
+        unsafe {
+            (*job).gen.store(gen, Ordering::Relaxed);
+            (*job).t0 = std::time::Instant::now();
+            #[cfg(feature = "track-experts")]
+            {
+                (*job).ts0 = prow::Timestamp::now();
+            }
+        }
+        sh.job.store(job, Ordering::Release);
+        sh.gen.0.store(gen, Ordering::Release);
+        if run {
+            self.post_stats.lock().unwrap().1 += entered.elapsed().as_secs_f64();
+        }
     }
 }
 impl Drop for Threads {
@@ -630,6 +654,20 @@ impl Pool for Threads {
     }
     fn run_slotted(&self, n: usize, slot: &(dyn Fn(usize) -> usize + Sync), f: &(dyn Fn(usize) + Sync)) {
         self.publish(n, None, None, None, Some(slot), f)
+    }
+    fn prepares(&self) -> bool {
+        self.workers > 1
+    }
+    fn prepare_slotted(&self, n: usize, slot: &(dyn Fn(usize) -> usize + Sync), f: Box<dyn Fn(usize) + Send + Sync>) -> usize {
+        let fr: &(dyn Fn(usize) + Sync) = unsafe { &*(&*f as *const (dyn Fn(usize) + Send + Sync)) };
+        self.build(n, None, None, None, Some(slot), fr, Some(f), false) as usize
+    }
+    fn run_prepared(&self, job: usize) {
+        cpu_zone!("pool.run");
+        let entered = std::time::Instant::now();
+        let job = job as *mut Job;
+        self.announce(job, true);
+        self.finish(job, entered, true);
     }
     fn prefetch_slotted(&self, n: usize, slot: Box<dyn Fn(usize) -> usize + Send + Sync>, f: Box<dyn Fn(usize) + Send + Sync>) -> Option<std::sync::Arc<Vec<std::sync::atomic::AtomicU8>>> {
         if n > 1 {
@@ -758,20 +796,17 @@ pub fn physical_cores() -> Vec<usize> {
 pub struct CpuExperts<'a> {
     stream: &'a expert::Stream<'a>,
     pool: &'a dyn Pool,
-    /// The node of every slice of every expert record (`[MOE_LAYERS][E][SLICES]`), asked of the
-    /// pool once at construction, so slotting a prefetch is lookups, not a lock a slice.
-    slice_node: Vec<u8>,
-    /// The pool's queue for every slice (`[MOE_LAYERS][E][SLICES]`): its node's, with the core
-    /// complex the slice's hash names — a map, so a run's slotting is a byte a part (tcdent
-    /// 2026-10-16: "hold that as a map of offsets in memory for the lookup").
-    slice_slot: Vec<u8>,
-    /// Every expert's slices ordered by their queue (`[MOE_LAYERS][E][SLICES]`, slice ids), so a prefetch's items — an
-    /// (expert, queue) and its run of slices — are cut from a table instead of grouped a call (the grouping's
-    /// allocations were ~31 µs of a decode layer's 53 µs `slot` lap, 2026-10-20).
-    slice_order: Vec<u8>,
-    /// The last prefetch's plan, for that layer's run: the experts in the order posted (the run takes them in the order
-    /// they arrive, the planned first), each slice's prefetch item and the item's taker (the run reads the slice there).
-    planned: std::sync::Mutex<Option<Planned>>,
+    /// The slice tables and the last prefetch's plan, shared with the builder thread.
+    tables: std::sync::Arc<std::sync::RwLock<Tables>>,
+    planned: std::sync::Arc<std::sync::Mutex<Option<Planned>>>,
+    /// The run builder (083): a thread on a core of its own that plans a decode layer's expert run at the layer's dispatch
+    /// — the pairs, the order, the slots, the items, both jobs sorted and allocated — so the main thread, at the run, only
+    /// announces. `None`: planned inline.
+    builder_core: Option<usize>,
+    builder: Option<std::sync::Arc<Builder>>,
+    /// The (layer, tokens) a plan was last requested for: the run waits for the builder only for that one (the draft
+    /// layer's run, never requested, waited the whole fallback three times a step: draft 7.2 → 18.9 ms, 2026-10-22).
+    requested: Option<(usize, usize)>,
     /// A step's activations quantized once each (`[STEP][H]` and their groups), the experts' hidden
     /// states (`[STEP][TOP_K][D_FF]`) and those quantized once each for the down rows.
     xq: Vec<i8>,
@@ -789,7 +824,7 @@ pub struct CpuExperts<'a> {
     /// `track-experts`: the last prefetch — its layer, the experts it predicted, each one's items and how many of them
     /// finished touching their slices — read when that layer's run starts (`prefetch_use` rows).
     #[cfg(feature = "track-experts")]
-    pf: std::sync::Mutex<Option<(usize, Vec<usize>, Vec<u16>, std::sync::Arc<Vec<std::sync::atomic::AtomicU16>>)>>,
+    pf: std::sync::Arc<std::sync::Mutex<Option<(usize, Vec<usize>, Vec<u16>, std::sync::Arc<Vec<std::sync::atomic::AtomicU16>>)>>>,
     /// `track-experts`: every core's performance counters, programmed once with `pmc::FILLS` (where a run's bytes come
     /// from); the items read them themselves (`rdpmc`).
     #[cfg(feature = "track-experts")]
@@ -836,12 +871,105 @@ struct ItemAcc {
 use crate::layout::{DOWN_ITEMS, GU_ITEMS, GU_PER_RUN};
 use crate::STEP;
 
+/// The slice tables (`relearn`).
+#[derive(Default)]
+struct Tables {
+    /// The node of every slice of every expert record (`[MOE_LAYERS][E][SLICES]`), asked of the pool once, so slotting
+    /// a prefetch is lookups, not a lock a slice.
+    slice_node: Vec<u8>,
+    /// The pool's queue for every slice (`[MOE_LAYERS][E][SLICES]`): its node's, with the core complex the slice pair's
+    /// hash names — a map, so a run's slotting is a byte a part (tcdent 2026-10-16: "hold that as a map of offsets in
+    /// memory for the lookup").
+    slice_slot: Vec<u8>,
+    /// Every expert's slices ordered by their queue (`[MOE_LAYERS][E][SLICES]`, slice ids), so a prefetch's items are
+    /// cut from a table instead of grouped a call (the grouping's allocations were ~31 µs of a decode layer's 53 µs
+    /// `slot` lap, 2026-10-20).
+    slice_order: Vec<u8>,
+}
+/// What planning a run needs that is not the run's own: the tables, the plan, the stream, the pool, the step buffers.
+struct Ctx {
+    tables: std::sync::Arc<std::sync::RwLock<Tables>>,
+    planned: std::sync::Arc<std::sync::Mutex<Option<Planned>>>,
+    stream: &'static expert::Stream<'static>,
+    pool: &'static dyn Pool,
+    h_p: usize,
+    hq_p: usize,
+    hs_p: usize,
+    hg_p: usize,
+    #[cfg(feature = "track-experts")]
+    pf: std::sync::Arc<std::sync::Mutex<Option<(usize, Vec<usize>, Vec<u16>, std::sync::Arc<Vec<std::sync::atomic::AtomicU16>>)>>>,
+    #[cfg(feature = "track-experts")]
+    acc_p: usize,
+    #[cfg(feature = "track-experts")]
+    fill_acc_p: usize,
+    #[cfg(feature = "track-experts")]
+    rdpmc: bool,
+}
+/// A planned run's data, shared by its two jobs' items.
+struct RunData {
+    l: usize,
+    n: usize,
+    /// Each expert's (token, pick) pairs, `first[e]..first[e + 1]`.
+    pairs: Vec<(u16, u8)>,
+    first: Vec<usize>,
+    /// The run's experts in the order they are read (the plan's first).
+    experts: Vec<usize>,
+    /// Each (expert position, slice)'s slot.
+    slot_tab: Vec<u8>,
+    /// The gate/up items: (expert position, first part, parts).
+    gitems: Vec<(u16, u16, u8)>,
+    /// A decode step's quantize groups counted to completion (`[experts][groups]`).
+    group_done: Vec<std::sync::atomic::AtomicU8>,
+    /// The step's quantized activations.
+    xq: usize,
+    xs: usize,
+    xg: usize,
+    /// The expert rows, set at the run.
+    out_p: AtomicUsize,
+    /// `track-experts`: the prefetch made for this layer (its experts, each one's items and the count of them touched,
+    /// still counting until the run), each expert's status at the run (0 complete, 1 partial, 2 missed), whether the
+    /// items count their fills.
+    #[cfg(feature = "track-experts")]
+    pf: Option<(Vec<usize>, Vec<u16>, std::sync::Arc<Vec<std::sync::atomic::AtomicU16>>)>,
+    #[cfg(feature = "track-experts")]
+    status: Vec<std::sync::atomic::AtomicU8>,
+    #[cfg(feature = "track-experts")]
+    counted: std::sync::atomic::AtomicBool,
+    #[cfg(feature = "track-experts")]
+    rdpmc: bool,
+    #[cfg(feature = "track-experts")]
+    gu_bytes: usize,
+}
+/// A run planned ahead: its data, its two jobs (built by the pool if it prepares; else the closures, run slotted).
+struct RunPlan {
+    data: std::sync::Arc<RunData>,
+    gu_job: usize,
+    down_job: usize,
+    gu_slot: Box<dyn Fn(usize) -> usize + Send + Sync>,
+    gu_f: Box<dyn Fn(usize) + Send + Sync>,
+    down_slot: Box<dyn Fn(usize) -> usize + Send + Sync>,
+    down_f: Box<dyn Fn(usize) + Send + Sync>,
+}
+/// A planning request to the builder thread: the layer, the picks as routed, the step's activations.
+struct Req {
+    l: usize,
+    idx: Vec<[usize; TOP_K]>,
+    xq: usize,
+    xs: usize,
+    xg: usize,
+}
+/// The builder thread's mailbox: a request in, a plan out.
+struct Builder {
+    req: std::sync::atomic::AtomicPtr<Req>,
+    ready: std::sync::atomic::AtomicPtr<RunPlan>,
+    quit: std::sync::atomic::AtomicBool,
+}
 impl<'a> CpuExperts<'a> {
     pub fn new(stream: &'a expert::Stream<'a>, pool: &'a dyn Pool) -> Self {
         use common::q4::GROUP;
         #[cfg(feature = "track-experts")]
         let item_acc = (0..SLOTS).map(|_| std::array::from_fn(|_| ItemAcc::default())).collect();
-        let mut this = CpuExperts { #[cfg(feature = "track-experts")] item_acc, #[cfg(feature = "track-experts")] pf: std::sync::Mutex::new(None), #[cfg(feature = "track-experts")] pmcs: Vec::new(), #[cfg(feature = "track-experts")] rdpmc: false, #[cfg(feature = "track-experts")] fill_acc: (0..SLOTS).map(|_| FillAcc::default()).collect(), stream, pool, slice_node: Vec::new(), slice_slot: Vec::new(), slice_order: Vec::new(), planned: std::sync::Mutex::new(None), xq: vec![0; STEP * H], xs: vec![0.0; STEP * H / GROUP], xg: vec![0; STEP * H / GROUP], h: vec![0.0; STEP * TOP_K * D_FF], hq: vec![0; STEP * TOP_K * D_FF], hs: vec![0.0; STEP * TOP_K * D_FF / GROUP], hg: vec![0; STEP * TOP_K * D_FF / GROUP], elapsed: 0.0 };
+        let mut this = CpuExperts { #[cfg(feature = "track-experts")] item_acc, #[cfg(feature = "track-experts")] pf: std::sync::Arc::new(std::sync::Mutex::new(None)), #[cfg(feature = "track-experts")] pmcs: Vec::new(), #[cfg(feature = "track-experts")] rdpmc: false, #[cfg(feature = "track-experts")] fill_acc: (0..SLOTS).map(|_| FillAcc::default()).collect(), stream, pool, tables: std::sync::Arc::new(std::sync::RwLock::new(Tables::default())), planned: std::sync::Arc::new(std::sync::Mutex::new(None)), builder_core: None, builder: None, requested: None, xq: vec![0; STEP * H], xs: vec![0.0; STEP * H / GROUP], xg: vec![0; STEP * H / GROUP], h: vec![0.0; STEP * TOP_K * D_FF], hq: vec![0; STEP * TOP_K * D_FF], hs: vec![0.0; STEP * TOP_K * D_FF / GROUP], hg: vec![0; STEP * TOP_K * D_FF / GROUP], elapsed: 0.0 };
         this.relearn();
         // the fill counters on every core (the NMI watchdog holds a counter on each CPU: off first, 2026-10-20)
         #[cfg(feature = "track-experts")]
@@ -878,7 +1006,8 @@ impl<'a> CpuExperts<'a> {
                 }
             }
         }
-        self.slice_node = slice_node;
+        let mut t = self.tables.write().unwrap();
+        t.slice_node = slice_node;
         // each expert's slices in queue order (stable: within a queue, the compute's order)
         const SLICES: usize = GU_ITEMS + DOWN_ITEMS;
         let mut order = Vec::with_capacity(slice_slot.len());
@@ -887,8 +1016,67 @@ impl<'a> CpuExperts<'a> {
             ix.sort_by_key(|&j| rec[j as usize]);
             order.extend_from_slice(&ix);
         }
-        self.slice_order = order;
-        self.slice_slot = slice_slot;
+        t.slice_order = order;
+        t.slice_slot = slice_slot;
+    }
+    /// Plan decode runs on a thread pinned to `core` (not a pool core), from each layer's dispatch.
+    pub fn with_builder(mut self, core: usize) -> Self {
+        self.builder_core = Some(core);
+        self
+    }
+    /// What planning needs, as the builder thread and the inline path see it.
+    fn ctx(&self) -> Ctx {
+        Ctx {
+            tables: self.tables.clone(),
+            planned: self.planned.clone(),
+            // the stream and the pool live as long as the process (the node leaks both)
+            stream: unsafe { std::mem::transmute::<&expert::Stream, &'static expert::Stream<'static>>(self.stream) },
+            pool: unsafe { std::mem::transmute::<&dyn Pool, &'static dyn Pool>(self.pool) },
+            h_p: self.h.as_ptr() as usize,
+            hq_p: self.hq.as_ptr() as usize,
+            hs_p: self.hs.as_ptr() as usize,
+            hg_p: self.hg.as_ptr() as usize,
+            #[cfg(feature = "track-experts")]
+            pf: self.pf.clone(),
+            #[cfg(feature = "track-experts")]
+            acc_p: self.item_acc.as_ptr() as usize,
+            #[cfg(feature = "track-experts")]
+            fill_acc_p: self.fill_acc.as_ptr() as usize,
+            #[cfg(feature = "track-experts")]
+            rdpmc: self.rdpmc,
+        }
+    }
+    /// The builder, started on first use (after every `relearn`): it spins on its mailbox.
+    fn builder(&mut self) -> Option<std::sync::Arc<Builder>> {
+        let core = self.builder_core?;
+        if self.builder.is_none() {
+            let b = std::sync::Arc::new(Builder { req: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()), ready: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()), quit: std::sync::atomic::AtomicBool::new(false) });
+            let ctx = self.ctx();
+            let bt = b.clone();
+            std::thread::Builder::new()
+                .name("builder".into())
+                .spawn(move || {
+                    pin(core);
+                    while !bt.quit.load(Ordering::Relaxed) {
+                        let r = bt.req.swap(std::ptr::null_mut(), Ordering::AcqRel);
+                        if r.is_null() {
+                            std::hint::spin_loop();
+                            continue;
+                        }
+                        let r = unsafe { Box::from_raw(r) };
+                        let n = r.idx.len();
+                        let (xq, xs, xg) = unsafe { (std::slice::from_raw_parts(r.xq as *const i8, n * H), std::slice::from_raw_parts(r.xs as *const f32, n * (H / 128)), std::slice::from_raw_parts(r.xg as *const i32, n * (H / 128))) };
+                        let plan = plan_run(&ctx, r.l, &r.idx, xq, xs, xg);
+                        let old = bt.ready.swap(Box::into_raw(plan), Ordering::AcqRel);
+                        if !old.is_null() {
+                            drop(unsafe { Box::from_raw(old) });
+                        }
+                    }
+                })
+                .unwrap();
+            self.builder = Some(b);
+        }
+        self.builder.clone()
     }
 }
 /// Pull every cache line of `b` through this core: into its L2 and, as the core streams on, its CCD's L3. One 32-byte
@@ -944,6 +1132,271 @@ struct Planned {
     /// Each item's taker (the pool's worker index; `u8::MAX`: not taken), filled in as the prefetch runs.
     takers: Option<std::sync::Arc<Vec<std::sync::atomic::AtomicU8>>>,
 }
+/// Plan a layer's expert run from its picks (`idx`, the residents marked `E`) and the prefetch's plan: the experts and
+/// their (token, pick) pairs, in the plan's order; each slice's slot (a planned slice to its taker's own queue); the
+/// gate/up items; the quantize groups' counters; and, where the pool prepares, both jobs sorted and allocated. Nothing
+/// here touches the run's output: the plan is the same whichever thread makes it.
+fn plan_run(ctx: &Ctx, l: usize, idx: &[[usize; TOP_K]], xq: &[i8], xs: &[f32], xg: &[i32]) -> Box<RunPlan> {
+    use common::q4::{self, Act, QAct, GEMM_TOKENS, GROUP};
+    use common::swiglu::swiglu_clamped;
+    use expert::{DOWN_PARTS, DOWN_ROWS, GU_PARTS, GU_ROWS, SUB};
+    use std::sync::Arc;
+    /// Pair `i`'s (token, slot) as the index of its hidden state and output row.
+    fn blk_slot(pairs: &[(u16, u8)], i: usize) -> usize {
+        pairs[i].0 as usize * TOP_K + pairs[i].1 as usize
+    }
+    let n = idx.len();
+    assert!(n <= STEP);
+    const HG: usize = H / GROUP;
+    const DG: usize = D_FF / GROUP;
+    const QP: usize = GROUP / GU_ROWS;
+    const { assert!(GROUP % GU_ROWS == 0 && GU_PARTS % QP == 0 && GU_PER_RUN % (QP / SUB) == 0 && QP / SUB == 2) };
+    // the experts picked, each with the (token, slot) pairs that picked it: a counting sort into one list,
+    // `first[e]..first[e + 1]` an expert's pairs. A pick of `E` is resident on a card and runs there (`xpt_dispatch`):
+    // skipped here, its output slot filled by the join
+    let mut first = vec![0usize; E + 1];
+    for picks in idx {
+        for &e in picks {
+            if e < E {
+                first[e + 1] += 1;
+            }
+        }
+    }
+    for e in 0..E {
+        first[e + 1] += first[e];
+    }
+    let mut fill = first.clone();
+    let mut pairs = vec![(0u16, 0u8); n * TOP_K];
+    for (i, picks) in idx.iter().enumerate() {
+        for (k, &e) in picks.iter().enumerate() {
+            if e < E {
+                pairs[fill[e]] = (i as u16, k as u8);
+                fill[e] += 1;
+            }
+        }
+    }
+    // the run's experts in the order the prefetch posted them (its plan for this layer), then the rest by id: each CCD's
+    // queue takes its items in this order, so the run reads first what arrived first, and the experts it streams from
+    // DRAM come after the prefetched ones. The outputs land in fixed rows: the order changes no bits.
+    let mut experts: Vec<usize> = (0..E).filter(|&e| first[e + 1] > first[e]).collect();
+    let planned = {
+        let mut p = ctx.planned.lock().unwrap();
+        if p.as_ref().is_some_and(|p| p.l == l) { p.take() } else { None }
+    };
+    let mut pos_of = [u16::MAX; E];
+    if let Some(p) = &planned {
+        for (k, &e) in p.idx.iter().enumerate() {
+            pos_of[e] = k as u16;
+        }
+        experts.sort_by_key(|&e| if pos_of[e] != u16::MAX { pos_of[e] as usize } else { E + e });
+    }
+    let ne = experts.len();
+    // `track-experts`: the prefetch made for this layer, read against this run's experts when the run comes (`execute`)
+    #[cfg(feature = "track-experts")]
+    let pf = ctx.pf.lock().unwrap().take().filter(|p| p.0 == l).map(|p| (p.1, p.2, p.3));
+    // each (expert position, slice)'s slot: a planned slice to the worker that touched it (its own queue, `CORE`), else its
+    // CCD's queue
+    let slot_tab: Vec<u8> = {
+        let tables = ctx.tables.read().unwrap();
+        let slot_of = |e: usize, j: usize| tables.slice_slot[((l - FIRST_K_DENSE_REPLACE) * E + e) * (GU_ITEMS + DOWN_ITEMS) + j] as usize;
+        (0..ne * (GU_ITEMS + DOWN_ITEMS))
+            .map(|x| {
+                let (e, j) = (experts[x / (GU_ITEMS + DOWN_ITEMS)], x % (GU_ITEMS + DOWN_ITEMS));
+                if let Some(p) = &planned {
+                    let k = pos_of[e];
+                    if k != u16::MAX {
+                        let t = p.item_of[k as usize * (GU_ITEMS + DOWN_ITEMS) + j];
+                        if t != u16::MAX {
+                            if let Some(tk) = &p.takers {
+                                let w = tk[t as usize].load(Ordering::Relaxed);
+                                if w != u8::MAX {
+                                    return (CORE + w as usize) as u8;
+                                }
+                            }
+                        }
+                    }
+                }
+                slot_of(e, j) as u8
+            })
+            .collect()
+    };
+    // the gate/up items, (expert position, first part, parts): a long step's are folded — one quantize group each, QP
+    // parts, two slices on one CCD, quantized in place by the core that computed it. A decode step keeps fine parts:
+    // folded, a 544 KB item a core left the CCD's cores nothing to balance the tail with (gate/up 311 → 371 µs a layer
+    // folded whole, 2026-10-22); its groups are quantized by whichever part completes them (`group_done`).
+    let mut gitems: Vec<(u16, u16, u8)> = Vec::with_capacity(ne * GU_PARTS);
+    for j in 0..ne {
+        if n > SPEC_TOKENS {
+            for p in 0..GU_PARTS / QP {
+                gitems.push((j as u16, (p * QP) as u16, QP as u8));
+            }
+        } else {
+            for p in 0..GU_PARTS {
+                gitems.push((j as u16, p as u16, 1));
+            }
+        }
+    }
+    #[cfg(feature = "track-experts")]
+    let gu_bytes = (2 * GU_ROWS * H / 2 + 2 * GU_ROWS * HG * 4) * gitems.iter().map(|g| g.2 as usize).sum::<usize>() / gitems.len().max(1);
+    let d = Arc::new(RunData {
+        l,
+        n,
+        pairs,
+        first,
+        experts,
+        slot_tab,
+        gitems,
+        group_done: (0..ne * (GU_PARTS / QP)).map(|_| std::sync::atomic::AtomicU8::new(0)).collect(),
+        xq: xq.as_ptr() as usize,
+        xs: xs.as_ptr() as usize,
+        xg: xg.as_ptr() as usize,
+        out_p: AtomicUsize::new(0),
+        #[cfg(feature = "track-experts")]
+        pf,
+        #[cfg(feature = "track-experts")]
+        status: (0..E).map(|_| std::sync::atomic::AtomicU8::new(2)).collect(),
+        #[cfg(feature = "track-experts")]
+        counted: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(feature = "track-experts")]
+        rdpmc: ctx.rdpmc,
+        #[cfg(feature = "track-experts")]
+        gu_bytes,
+    });
+    let (stream, h_p, hq_p, hs_p, hg_p) = (ctx.stream, ctx.h_p, ctx.hq_p, ctx.hs_p, ctx.hg_p);
+    #[cfg(feature = "track-experts")]
+    let (acc_p, fill_acc_p) = (ctx.acc_p, ctx.fill_acc_p);
+    // an item's L3 hits and misses (its core's counters around it), to its expert's status, when this run is counted
+    #[cfg(feature = "track-experts")]
+    let fill = move |d: &RunData, slot: usize, e: usize, c0: (u64, u64)| {
+        if d.counted.load(Ordering::Relaxed) {
+            let (h, m) = (common::pmc::rdpmc(4).wrapping_sub(c0.0), common::pmc::rdpmc(5).wrapping_sub(c0.1));
+            let st = d.status[e].load(Ordering::Relaxed) as usize;
+            let fa = unsafe { &*(fill_acc_p as *const FillAcc).add(slot) };
+            fa.0[2 * st].fetch_add(h & ((1 << 48) - 1), Ordering::Relaxed);
+            fa.0[2 * st + 1].fetch_add(m & ((1 << 48) - 1), Ordering::Relaxed);
+        }
+    };
+    #[cfg(feature = "track-experts")]
+    let fill0 = move |d: &RunData| if d.counted.load(Ordering::Relaxed) { (common::pmc::rdpmc(4), common::pmc::rdpmc(5)) } else { (0, 0) };
+    #[cfg(feature = "track-experts")]
+    let acc_at = move |slot: usize, b: usize| unsafe { &(*(acc_p as *const [ItemAcc; BUCKETS]).add(slot))[b] };
+    // the gate/up rows: part (j, c) owns expert experts[j]'s hidden channels c·GU_ROWS.., for all of its tokens at once
+    // (`q4::gemm`: the part's bytes read once, every token's dot on them), in blocks of GEMM_TOKENS
+    let dg = d.clone();
+    let gu_slot: Box<dyn Fn(usize) -> usize + Send + Sync> = Box::new(move |i: usize| {
+        let (j, c0, _) = dg.gitems[i];
+        dg.slot_tab[j as usize * (GU_ITEMS + DOWN_ITEMS) + c0 as usize / SUB] as usize
+    });
+    let dg = d.clone();
+    let gu_f: Box<dyn Fn(usize) + Send + Sync> = Box::new(move |i: usize| {
+        let d = &*dg;
+        #[cfg(feature = "track-experts")]
+        let t_item = std::time::Instant::now();
+        let (j, c0, len) = d.gitems[i];
+        let (j, c0, len) = (j as usize, c0 as usize, len as usize);
+        let e = d.experts[j];
+        #[cfg(feature = "track-experts")]
+        let f0 = fill0(d);
+        let w = expert::Weights::at(stream, d.l, e);
+        let pairs = &d.pairs[d.first[e]..d.first[e + 1]];
+        let (xq, xs, xg) = unsafe { (std::slice::from_raw_parts(d.xq as *const i8, d.n * H), std::slice::from_raw_parts(d.xs as *const f32, d.n * HG), std::slice::from_raw_parts(d.xg as *const i32, d.n * HG)) };
+        for c in c0..c0 + len {
+            let (gw, uw, gs, usc) = w.gu(c);
+            let mut b0 = 0;
+            while b0 < pairs.len() {
+                let blk = &pairs[b0..(b0 + GEMM_TOKENS).min(pairs.len())];
+                let act = |i: usize| {
+                    let t = blk[i].0 as usize;
+                    Act { q: &xq[t * H..(t + 1) * H], scale: &xs[t * HG..(t + 1) * HG], gsum: &xg[t * HG..(t + 1) * HG] }
+                };
+                let mut gu = [[0f32; 2 * GU_ROWS]; GEMM_TOKENS];
+                let gp = gu.as_mut_ptr() as *mut f32;
+                q4::gemm::<H>(GU_ROWS, gw, gs, blk.len(), act, |i| unsafe { gp.add(i * 2 * GU_ROWS) });
+                q4::gemm::<H>(GU_ROWS, uw, usc, blk.len(), act, |i| unsafe { gp.add(i * 2 * GU_ROWS + GU_ROWS) });
+                for (i, &(t, k)) in blk.iter().enumerate() {
+                    let h = unsafe { std::slice::from_raw_parts_mut((h_p as *mut f32).add((t as usize * TOP_K + k as usize) * D_FF + c * GU_ROWS), GU_ROWS) };
+                    swiglu_clamped::<GU_ROWS>(&gu[i], SWIGLU_LIMIT, h);
+                }
+                b0 += GEMM_TOKENS;
+            }
+        }
+        // a folded item is a group; a fine part completes one when it is the group's last (the count's acquire orders the
+        // mates' writes of `h` before this core reads them)
+        let group = if len == QP { Some(c0 / QP) } else if d.group_done[j * (GU_PARTS / QP) + c0 / QP].fetch_add(1, Ordering::AcqRel) as usize + 1 == QP { Some(c0 / QP) } else { None };
+        if let Some(p) = group {
+            // this group of every token's hidden state, quantized as the whole vector's would be (per group)
+            for &(t, k) in pairs {
+                let s = t as usize * TOP_K + k as usize;
+                let (x, q, sc, g) = unsafe {
+                    (
+                        std::slice::from_raw_parts((h_p as *const f32).add(s * D_FF + p * GROUP), GROUP),
+                        std::slice::from_raw_parts_mut((hq_p as *mut i8).add(s * D_FF + p * GROUP), GROUP),
+                        std::slice::from_raw_parts_mut((hs_p as *mut f32).add(s * DG + p), 1),
+                        std::slice::from_raw_parts_mut((hg_p as *mut i32).add(s * DG + p), 1),
+                    )
+                };
+                QAct { q, scale: sc, gsum: g }.quantize(x);
+            }
+        }
+        #[cfg(feature = "track-experts")]
+        {
+            let slot = d.slot_tab[j * (GU_ITEMS + DOWN_ITEMS) + c0 / SUB] as usize;
+            acc_at(slot, bucket_of(pairs.len())).add(t_item.elapsed().as_nanos() as u64, pairs.len());
+            fill(d, slot, e, f0);
+        }
+    });
+    // the down rows: part (j, c) owns rows c·DOWN_ROWS.. of expert experts[j]'s output, for all of its tokens, likewise
+    let dd = d.clone();
+    let down_slot: Box<dyn Fn(usize) -> usize + Send + Sync> = Box::new(move |i: usize| dd.slot_tab[(i / DOWN_PARTS) * (GU_ITEMS + DOWN_ITEMS) + GU_ITEMS + i % DOWN_PARTS / SUB] as usize);
+    let dd = d.clone();
+    let down_f: Box<dyn Fn(usize) + Send + Sync> = Box::new(move |i: usize| {
+        let d = &*dd;
+        #[cfg(feature = "track-experts")]
+        let t_item = std::time::Instant::now();
+        let (j, c) = (i / DOWN_PARTS, i % DOWN_PARTS);
+        let e = d.experts[j];
+        #[cfg(feature = "track-experts")]
+        let c0 = fill0(d);
+        let w = expert::Weights::at(stream, d.l, e);
+        let (dw, ds) = w.down(c);
+        let r0 = c * DOWN_ROWS;
+        let pairs = &d.pairs[d.first[e]..d.first[e + 1]];
+        let slot = |i: usize| blk_slot(pairs, i);
+        let (hq, hs, hg) = unsafe { (std::slice::from_raw_parts(hq_p as *const i8, d.n * TOP_K * D_FF), std::slice::from_raw_parts(hs_p as *const f32, d.n * TOP_K * DG), std::slice::from_raw_parts(hg_p as *const i32, d.n * TOP_K * DG)) };
+        let out_p = d.out_p.load(Ordering::Acquire);
+        let mut b0 = 0;
+        while b0 < pairs.len() {
+            let blk = &pairs[b0..(b0 + GEMM_TOKENS).min(pairs.len())];
+            let act = |i: usize| {
+                let s = slot(b0 + i);
+                Act { q: &hq[s * D_FF..(s + 1) * D_FF], scale: &hs[s * DG..(s + 1) * DG], gsum: &hg[s * DG..(s + 1) * DG] }
+            };
+            q4::gemm::<D_FF>(DOWN_ROWS, dw, ds, blk.len(), act, |i| unsafe { (out_p as *mut f32).add(slot(b0 + i) * H + r0) });
+            b0 += GEMM_TOKENS;
+        }
+        // the rows may be a card's VRAM through the BAR (002): this core's write-combining stores out before the run ends
+        // and the main thread writes the leader's word
+        unsafe { core::arch::x86_64::_mm_sfence() };
+        #[cfg(feature = "track-experts")]
+        {
+            let slot = d.slot_tab[j * (GU_ITEMS + DOWN_ITEMS) + GU_ITEMS + c / SUB] as usize;
+            acc_at(slot, bucket_of(pairs.len())).add(t_item.elapsed().as_nanos() as u64, pairs.len());
+            fill(d, slot, e, c0);
+        }
+    });
+    // the jobs, where the pool prepares them: built here with the closures as their own, announced at the run; else the
+    // closures stay with the plan and run slotted
+    let (gu_job, down_job, gu_f, down_f) = if ctx.pool.prepares() {
+        let gu_job = ctx.pool.prepare_slotted(d.gitems.len(), &*gu_slot, gu_f);
+        let down_job = ctx.pool.prepare_slotted(ne * DOWN_PARTS, &*down_slot, down_f);
+        let none: Box<dyn Fn(usize) + Send + Sync> = Box::new(|_| {});
+        let none2: Box<dyn Fn(usize) + Send + Sync> = Box::new(|_| {});
+        (gu_job, down_job, none, none2)
+    } else {
+        (0, 0, gu_f, down_f)
+    };
+    Box::new(RunPlan { data: d, gu_job, down_job, gu_slot, gu_f, down_slot, down_f })
+}
 impl Routed for CpuExperts<'_> {
     fn elapsed(&mut self) -> f64 {
         std::mem::take(&mut self.elapsed)
@@ -958,6 +1411,7 @@ impl Routed for CpuExperts<'_> {
         let (n_gu, n_down) = (GU_ITEMS, DOWN_ITEMS);
         let idx: Vec<usize> = idx.to_vec();
         let idx_plan = idx.clone();
+        let tables = self.tables.read().unwrap();
         // the items cut from `slice_order` (each expert's slices already in queue order): an item is (expert position,
         // queue, its run in `slices`), every item's slice ids in one flat copy the job owns
         let mut items: Vec<(usize, usize, u16, u16)> = Vec::with_capacity(idx.len() * (n_gu + n_down));
@@ -965,7 +1419,7 @@ impl Routed for CpuExperts<'_> {
         let mut item_of = vec![u16::MAX; idx.len() * (n_gu + n_down)];
         for (k, &e) in idx.iter().enumerate() {
             let rec = ((l - FIRST_K_DENSE_REPLACE) * E + e) * (n_gu + n_down);
-            let (order, slot_of) = (&self.slice_order[rec..rec + n_gu + n_down], &self.slice_slot[rec..rec + n_gu + n_down]);
+            let (order, slot_of) = (&tables.slice_order[rec..rec + n_gu + n_down], &tables.slice_slot[rec..rec + n_gu + n_down]);
             // an item a slice (272 KB, ~70 µs a core): a CCD's 13 experts' worth packs its cores to the window's end. As one
             // item an (expert, CCD) — four slices, ~290 µs — a CCD's 13 items over ~7 takers went in two waves, the second
             // ending at the cutoff with ~2 items in flight and cores idle a quarter of the window (busy 464 of 617 µs,
@@ -988,6 +1442,7 @@ impl Routed for CpuExperts<'_> {
                 a = b;
             }
         }
+        drop(tables);
         let n = items.len();
         #[cfg(feature = "track-experts")]
         let finished = {
@@ -1064,274 +1519,103 @@ impl Routed for CpuExperts<'_> {
     fn run_batch_act(&mut self, l: usize, idx: &[[usize; TOP_K]], xq: &[i8], xs: &[f32], xg: &[i32], out: &mut [f32]) {
         self.run_batch_q(l, idx, xq, xs, xg, out)
     }
+    fn prepare_batch_act(&mut self, l: usize, idx: &[[usize; TOP_K]], xq: &[i8], xs: &[f32], xg: &[i32]) {
+        self.prepare_q(l, idx, xq, xs, xg)
+    }
 }
 impl CpuExperts<'_> {
     /// The step's experts over quantized activations (`run_batch_act`'s form; `run_batch` quantizes first).
+    /// A decode layer's run planned at its dispatch, on the builder (083): the pairs, the order, the slots, the items and
+    /// both jobs are ready when the run comes, and the main thread only announces them.
+    fn prepare_q(&mut self, l: usize, idx: &[[usize; TOP_K]], xq: &[i8], xs: &[f32], xg: &[i32]) {
+        if idx.len() > SPEC_TOKENS {
+            return;
+        }
+        if let Some(b) = self.builder() {
+            let r = Box::new(Req { l, idx: idx.to_vec(), xq: xq.as_ptr() as usize, xs: xs.as_ptr() as usize, xg: xg.as_ptr() as usize });
+            let old = b.req.swap(Box::into_raw(r), Ordering::AcqRel);
+            if !old.is_null() {
+                drop(unsafe { Box::from_raw(old) });
+            }
+            self.requested = Some((l, idx.len()));
+        }
+    }
     fn run_batch_q(&mut self, l: usize, idx: &[[usize; TOP_K]], xq: &[i8], xs: &[f32], xg: &[i32], out: &mut [f32]) {
-        /// Pair `i`'s (token, slot) as the index of its hidden state and output row.
-        fn blk_slot(pairs: &[(u16, u8)], i: usize) -> usize {
-            pairs[i].0 as usize * TOP_K + pairs[i].1 as usize
-        }
-        use common::q4::{self, Act, QAct, GEMM_TOKENS, GROUP};
-        use common::swiglu::swiglu_clamped;
-        use expert::{DOWN_PARTS, DOWN_ROWS, GU_PARTS, GU_ROWS, SUB};
         let t0 = std::time::Instant::now();
-        let n = idx.len();
-        assert!(n <= STEP);
-        const HG: usize = H / GROUP;
-        const DG: usize = D_FF / GROUP;
-        // the experts picked, each with the (token, slot) pairs that picked it: a counting sort into one
-        // list, `first[e]..first[e + 1]` an expert's pairs (no allocation an expert)
-        // a pick of `E` is resident on a card and runs there (`Placed::xpt_dispatch`): skipped here, its
-        // output slot filled by the join
-        let mut first = [0usize; E + 1];
-        for picks in idx {
-            for &e in picks {
-                if e < E {
-                    first[e + 1] += 1;
-                }
-            }
-        }
-        for e in 0..E {
-            first[e + 1] += first[e];
-        }
-        let mut fill = first;
-        let mut pairs = vec![(0u16, 0u8); n * TOP_K];
-        for (i, picks) in idx.iter().enumerate() {
-            for (k, &e) in picks.iter().enumerate() {
-                if e < E {
-                    pairs[fill[e]] = (i as u16, k as u8);
-                    fill[e] += 1;
-                }
-            }
-        }
-        // the run's experts in the order the prefetch posted them (its plan for this layer), then the rest by id: each
-        // CCD's queue takes its items in this order, so the run reads first what arrived first, and the experts it streams
-        // from DRAM come after the prefetched ones are read (in id order, the run streamed a high-id unplanned expert
-        // between planned ones). The outputs land in fixed rows: the order changes no bits.
-        let mut experts: Vec<usize> = (0..E).filter(|&e| first[e + 1] > first[e]).collect();
-        let planned = {
-            let mut p = self.planned.lock().unwrap();
-            if p.as_ref().is_some_and(|p| p.l == l) { p.take() } else { None }
-        };
-        // each expert's position in the plan (`u16::MAX`: unplanned)
-        let mut pos_of = [u16::MAX; E];
-        if let Some(p) = &planned {
-            for (k, &e) in p.idx.iter().enumerate() {
-                pos_of[e] = k as u16;
-            }
-            experts.sort_by_key(|&e| if pos_of[e] != u16::MAX { pos_of[e] as usize } else { E + e });
-        }
-        // `track-experts`: this run's host experts against the prefetch made for this layer — predicted and every item
-        // touched, predicted but not finished when the run began, not predicted (decode's L3 question, 2026-10-20)
-        #[cfg(feature = "track-experts")]
-        let mut pf_use: Option<[usize; 8]> = None;
-        // each expert's prefetch status for the items' fill counts: 0 complete, 1 partial, 2 missed
-        #[cfg(feature = "track-experts")]
-        let mut status = [2u8; E];
-        #[cfg(feature = "track-experts")]
-        if let Some((pl, pidx, per, fin)) = self.pf.lock().unwrap().take() {
-            if pl == l {
-                let (mut complete, mut partial, mut missed, mut items, mut items_done) = (0usize, 0usize, 0usize, 0usize, 0usize);
-                for &e in &experts {
-                    match pidx.iter().position(|&p| p == e) {
-                        Some(k) => {
-                            let d = fin[k].load(Ordering::Relaxed) as usize;
-                            items += per[k] as usize;
-                            items_done += d;
-                            if d == per[k] as usize {
-                                complete += 1;
-                                status[e] = 0;
-                            } else {
-                                partial += 1;
-                                status[e] = 1;
-                            }
+        // the builder's plan for this layer, else planned here
+        let mut plan: Option<Box<RunPlan>> = None;
+        if self.requested.take() == Some((l, idx.len())) {
+            if let Some(b) = self.builder.clone() {
+                let wait = std::time::Instant::now();
+                loop {
+                    let p = b.ready.swap(std::ptr::null_mut(), Ordering::AcqRel);
+                    if !p.is_null() {
+                        let p = unsafe { Box::from_raw(p) };
+                        if p.data.l == l && p.data.n == idx.len() {
+                            plan = Some(p);
                         }
-                        None => missed += 1,
+                        break;
                     }
-                }
-                let all_done: usize = fin.iter().map(|f| f.load(Ordering::Relaxed) as usize).sum();
-                let all: usize = per.iter().map(|&x| x as usize).sum();
-                pf_use = Some([experts.len(), complete, partial, missed, items, items_done, pidx.len(), all * 1_000_000 + all_done]);
-            }
-        }
-        // an item's L3 hits and misses (its core's counters around it), to its expert's status, when this run is counted
-        #[cfg(feature = "track-experts")]
-        let (counted, fill_acc, status) = (pf_use.is_some() && self.rdpmc, &self.fill_acc, &status);
-        #[cfg(feature = "track-experts")]
-        let fill = move |slot: usize, e: usize, c0: (u64, u64)| {
-            if counted {
-                let (h, m) = (common::pmc::rdpmc(4).wrapping_sub(c0.0), common::pmc::rdpmc(5).wrapping_sub(c0.1));
-                let s = status[e] as usize;
-                fill_acc[slot].0[2 * s].fetch_add(h & ((1 << 48) - 1), Ordering::Relaxed);
-                fill_acc[slot].0[2 * s + 1].fetch_add(m & ((1 << 48) - 1), Ordering::Relaxed);
-            }
-        };
-        #[cfg(feature = "track-experts")]
-        let fill0 = move || if counted { (common::pmc::rdpmc(4), common::pmc::rdpmc(5)) } else { (0, 0) };
-        let ne = experts.len();
-        let uses = |e: usize| &pairs[first[e]..first[e + 1]];
-        let stream = self.stream;
-        let slice_slot = &self.slice_slot;
-        let slot_of = |e: usize, j: usize| slice_slot[((l - FIRST_K_DENSE_REPLACE) * E + e) * (GU_ITEMS + DOWN_ITEMS) + j] as usize;
-        // a planned slice to the worker that touched it (its core's own slot, `CORE`), else to its CCD's queue
-        let planned_r = &planned;
-        let pslot = move |e: usize, j: usize| -> usize {
-            if let Some(p) = planned_r {
-                let k = pos_of[e];
-                if k != u16::MAX {
-                    let t = p.item_of[k as usize * (GU_ITEMS + DOWN_ITEMS) + j];
-                    if t != u16::MAX {
-                        if let Some(tk) = &p.takers {
-                            let w = tk[t as usize].load(Ordering::Relaxed);
-                            if w != u8::MAX {
-                                return CORE + w as usize;
-                            }
-                        }
+                    if wait.elapsed() > std::time::Duration::from_millis(5) {
+                        break;
                     }
-                }
-            }
-            slot_of(e, j)
-        };
-        let h_p = self.h.as_mut_ptr() as usize;
-        // the gate/up rows: part (j, c) owns expert experts[j]'s hidden channels c·GU_ROWS.., for all of
-        // its tokens at once (`q4::gemm`: the part's bytes read once, every token's dot on them), in
-        // blocks of GEMM_TOKENS
-        let uses_r = &uses;
-        let experts_r = &experts;
-        // QP parts are one quantize group of the hidden state (two slices, placed on one CCD: `relearn`)
-        const QP: usize = GROUP / GU_ROWS;
-        const { assert!(GROUP % GU_ROWS == 0 && GU_PARTS % QP == 0 && GU_PER_RUN % (QP / SUB) == 0 && QP / SUB == 2) };
-        // each (expert position, slice)'s slot once, not an item at a time
-        let slot_tab: Vec<u8> = (0..ne * (GU_ITEMS + DOWN_ITEMS)).map(|x| pslot(experts[x / (GU_ITEMS + DOWN_ITEMS)], x % (GU_ITEMS + DOWN_ITEMS)) as u8).collect();
-        let slot_tab = &slot_tab;
-        // the gate/up items, (expert position, first part, parts): a long step's are folded — one quantize group each, QP
-        // parts, two slices on one CCD, quantized in place by the core that computed it. A decode step keeps fine parts:
-        // folded, a 544 KB item a core left the CCD's cores nothing to balance the tail with (gate/up 311 → 371 µs a layer
-        // folded whole, 2026-10-22); its groups are quantized by whichever part completes them (`group_done`).
-        let mut gitems: Vec<(u16, u16, u8)> = Vec::with_capacity(ne * GU_PARTS);
-        for j in 0..ne {
-            if n > SPEC_TOKENS {
-                for p in 0..GU_PARTS / QP {
-                    gitems.push((j as u16, (p * QP) as u16, QP as u8));
-                }
-            } else {
-                for p in 0..GU_PARTS {
-                    gitems.push((j as u16, p as u16, 1));
+                    std::hint::spin_loop();
                 }
             }
         }
-        // a decode step's quantize groups, counted to completion: the part that brings a group's QP parts to done quantizes
-        // it for the expert's tokens there and then — on the group's CCD (the slice pairing), from its mates' L2s, not
-        // gathered across the fabric from twelve takers by a run of its own (42 µs a layer, 2026-10-22)
-        let group_done: Vec<std::sync::atomic::AtomicU8> = (0..ne * (GU_PARTS / QP)).map(|_| std::sync::atomic::AtomicU8::new(0)).collect();
-        let group_done = &group_done;
-        let gitems = &gitems;
-        let gate_slot = move |i: usize| {
-            let (j, c0, _) = gitems[i];
-            slot_tab[j as usize * (GU_ITEMS + DOWN_ITEMS) + c0 as usize / SUB] as usize
-        };
-        let (hq_p, hs_p, hg_p) = (self.hq.as_mut_ptr() as usize, self.hs.as_mut_ptr() as usize, self.hg.as_mut_ptr() as usize);
+        let plan = plan.unwrap_or_else(|| plan_run(&self.ctx(), l, idx, xq, xs, xg));
+        self.execute(plan, out);
+        self.elapsed += t0.elapsed().as_secs_f64();
+    }
+    /// The planned run: both jobs announced (or run slotted where the pool does not prepare), then the accounting.
+    fn execute(&mut self, plan: Box<RunPlan>, out: &mut [f32]) {
+        let d = &plan.data;
+        let (l, n) = (d.l, d.n);
+        d.out_p.store(out.as_mut_ptr() as usize, Ordering::Release);
+        // `track-experts`: this run's host experts against the prefetch made for this layer, as it stands now — predicted
+        // and every item touched, predicted but not finished when the run began, not predicted (decode's L3 question,
+        // 2026-10-20); each expert's status for the items' fill counts
         #[cfg(feature = "track-experts")]
-        let acc = &self.item_acc;
+        let pf_use: Option<[usize; 8]> = d.pf.as_ref().map(|(pidx, per, fin)| {
+            let (mut complete, mut partial, mut missed, mut items, mut items_done) = (0usize, 0usize, 0usize, 0usize, 0usize);
+            for &e in &d.experts {
+                match pidx.iter().position(|&p| p == e) {
+                    Some(k) => {
+                        let done = fin[k].load(Ordering::Relaxed) as usize;
+                        items += per[k] as usize;
+                        items_done += done;
+                        let st = if done == per[k] as usize { complete += 1; 0 } else { partial += 1; 1 };
+                        d.status[e].store(st, Ordering::Relaxed);
+                    }
+                    None => missed += 1,
+                }
+            }
+            let all_done: usize = fin.iter().map(|f| f.load(Ordering::Relaxed) as usize).sum();
+            let all: usize = per.iter().map(|&x| x as usize).sum();
+            [d.experts.len(), complete, partial, missed, items, items_done, pidx.len(), all * 1_000_000 + all_done]
+        });
+        #[cfg(feature = "track-experts")]
+        d.counted.store(pf_use.is_some() && d.rdpmc, Ordering::Release);
         {
             cpu_zone!("experts.gu");
-            self.pool.run_slotted(gitems.len(), &gate_slot, &move |i| {
-            #[cfg(feature = "track-experts")]
-            let t_item = std::time::Instant::now();
-            let (j, c0, len) = gitems[i];
-            let (j, c0, len) = (j as usize, c0 as usize, len as usize);
-            let e = experts_r[j];
-            #[cfg(feature = "track-experts")]
-            let f0 = fill0();
-            let w = expert::Weights::at(stream, l, e);
-            let pairs = uses_r(e);
-            for c in c0..c0 + len {
-            let (gw, uw, gs, usc) = w.gu(c);
-            let mut b0 = 0;
-            while b0 < pairs.len() {
-                let blk = &pairs[b0..(b0 + GEMM_TOKENS).min(pairs.len())];
-                let act = |i: usize| {
-                    let t = blk[i].0 as usize;
-                    Act { q: &xq[t * H..(t + 1) * H], scale: &xs[t * HG..(t + 1) * HG], gsum: &xg[t * HG..(t + 1) * HG] }
-                };
-                let mut gu = [[0f32; 2 * GU_ROWS]; GEMM_TOKENS];
-                let gp = gu.as_mut_ptr() as *mut f32;
-                q4::gemm::<H>(GU_ROWS, gw, gs, blk.len(), act, |i| unsafe { gp.add(i * 2 * GU_ROWS) });
-                q4::gemm::<H>(GU_ROWS, uw, usc, blk.len(), act, |i| unsafe { gp.add(i * 2 * GU_ROWS + GU_ROWS) });
-                for (i, &(t, k)) in blk.iter().enumerate() {
-                    let h = unsafe { std::slice::from_raw_parts_mut((h_p as *mut f32).add((t as usize * TOP_K + k as usize) * D_FF + c * GU_ROWS), GU_ROWS) };
-                    swiglu_clamped::<GU_ROWS>(&gu[i], SWIGLU_LIMIT, h);
-                }
-                b0 += GEMM_TOKENS;
+            if plan.gu_job != 0 {
+                self.pool.run_prepared(plan.gu_job);
+            } else {
+                self.pool.run_slotted(d.gitems.len(), &*plan.gu_slot, &*plan.gu_f);
             }
-            }
-            // a folded item is a group; a fine part completes one when it is the group's last (the count's acquire orders
-            // the mates' writes of `h` before this core reads them)
-            let group = if len == QP { Some(c0 / QP) } else if group_done[j * (GU_PARTS / QP) + c0 / QP].fetch_add(1, Ordering::AcqRel) as usize + 1 == QP { Some(c0 / QP) } else { None };
-            if let Some(p) = group {
-                // this group of every token's hidden state, quantized as the whole vector's would be (per group)
-                for &(t, k) in pairs {
-                    let s = t as usize * TOP_K + k as usize;
-                    let (x, q, sc, g) = unsafe {
-                        (
-                            std::slice::from_raw_parts((h_p as *const f32).add(s * D_FF + p * GROUP), GROUP),
-                            std::slice::from_raw_parts_mut((hq_p as *mut i8).add(s * D_FF + p * GROUP), GROUP),
-                            std::slice::from_raw_parts_mut((hs_p as *mut f32).add(s * DG + p), 1),
-                            std::slice::from_raw_parts_mut((hg_p as *mut i32).add(s * DG + p), 1),
-                        )
-                    };
-                    QAct { q, scale: sc, gsum: g }.quantize(x);
-                }
-            }
-            #[cfg(feature = "track-experts")]
-            acc[gate_slot(i)][bucket_of(pairs.len())].add(t_item.elapsed().as_nanos() as u64, pairs.len());
-            #[cfg(feature = "track-experts")]
-            fill(gate_slot(i), e, f0);
-            });
         }
         #[cfg(feature = "track-experts")]
-        self.item_rows(l, "gu", (2 * GU_ROWS * H / 2 + 2 * GU_ROWS * HG * 4) * gitems.iter().map(|g| g.2 as usize).sum::<usize>() / gitems.len().max(1));
-        // the down rows: part (j, c) owns rows c·DOWN_ROWS.. of expert experts[j]'s output, for all of its tokens, likewise
-        let (hq, hs, hg) = (&self.hq, &self.hs, &self.hg);
-        let out_p = out.as_mut_ptr() as usize;
-        let down_slot = move |i: usize| slot_tab[(i / DOWN_PARTS) * (GU_ITEMS + DOWN_ITEMS) + GU_ITEMS + i % DOWN_PARTS / SUB] as usize;
+        self.item_rows(l, "gu", d.gu_bytes);
         {
             cpu_zone!("experts.down");
-            self.pool.run_slotted(ne * DOWN_PARTS, &down_slot, &move |i| {
-            #[cfg(feature = "track-experts")]
-            let t_item = std::time::Instant::now();
-            let (j, c) = (i / DOWN_PARTS, i % DOWN_PARTS);
-            let e = experts_r[j];
-            #[cfg(feature = "track-experts")]
-            let c0 = fill0();
-            let w = expert::Weights::at(stream, l, e);
-            let (dw, ds) = w.down(c);
-            let r0 = c * DOWN_ROWS;
-            let pairs = uses_r(e);
-            let slot = |i: usize| blk_slot(pairs, i);
-            let mut b0 = 0;
-            while b0 < pairs.len() {
-                let blk = &pairs[b0..(b0 + GEMM_TOKENS).min(pairs.len())];
-                let act = |i: usize| {
-                    let s = slot(b0 + i);
-                    Act { q: &hq[s * D_FF..(s + 1) * D_FF], scale: &hs[s * DG..(s + 1) * DG], gsum: &hg[s * DG..(s + 1) * DG] }
-                };
-                q4::gemm::<D_FF>(DOWN_ROWS, dw, ds, blk.len(), act, |i| unsafe { (out_p as *mut f32).add(slot(b0 + i) * H + r0) });
-                b0 += GEMM_TOKENS;
+            if plan.down_job != 0 {
+                self.pool.run_prepared(plan.down_job);
+            } else {
+                self.pool.run_slotted(d.experts.len() * expert::DOWN_PARTS, &*plan.down_slot, &*plan.down_f);
             }
-            // the rows may be a card's VRAM through the BAR (002): this core's write-combining stores out before the
-            // run ends and the main thread writes the leader's word
-            unsafe { core::arch::x86_64::_mm_sfence() };
-            #[cfg(feature = "track-experts")]
-            acc[down_slot(i)][bucket_of(pairs.len())].add(t_item.elapsed().as_nanos() as u64, pairs.len());
-            #[cfg(feature = "track-experts")]
-            fill(down_slot(i), e, c0);
-            });
         }
         #[cfg(feature = "track-experts")]
-        self.item_rows(l, "down", DOWN_ROWS * D_FF / 2 + DOWN_ROWS * DG * 4);
-        self.elapsed += t0.elapsed().as_secs_f64();
+        self.item_rows(l, "down", expert::DOWN_ROWS * D_FF / 2 + expert::DOWN_ROWS * (D_FF / common::q4::GROUP) * 4);
         #[cfg(feature = "track-experts")]
         if let Some(u) = pf_use {
             // the items' fills by status, summed over the slots and cleared
@@ -1341,7 +1625,7 @@ impl CpuExperts<'_> {
                     f[i] += x.swap(0, Ordering::Relaxed);
                 }
             }
-            prow::row!("track-experts", "prefetch_use", { "layer" => l, "tokens" => n, "host_experts" => u[0], "complete" => u[1], "partial" => u[2], "missed" => u[3], "used_items" => u[4], "used_items_done" => u[5], "predicted" => u[6], "items" => u[7] / 1_000_000, "items_done" => u[7] % 1_000_000, "counted" => self.rdpmc as u8, "c_hit" => f[0], "c_miss" => f[1], "p_hit" => f[2], "p_miss" => f[3], "m_hit" => f[4], "m_miss" => f[5], "run_us" => t0.elapsed().as_secs_f64() * 1e6 });
+            prow::row!("track-experts", "prefetch_use", { "layer" => l, "tokens" => n, "host_experts" => u[0], "complete" => u[1], "partial" => u[2], "missed" => u[3], "used_items" => u[4], "used_items_done" => u[5], "predicted" => u[6], "items" => u[7] / 1_000_000, "items_done" => u[7] % 1_000_000, "counted" => d.counted.load(Ordering::Relaxed) as u8, "c_hit" => f[0], "c_miss" => f[1], "p_hit" => f[2], "p_miss" => f[3], "m_hit" => f[4], "m_miss" => f[5], "run_us" => 0.0 });
         }
     }
 }
@@ -2309,6 +2593,8 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     // `E` in `picks`); the picks as routed are kept for the accounting
                     s.b_routed[t0..t0 + n].copy_from_slice(&picks[..n]);
                     let jobs = pl.xpt_dispatch(l, n, &mut picks[..n]);
+                    // the run planned now, off this thread (083): its pairs, order, slots, items and jobs ready for `run`
+                    s.routed.prepare_batch_act(l, &picks[..n], xq, xs, xg);
                     p.resident += jobs;
                     p.picks += n * TOP_K;
                     jobs_of[ch] = jobs;
