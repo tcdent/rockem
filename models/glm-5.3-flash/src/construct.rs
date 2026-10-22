@@ -1131,11 +1131,9 @@ impl CpuExperts<'_> {
         // the gate/up items, (expert position, first part, parts): a long step's are folded — one quantize group each, QP
         // parts, two slices on one CCD, quantized in place by the core that computed it. A decode step keeps fine parts:
         // folded, a 544 KB item a core left the CCD's cores nothing to balance the tail with (gate/up 311 → 371 µs a layer
-        // folded whole, 2026-10-22), more than the quantize run it saves; its rows are quantized in the run below.
+        // folded whole, 2026-10-22); its groups are quantized by whichever part completes them (`group_done`).
         let mut gitems: Vec<(u16, u16, u8)> = Vec::with_capacity(ne * GU_PARTS);
-        let mut unplanned_rows: Vec<u32> = Vec::new();
         for j in 0..ne {
-            let e = experts[j];
             if n > SPEC_TOKENS {
                 for p in 0..GU_PARTS / QP {
                     gitems.push((j as u16, (p * QP) as u16, QP as u8));
@@ -1144,11 +1142,13 @@ impl CpuExperts<'_> {
                 for p in 0..GU_PARTS {
                     gitems.push((j as u16, p as u16, 1));
                 }
-                for &(t, k) in uses(e) {
-                    unplanned_rows.push((t as usize * TOP_K + k as usize) as u32);
-                }
             }
         }
+        // a decode step's quantize groups, counted to completion: the part that brings a group's QP parts to done quantizes
+        // it for the expert's tokens there and then — on the group's CCD (the slice pairing), from its mates' L2s, not
+        // gathered across the fabric from twelve takers by a run of its own (42 µs a layer, 2026-10-22)
+        let group_done: Vec<std::sync::atomic::AtomicU8> = (0..ne * (GU_PARTS / QP)).map(|_| std::sync::atomic::AtomicU8::new(0)).collect();
+        let group_done = &group_done;
         let gitems = &gitems;
         let gate_slot = move |i: usize| {
             let (j, c0, _) = gitems[i];
@@ -1189,9 +1189,11 @@ impl CpuExperts<'_> {
                 b0 += GEMM_TOKENS;
             }
             }
-            if len == QP {
-                // this item's group of every token's hidden state, quantized as the whole vector's would be (per group)
-                let p = c0 / QP;
+            // a folded item is a group; a fine part completes one when it is the group's last (the count's acquire orders
+            // the mates' writes of `h` before this core reads them)
+            let group = if len == QP { Some(c0 / QP) } else if group_done[j * (GU_PARTS / QP) + c0 / QP].fetch_add(1, Ordering::AcqRel) as usize + 1 == QP { Some(c0 / QP) } else { None };
+            if let Some(p) = group {
+                // this group of every token's hidden state, quantized as the whole vector's would be (per group)
                 for &(t, k) in pairs {
                     let s = t as usize * TOP_K + k as usize;
                     let (x, q, sc, g) = unsafe {
@@ -1213,21 +1215,6 @@ impl CpuExperts<'_> {
         }
         #[cfg(feature = "track-experts")]
         self.item_rows(l, "gu", (2 * GU_ROWS * H / 2 + 2 * GU_ROWS * HG * 4) * gitems.iter().map(|g| g.2 as usize).sum::<usize>() / gitems.len().max(1));
-        // the unplanned experts' hidden states quantized here (2 µs each) or over the pool
-        let h = &self.h;
-        let quantize_h = move |i: usize| {
-            let (q, sc, g) = unsafe { (std::slice::from_raw_parts_mut((hq_p as *mut i8).add(i * D_FF), D_FF), std::slice::from_raw_parts_mut((hs_p as *mut f32).add(i * DG), DG), std::slice::from_raw_parts_mut((hg_p as *mut i32).add(i * DG), DG)) };
-            QAct { q, scale: sc, gsum: g }.quantize(&h[i * D_FF..(i + 1) * D_FF]);
-        };
-        if unplanned_rows.len() <= 16 {
-            for &r in &unplanned_rows {
-                quantize_h(r as usize);
-            }
-        } else {
-            cpu_zone!("experts.quant");
-            let rows = &unplanned_rows;
-            self.pool.run(rows.len(), &move |i| quantize_h(rows[i] as usize));
-        }
         // the down rows: part (j, c) owns rows c·DOWN_ROWS.. of expert experts[j]'s output, for all of its tokens, likewise
         let (hq, hs, hg) = (&self.hq, &self.hs, &self.hg);
         let out_p = out.as_mut_ptr() as usize;

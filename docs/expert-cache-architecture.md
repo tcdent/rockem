@@ -585,6 +585,16 @@ time: 92 workers read it out of core 0's cache.
 than before affinity (measured: 303 → 276), the quant run back near 20 µs, `route`/`dispatch`/`act.read` back near 10,
 the posting overhead ~2.4 ms a verify step. Each build is read against these, not against the previous build.
 
+**Rule 2, built (aff12):** a decode step keeps fine gate/up parts, and the part that completes a quantize group (an
+atomic count per expert × group) quantizes it on the spot, from its mates' L2s on the group's CCD; the quantize run is
+gone. Same request as below: the posting overhead 4.4 → 2.95 ms a verify step, the experts lap 25.39 → 24.24, the step
+63.26 → 62.28; completed experts' lines from L3 85.9 %, bit-identical.
+
+**Where the map stands against the pre-affinity build** (card15 → aff12, same 96-token request): the pool's runs 22.19
+→ 21.3 ms a verify step (with the quantize now inside them), completed experts' L3 share 83 → 86 %, the step 63.17 →
+62.28. Not yet the self row's ~90 %, and `route`/`dispatch`/`act.read` are 14/14/12 µs a layer against 8.5/8/7 before
+any core of CCD 0 touched: ~0.7 ms a verify step owed to Rule 3's structural form.
+
 **Measured on the way** (same 96-token request, per layer p50 unless noted): card17 (before): gate/up 303, quant 20,
 route 8.5, completed experts 83 % from L3. aff2 (affinity, 4 touchers): 78 %. aff3/4 (8 touchers): 87.4 %, gate/up 276,
 the pool's runs 22.19 → 20.97 ms a verify step, but quant 45 and route/dispatch/act.read ~18 and the posting overhead
