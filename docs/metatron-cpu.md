@@ -353,6 +353,33 @@ on the existing `prefetch_use` counters, no bench. The same rule reads back onto
 cores a CCD today share nothing deliberately: any line one core pulls that another core of the CCD later needs is a
 second DRAM read.
 
+### What the L3 keeps of a touch (measured 2026-10-22, `bench-reuse`, CCD 6, local memory)
+
+The decode prefetch fills a CCD's L3 by *touching* lines (one load a line); the run then reads them. What the L3 keeps
+of such a set, for the core that touched it (self) and for its neighbour (peer), and of a set the gemv has *read*
+before (warm: the same region every round); L2-miss lines served from L3 (`pf_hit_l3 / (pf_hit_l3 + pf_miss_l3)`):
+
+| set a CCD | touched, self | touched, peer | touched twice in L1 (self2) | re-referenced in L2 (self3) | stored back unchanged (selfw / peerw) | read before (warm) |
+|---|---|---|---|---|---|---|
+| ≤ 4 MB | 99 % (the L2s hold it) | 99 % | | | | |
+| 6–8 MB | 91–92 % | 89 % | | | | |
+| 12 MB | 91 % | 72 % | 91 % | 91 % | **7 % / 2 %** | 96 % |
+| 24 MB | 66 % | 48 % | 66 % | 66 % | 3 % / 1 % | **95 %** |
+
+(The L3 is 32 MB, 16-way, 32768 sets, cores 48–55; `bench-touch`'s items/slices modes confirm the touch kernel reaches
+the DRAM ceiling on contiguous streams, 366–378 GB/s box-wide, and 272 → 322 on the production item shape as the lines
+in flight go 4 → 16.)
+
+Reading: a line that enters the L3 as an L2 victim after one reference is the first the replacement chooses, and it
+is chosen well below capacity (9 % of a 12 MB set, a third of 24 MB, with nothing else running). A line that has *hit*
+in the L3 is kept (95 % of 24 MB). Re-referencing a line while it is still in L1 or L2 does not change its class, and a
+dirty victim is not kept at all (the stored-back set read from DRAM). So the only promotion a touch can buy is a
+second pass over the set after it has left the L2s — an L3 hit a line, ~200 µs a layer of L3 time at the plan's size,
+which the prefetch window (fully used by the first pass at ~23 GB/s a CCD) does not have. The node's 85 % for a
+completed prefetched expert against the policy's ~88–91 % at its 14 MB plan is that floor plus the run's own DRAM
+installs; the one lever left on that gap is CAT around the affinity, bounded at ~0.7 ms a verify step (inferred from
+the serial delivery model).
+
 ## 4. Clocks and power
 
 **The power cap sets the all-core clock** (2026-10-20, APERF/MPERF through `/dev/cpu/N/msr`, power through the

@@ -41,6 +41,18 @@ fn cpus(spec: &str) -> Vec<usize> {
     v
 }
 
+/// A line a 64 bytes, loaded and stored back unchanged: the line leaves the L2 dirty, which the L3 must keep (a clean
+/// once-read victim is its first choice to replace, 2026-10-22). Bytes unchanged.
+#[target_feature(enable = "avx2")]
+unsafe fn touch_dirty(p: *mut u8, len: usize) {
+    use core::arch::x86_64::*;
+    let mut i = 0;
+    while i + 64 <= len {
+        let v = _mm256_loadu_si256(p.add(i) as *const __m256i);
+        _mm256_storeu_si256(p.add(i) as *mut __m256i, v);
+        i += 64;
+    }
+}
 /// A line a 64 bytes, with AVX loads, four in flight (the node's prefetch `touch`).
 #[target_feature(enable = "avx2")]
 unsafe fn touch(p: *const u8, len: usize) {
@@ -103,9 +115,39 @@ fn main() {
                 let mut mine = [0u64; 6];
                 for r in 1..=rounds {
                     let reg = if mode == "warm" { 0 } else { r };
+                    // `*2`: each 4 KB read twice back to back (the second from L1), so the L2's eviction inserts the line into
+                    // the L3 as re-referenced rather than as a once-read scan (the replacement's lowest class, 2026-10-22)
+                    let twice = |p: *const u8, len: usize| unsafe {
+                        let mut o = 0;
+                        while o < len {
+                            let c = (len - o).min(4096);
+                            touch(p.add(o), c);
+                            touch(p.add(o), c);
+                            o += c;
+                        }
+                    };
+                    // `*3`: each 4 KB read, then the chunk 32 KB behind it read again (out of L1 by then: an L2 hit — a
+                    // re-reference the L2 sees)
+                    let behind = |p: *const u8, len: usize| unsafe {
+                        let mut o = 0;
+                        while o < len {
+                            let c = (len - o).min(4096);
+                            touch(p.add(o), c);
+                            if o >= 32768 {
+                                touch(p.add(o - 32768), 4096);
+                            }
+                            o += c;
+                        }
+                    };
                     match mode {
+                        "selfw" => unsafe { touch_dirty(w.as_ptr().add(reg * wbytes) as *mut u8, wbytes) },
+                        "peerw" => unsafe { touch_dirty((peer_base as *mut u8).add(reg * wbytes), wbytes) },
+                        "self3" => behind(unsafe { w.as_ptr().add(reg * wbytes) }, wbytes),
+                        "peer3" => behind(unsafe { (peer_base as *const u8).add(reg * wbytes) }, wbytes),
                         "self" => unsafe { touch(w.as_ptr().add(reg * wbytes), wbytes) },
                         "peer" => unsafe { touch((peer_base as *const u8).add(reg * wbytes), wbytes) },
+                        "self2" => twice(unsafe { w.as_ptr().add(reg * wbytes) }, wbytes),
+                        "peer2" => twice(unsafe { (peer_base as *const u8).add(reg * wbytes) }, wbytes),
                         "peer-flush" => unsafe {
                             touch((peer_base as *const u8).add(reg * wbytes), wbytes);
                             touch(scratch.as_ptr(), scratch.len());
