@@ -63,11 +63,8 @@ pub trait Pool: Sync {
     /// `prefetch_on` with each item's queue given outright. Returns, for a pool that records it, which worker took each
     /// item (`u8::MAX`: not taken), filled in as the items are claimed: a later run can send the item's bytes to the
     /// core whose caches hold them.
-    /// `f(i, owner)`: the item's taker calls it with `owner` true; a worker whose queue has run dry calls it with
-    /// `owner` false over the queue's items from the last — the item's own say in how it is shared (a touch hands out
-    /// pieces from its two ends).
     #[cfg(feature = "std")]
-    fn prefetch_slotted(&self, n: usize, slot: std::boxed::Box<dyn Fn(usize) -> usize + Send + Sync>, f: std::boxed::Box<dyn Fn(usize, bool) + Send + Sync>) -> Option<std::sync::Arc<std::vec::Vec<core::sync::atomic::AtomicU8>>> {
+    fn prefetch_slotted(&self, n: usize, slot: std::boxed::Box<dyn Fn(usize) -> usize + Send + Sync>, f: std::boxed::Box<dyn Fn(usize) + Send + Sync>) -> Option<std::sync::Arc<std::vec::Vec<core::sync::atomic::AtomicU8>>> {
         let _ = (n, slot, f);
         None
     }

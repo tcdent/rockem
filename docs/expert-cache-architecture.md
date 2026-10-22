@@ -610,6 +610,14 @@ same as the cold one: the price is the store, not the load. The builder core and
 blocks while they idle (`prewarm`), so the plan's and the prefetch's stores land in lines their own L2 holds modified.
 The plan 46 → 17.8 µs, the overhead 3.5 → ~1.0 ms a verify step, the step 55.75 → 53.0 ms (queue 083 has the chain).
 
+**Rule 6 — the prefetch's rate is the box's; the window is a bytes problem (2026-10-22, queue 091).** The touch
+reads 316–322 GB/s on fresh bytes against a STREAM Triad of ~293 for this box (metatron-cpu §2); eight touchers a CCD,
+sixteen lines in flight, the abandon flag read inside the stream. Each expert's slices are split over a node's CCDs
+to a slice with pairs whole, and a CCD's share follows its touchers (the main CCD's four) — the queues are even and
+the main CCD is no longer the laggard. Sharing items from both ends at the tail is on the shelf (busier cores, no
+more bytes at the ceiling). Completing 174 MB inside a ~500 µs window needs ~350 GB/s this box does not have, so the
+lever is fewer bytes: the predictor's precision.
+
 ## 12. Risks, unknowns, and decisions
 
 **Unknowns (each has a phase that answers it):**

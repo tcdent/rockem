@@ -91,8 +91,8 @@ const PREFETCH_CAP: usize = 13;
 /// 2026-10-22). On the main thread's CCD fewer: its core 0 runs the step's critical path between the layers (`route`,
 /// `dispatch`, `act.read`) while the prefetch streams, and those phases doubled with seven cores streaming beside it
 /// (8.5 → 18 µs a layer; a CCD's delivery is shared by its cores).
-const PREFETCH_CORES: usize = 2;
-const PREFETCH_CORES_MAIN: usize = 2;
+const PREFETCH_CORES: usize = 8;
+const PREFETCH_CORES_MAIN: usize = 4;
 
 struct Job {
     /// The generation that announced it (0 until announced).
@@ -117,9 +117,8 @@ struct Job {
     light: bool,
     taker: std::sync::Arc<Vec<std::sync::atomic::AtomicU8>>,
     _owned: Option<Box<dyn Fn(usize) + Send + Sync>>,
-    /// A prefetch's closure, `(item, owner)`: the taker with `owner`; a worker whose CCD queue ran dry helps over the
-    /// queue's items from the last with `owner` false (the item shares itself in pieces from its ends).
-    light_f: Option<Box<dyn Fn(usize, bool) + Send + Sync>>,
+    /// A prefetch's closure, the job's own.
+    light_f: Option<Box<dyn Fn(usize) + Send + Sync>>,
     /// Workers inside the job now, and completions.
     inside: AtomicUsize,
     done: Counter,
@@ -141,22 +140,6 @@ struct Job {
 /// A counter on its own cache line.
 #[repr(align(64))]
 struct Counter(AtomicUsize);
-/// A piece of an item claimed: the owner's from the front (the count in the low word), a helper's from the back (the
-/// high word); `None` once the two have met.
-fn claim_piece(c: &std::sync::atomic::AtomicU64, n: usize, owner: bool) -> Option<usize> {
-    let mut v = c.load(Ordering::Acquire);
-    loop {
-        let (front, back) = ((v & 0xffff_ffff) as usize, (v >> 32) as usize);
-        if front + back >= n {
-            return None;
-        }
-        let (nv, i) = if owner { (v + 1, front) } else { (v + (1 << 32), n - 1 - back) };
-        match c.compare_exchange_weak(v, nv, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => return Some(i),
-            Err(cur) => v = cur,
-        }
-    }
-}
 /// `n` atomics at zero, from one zeroed allocation (an element-by-element collect of a few thousand was microseconds of
 /// a plan).
 fn zeroed_atomics<T>(n: usize) -> Vec<T> {
@@ -291,23 +274,12 @@ unsafe fn work(job: *const Job, order: &[usize], node: usize, who: usize) {
             let item = j.order[i] as usize;
             if j.light {
                 j.taker[item].store(who as u8, Ordering::Relaxed);
-                (j.light_f.as_ref().unwrap())(item, true);
+                (j.light_f.as_ref().unwrap())(item);
             } else {
                 f(item);
             }
             mine += 1;
             local += (k == 0) as usize;
-        }
-        if j.light {
-            // the queue ran dry: help the items still in progress, the last claimed first (each shares itself from
-            // its back; a finished one returns at once)
-            let lf = j.light_f.as_ref().unwrap();
-            for x in (j.start[s] as usize..j.start[s + 1] as usize).rev() {
-                if j.stop.load(Ordering::Relaxed) {
-                    break;
-                }
-                lf(j.order[x] as usize, false);
-            }
         }
     }
     if mine > 0 {
@@ -562,14 +534,14 @@ impl Threads {
     }
     /// The job slotted and announced: the workers take it up; the job before it is stopped (a prefetch still running
     /// gives up its unclaimed items) and freed at `idle`.
-    fn post(&self, n: usize, at: Option<&(dyn Fn(usize) -> *const u8 + Sync)>, node: Option<&(dyn Fn(usize) -> usize + Sync)>, ccd: Option<&(dyn Fn(usize) -> usize + Sync)>, given: Option<&(dyn Fn(usize) -> usize + Sync)>, light_f: Box<dyn Fn(usize, bool) + Send + Sync>) -> *mut Job {
+    fn post(&self, n: usize, at: Option<&(dyn Fn(usize) -> *const u8 + Sync)>, node: Option<&(dyn Fn(usize) -> usize + Sync)>, ccd: Option<&(dyn Fn(usize) -> usize + Sync)>, given: Option<&(dyn Fn(usize) -> usize + Sync)>, light_f: Box<dyn Fn(usize) + Send + Sync>) -> *mut Job {
         let job = self.build(n, at, node, ccd, given, None, &|_| {}, None, Some(light_f));
         self.announce(job, false);
         job
     }
     /// The job slotted and allocated, not announced: a run's can be built ahead of its moment, off the main thread.
     #[allow(clippy::too_many_arguments)]
-    fn build(&self, n: usize, at: Option<&(dyn Fn(usize) -> *const u8 + Sync)>, node: Option<&(dyn Fn(usize) -> usize + Sync)>, ccd: Option<&(dyn Fn(usize) -> usize + Sync)>, given: Option<&(dyn Fn(usize) -> usize + Sync)>, slots: Option<&[u8]>, f: &(dyn Fn(usize) + Sync), owned: Option<Box<dyn Fn(usize) + Send + Sync>>, light_f: Option<Box<dyn Fn(usize, bool) + Send + Sync>>) -> *mut Job {
+    fn build(&self, n: usize, at: Option<&(dyn Fn(usize) -> *const u8 + Sync)>, node: Option<&(dyn Fn(usize) -> usize + Sync)>, ccd: Option<&(dyn Fn(usize) -> usize + Sync)>, given: Option<&(dyn Fn(usize) -> usize + Sync)>, slots: Option<&[u8]>, f: &(dyn Fn(usize) + Sync), owned: Option<Box<dyn Fn(usize) + Send + Sync>>, light_f: Option<Box<dyn Fn(usize) + Send + Sync>>) -> *mut Job {
         let light = light_f.is_some();
         let entered = std::time::Instant::now();
         let z = prow::Timestamp::now();
@@ -735,7 +707,7 @@ impl Pool for Threads {
         }
         self.finish(job, entered, true);
     }
-    fn prefetch_slotted(&self, n: usize, slot: Box<dyn Fn(usize) -> usize + Send + Sync>, f: Box<dyn Fn(usize, bool) + Send + Sync>) -> Option<std::sync::Arc<Vec<std::sync::atomic::AtomicU8>>> {
+    fn prefetch_slotted(&self, n: usize, slot: Box<dyn Fn(usize) -> usize + Send + Sync>, f: Box<dyn Fn(usize) + Send + Sync>) -> Option<std::sync::Arc<Vec<std::sync::atomic::AtomicU8>>> {
         if n > 1 {
             let job = self.post(n, None, None, None, Some(&*slot), f);
             Some(unsafe { (*job).taker.clone() })
@@ -745,7 +717,7 @@ impl Pool for Threads {
     }
     fn prefetch_on(&self, n: usize, node: Box<dyn Fn(usize) -> usize + Send + Sync>, ccd: Box<dyn Fn(usize) -> usize + Send + Sync>, f: Box<dyn Fn(usize) + Send + Sync>) {
         if n > 1 {
-            self.post(n, None, Some(&*node), Some(&*ccd), None, Box::new(move |i, owner| if owner { f(i) }));
+            self.post(n, None, Some(&*node), Some(&*ccd), None, f);
         }
     }
     fn node_of(&self, p: *const u8) -> usize {
@@ -783,7 +755,7 @@ impl Pool for Threads {
     fn prefetch(&self, n: usize, at: Box<dyn Fn(usize) -> *const u8 + Send + Sync>, ccd: Box<dyn Fn(usize) -> usize + Send + Sync>, f: Box<dyn Fn(usize) + Send + Sync>) {
         if n > 1 {
             // the job owns `f`; `at` and `ccd` are needed only to slot the items here
-            self.post(n, Some(&*at), None, Some(&*ccd), None, Box::new(move |i, owner| if owner { f(i) }));
+            self.post(n, Some(&*at), None, Some(&*ccd), None, f);
         }
     }
     fn run_at(&self, n: usize, at: &(dyn Fn(usize) -> *const u8 + Sync), f: &(dyn Fn(usize) + Sync)) {
@@ -1100,9 +1072,9 @@ impl<'a> CpuExperts<'a> {
                         }
                     }
                     units.sort_by_key(|u| (std::cmp::Reverse(u.1), u.0));
-                    // a CCD's bytes follow its touchers (the main CCD keeps cores free for the main thread and was the
-                    // queue left unfinished on most layers, aff31): the unit goes to the CCD whose load after it, in
-                    // slices a toucher, is least
+                    // a CCD's bytes follow its touchers (the main CCD keeps four cores free for the main thread, and at a full
+                    // share it was the queue left unfinished on most layers, 2026-10-22): the unit goes to the CCD whose load
+                    // after it, in slices a toucher, is least
                     let cap: Vec<usize> = (0..nc).map(|i| pool.prefetchers(pool.slot(d as usize, i))).collect();
                     let mut load = vec![0usize; nc];
                     for &(first, n) in &units {
@@ -1225,8 +1197,8 @@ impl<'a> CpuExperts<'a> {
     }
 }
 /// Pull every cache line of `b` through this core: into its L2 and, as the core streams on, its CCD's L3. One 32-byte
-/// AVX2 load a line, sixteen lines in flight: on the prefetch's item shape (272–544 KB streams, four a CCD at once) four
-/// in flight reached 272 GB/s box-wide against the contiguous stream's 366, sixteen 322 (`bench-touch`, 2026-10-22).
+/// AVX2 load a line, sixteen lines in flight (sixty-four measured the same on fresh memory, `bench-touch`
+/// 2026-10-22); `stop` is read every 4 KB inside the stream and ends the touch early (false) when it says so.
 #[inline(always)]
 fn touch(b: &[u8], stop: &dyn Fn() -> bool) -> bool {
     #[cfg(target_arch = "x86_64")]
@@ -1249,13 +1221,12 @@ fn touch(b: &[u8], stop: &dyn Fn() -> bool) -> bool {
 #[target_feature(enable = "avx2")]
 unsafe fn touch_avx2(p: *const u8, len: usize, stop: &dyn Fn() -> bool) -> bool {
     use std::arch::x86_64::*;
-    const K: usize = 64;
+    const K: usize = 16;
     let mut acc = [_mm256_setzero_si256(); K];
     let mut i = 0;
     let mut next_check = 0;
     while i + 64 * K <= len {
         // the abandon check every 4 KB, inside the stream: a touch called a chunk drained its loads at each call's end
-        // (one DRAM latency a chunk, half the rate at two touchers a CCD, 2026-10-22)
         if i >= next_check {
             if stop() {
                 return false;
@@ -1619,27 +1590,18 @@ impl Routed for CpuExperts<'_> {
             *self.pf.lock().unwrap() = Some((l, idx.clone(), per, fin.clone()));
             fin
         };
-        // each item's pieces claimed from its two ends (the owner's count low, the helpers' high), and the pieces done
-        let pieces: Vec<std::sync::atomic::AtomicU64> = zeroed_atomics(n);
-        let pieces_done: Vec<std::sync::atomic::AtomicU16> = zeroed_atomics(n);
-        let items = std::sync::Arc::new((items, slices, pieces, pieces_done));
+        let items = std::sync::Arc::new((items, slices));
         let (i1, i3) = (items.clone(), items);
         let slot = move |i: usize| i1.0[i].1;
-        // the touching yields between 4 KB chunks once the job is overtaken: the run that overtakes it
-        // waits for the items in flight (the run's slotting time was 13 µs with 64 KB chunks, 2026-10-16)
+        // the touch reads the abandon flag every 4 KB inside its stream: the run that overtakes this job waits only for
+        // the chunks in flight
         let pool_s: &'static dyn Pool = unsafe { std::mem::transmute::<&dyn Pool, &'static dyn Pool>(pool) };
-        // an item is touched in PIECE-byte pieces: its taker from the front, a helper whose queue ran dry from the back,
-        // the two streams meeting — no core idles at a CCD's tail while one finishes the last item (the cleanroom at
-        // the production shape: 282 → 313 GB/s, the contiguous stream's rate, `bench-touch` share, 2026-10-22)
-        const PIECE: usize = 64 << 10;
-        let f = move |i: usize, owner: bool| {
-            let (it, slices, pieces, pieces_done) = (&i3.0[i], &i3.1, &i3.2[i], &i3.3[i]);
+        let f = move |i: usize| {
+            let (it, slices) = (&i3.0[i], &i3.1);
             let w = expert::Weights::at(stream, l, idx[it.0]);
-            // the item's bytes: its slices as ranges, adjacent ones merged
+            // the item's slices as one byte range where adjacent in memory, else one by one
             let run = &slices[it.2 as usize..(it.2 + it.3) as usize];
             let bytes_of = |j: usize| if j < n_gu { w.gu_bytes(j) } else { w.down_bytes(j - n_gu) };
-            let mut ranges: [(usize, usize); 8] = [(0, 0); 8];
-            let mut nr = 0;
             let mut a = 0;
             while a < run.len() {
                 let first = bytes_of(run[a] as usize);
@@ -1653,38 +1615,14 @@ impl Routed for CpuExperts<'_> {
                     end += nb.len();
                     b += 1;
                 }
-                ranges[nr] = (start, end);
-                nr += 1;
+                if !touch(unsafe { std::slice::from_raw_parts(start as *const u8, end - start) }, &|| pool_s.abandoned()) {
+                    return;
+                }
                 a = b;
             }
-            let total: usize = ranges[..nr].iter().map(|r| r.1 - r.0).sum();
-            let n_pieces = total.div_ceil(PIECE);
-            while let Some(k) = claim_piece(pieces, n_pieces, owner) {
-                // piece k: bytes [k·PIECE, (k+1)·PIECE) of the ranges in order
-                let (mut o, mut left) = (k * PIECE, PIECE.min(total - k * PIECE));
-                for &(start, end) in &ranges[..nr] {
-                    let len = end - start;
-                    if o >= len {
-                        o -= len;
-                        continue;
-                    }
-                    let take = left.min(len - o);
-                    if !touch(unsafe { std::slice::from_raw_parts((start + o) as *const u8, take) }, &|| pool_s.abandoned()) {
-                        return;
-                    }
-                    left -= take;
-                    o = 0;
-                    if left == 0 {
-                        break;
-                    }
-                }
-                if pieces_done.fetch_add(1, std::sync::atomic::Ordering::AcqRel) as usize + 1 == n_pieces {
-                    #[cfg(feature = "track-experts")]
-                    finished[it.0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
+            #[cfg(feature = "track-experts")]
+            finished[it.0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         };
-        let z = draft_zone("pf.closures", z);
         let takers = self.pool.prefetch_slotted(n, Box::new(slot), Box::new(f));
         let z = draft_zone("pf.post", z);
         *self.planned.lock().unwrap() = Some(Planned { l, idx: idx_plan, item_of, takers });

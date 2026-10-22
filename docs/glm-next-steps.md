@@ -150,7 +150,7 @@ the index. Reorganized 2026-10-18 from the single-page version (in git history b
 | [080](queue/080-launch-granularity.md) | Launch and timeline granularity: steps cut too fine | Open — noted (`rows_d2`'s 32-token passes, ~530 launches a card a prefill step) | prefill, profiling |
 | [081](queue/081-confidence-gated-draft-depth.md) | Draft depth chosen a step by the draft's confidence | Deployed — gated depth 3: 18k 26.6–27.2 → 24.8–25.0 ms an emitted token; the draft instrumented | decode |
 | [082](queue/082-card-side-expert-prediction.md) | Expert prediction on the cards' idle time | Open — designed: on card0 in the host experts' gap, per-token probabilities, learned online; prefetch yield measured: 31 / 36 / 42 µs an expert complete / partial / missed | decode, prefill |
-| [083](queue/083-pool-posting-on-the-main-thread.md) | The pool's posting on the main thread | Open — measured: ~2.7 ms a verify step of sort/alloc/rows on the critical path | decode |
+| [083](queue/083-pool-posting-on-the-main-thread.md) | The pool's posting on the main thread | Built — the main thread's overhead outside the pool's runs 3.5 → ~1.0 ms a verify step (common::alloc, rows off the main thread, the plan's stores prewarmed); step 55.75 → 53.0 | decode |
 | [084](queue/084-one-token-gemv-from-l3.md) | The one-token gemv from L3 under full load | Open — ~9 GB/s a core on 92 cores vs a load loop's ~55 | decode |
 | [085](queue/085-pool-core-quiet.md) | The pool's cores kept quiet | Open — 1 kHz idle wakes, ticks on busy cores, the NMI watchdog | decode, prefill |
 | [086](queue/086-predictor-input-map.md) | The prefetch predictor's input map | Quantified, on the shelf — −0.10 missed a layer, all of them partial: no time gained | decode |
@@ -158,6 +158,7 @@ the index. Reorganized 2026-10-18 from the single-page version (in git history b
 | [088](queue/088-prefill-labels-off-the-main-thread.md) | Prefill's predictor labels off the main thread | Done — lesson buffers reused, prefill 1.87 → 1.85 | prefill |
 | [089](queue/089-mla-o-in-the-verify-step.md) | The MLA output projection in a verify step | Open — ~142 µs a launch, ~1.6 ms a verify step on the critical path | decode |
 | [090](queue/090-prefetch-streamed-into-the-run.md) | The prefetch streamed into the run | Open — a direction: arrival timed to the run's consumption order | decode |
+| [091](queue/091-prefetch-inside-the-window.md) | The prefetch inside the window | Measured to the box's ceiling (316 GB/s on fresh bytes against a STREAM Triad of ~293): the rate is the box's, the lever is bytes | decode |
 
 ## Order (2026-10-18, evening — the 20 ms path)
 
