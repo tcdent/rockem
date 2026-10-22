@@ -238,6 +238,121 @@ different core and pulls the expert's tokens' activations (4 KB a token) into it
 this at once it costs ~10 % of the kernel's rate: 58.6 vs 65.7 GMAC/s a core at 16 tokens. One core alone loses
 3–4 %. On the shelf at ≤ 0.13 ms a prompt token.
 
+### A touched line is not yet an L3 line: the core boundary inside a CCD (measured 2026-10-21/22)
+
+**The question.** Decode's prefetch touches the next layer's expert slices on four cores of each CCD so the run finds
+them in that CCD's L3. The run measured only 83 % of a *completed* prefetched expert's lines from L3 (`prefetch_use`
+rows, the fill counters around every item), and raising that share (CAT, more prefetch cores, a better predictor)
+never moved the run's time in proportion. Phase 0 of docs/expert-cache-architecture.md had recorded a planned set
+losing 30–54 % to a competing stream. tcdent: "I don't think that we've accurately mapped and understood the L3 cache
+eviction, and so we're fighting against evictions when it's not that we're running out of megabytes of headroom …
+we're probably stepping on our own toes." This section is the map. Every number below is from one sitting on a quiet
+box (the serving node resident and idle, the cards idle, THP `always`, resctrl mounted with every domain at `ffff`
+and MB unthrottled), read back from a file on the box so the console could not truncate it.
+
+**Method.** `bench-l3` (bringup/bench/src/l3.rs, the musl binary in `bundles/tools/`, run from the box over
+`bringup/box/box.sh`): per CCD, four "keep" cores touch X MB of fresh lines (AVX loads, a line each); the CCD's other
+cores stream Y MB of fresh DRAM lines through the same L3; then each keep core reads its *neighbouring* keep core's
+slice with the Zen 3 fill counters programmed around the read (`common::pmc`: event 0x43 demand fills by source,
+umask 0x02 local CCX / 0x08 local DRAM / 0x50 far; 0x70/0x71/0x72 L2 prefetches that hit L2 / hit L3 / missed L3).
+"From L3" is the share of fills, prefetched or demanded, that came from the CCX rather than memory. `--reread` has
+the stream cores read the set a second time. `bench-reuse` (src/reuse.rs) runs the decode `gemv` over a region in
+three modes — *self* (the toucher reads it), *peer* (its CCD neighbour reads it), *peer-flush* (the toucher streams
+1 MB of scratch through its L2 first) — with the same counters. Where a buffer is homed: `/proc/<pid>/numa_maps`
+of the running bench. The expert record is ~13 MB (`layout::RECORD`); a CCD's share of a layer's 13-expert plan is
+~14 MB; a CCD's L3 is 32 MB, 16-way, a victim cache of the eight 512 KB L2s.
+
+**1. Alone, a set stays.** One CCD, nothing competing (Y = 0), neighbour read:
+
+| X touched | from L3 |
+|---|---|
+| 4 MB | 97.1 % |
+| 8 MB | 96.7 % |
+| 13 MB | 98.5 % |
+| 16 MB | 97.8 % |
+| 24 MB | 95.0 % |
+| 13 MB, with the run's 8 MB stream after it | 95.4 % (95.2 % on CCD 0) |
+| 12 MB, 16 MB stream (phase 0 recorded 46 %) | 91.6 % |
+| 13 MB, 8 MB stream concurrent with the read | 93.6 % |
+| 13 MB, then reread by the stream cores | 99.9 % |
+
+(CCD 1; its buffer, as it turned out, 89 % remote-homed — see 4.) Capacity is not the problem at 13 MB a CCD, nor
+at 24; a `prefetcht0` touch leaves 7 % (phase 0: 9 %), so the touch must be loads.
+
+**2. The loss appears with the other CCDs, and is not DRAM-channel sharing.** 13 MB + 8 MB stream each:
+
+| CCDs touching at once | from L3 |
+|---|---|
+| 3 (one node: its four channels shared) | 94.8 % |
+| 6 (socket 0) | 92.6 % |
+| 6 (socket 1 alone) | 66.0 % |
+| 6 (CCDs 3–8, both sockets) | 71.1 % |
+| 12 | 77.9 %, 76.5 %, 78.9 % (12 MB), 78.0 % (THP `never`) |
+| 12, no stream (the touch alone) | 87.6 % |
+| 12, 6 MB each | 87.2 % |
+| 12, CAT 12 keep ways | 83.1 % |
+
+**3. It is per node, not per socket, and a constant share of the lines.** Single CCDs alone, 13 MB, Y = 0:
+CCD 0 95.2 (with Y = 8), CCD 1 98.5 / 97.8 / 98.0, CCD 2 97.9 — all node 0; CCD 3 81.1, CCD 4 80.6 (node 1); CCD 6
+80.4 / 82.3 (40 rounds) / 82.8 (THP `never`), CCD 9 82.1 (nodes 2, 3). On CCD 6 a 4 MB set reads 76.8 %: the share
+lost does not depend on the set's size, nor on page size, nor on how long the set sits. On CCD 6 with `--reread`:
+the keep cores' first read 82.0 %, the stream cores' reread right after **99.8 %**, zero DRAM fills. Nothing was
+evicted. The lines missed on the first read were fetched from DRAM *then*, and were in L3 from then on.
+
+**4. The variable is where the memory is homed.** Node free memory at the time: node 0 680 MB, node 1 356 MB,
+node 2 65.4 GB, node 3 30.0 GB (the node reserves 212 GB of hugepages and the context cache holds 157 GB). The bench
+on CCD 1 (node 0) got its 1.3 GB buffer 89 % on node 2: *remote*. The bench on CCD 6 got it 100 % on node 2:
+*local*. So the table in 3 reads: remote-homed lines, touched on one core and read by a neighbour, ~98 % found;
+local-homed lines, ~82 % on the first read. Production's expert slices are node-local by design (`layout::placement_runs`),
+so production is always the local case — and its 83 % for a completed expert is this number.
+
+**5. Where the lost lines are: the toucher's L2.** `bench-reuse`, 1.5 MB a core, 8 cores, 30 rounds:
+
+| the region read by… | CCD 1 (remote-homed) | CCD 6 (local-homed) |
+|---|---|---|
+| the core that touched it (self) | 0.97 hit / 0.11 miss (~90 %) | 0.97 / 0.11 (~90 %) |
+| its neighbour (peer) | 0.96 / 0.12 (~89 %) | **0.73 / 0.35 (~68 %)** |
+| its neighbour after the toucher flushed its L2 with a 1 MB stream (peer-flush) | 0.74 / 0.34 (~68 %) | 0.71 / 0.37 (~66 %) |
+
+(L2 prefetch fills that hit / missed L3, a line read; the demand fills were ~0.01 a line: the L2 prefetcher brings
+nearly every line.) A core finds its own touched lines equally well everywhere. A neighbour finds them for
+remote-homed memory and loses a third of them for local-homed memory — and a third of a 1.5 MB region is exactly
+what a 512 KB L2 holds. In bench-l3, four touching L2s hold 2 MB of a 13 MB set, 15 %: the measured first-read loss
+is 16–18 %.
+
+**The mechanism (inferred; fits 1–5, with two open points).** The L3 is a victim cache: a line a core has just
+loaded is in that core's L1/L2 and reaches L3 only when the L2 evicts it. The last 512 KB each toucher streamed is
+therefore not in L3 when the run starts. When another core of the same CCX asks for such a line, the CCX must either
+forward it core-to-core or fetch it from memory. The measurements say the fabric *forwards it for remote-homed
+memory and refetches it from DRAM for local-homed memory* (DRAM being the cheaper source when it is on this node),
+and only that refetch installs the line in L3 — which is why a second read finds 99.8 %, why the loss is a fixed
+share (the touchers' L2 capacity over the set), why it depends on nothing else we varied, and why neither CAT nor
+more prefetch cores could help (nothing was evicted; more touching cores means more L2s holding tails). It is also
+why phase 0's "L3 and DRAM share the CCD's delivery" came out as it did under concurrent streams: a share of the
+"L3" reads were DRAM reads.
+
+Open points: (a) a 4 MB set on CCD 6 loses 23 %, where four 512 KB L2s would predict up to 50 % — an L2 streaming
+a set may keep less than its capacity of it; (b) peer-flush loses on both nodes, where pushing the lines into L3
+first should have restored them. Both are measurable with the same two benches; neither changes the conclusion that
+the lines a neighbour misses are the ones that never left the toucher's L2.
+
+**What phase 0 got wrong.** Its one-CCD retention numbers (69.5 % at 12 MB + 8 MB; 46 % at 12 + 16) were taken
+without recording where the buffers were homed or what else was running; today's same cells read 95.4 % and 91.6 %
+(remote-homed) — so those numbers do not describe the L3's capacity or replacement, which both benches now show to be
+nearly ideal at 13–24 MB a CCD. Its CAT result (+10–12 points at production shape) stands as measured but is now
+explained as partly an artefact of the same first-read refetch. Lesson, for every cache measurement from here: record
+the buffer's homing (`numa_maps`), the free memory per node, and whether the reader is the toucher.
+
+**The design consequence.** The placement principle was right and incomplete: node-local placement puts the bytes on
+the chips next to the CCDs that use them; inside the CCD the touch and the read must also be *core*-local, because a
+core-to-core hand-off of local-homed lines is a DRAM read. For decode's prefetch: the run should read each planned
+item on the core that touched it (bench-reuse's self row, ~90 % everywhere, the L2-resident part hitting L2), which
+means the prefetch job recording each item's taker and the run's per-CCD queue handing planned items to their takers
+first — core affinity for planned items, a few bytes a job. Predicted: completed experts' lines from L3 83 → ~95 %
+on the existing `prefetch_use` counters, no bench. The same rule reads back onto the expert run itself, whose eight
+cores a CCD today share nothing deliberately: any line one core pulls that another core of the CCD later needs is a
+second DRAM read.
+
 ## 4. Clocks and power
 
 **The power cap sets the all-core clock** (2026-10-20, APERF/MPERF through `/dev/cpu/N/msr`, power through the

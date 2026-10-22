@@ -307,6 +307,12 @@ Phase 1 before phase 2 because phase 1 alone separates the window from capacity,
 Phase 3 can start in parallel with phase 2 on the cards' side: they meet only at `P`.
 
 ## Phase 0 results (measured 2026-10-20, `bench-l3`, metatron, beside the serving node)
+> **Corrected 2026-10-22** (docs/metatron-cpu.md §3, "A touched line is not yet an L3 line"): the retention losses
+> below were not evictions. On a quiet box the same cells read 91.6–95.4 % on one CCD; the loss measured here and in
+> the node (a completed expert's 83 %) is the share of a planned set still in the touching cores' L2s when another core
+> reads it, which for local-homed memory is refetched from DRAM rather than forwarded. The capacity, replacement and
+> CAT conclusions in this section are superseded by that account; the measurements stand as taken.
+
 Per CCD four keep cores touch X MB of fresh lines, the CCD's other cores read Y MB of fresh DRAM lines, then each keep
 core reads its neighbour's planned slice; fill counters (prefetch hits + demand fills from L3, of all lines) around the
 read. resctrl CAT: the keep cores' group fills ways 0..K, every other CPU ways K..16.
@@ -529,6 +535,14 @@ ms a verify step, verify step 61.50 → 61.33 ms.
 all host lines from L3 55.4 → 56.3 %. The 96-token decode's experts lap read 25.41 ms against card15's 23.96 — but
 card17, card15's code on another boot, read 25.39 on the same request: one 96-token request varies by ~1.5 ms boot to
 boot, so it decides nothing. Long runs decide (below).
+
+**The core boundary inside a CCD** (2026-10-22, docs/metatron-cpu.md §3): the lines a completed prefetched expert
+"loses" (83 % from L3) are the ones still in the four touching cores' L2s when the run's other cores read them; for
+local-homed memory the CCX refetches those from DRAM instead of forwarding them. Nothing is evicted (a reread finds
+99.8 %); CAT, the input map and more prefetch cores could not have moved the run. tcdent: the placement principle
+(bytes on the node, L3 to the CCD, no cross-CCD traffic) was right and must extend to the core: the touch and the read
+on the same core. Next: planned items read by their takers (core affinity in the run's per-CCD queue), predicted 83 →
+~95 % on `prefetch_use`.
 
 ## 12. Risks, unknowns, and decisions
 
