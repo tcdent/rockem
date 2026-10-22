@@ -18,6 +18,10 @@ name = "bench-experts"
 path = "src/experts.rs"
 
 [[bin]]
+name = "bench-alloc"
+path = "src/alloc.rs"
+
+[[bin]]
 name = "dump-expert"
 path = "src/dump_expert.rs"
 

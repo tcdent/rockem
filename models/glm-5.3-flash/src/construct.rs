@@ -472,6 +472,7 @@ impl Threads {
             std::hint::spin_loop();
         }
         let j = unsafe { &*job };
+        cpu_zone!("pool.account");
         #[cfg(feature = "track-experts")]
         if placed {
             // the run's tail by core: when each worker finished, against the run's wall (074)
@@ -520,6 +521,7 @@ impl Threads {
     #[allow(clippy::too_many_arguments)]
     fn build(&self, n: usize, at: Option<&(dyn Fn(usize) -> *const u8 + Sync)>, node: Option<&(dyn Fn(usize) -> usize + Sync)>, ccd: Option<&(dyn Fn(usize) -> usize + Sync)>, given: Option<&(dyn Fn(usize) -> usize + Sync)>, f: &(dyn Fn(usize) + Sync), owned: Option<Box<dyn Fn(usize) + Send + Sync>>, light: bool) -> *mut Job {
         let entered = std::time::Instant::now();
+        let z = prow::Timestamp::now();
         let mut start = [0u32; SLOTS + 1];
         let mut order = vec![0u32; n];
         let slot_by_node = |i: usize, d: usize| match ccd {
@@ -560,6 +562,7 @@ impl Threads {
             fill[s] += 1;
         }
         let sorted = std::time::Instant::now();
+        let z = draft_zone("pool.build.sort", z);
         let fp: *const (dyn Fn(usize) + Sync) = unsafe { std::mem::transmute(f) };
         let job = Box::into_raw(Box::new(Job {
             gen: std::sync::atomic::AtomicU64::new(0),
@@ -586,6 +589,7 @@ impl Threads {
             #[cfg(feature = "track-experts")]
             ts0: prow::Timestamp::now(),
         }));
+        draft_zone("pool.build.alloc", z);
         if !light {
             let mut ps = self.post_stats.lock().unwrap();
             ps.0 += (sorted - entered).as_secs_f64();
@@ -666,7 +670,10 @@ impl Pool for Threads {
         cpu_zone!("pool.run");
         let entered = std::time::Instant::now();
         let job = job as *mut Job;
-        self.announce(job, true);
+        {
+            cpu_zone!("pool.announce");
+            self.announce(job, true);
+        }
         self.finish(job, entered, true);
     }
     fn prefetch_slotted(&self, n: usize, slot: Box<dyn Fn(usize) -> usize + Send + Sync>, f: Box<dyn Fn(usize) + Send + Sync>) -> Option<std::sync::Arc<Vec<std::sync::atomic::AtomicU8>>> {
@@ -949,6 +956,8 @@ struct RunPlan {
     gu_f: Box<dyn Fn(usize) + Send + Sync>,
     down_slot: Box<dyn Fn(usize) -> usize + Send + Sync>,
     down_f: Box<dyn Fn(usize) + Send + Sync>,
+    /// The plan's stages, ns from its start: pairs sorted, experts ordered, slots read, data and closures built, jobs built.
+    stages: [u64; 5],
 }
 /// A planning request to the builder thread: the layer, the picks as routed, the step's activations.
 struct Req {
@@ -1066,7 +1075,10 @@ impl<'a> CpuExperts<'a> {
                         let r = unsafe { Box::from_raw(r) };
                         let n = r.idx.len();
                         let (xq, xs, xg) = unsafe { (std::slice::from_raw_parts(r.xq as *const i8, n * H), std::slice::from_raw_parts(r.xs as *const f32, n * (H / 128)), std::slice::from_raw_parts(r.xg as *const i32, n * (H / 128))) };
+                        let tb = std::time::Instant::now();
                         let plan = plan_run(&ctx, r.l, &r.idx, xq, xs, xg);
+                        let st = plan.stages;
+                        prow::row!("track-zones", "plan_build", { "layer" => r.l, "us" => tb.elapsed().as_secs_f64() * 1e6, "pairs_us" => st[0] as f64 / 1e3, "order_us" => st[1] as f64 / 1e3, "slots_us" => st[2] as f64 / 1e3, "data_us" => st[3] as f64 / 1e3, "jobs_us" => st[4] as f64 / 1e3 });
                         let old = bt.ready.swap(Box::into_raw(plan), Ordering::AcqRel);
                         if !old.is_null() {
                             drop(unsafe { Box::from_raw(old) });
@@ -1147,6 +1159,8 @@ fn plan_run(ctx: &Ctx, l: usize, idx: &[[usize; TOP_K]], xq: &[i8], xs: &[f32], 
     }
     let n = idx.len();
     assert!(n <= STEP);
+    let t_plan = std::time::Instant::now();
+    let mut stages = [0u64; 5];
     const HG: usize = H / GROUP;
     const DG: usize = D_FF / GROUP;
     const QP: usize = GROUP / GU_ROWS;
@@ -1178,6 +1192,7 @@ fn plan_run(ctx: &Ctx, l: usize, idx: &[[usize; TOP_K]], xq: &[i8], xs: &[f32], 
     // the run's experts in the order the prefetch posted them (its plan for this layer), then the rest by id: each CCD's
     // queue takes its items in this order, so the run reads first what arrived first, and the experts it streams from
     // DRAM come after the prefetched ones. The outputs land in fixed rows: the order changes no bits.
+    stages[0] = t_plan.elapsed().as_nanos() as u64;
     let mut experts: Vec<usize> = (0..E).filter(|&e| first[e + 1] > first[e]).collect();
     let planned = {
         let mut p = ctx.planned.lock().unwrap();
@@ -1191,6 +1206,7 @@ fn plan_run(ctx: &Ctx, l: usize, idx: &[[usize; TOP_K]], xq: &[i8], xs: &[f32], 
         experts.sort_by_key(|&e| if pos_of[e] != u16::MAX { pos_of[e] as usize } else { E + e });
     }
     let ne = experts.len();
+    stages[1] = t_plan.elapsed().as_nanos() as u64;
     // `track-experts`: the prefetch made for this layer, read against this run's experts when the run comes (`execute`)
     #[cfg(feature = "track-experts")]
     let pf = ctx.pf.lock().unwrap().take().filter(|p| p.0 == l).map(|p| (p.1, p.2, p.3));
@@ -1224,6 +1240,7 @@ fn plan_run(ctx: &Ctx, l: usize, idx: &[[usize; TOP_K]], xq: &[i8], xs: &[f32], 
     // parts, two slices on one CCD, quantized in place by the core that computed it. A decode step keeps fine parts:
     // folded, a 544 KB item a core left the CCD's cores nothing to balance the tail with (gate/up 311 → 371 µs a layer
     // folded whole, 2026-10-22); its groups are quantized by whichever part completes them (`group_done`).
+    stages[2] = t_plan.elapsed().as_nanos() as u64;
     let mut gitems: Vec<(u16, u16, u8)> = Vec::with_capacity(ne * GU_PARTS);
     for j in 0..ne {
         if n > SPEC_TOKENS {
@@ -1386,6 +1403,7 @@ fn plan_run(ctx: &Ctx, l: usize, idx: &[[usize; TOP_K]], xq: &[i8], xs: &[f32], 
     });
     // the jobs, where the pool prepares them: built here with the closures as their own, announced at the run; else the
     // closures stay with the plan and run slotted
+    stages[3] = t_plan.elapsed().as_nanos() as u64;
     let (gu_job, down_job, gu_f, down_f) = if ctx.pool.prepares() {
         let gu_job = ctx.pool.prepare_slotted(d.gitems.len(), &*gu_slot, gu_f);
         let down_job = ctx.pool.prepare_slotted(ne * DOWN_PARTS, &*down_slot, down_f);
@@ -1395,7 +1413,8 @@ fn plan_run(ctx: &Ctx, l: usize, idx: &[[usize; TOP_K]], xq: &[i8], xs: &[f32], 
     } else {
         (0, 0, gu_f, down_f)
     };
-    Box::new(RunPlan { data: d, gu_job, down_job, gu_slot, gu_f, down_slot, down_f })
+    stages[4] = t_plan.elapsed().as_nanos() as u64;
+    Box::new(RunPlan { data: d, gu_job, down_job, gu_slot, gu_f, down_slot, down_f, stages })
 }
 impl Routed for CpuExperts<'_> {
     fn elapsed(&mut self) -> f64 {
@@ -1409,6 +1428,7 @@ impl Routed for CpuExperts<'_> {
         // an item an (expert, node, CCD): the slices of that expert the compute will slot there, in the
         // compute's order — a slice's node from its rows' page, its CCD from the expert's id and the slice
         let (n_gu, n_down) = (GU_ITEMS, DOWN_ITEMS);
+        let z = prow::Timestamp::now();
         let idx: Vec<usize> = idx.to_vec();
         let idx_plan = idx.clone();
         let tables = self.tables.read().unwrap();
@@ -1444,6 +1464,7 @@ impl Routed for CpuExperts<'_> {
         }
         drop(tables);
         let n = items.len();
+        let z = draft_zone("pf.cut", z);
         #[cfg(feature = "track-experts")]
         let finished = {
             let mut per = vec![0u16; idx.len()];
@@ -1496,8 +1517,11 @@ impl Routed for CpuExperts<'_> {
             #[cfg(feature = "track-experts")]
             finished[it.0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         };
+        let z = draft_zone("pf.closures", z);
         let takers = self.pool.prefetch_slotted(n, Box::new(slot), Box::new(f));
+        let z = draft_zone("pf.post", z);
         *self.planned.lock().unwrap() = Some(Planned { l, idx: idx_plan, item_of, takers });
+        draft_zone("pf.planned", z);
     }
     fn run(&mut self, l: usize, idx: &[usize; TOP_K], x: &[f32], out: &mut [f32]) {
         self.run_batch(l, std::slice::from_ref(idx), x, out)
@@ -1547,6 +1571,7 @@ impl CpuExperts<'_> {
         if self.requested.take() == Some((l, idx.len())) {
             if let Some(b) = self.builder.clone() {
                 let wait = std::time::Instant::now();
+                let z = prow::Timestamp::now();
                 loop {
                     let p = b.ready.swap(std::ptr::null_mut(), Ordering::AcqRel);
                     if !p.is_null() {
@@ -1561,9 +1586,13 @@ impl CpuExperts<'_> {
                     }
                     std::hint::spin_loop();
                 }
+                prow::zone_at!("track-zones", "plan.wait", prow::lane(), z, prow::Timestamp::now());
             }
         }
-        let plan = plan.unwrap_or_else(|| plan_run(&self.ctx(), l, idx, xq, xs, xg));
+        let plan = plan.unwrap_or_else(|| {
+            cpu_zone!("plan.inline");
+            plan_run(&self.ctx(), l, idx, xq, xs, xg)
+        });
         self.execute(plan, out);
         self.elapsed += t0.elapsed().as_secs_f64();
     }
@@ -1604,8 +1633,12 @@ impl CpuExperts<'_> {
                 self.pool.run_slotted(d.gitems.len(), &*plan.gu_slot, &*plan.gu_f);
             }
         }
+        #[cfg(feature = "track-zones")]
+        let mid = prow::Timestamp::now();
         #[cfg(feature = "track-experts")]
         self.item_rows(l, "gu", d.gu_bytes);
+        #[cfg(feature = "track-zones")]
+        prow::zone_at!("track-zones", "run.mid", prow::lane(), mid, prow::Timestamp::now());
         {
             cpu_zone!("experts.down");
             if plan.down_job != 0 {
@@ -1614,6 +1647,8 @@ impl CpuExperts<'_> {
                 self.pool.run_slotted(d.experts.len() * expert::DOWN_PARTS, &*plan.down_slot, &*plan.down_f);
             }
         }
+        #[cfg(feature = "track-zones")]
+        let post = prow::Timestamp::now();
         #[cfg(feature = "track-experts")]
         self.item_rows(l, "down", expert::DOWN_ROWS * D_FF / 2 + expert::DOWN_ROWS * (D_FF / common::q4::GROUP) * 4);
         #[cfg(feature = "track-experts")]
@@ -1627,6 +1662,8 @@ impl CpuExperts<'_> {
             }
             prow::row!("track-experts", "prefetch_use", { "layer" => l, "tokens" => n, "host_experts" => u[0], "complete" => u[1], "partial" => u[2], "missed" => u[3], "used_items" => u[4], "used_items_done" => u[5], "predicted" => u[6], "items" => u[7] / 1_000_000, "items_done" => u[7] % 1_000_000, "counted" => d.counted.load(Ordering::Relaxed) as u8, "c_hit" => f[0], "c_miss" => f[1], "p_hit" => f[2], "p_miss" => f[3], "m_hit" => f[4], "m_miss" => f[5], "run_us" => 0.0 });
         }
+        #[cfg(feature = "track-zones")]
+        prow::zone_at!("track-zones", "run.post", prow::lane(), post, prow::Timestamp::now());
     }
 }
 #[cfg(feature = "track-experts")]
@@ -2608,8 +2645,14 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 // the prefetch predictor on the cards, right ahead of the FFN's output half, which spins until the host's
                 // experts are in: this layer's pair predicts the next (a decode step's prediction is the plan); the pairs
                 // learn from the picks at the step's end
-                pl.plan_step(l, n, &s.b_routed[t0..t0 + n]);
-                pl.ffn_post(l, n);
+                {
+                    cpu_zone!("plan_step");
+                    pl.plan_step(l, n, &s.b_routed[t0..t0 + n]);
+                }
+                {
+                    cpu_zone!("ffn_post");
+                    pl.ffn_post(l, n);
+                }
                 // the outputs: the layer's leader card's rows in its VRAM (002) — the host's experts write theirs through
                 // the BAR, the cards' jobs theirs directly; the leader sums them
                 let out: &mut [f32] = unsafe { std::slice::from_raw_parts_mut(pl.expert_out(l).add(t0 * TOP_K * H), n * TOP_K * H) };
