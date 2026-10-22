@@ -153,9 +153,13 @@ one a CCD and up; the probe's idle pool resident.
 
 **The box's Triad is ~293 GB/s, 72 % of 409.6; pure reads run a few % above it (the decode prefetch reads 316 on
 fresh bytes, `prefetch_job` rows).** The 23 % to Dell's 378 is the box, not software: socket 1 reads 13 % less than
-socket 0 alone (node 2 is the weak node in every measurement since 2026-10-16); both sockets together lose 8 % more
-(316 alone → 290); socket 0 alone is 11 % under Dell's per-socket 189, the NPS2-against-NPS4 band (Rome: NPS2 = 0.92
-of NPS4) plus interleave. The 7R13 cannot do NPS4 ([[epyc-7r13-topology]]); the socket-1 deficit and the fabric pin
+socket 0 alone (node 2 is the weak node in every measurement since 2026-10-16), and socket 0 alone is 11 % under
+Dell's per-socket 189, the NPS2-against-NPS4 band (Rome: NPS2 = 0.92 of NPS4) plus interleave. There is no
+cross-socket loss: "both sockets together" reads 290 because every thread gets the same bytes and the round ends with
+the slowest — 2 × 147 — not because anything crosses the fabric (nothing does, in the bench or in production, where
+every expert byte is node-local). The probe's "nodes alone sum 365, together 337" is the same arithmetic. What is
+real is that the slowest node ends every layer, which is what the run-rate placement (`calibrate`/`retrain`) exists
+to absorb. The 7R13 cannot do NPS4 ([[epyc-7r13-topology]]); the socket-1 deficit and the fabric pin
 are firmware or hardware (§1). A STREAM run with default-sized arrays (15 MB a thread at 16 threads) fits this box's
 L3s and would print ~358 here — any 378 quoted for a Milan box needs its array size.
 
