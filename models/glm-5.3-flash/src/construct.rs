@@ -1913,6 +1913,9 @@ pub trait Placed {
     /// Every routed expert row of the chunk is in the leader's VRAM (the host's run and the residents' join done):
     /// the leader's word, after which it sums the rows in pick order into the streams and forwards the sums (002).
     fn ffn_done(&mut self, l: usize);
+    /// Lab (`dump-pred`): token `i`'s `HC · H` residual streams as layer `l`'s FFN card holds them now (at the
+    /// dispatch: after the layer's attention, before its FFN output).
+    fn streams(&mut self, l: usize, i: usize, out: &mut [f32]);
     /// Token `i`'s layer output off the streams (bring-up).
     fn layer_out(&mut self, l: usize, i: usize, mean: &mut [f32]);
     /// The head over tokens `from..from + n`'s streams, `[n][VOCAB_SIZE]`; the step ends.
@@ -2066,6 +2069,9 @@ pub struct CpuModel<'p, R: Routed> {
     b_y: Vec<f32>,
     b_score: Vec<f32>,
     b_out: Vec<f32>,
+    /// `dump-pred`: the step's tokens' residual streams at a layer's dispatch, `[STEP][HC · H]`.
+    #[cfg(feature = "dump-pred")]
+    b_streams: Vec<f32>,
 }
 
 impl<'p, R: Routed> CpuModel<'p, R> {
@@ -2139,6 +2145,8 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             b_xn: vec![0.0; STEP * H],
             b_y: vec![0.0; STEP * H],
             b_score: vec![0.0; STEP * ROUTE_ROWS],
+            #[cfg(feature = "dump-pred")]
+            b_streams: vec![0.0; STEP * HC * H],
             b_out: vec![0.0; STEP * TOP_K * H],
         }
     }
@@ -2718,6 +2726,10 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     }
                     pl.ffn_input(l, n, &mut s.b_xq[t0 * H..(t0 + n) * H], &mut s.b_xs[t0 * HG..(t0 + n) * HG], &mut s.b_xg[t0 * HG..(t0 + n) * HG], &mut s.b_picks[t0..t0 + n], &mut s.b_wts[t0..t0 + n], s.pool);
                     lap(&mut p.kda_card, "kda_card");
+                    #[cfg(feature = "dump-pred")]
+                    for i in 0..n {
+                        pl.streams(l, i, &mut s.b_streams[(t0 + i) * HC * H..(t0 + i + 1) * HC * H]);
+                    }
                     let (picks, wts) = (&mut s.b_picks[t0..t0 + n], &mut s.b_wts[t0..t0 + n]);
                     let (xq, xs, xg) = (&s.b_xq[t0 * H..(t0 + n) * H], &s.b_xs[t0 * HG..(t0 + n) * HG], &s.b_xg[t0 * HG..(t0 + n) * HG]);
                     // bring-up: forced picks and the traces take the card's logits and input through the host's own routing and norm
@@ -2845,7 +2857,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     #[cfg(feature = "dump-pred")]
                     {
                         pl.ffn_logits(l, n, &mut s.b_x, &mut s.b_score);
-                        let ahead = more_ahead(&mut **pl, w, l, n, &s.b_x, &s.b_picks[t0..t0 + n], &s.b_wts[t0..t0 + n]);
+                        let ahead = more_ahead(&mut **pl, w, l, n, &s.b_x, &s.b_picks[t0..t0 + n], &s.b_wts[t0..t0 + n], &s.b_streams[t0 * HC * H..(t0 + n) * HC * H], s.pool, tr);
                         dump_pred(l, n, &s.b_routed[t0..t0 + n], &s.b_xq[t0 * H..(t0 + n) * H], &s.b_xs[t0 * HG..(t0 + n) * HG], &s.b_score, &ahead);
                     }
                     let z = draft_zone("slot.ahead", z);
@@ -2975,16 +2987,74 @@ fn mla_rows(a: &weights::Mla, cache: &mut [u16], pools: &mut [u16], pos: usize, 
 /// before the host's experts are in); plus every routed row (the layer's whole FFN output, after the host's experts:
 /// the bound). Normed as the route-ahead is (layer l's post-norm). `[n][MORE][E]` logits.
 #[cfg(feature = "dump-pred")]
-const MORE: usize = 3;
+/// The dump's extra columns a token: 0 layer l + 1's router over the FFN input plus the shared output; 1 plus the
+/// resident picks' rows; 2 plus every routed row (the whole FFN output); then **attention-ahead** — layer l + 1's own
+/// attention run on the host's reference (`kda::step`) over the stale streams with its real state, then its FFN input
+/// and router: 3 the exact FFN output (every routed row) with the state as at the step's start (the bound); 4 the
+/// FFN output taken as the shared output alone, the state carried token to token through the step; 5 the shared
+/// output alone and the **read-out only** on the step's starting state (`kda::readout`: no forget gate, no delta
+/// update — the form a card can run in its idle before `hc_post`). Where layer l + 1's attention is MLA, 3–5 repeat
+/// column 0. Columns 0–2 are normed with layer l + 1's post norm (layer l's, before 2026-10-22, misranked them).
+const MORE: usize = 6;
 #[cfg(feature = "dump-pred")]
-fn more_ahead(pl: &mut dyn Placed, w: &Weights, l: usize, n: usize, x: &[f32], marked: &[[usize; TOP_K]], wts: &[[f32; TOP_K]]) -> Vec<f32> {
+#[allow(clippy::too_many_arguments)]
+fn more_ahead(pl: &mut dyn Placed, w: &Weights, l: usize, n: usize, x: &[f32], marked: &[[usize; TOP_K]], wts: &[[f32; TOP_K]], streams: &[f32], pool: &dyn Pool, tr: &mut impl Trace) -> Vec<f32> {
     let Ffn::Moe(m2) = &w.layers[l + 1].ffn else { unreachable!() };
     let (mut shared, mut rows) = (vec![0f32; n * H], vec![0f32; n * TOP_K * H]);
     pl.ffn_parts(l, n, &mut shared, &mut rows);
     let mut out = vec![0f32; n * MORE * E];
-    let (mut v, mut vn) = (vec![0f32; H], vec![0f32; H]);
+    // layer l + 1's router over a FFN input (the pool's GEMV: the scalar loop was ~1 ms a column)
+    let route = |v: &[f32], ln: &[f32], o: &mut [f32]| {
+        let mut vn = vec![0f32; H];
+        common::rmsnorm::rmsnorm_tree::<H>(v, ln, RMS_NORM_EPS, &mut vn);
+        gemv::bf16_par_r::<E, H, 1>(m2.router, &vn, o, pool);
+    };
+    // attention-ahead, where layer l + 1 is a KDA layer
+    let lw1 = &w.layers[l + 1];
+    if let Attn::Kda(kw) = &lw1.attn {
+        let (mut win0, mut mem0) = (vec![0f32; KDA_WINDOW], vec![0f32; KDA_MEMORY]);
+        pl.snapshot(l + 1, &mut win0, &mut mem0);
+        let (mut win_c, mut mem_c) = (win0.clone(), mem0.clone());
+        let (mut flat, mut coef) = (vec![0f32; HC * H], vec![0f32; HC_COEFS]);
+        let (mut mixed, mut conv, mut fa, mut f, mut beta, mut ga, mut gate, mut normed, mut heads) = (vec![0f32; CONV_DIM], vec![0f32; CONV_DIM], vec![0f32; KDA_DIM], vec![0f32; KDA_QKV], vec![0f32; KDA_HEADS], vec![0f32; KDA_DIM], vec![0f32; KDA_QKV], vec![0f32; KDA_QKV], vec![0f32; KDA_HEADS * kda::HEAD_SCRATCH]);
+        let (mut xa, mut xn, mut ya, mut xf, mut y) = (vec![0f32; H], vec![0f32; H], vec![0f32; H], vec![0f32; H], vec![0f32; H]);
+        for i in 0..n {
+            for c in 3..MORE {
+                let mut st = streams[i * HC * H..(i + 1) * HC * H].to_vec();
+                let mut hs = hc::Scratch { flat: &mut flat, coef: &mut coef };
+                // layer l's FFN output into the streams: the whole output (3) or the shared output alone (4, 5)
+                let mix_f = hc::pre(&w.layers[l].hc_ffn, &st, &mut hs, pool, &mut xa);
+                y.copy_from_slice(&shared[i * H..(i + 1) * H]);
+                if c == 3 {
+                    for k in 0..TOP_K {
+                        for d in 0..H {
+                            y[d] += wts[i][k] * rows[(i * TOP_K + k) * H + d];
+                        }
+                    }
+                }
+                hc::post(&mix_f, &y, &mut st);
+                // layer l + 1's attention on them: its state as at the step's start (3), carried (4), or the read-out alone (5)
+                let mix_a = hc::pre(&lw1.hc_attn, &st, &mut hs, pool, &mut xa);
+                common::rmsnorm::rmsnorm_tree::<H>(&xa, lw1.input_ln, RMS_NORM_EPS, &mut xn);
+                let mut ks = kda::Scratch { mixed: &mut mixed, conv: &mut conv, fa: &mut fa, f: &mut f, beta: &mut beta, ga: &mut ga, gate: &mut gate, normed: &mut normed, heads: &mut heads };
+                if c == 4 {
+                    kda::step(l + 1, kw, &xn, &mut win_c, &mut mem_c, &mut ks, pool, tr, &mut ya);
+                } else if c == 5 {
+                    kda::readout(kw, &xn, &win0, &mem0, &mut ks, pool, &mut ya);
+                } else {
+                    let (mut win, mut mem) = (win0.clone(), mem0.clone());
+                    kda::step(l + 1, kw, &xn, &mut win, &mut mem, &mut ks, pool, tr, &mut ya);
+                }
+                hc::post(&mix_a, &ya, &mut st);
+                let _ = hc::pre(&lw1.hc_ffn, &st, &mut hs, pool, &mut xf);
+                let (o0, o1) = ((i * MORE + c) * E, (i * MORE + c + 1) * E);
+                route(&xf, lw1.post_ln, &mut out[o0..o1]);
+            }
+        }
+    }
+    let mut v = vec![0f32; H];
     for i in 0..n {
-        for c in 0..MORE {
+        for c in 0..3 {
             for d in 0..H {
                 v[d] = x[i * H + d] + shared[i * H + d];
             }
@@ -2996,16 +3066,15 @@ fn more_ahead(pl: &mut dyn Placed, w: &Weights, l: usize, n: usize, x: &[f32], m
                     }
                 }
             }
-            common::rmsnorm::rmsnorm_tree::<H>(&v, w.layers[l].post_ln, RMS_NORM_EPS, &mut vn);
-            for e in 0..E {
-                let r = &m2.router[e * H..(e + 1) * H];
-                let mut acc = [0f32; 8];
-                for d in (0..H).step_by(8) {
-                    for j in 0..8 {
-                        acc[j] += widen(r[d + j]) * vn[d + j];
-                    }
-                }
-                out[(i * MORE + c) * E + e] = acc.iter().sum();
+            let (o0, o1) = ((i * MORE + c) * E, (i * MORE + c + 1) * E);
+            route(&v, lw1.post_ln, &mut out[o0..o1]);
+        }
+        if !matches!(lw1.attn, Attn::Kda(_)) {
+            for c in 3..MORE {
+                let (o0, o1) = ((i * MORE + c) * E, (i * MORE + c + 1) * E);
+                let (s0, s1) = (i * MORE * E, i * MORE * E + E);
+                let src = out[s0..s1].to_vec();
+                out[o0..o1].copy_from_slice(&src);
             }
         }
     }

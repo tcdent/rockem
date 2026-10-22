@@ -2039,6 +2039,14 @@ impl Placed for Cards {
         let f = self.ffns[l].as_ref().unwrap();
         unsafe { &*(self.peers[f.card].words.at(self.wd(W_EXPERTS, 0)) as *const AtomicU32) }.store(self.half_seq[l][self.ch][1], std::sync::atomic::Ordering::Release);
     }
+    fn streams(&mut self, l: usize, i: usize, out: &mut [f32]) {
+        // lab only: the layer's FFN card's streams of token `i`, through the host's FFN-input buffer
+        let f = self.ffns[l].as_ref().unwrap();
+        let c = &self.cards[f.card];
+        self.copy_out(c, c.streams.at(i * HC * H * 4), self.shared.xh.va, HC);
+        c.k.sync();
+        read(&self.shared.xh, 0, &mut out[..HC * H]);
+    }
     fn layer_out(&mut self, _l: usize, i: usize, mean: &mut [f32]) {
         let c = &self.cards[self.head_card];
         let mut a = Args::new();

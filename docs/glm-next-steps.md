@@ -159,6 +159,7 @@ the index. Reorganized 2026-10-18 from the single-page version (in git history b
 | [089](queue/089-mla-o-in-the-verify-step.md) | The MLA output projection in a verify step | Open — ~142 µs a launch, ~1.6 ms a verify step on the critical path | decode |
 | [090](queue/090-prefetch-streamed-into-the-run.md) | The prefetch streamed into the run | Open — a direction: arrival timed to the run's consumption order | decode |
 | [091](queue/091-prefetch-inside-the-window.md) | The prefetch inside the window | Measured to the box's ceiling (316 GB/s on fresh bytes against a STREAM Triad of ~293): the rate is the box's, the lever is bytes | decode |
+| [092](queue/092-attention-ahead-predictor.md) | Attention-ahead: layer l+1's own attention as the predictor's margin | Ceiling measured: raw recall@13 at KDA layers .561 → .648–.690; the kernel to build | decode |
 
 ## Order (2026-10-18, evening — the 20 ms path)
 

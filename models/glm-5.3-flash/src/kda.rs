@@ -91,6 +91,54 @@ pub fn step(l: usize, w: &weights::Kda, xn: &[f32], window: &mut [f32], mem: &mu
     gemv::bf16_par::<H, KDA_QKV>(w.o, s.normed, out, pool);
 }
 
+/// The read-out alone, on the memory as it stands: the query projected and run through the convolution against the
+/// window (neither updated), l2-normed and scaled, `S·q` a head, the gated norm, the output projection. No forget
+/// gate, no delta update — what layer l + 1's attention would say about an input before the token's own update, the
+/// expert predictor's attention-ahead (2026-10-22). `s.mixed[..KDA_QKV]`, `s.conv[..KDA_QKV]`, `s.ga`, `s.gate`,
+/// `s.normed` and `s.heads` are used.
+pub fn readout(w: &weights::Kda, xn: &[f32], window: &[f32], mem: &[f32], s: &mut Scratch, pool: &dyn Pool, out: &mut [f32]) {
+    gemv::bf16_par::<KDA_QKV, H>(w.q, xn, &mut s.mixed[..KDA_QKV], pool);
+    let taps = w.conv[0];
+    for c in 0..KDA_QKV {
+        let mut acc = 0f32;
+        for j in 0..CONV_TAPS - 1 {
+            acc += gemv::widen(taps[c * CONV_TAPS + j]) * window[j * CONV_DIM + c];
+        }
+        acc += gemv::widen(taps[c * CONV_TAPS + CONV_TAPS - 1]) * s.mixed[c];
+        s.conv[c] = silu(acc);
+    }
+    gemv::bf16::<KDA_DIM, H>(w.g_a, xn, s.ga);
+    gemv::bf16_par::<KDA_QKV, KDA_DIM>(w.g_b, s.ga, s.gate, pool);
+    let (conv, gate) = (&*s.conv, &*s.gate);
+    let (normed_p, heads_p) = (s.normed.as_mut_ptr() as usize, s.heads.as_mut_ptr() as usize);
+    let scale = 1.0 / sqrt(KDA_DIM as f32);
+    pool.run(KDA_HEADS, &move |h| {
+        let m = &mem[h * KDA_DIM * KDA_DIM..(h + 1) * KDA_DIM * KDA_DIM];
+        let normed = unsafe { core::slice::from_raw_parts_mut((normed_p as *mut f32).add(h * KDA_DIM), KDA_DIM) };
+        let hs = unsafe { core::slice::from_raw_parts_mut((heads_p as *mut f32).add(h * HEAD_SCRATCH), HEAD_SCRATCH) };
+        let (qh, rest) = hs.split_at_mut(KDA_DIM);
+        let (o, on) = rest.split_at_mut(KDA_DIM);
+        let on = &mut on[..KDA_DIM];
+        qh.copy_from_slice(&conv[h * KDA_DIM..(h + 1) * KDA_DIM]);
+        l2norm(qh);
+        for vv in 0..KDA_DIM {
+            o[vv] = 0.0;
+        }
+        for kk in 0..KDA_DIM {
+            let qk = qh[kk] * scale;
+            let row = &m[kk * KDA_DIM..(kk + 1) * KDA_DIM];
+            for vv in 0..KDA_DIM {
+                o[vv] += row[vv] * qk;
+            }
+        }
+        rmsnorm::<KDA_DIM>(o, &w.o_norm, RMS_NORM_EPS, on);
+        for vv in 0..KDA_DIM {
+            normed[vv] = on[vv] * sigmoid(gate[h * KDA_DIM + vv]);
+        }
+    });
+    gemv::bf16_par::<H, KDA_QKV>(w.o, s.normed, out, pool);
+}
+
 /// One head's recurrence at this position: l2-normed query and key, the bounded
 /// forget gate on the memory, the delta-rule update, the readout, the gated norm.
 #[inline(always)]
