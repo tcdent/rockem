@@ -1532,7 +1532,7 @@ impl Placed for Cards {
         }).unwrap();
         self.resident.loader = Some(tx);
     }
-    fn xpt_dispatch(&mut self, l: usize, n: usize, picks: &mut [[usize; TOP_K]]) -> usize {
+    fn xpt_dispatch(&mut self, l: usize, n: usize, picks: &mut [[usize; TOP_K]], marked: &mut dyn FnMut(&[[usize; TOP_K]])) -> usize {
         use std::sync::atomic::Ordering;
         prow::zone!("track-zones", "dispatch");
         let ml = l - glm_5_3_flash::FIRST_K_DENSE_REPLACE;
@@ -1582,6 +1582,7 @@ impl Placed for Cards {
                 }
             }
         }
+        marked(picks);
         // the launches: a step of a few tokens runs a token a job (`xpt_gu`, `xpt_down` over `[jobs][3]`: slot,
         // token, output row); a prefill step's jobs grouped by slot — a group table (slot, first job, jobs, 0)
         // and the jobs (token, output row) — through gate/up over every group, the hidden states quantized,

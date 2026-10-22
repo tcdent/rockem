@@ -6,8 +6,12 @@
 //!
 //! - a block is a power of two from 16 B to 1 MiB (`CLASSES`), its class recovered from the `Layout` Rust hands back
 //!   at `dealloc` (no header); larger or over-aligned requests go to the libc allocator (the model's buffers, at boot);
-//! - every thread keeps a magazine a class — an intrusive free list — and allocates and frees there without a lock;
-//!   a list past `KEEP` bytes spills half to the class's central list, an empty one refills `BATCH` blocks from it;
+//! - every thread keeps a magazine a class — an intrusive queue, freed blocks at the tail, allocations from the head —
+//!   and allocates and frees there without a lock; a queue past `KEEP` bytes spills its older half to the class's
+//!   central list, an empty one refills `BATCH` blocks from it. First in, first out, and deep: a block a plan wrote is
+//!   read by every core of the pool, and its lines sit shared in their caches; handed straight back (last in, first
+//!   out) the next plan's stores into it each invalidated a line across the box — the plan took 35 µs for ~25 KB of
+//!   writes (2026-10-22). Reused ~`KEEP`/size allocations later, the expert stream has long evicted them everywhere;
 //! - the central list carves fresh blocks from 2 MiB slabs mapped populated (no first-touch faults on the hot path)
 //!   and never unmaps them: the appliance's working set is fixed, what a step allocates it allocates every step.
 //!
@@ -26,8 +30,8 @@ const CLASSES: usize = MAX_SHIFT - MIN_SHIFT + 1;
 const SLAB: usize = 2 << 20;
 /// Blocks a refill takes from the central list.
 const BATCH: usize = 16;
-/// Bytes of one class a thread keeps before spilling half of them to the central list.
-const KEEP: usize = 64 << 10;
+/// Bytes of one class a thread keeps before spilling the older half to the central list.
+const KEEP: usize = 1 << 20;
 
 /// The allocator, for `#[global_allocator]`.
 pub struct Classes;
@@ -43,10 +47,11 @@ fn class_of(layout: &Layout) -> Option<usize> {
 
 struct Magazine {
     head: [*mut u8; CLASSES],
+    tail: [*mut u8; CLASSES],
     count: [u32; CLASSES],
 }
 std::thread_local! {
-    static MAG: UnsafeCell<Magazine> = const { UnsafeCell::new(Magazine { head: [ptr::null_mut(); CLASSES], count: [0; CLASSES] }) };
+    static MAG: UnsafeCell<Magazine> = const { UnsafeCell::new(Magazine { head: [ptr::null_mut(); CLASSES], tail: [ptr::null_mut(); CLASSES], count: [0; CLASSES] }) };
 }
 
 /// One class's central state: its free list and the slab it is carving blocks from.
@@ -65,6 +70,27 @@ static MAPPED: AtomicUsize = AtomicUsize::new(0);
 /// Bytes mapped in slabs so far.
 pub fn mapped() -> usize {
     MAPPED.load(Ordering::Relaxed)
+}
+
+/// Write the blocks this thread will allocate next (the head of each magazine, up to `bytes` a class) so they sit
+/// modified in its own cache: a store into a line another core read, or one evicted long ago, costs ~35 ns for the
+/// invalidation or the fetch, and a plan written into such lines was ~25 µs of ~25 KB (2026-10-22); into lines this
+/// core owns it is the stores. For a thread with idle time ahead of a burst of allocation.
+pub fn prewarm(bytes: usize) {
+    let _ = MAG.try_with(|m| unsafe {
+        let m = &mut *m.get();
+        for c in 0..CLASSES {
+            let size = 1 << (c + MIN_SHIFT);
+            let mut p = m.head[c];
+            let mut left = bytes;
+            while !p.is_null() && left >= size {
+                let next = *(p as *mut *mut u8);
+                ptr::write_bytes(p.add(8), 0, size - 8);
+                left -= size;
+                p = next;
+            }
+        }
+    });
 }
 
 extern "C" {
@@ -87,16 +113,21 @@ impl Central {
     fn unlock(&self) {
         self.lock.store(false, Ordering::Release);
     }
-    /// Up to `n` blocks of `size` as a linked list (the next pointer in each block's first word), and how many.
-    unsafe fn take(&self, size: usize, n: usize) -> (*mut u8, u32) {
+    /// Up to `n` blocks of `size` as a linked list (the next pointer in each block's first word): its head, its last
+    /// block, and how many.
+    unsafe fn take(&self, size: usize, n: usize) -> (*mut u8, *mut u8, u32) {
         self.lock();
         let mut list: *mut u8 = ptr::null_mut();
+        let mut last: *mut u8 = ptr::null_mut();
         let mut got = 0u32;
         let head = self.head.get();
         while (got as usize) < n && !(*head).is_null() {
             let p = *head;
             *head = *(p as *mut *mut u8);
             *(p as *mut *mut u8) = list;
+            if list.is_null() {
+                last = p;
+            }
             list = p;
             got += 1;
         }
@@ -117,11 +148,14 @@ impl Central {
             let p = *bump;
             *bump = p.add(size);
             *(p as *mut *mut u8) = list;
+            if list.is_null() {
+                last = p;
+            }
             list = p;
             got += 1;
         }
         self.unlock();
-        (list, got)
+        (list, last, got)
     }
     /// A linked list of blocks given back.
     unsafe fn give(&self, list: *mut u8, last: *mut u8) {
@@ -141,18 +175,22 @@ unsafe impl GlobalAlloc for Classes {
         let Ok(p) = MAG.try_with(|m| {
             let m = &mut *m.get();
             if m.head[c].is_null() {
-                let (list, got) = CENTRAL[c].take(size, BATCH);
+                let (list, last, got) = CENTRAL[c].take(size, BATCH);
                 m.head[c] = list;
+                m.tail[c] = last;
                 m.count[c] = got;
             }
             let p = m.head[c];
             if !p.is_null() {
                 m.head[c] = *(p as *mut *mut u8);
+                if m.head[c].is_null() {
+                    m.tail[c] = ptr::null_mut();
+                }
                 m.count[c] -= 1;
             }
             p
         }) else {
-            let (list, _) = CENTRAL[c].take(size, 1);
+            let (list, _, _) = CENTRAL[c].take(size, 1);
             return list;
         };
         p
@@ -164,24 +202,24 @@ unsafe impl GlobalAlloc for Classes {
         if MAG
             .try_with(|m| {
                 let m = &mut *m.get();
-                *(p as *mut *mut u8) = m.head[c];
-                m.head[c] = p;
+                *(p as *mut *mut u8) = ptr::null_mut();
+                if m.tail[c].is_null() {
+                    m.head[c] = p;
+                } else {
+                    *(m.tail[c] as *mut *mut u8) = p;
+                }
+                m.tail[c] = p;
                 m.count[c] += 1;
                 if m.count[c] as usize * size > KEEP && m.count[c] >= 2 {
-                    // the older half of the list to the central list
-                    let keep = m.count[c] / 2;
-                    let mut last = m.head[c];
-                    for _ in 1..keep {
+                    // the older half of the queue, from its head, to the central list
+                    let spill = m.count[c] / 2;
+                    let (first, mut last) = (m.head[c], m.head[c]);
+                    for _ in 1..spill {
                         last = *(last as *mut *mut u8);
                     }
-                    let spill = *(last as *mut *mut u8);
-                    *(last as *mut *mut u8) = ptr::null_mut();
-                    let mut tail = spill;
-                    while !(*(tail as *mut *mut u8)).is_null() {
-                        tail = *(tail as *mut *mut u8);
-                    }
-                    CENTRAL[c].give(spill, tail);
-                    m.count[c] = keep;
+                    m.head[c] = *(last as *mut *mut u8);
+                    CENTRAL[c].give(first, last);
+                    m.count[c] -= spill;
                 }
             })
             .is_err()
