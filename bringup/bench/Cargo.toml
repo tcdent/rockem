@@ -123,3 +123,7 @@ path = "src/mla_attend.rs"
 [[bin]]
 name = "bench-pred"
 path = "src/pred.rs"
+
+[[bin]]
+name = "bench-touch"
+path = "src/touch.rs"
