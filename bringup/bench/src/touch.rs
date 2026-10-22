@@ -134,15 +134,45 @@ unsafe fn touch_pf<const K: usize>(p: *const u8, len: usize, ahead: usize) {
     }
     std::hint::black_box(s);
 }
-/// The touch in chunks with the node's abandon check between them.
-unsafe fn touch_chunks(inflight: usize, chunk: usize, p: *const u8, len: usize, stop: &AtomicBool) {
-    let mut o = 0;
-    while o < len {
-        if stop.load(Ordering::Relaxed) {
-            return;
+/// The touch over a run with the abandon flag read every `chunk` bytes *inside* the streaming loop: the accumulators
+/// are reduced once, at the end. (A touch called a chunk reduced its accumulators each call, so a chunk's loads all
+/// returned before the next chunk's issued — one DRAM latency of bubble a chunk, hidden by eight cores a CCD, half
+/// the rate at two: 216 against 383 GB/s, 2026-10-22.)
+#[target_feature(enable = "avx2")]
+unsafe fn touch_flag<const K: usize>(p: *const u8, len: usize, chunk: usize, stop: &AtomicBool) {
+    use core::arch::x86_64::*;
+    let mut acc = [_mm256_setzero_si256(); K];
+    let mut i = 0;
+    let mut next_check = 0;
+    while i + 64 * K <= len {
+        if i >= next_check {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            next_check = i + chunk;
         }
-        touch_n(inflight, p.add(o), chunk.min(len - o));
-        o += chunk;
+        for k in 0..K {
+            acc[k] = _mm256_xor_si256(acc[k], _mm256_loadu_si256(p.add(i + 64 * k) as *const __m256i));
+        }
+        i += 64 * K;
+    }
+    while i + 32 <= len {
+        acc[0] = _mm256_xor_si256(acc[0], _mm256_loadu_si256(p.add(i) as *const __m256i));
+        i += 64;
+    }
+    let mut s = acc[0];
+    for k in 1..K {
+        s = _mm256_xor_si256(s, acc[k]);
+    }
+    std::hint::black_box(s);
+}
+unsafe fn touch_chunks(inflight: usize, chunk: usize, p: *const u8, len: usize, stop: &AtomicBool) {
+    match inflight {
+        64 => touch_flag::<64>(p, len, chunk, stop),
+        32 => touch_flag::<32>(p, len, chunk, stop),
+        16 => touch_flag::<16>(p, len, chunk, stop),
+        8 => touch_flag::<8>(p, len, chunk, stop),
+        _ => touch_flag::<4>(p, len, chunk, stop),
     }
 }
 

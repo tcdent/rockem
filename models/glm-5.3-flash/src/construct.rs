@@ -91,8 +91,8 @@ const PREFETCH_CAP: usize = 13;
 /// 2026-10-22). On the main thread's CCD fewer: its core 0 runs the step's critical path between the layers (`route`,
 /// `dispatch`, `act.read`) while the prefetch streams, and those phases doubled with seven cores streaming beside it
 /// (8.5 → 18 µs a layer; a CCD's delivery is shared by its cores).
-const PREFETCH_CORES: usize = 8;
-const PREFETCH_CORES_MAIN: usize = 4;
+const PREFETCH_CORES: usize = 2;
+const PREFETCH_CORES_MAIN: usize = 2;
 
 struct Job {
     /// The generation that announced it (0 until announced).
@@ -1228,10 +1228,10 @@ impl<'a> CpuExperts<'a> {
 /// AVX2 load a line, sixteen lines in flight: on the prefetch's item shape (272–544 KB streams, four a CCD at once) four
 /// in flight reached 272 GB/s box-wide against the contiguous stream's 366, sixteen 322 (`bench-touch`, 2026-10-22).
 #[inline(always)]
-fn touch(b: &[u8]) {
+fn touch(b: &[u8], stop: &dyn Fn() -> bool) -> bool {
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        touch_avx2(b.as_ptr(), b.len())
+        touch_avx2(b.as_ptr(), b.len(), stop)
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -1242,16 +1242,26 @@ fn touch(b: &[u8]) {
             i += 64;
         }
         std::hint::black_box(acc);
+        !stop()
     }
 }
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn touch_avx2(p: *const u8, len: usize) {
+unsafe fn touch_avx2(p: *const u8, len: usize, stop: &dyn Fn() -> bool) -> bool {
     use std::arch::x86_64::*;
-    const K: usize = 16;
+    const K: usize = 64;
     let mut acc = [_mm256_setzero_si256(); K];
     let mut i = 0;
+    let mut next_check = 0;
     while i + 64 * K <= len {
+        // the abandon check every 4 KB, inside the stream: a touch called a chunk drained its loads at each call's end
+        // (one DRAM latency a chunk, half the rate at two touchers a CCD, 2026-10-22)
+        if i >= next_check {
+            if stop() {
+                return false;
+            }
+            next_check = i + (4 << 10);
+        }
         for k in 0..K {
             acc[k] = _mm256_xor_si256(acc[k], _mm256_loadu_si256(p.add(i + 64 * k) as *const __m256i));
         }
@@ -1266,6 +1276,7 @@ unsafe fn touch_avx2(p: *const u8, len: usize) {
         s = _mm256_xor_si256(s, acc[k]);
     }
     std::hint::black_box(s);
+    true
 }
 /// A decode layer's prefetch as its run sees it (`CpuExperts::planned`).
 struct Planned {
@@ -1658,11 +1669,8 @@ impl Routed for CpuExperts<'_> {
                         continue;
                     }
                     let take = left.min(len - o);
-                    for chunk in unsafe { std::slice::from_raw_parts((start + o) as *const u8, take) }.chunks(4 << 10) {
-                        if pool_s.abandoned() {
-                            return;
-                        }
-                        touch(chunk);
+                    if !touch(unsafe { std::slice::from_raw_parts((start + o) as *const u8, take) }, &|| pool_s.abandoned()) {
+                        return;
                     }
                     left -= take;
                     o = 0;

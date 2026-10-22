@@ -129,8 +129,29 @@ start together. The table reports the best of 3 runs.
 | 2026-10-15 19:35 (NPS2) | node 0, 3 CCDs | 66 | 79 | **85** | 84 | 82 | 82 |
 | 2026-10-16 12:35 (NPS2 + APBDIS) | node 0 | 64 | 78 | 83 | 83 | | |
 
-Four cores a CCD saturate the channels. Eight cost nothing here, unlike Dell's runs, where one core a CCD was
-best. SMT siblings and 2 MiB pages do not raise the ceiling.
+Four cores a CCD saturate one node's channels, and eight cost nothing — **when one node streams alone**. The rows
+above are one node (socket 0, or node 0) with the rest of the box idle, and that is why they disagreed with Dell's
+one-core-a-CCD Triad: Dell streamed the whole box. Box-wide the picture inverts (2026-10-22, probe boot, `bench-touch`
+on every CCD's cores at once, node-local 40 MB a core, 10 rounds, the probe's idle pool resident):
+
+| cores a CCD, box-wide (12 CCDs) | lines in flight a core | GB/s box | a CCD | a core |
+|---|---|---|---|---|
+| 8 (92 cores) — the touch, the probe loop, 16/32/64 in flight alike | 16–64 | 289–291 | 25.1 | 3.1 |
+| 8, a software prefetch 32 lines ahead | 16 | 308 | 26.8 | 3.4 |
+| 4 (48 cores) | 32 / 64 | 332 | 27.7 | 6.9 |
+| 3 (36 cores) | 64 | 350 | 29.1 | 9.7 |
+| **2 (24 cores)** | 32 / 64 | **373 / 383** | 31.1 / 31.9 | 15.5 / 16.0 |
+| 2, a software prefetch 32 lines ahead | 16 | **405** | 33.8 | 16.9 |
+
+**The rule: two cores a CCD, deep, read the box's ceiling; eight read three quarters of it.** The total concurrency is
+the same (8 × 16 = 2 × 64 lines a CCD), so it is not latency coverage that is lost, it is the number of concurrent
+streams the sixteen memory controllers see — 96 against 24, six a channel against one and a half — and their
+row-buffer locality with it. One core a CCD is latency-bound (a core streams ~14–17 GB/s at most: `runs 14144K`, one
+core a CCD, 13.7 a core); two are enough. One node alone never showed it because its three CCDs put 24 streams on
+four channels either way. A box-wide design that streams from every core — the decode prefetch ran 8 touchers a CCD at
+16 in flight — leaves 25 % of the box on the table; the compute runs stream from every core too (the expert kernels'
+DRAM phase), which this says is worth measuring against four and two. SMT siblings and 2 MiB pages do not raise the
+ceiling.
 
 ### What places memory, and why it matters
 
