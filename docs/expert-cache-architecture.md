@@ -544,6 +544,53 @@ local-homed memory the CCX refetches those from DRAM instead of forwarding them.
 on the same core. Next: planned items read by their takers (core affinity in the run's per-CCD queue), predicted 83 →
 ~95 % on `prefetch_use`.
 
+## 13. The CCD map (designed 2026-10-22, from the measurements in metatron-cpu §3)
+
+tcdent: "map out how you're using the CCDs rather than just reactively observing and correcting … you've observed the
+ideal, create the ideal, and then deploy it." The decode expert phase, per MoE layer, as it is meant to run:
+
+**The box.** 12 CCDs, CCD *k* = cores 8k..8k+7, each with its own 32 MB L3 (a victim cache of its eight 512 KB L2s).
+The pool is 92 workers, every core but the housekeeping four (0, 24, 48, 72). The main thread is core 0, on CCD 0.
+Every expert's bytes are split over the 12 CCDs by its node (a quarter a node, `layout::placement_runs`) and, within
+the node, by a hash of expert and slice *pair* — a gate/up slice pair is one quantize group of the hidden state, so a
+group never straddles CCDs. Each CCD therefore owns ~1.1 MB of every expert, homed on its node, and a layer's plan is
+~14 MB a CCD.
+
+**Rule 1 — the touch and the read on one core.** A line one core loads sits in that core's L2 until evicted; it is not
+in L3, and for local-homed memory a neighbour's read of it is a DRAM refetch (§3: 82 % vs 98 %). So the prefetch
+records which worker took each item, and the run sends a planned expert's slices to that worker's own queue
+(`CORE + w`). A worker drains its own queue, then its CCD's (the unplanned experts, DRAM), then its CCD-mates' own
+queues (a steal, only when idle otherwise), then the node's and the rest. Every core of a CCD touches, so every core's
+first reads are its own lines and the CCD's DRAM phase starts only when its planned reads are done — with four
+touchers of eight, the other four streamed DRAM beside the takers' planned reads and the share fell (83 → 78 %).
+
+**Rule 2 — produce and consume on one core.** The hidden state a gate/up part writes is quantized where it was written:
+a planned expert's gate/up items are one quantize group each (two slices, one CCD, one taker), quantized in place.
+Unplanned experts keep fine parts, because one 544 KB DRAM item a core leaves a CCD's eight cores nothing to balance
+the tail with (gate/up 312 → 420 µs a layer when everything was folded); their rows are quantized in a run of their
+own, a third of the rows it was.
+
+**Rule 3 — the main thread's CCD streams less.** Core 0 runs the step's critical path between layers (`route`,
+`dispatch`, `act.read`, the plan read) while the prefetch streams; with seven cores of CCD 0 streaming beside it those
+phases doubled (8.5 → 18 µs each a layer). CCD 0 keeps three touchers. The structural answer — a CCD with no streaming
+for the main thread, and bytes placed in proportion to each node's streaming CCDs (node 0 holding 2/11) — touches
+the layout and is not built.
+
+**Rule 4 — the pool's bookkeeping stays small.** A job's shared slots keep a cache line each; the per-worker slots are
+plain `u32` atomics; `start` is `u32`. The 12 KB job with a padded counter a slot cost ~1 ms a verify step of main-thread
+time: 92 workers read it out of core 0's cache.
+
+**What the map predicts** (the counters that exist): a completed prefetched expert's lines from L3 in the high 80s to
+90s (bench-reuse's self row: ~90 % of L2 misses from L3 even for the toucher), the gate/up run ~25–30 µs a layer faster
+than before affinity (measured: 303 → 276), the quant run back near 20 µs, `route`/`dispatch`/`act.read` back near 10,
+the posting overhead ~2.4 ms a verify step. Each build is read against these, not against the previous build.
+
+**Measured on the way** (same 96-token request, per layer p50 unless noted): card17 (before): gate/up 303, quant 20,
+route 8.5, completed experts 83 % from L3. aff2 (affinity, 4 touchers): 78 %. aff3/4 (8 touchers): 87.4 %, gate/up 276,
+the pool's runs 22.19 → 20.97 ms a verify step, but quant 45 and route/dispatch/act.read ~18 and the posting overhead
+2.43 → 4.26 ms: the step 63.17 → 63.79. aff5 (fold without pairing): completed 59.5 %, gate/up 516 — a folded item's
+second slice on another CCD. aff7 (fold with pairing): 86.9 %, quant gone, gate/up 371. aff8 (small job): overhead 2.24.
+
 ## 12. Risks, unknowns, and decisions
 
 **Unknowns (each has a phase that answers it):**
