@@ -380,6 +380,17 @@ completed prefetched expert against the policy's ~88–91 % at its 14 MB plan is
 installs; the one lever left on that gap is CAT around the affinity, bounded at ~0.7 ms a verify step (inferred from
 the serial delivery model).
 
+**Why the lines are lost, and the price of keeping them** (2026-10-22). The cache is not short of room; it is full
+of the previous round's lines, *protected* because they were read: with the previous round's region flushed
+(`clflushopt`) before the touch, the toucher found 100 % of 12 MB and 98 % of 24 MB (against 91 % and 66 %), the
+neighbour 77 % / 75 % (against 72 / 48; its remainder is the L2 tail). In the node that is the previous layer's planned
+experts, read by its run and useless since. The flush itself costs 12.4 ns a line a core on this box (5 GB/s of lines,
+one CCD or all twelve alike): a core's share of a layer's plan, 1.75 MB, takes ~350 µs, most of a run or half the
+prefetch window. The other promotion, a second touch pass that hits in the L3, costs ~200 µs a layer of L3 time the
+window does not have. So a touch-based prefetch into this L3 keeps ~90 % of its lines at the plan's size, the node's
+85 % is that plus its run's own installs, and the last five points cost more than the ~0.3–0.4 ms a verify step they
+would return (CAT with cores split by item kind, or a partial second pass).
+
 ## 4. Clocks and power
 
 **The power cap sets the all-core clock** (2026-10-20, APERF/MPERF through `/dev/cpu/N/msr`, power through the

@@ -22,9 +22,11 @@
 use common::pmc::{Pmc, FILLS, FILL_NAMES};
 use common::q4::{gemv, Act, QAct, GROUP};
 use harness::arg;
+use std::sync::atomic::Ordering;
 use std::sync::Barrier;
 
 const K: usize = 4096;
+static FLUSH_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn num(name: &str, default: usize) -> usize {
     arg(name).map(|p| p.to_str().unwrap().parse().unwrap()).unwrap_or(default)
@@ -52,6 +54,17 @@ unsafe fn touch_dirty(p: *mut u8, len: usize) {
         _mm256_storeu_si256(p.add(i) as *mut __m256i, v);
         i += 64;
     }
+}
+/// Every line of `b` flushed from every cache level (`clflushopt`): the previous round's lines, read and so protected by
+/// the L3's replacement, made evictable before the next round's touch.
+#[target_feature(enable = "sse2")]
+unsafe fn flush(p: *const u8, len: usize) {
+    let mut i = 0;
+    while i < len {
+        core::arch::asm!("clflushopt [{p}]", p = in(reg) p.add(i), options(nostack, preserves_flags));
+        i += 64;
+    }
+    core::arch::asm!("sfence", options(nostack, preserves_flags));
 }
 /// A line a 64 bytes, with AVX loads, four in flight (the node's prefetch `touch`).
 #[target_feature(enable = "avx2")]
@@ -140,6 +153,29 @@ fn main() {
                         }
                     };
                     match mode {
+                        // `flush`: the cost alone — the previous round's region (read last round, in this core's caches and the
+                        // L3) flushed, timed; the touch of this round's region as `self`
+                        "flush" => unsafe {
+                            if reg > 0 {
+                                let tf = std::time::Instant::now();
+                                flush(w.as_ptr().add((reg - 1) * wbytes), wbytes);
+                                FLUSH_NS.fetch_add(tf.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                            }
+                            touch(w.as_ptr().add(reg * wbytes), wbytes)
+                        },
+                        // `*c`: the previous round's region flushed (by its toucher) before this round's touch
+                        "selfc" => unsafe {
+                            if reg > 0 {
+                                flush(w.as_ptr().add((reg - 1) * wbytes), wbytes);
+                            }
+                            touch(w.as_ptr().add(reg * wbytes), wbytes)
+                        },
+                        "peerc" => unsafe {
+                            if reg > 0 {
+                                flush((peer_base as *const u8).add((reg - 1) * wbytes), wbytes);
+                            }
+                            touch((peer_base as *const u8).add(reg * wbytes), wbytes)
+                        },
                         "selfw" => unsafe { touch_dirty(w.as_ptr().add(reg * wbytes) as *mut u8, wbytes) },
                         "peerw" => unsafe { touch_dirty((peer_base as *mut u8).add(reg * wbytes), wbytes) },
                         "self3" => behind(unsafe { w.as_ptr().add(reg * wbytes) }, wbytes),
@@ -183,6 +219,11 @@ fn main() {
     let lines = (threads * rounds * wbytes / 64) as f64;
     let f = fills.into_inner().unwrap();
     let per: Vec<String> = (0..6).map(|i| format!("{} {:.2}", FILL_NAMES[i], f[i] as f64 / lines)).collect();
+    if mode == "flush" {
+        let ns = FLUSH_NS.load(Ordering::Relaxed) as f64;
+        let lines = (threads * (rounds - 1) * wbytes / 64) as f64;
+        println!("mode flush: clflushopt {:.2} ns a line a core ({:.1} GB/s of lines a core), {:.0} us a core a round of {} KB", ns / lines, 64.0 / (ns / lines), ns / (threads * (rounds - 1)) as f64 / 1e3, wbytes >> 10);
+    }
     println!("mode {mode} fills a line read: {}", per.join(", "));
     println!("mode {mode} cores {threads} region {} KB a core: gemv {:.1}/{:.1}/{:.1} GB/s a core (min/med/max), {:.0} GB/s summed", wbytes >> 10, r[0], r[threads / 2], r[threads - 1], r.iter().sum::<f64>());
 }
