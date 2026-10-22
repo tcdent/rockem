@@ -1,6 +1,6 @@
 # 092 — Attention-ahead: layer l + 1's own attention as the predictor's margin
 
-**Status:** Ceiling measured (2026-10-22, lab dump pred3, 8 requests, 4,584 tokens) — a kernel to build
+**Status:** Ceilings measured (2026-10-22, lab dump pred3: 8 requests × 450 tokens, 1,690 steps, 4,603 tokens) — the kernel's form to decide against the window
 **Area:** decode
 **Gain:** raw recall@13 at KDA layers .561 → .648 (the card-runnable form measured so far), .690 with the exact FFN
 output; the exact-input ceiling is .705. Every expert predicted right is 13.4 MB not streamed for nothing: the
@@ -26,10 +26,30 @@ read-out on the stale input against its real recurrent state, already in that ca
 
 | column | all | l + 1 KDA (34 layers) | l + 1 MLA (8) |
 |---|---|---|---|
-| route-ahead over x_l (today's input) | .569 | .561 | .594 |
-| attention-ahead, exact FFN output, state at step start (bound) | — | **.690** | n/a |
-| attention-ahead, shared output only, full step, state carried | — | **.648** | n/a |
-| attention-ahead, shared output only, read-out only, step-start state (the kernel's form) | pending | pending | n/a |
+| route-ahead over x_l (today's input) | .576 | .568 | .601 |
+| attention-ahead, exact FFN output, full step, state at step start (bound) | .624 | **.694** | n/a |
+| attention-ahead, shared output only, full step, state carried | .593 | **.653** | n/a |
+| attention-ahead, shared output only, read-out only, step-start state | .559 | **.608** | n/a |
+
+(The first run, 14:04, on 4,584 tokens read .561 / .690 / .648 for the first three rows; the second agrees within .01.)
+The x+shared / +rows columns of the old lab code score far *below* the route-ahead (.376–.432 at KDA): adding the FFN
+output to x outside the hyper-connection is the wrong arithmetic — the attention-ahead path puts it through the real
+mixes, and its exact-FFN variant reaches .694 of a .705 ceiling, so the lab's buffers are right and those three columns
+are a bad construction, not bad data. Production's second margin on the same construction has a learned weight to
+neutralise it (+.005).
+
+**What the update is worth.** The read-out alone (q against the step-start memory: no forget gate, no delta update, no
+k/v) recovers +.040 of the route-ahead's gap at KDA layers; the token's own update and the carry across the step's
+tokens add another +.045 (.608 → .653); the exact FFN output another +.041 (→ .694). In the delta rule the read-out
+follows the update, so a token sees its own k/v in the memory it reads — the read-out form loses exactly that.
+
+**Cost in the window (the card's ~180 µs before `hc_post`; VRAM ~800 GB/s).** The weights are read once a layer for
+all the step's tokens, not once a token. Read-out form: q (32 MB bf16) + g_a/g_b (2 MB) + o_proj folded into the router
+(2.4 MB) + hc coefficient GEMVs ≈ 37 MB ≈ 45 µs. Full form (the .653 row): q, k, v, o (128 MB) + f_a/f_b, b, g (3 MB) +
+the memory sweeps on a 2 MB copy a head set, a token (2–4 tokens: 16 MB r/w) ≈ 150 MB ≈ 170–190 µs — at the window's
+edge in bf16; an int8 copy of layer l + 1's four projections for the predictor alone (64 MB, 34 layers → 2.2 GB of the
+~12 GB free a card) brings it to ~90 µs, int4 to ~50. The forget gate and delta on a state *copy* (never written back)
+keep the forward exact.
 
 The lab path (`dump-pred`): the token's residual streams fetched off the card at dispatch, layer l's FFN mix applied with
 the shared output (or every routed row, for the bound), layer l + 1's hyper-connection pre, input norm, `kda::step` or
@@ -47,8 +67,9 @@ calibration. No state is written. Budget ~36 MB of reads and ~20 MFLOP a token: 
 with a concept of pre-training this").
 
 ## Next
-1. The read-out column's number (running). Below ~.62 at KDA layers, the step-start read-out loses too much to the
-   missing update and the carried form (k, v, forget gate: +64 MB of weights) is the kernel instead.
-2. The kernel, timed in the window; the plan's precision by rank and completed experts a layer as the production read.
+1. Decide the form against the window (tcdent): the full carried form (.653) at ~180 µs bf16 or ~90 µs with an int8
+   predictor copy of the projections, or the read-out (.608) at ~45 µs as the first step. Recommended: the full form
+   with the weights read once a layer; the read-out as the fallback if it does not fit when timed.
+2. The kernel, timed in the window; the production read is the plan's precision by rank and completed experts a layer.
 3. The lookahead that informs the run: once the predicted routing is reliable, the host run starts on the predicted
    experts before the real routing confirms (tcdent's direction, not designed).
