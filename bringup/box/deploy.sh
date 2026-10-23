@@ -17,12 +17,15 @@ echo "rebooted $(date +%H:%M:%S)"
 sleep 60
 until timeout 2 bash -c 'echo > /dev/tcp/192.168.88.6/7332' 2>/dev/null; do sleep 5; done; echo "node up $(date +%H:%M:%S)"
 /usr/bin/grep -E "spec     :|panicked|cmdline|prow" $LOG/metatron-console.log | sed -E 's/.*\] //' | cut -c1-200
-tmux send-keys -t rockem:2.10 C-c; sleep 3; tmux send-keys -t rockem:2.10 C-c; sleep 2
-tmux send-keys -t rockem:2.10 "cd /home/slomp/Work/rockem/api && ROCKEM_BUNDLE=/home/slomp/Work/rockem/bundles/glm-5.3-flash-q4rtn ROCKEM_MODEL=glm-5.3-flash ROCKEM_TRANSCRIBE_MODEL=voxtral-small-24b ROCKEM_NODES=192.168.88.6:7332 uv run uvicorn rockem.app:app --host 192.168.88.2 --port 8765" Enter; sleep 10
+# the API: the Nomad job rockem-api on elsenor (service-net 192.168.88.3:8765, behind https://rockem.a10k.co), rebuilt
+# from the api/ tree and rerun — infra.lead's recipe (2026-10-23); it reads the bundle's manifest at startup, so a
+# bundle rebuild alone needs `nomad job restart rockem-api`. One scheduler only: never start a second API on the node
+(cd /home/slomp/Work/rockem/api && TAG=$(git -C /home/slomp/Work/rockem rev-parse --short=12 HEAD) && { [ -z "$(git -C /home/slomp/Work/rockem status --porcelain -- api/rockem api/pyproject.toml api/uv.lock)" ] || TAG=$TAG-dirty-$(date +%Y%m%d%H%M%S); } && timeout 900 podman build --network host -t registry.a10k.co/rockem/api:$TAG -f Containerfile . 2>&1 | tail -n 1 | cut -c1-100 && timeout 300 podman push registry.a10k.co/rockem/api:$TAG 2>&1 | tail -n 1 | cut -c1-100 && sed -i "s|registry.a10k.co/rockem/api:[0-9a-z-]*|registry.a10k.co/rockem/api:$TAG|" api.nomad.hcl && timeout 300 nomad job run api.nomad.hcl 2>&1 | tail -n 2 | cut -c1-100)
+until curl -s -m 3 http://192.168.88.3:8765/health >/dev/null; do sleep 3; done; echo "api up   : $(date +%H:%M:%S) $(curl -s -m 3 http://192.168.88.3:8765/health | cut -c1-80)"
 T0=$(date -u +'%Y-%m-%d %H:%M:%S')
 req() { # req <label> <json>: one request, wall time, the hardware watch over the console
   L=$LOG/metatron-console.log; n0=$(wc -l < $L); t0=$(date +%s.%N)
-  out=$(curl -s -m 300 http://192.168.88.2:8765/v1/chat/completions -H 'content-type: application/json' -d @$2); t1=$(date +%s.%N)
+  out=$(curl -s -m 300 http://192.168.88.3:8765/v1/chat/completions -H 'content-type: application/json' -d @$2); t1=$(date +%s.%N)
   echo "$1: wall $(echo "$t1 - $t0" | bc) s; $(echo "$out" | python3 -c 'import sys,json; d=json.load(sys.stdin); u=d.get("usage",{}); print("prompt", u.get("prompt_tokens"), "completion", u.get("completion_tokens"))' 2>&1 | head -1)"
   w=$(( n0 > 40 ? n0 - 40 : 1 )); sleep 2
   apei=$(tail -n +$w $L | /usr/bin/grep -c "Hardware error from APEI"); aer=$(tail -n +$w $L | /usr/bin/grep -cE "pcieport .*aer_status|AER: .*error received|Corrected error|Uncorrected")

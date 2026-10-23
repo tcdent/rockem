@@ -691,6 +691,7 @@ fn serve(listen: &str, sessions: &mut [Session], identity: u64) {
     // busy state held 95 workers in MWAITX, 100 % user time to the kernel, on an idle node (2026-10-15). The
     // accept blocks inside `incoming()`, so the call goes before the loop and after each connection's end.
     sessions.iter_mut().for_each(|s| s.e.idle());
+    let mut connections: u64 = 0;
     for conn in listener.incoming() {
         let Ok(mut s) = conn else { continue };
         s.set_nodelay(true).unwrap();
@@ -707,9 +708,13 @@ fn serve(listen: &str, sessions: &mut [Session], identity: u64) {
         session.started = false;
         // a new connection inherits nothing of the last one's audio: rows a sequence left queued when its connection
         // closed mid-way are dropped here, not refused at the next BOS (which refused every transcription after one
-        // abandoned, 2026-10-23)
+        // abandoned, 2026-10-23). Its placeholders' store keys start from a salt no other connection has, so audio
+        // positions never hit the store: a hit would skip the placeholders while the windows' rows sat queued, and the
+        // rows-left refusal fired at GENERATE (a repeated clip failed every time, rockem.api 2026-10-23); audio all but
+        // never repeats, so nothing is lost (tcdent: "we probably dont need to cache audio")
         session.e.audio_reset();
-        (session.audio_salt, session.audio_fed, session.audio_rows) = (0, 0, 0);
+        connections += 1;
+        (session.audio_salt, session.audio_fed, session.audio_rows) = (Store::key_bytes(0xcbf2_9ce4_8422_2325, &connections.to_le_bytes()), 0, 0);
         let mut word = [0u8; 4];
         let mut ids: Vec<u32> = Vec::new();
         // ids are fed as they arrive, in whatever steps arrive: a prompt that is already in the
@@ -749,7 +754,7 @@ fn serve(listen: &str, sessions: &mut [Session], identity: u64) {
                     // rows still queued: the sequence ends with placeholders unfilled — a protocol error (094)
                     let ok = flush(session, &mut ids, &mut s) && session.e.audio_queued() == 0;
                     session.e.audio_reset();
-                    (session.audio_salt, session.audio_fed, session.audio_rows) = (0, 0, 0);
+                    (session.audio_fed, session.audio_rows) = (0, 0);
                     session.start();
                     ok
                 }
@@ -816,6 +821,16 @@ fn serve(listen: &str, sessions: &mut [Session], identity: u64) {
                 _ => false,
             };
             if !ok {
+                // the connection closes: say why on the console (the client sees only the close)
+                let w = u32::from_le_bytes(word);
+                let what = match w {
+                    wire::GENERATE => "GENERATE".to_string(),
+                    wire::SCORE => "SCORE".to_string(),
+                    wire::AUDIO => "AUDIO".to_string(),
+                    id if id == bos => "BOS".to_string(),
+                    id => format!("id {id}"),
+                };
+                println!("refused  : {} at {what}: started {} pos {} pending {:?} audio fed {} of {} rows, {} queued", session.e.name(), session.started, session.pos, session.pending, session.audio_fed, session.audio_rows, session.e.audio_queued());
                 break;
             }
         }

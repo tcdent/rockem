@@ -109,15 +109,24 @@ node → client   id, id, …, </s>
 
 ## The node's store
 
-The store matches transcripts by a running hash of their ids. Every clip of the same length has
-the same ids (all placeholders), so two different recordings would match, and the second would
-be seeded with the first one's rows. **Two transcripts must match only if their ids and their
-windows agree:** the window's bytes go into the running key before the placeholders that use
-them. How (a digest of the window folded in at AUDIO, or per placeholder) is the node's choice;
-the requirement is that a hit installs the bytes a miss would have produced, as today. The node
-folds a 64-bit digest of the window's bytes into the running key at AUDIO (rockem.lead). Only
-the decoder's rows are cached; the encoder's output (7.7 MB a window) is transient, and a hit
-skips the positions that would have used it.
+Audio is not cached (tcdent, 2026-10-23). Each connection's placeholder positions are keyed
+from a salt no other connection has, so they never match the store, and every window's rows are
+always taken by its placeholders. Text-only prompts cache as before. A transcription is a single
+request, not a conversation that returns, so nothing is lost: the encoder and the prompt run in
+full each time.
+
+The rows a connection queued but never consumed belong to that connection. A new connection
+starts with none, and the refusals for leftover rows (at BOS, GENERATE or SCORE) apply within
+one sequence.
+
+### How this went wrong before
+
+The store first matched audio positions by the ids plus a 64-bit digest of each window, folded
+into the running key at AUDIO, so a repeated clip would hit. On a hit the node skipped the
+placeholder positions, but the rows the windows queued stayed, which is the case the refusals
+exist to catch. Separately, a connection that closed with rows still queued left them in the
+engine, and the node refused every later Voxtral connection until a restart (found on aff68,
+2026-10-23). Both were fixed in aff70: the salt, and leftover rows dropped at a new connection.
 
 ## The bundle
 
