@@ -46,7 +46,7 @@ token a workgroup, the last ranking — replaces `rows_h` + `pred_step` (60 µs)
 workgroup through barriered dots (aff42); 73 with a row a wave (aff43); 67 with the early pass handing it the first
 margin's threshold and the co-routing sums (aff44; the step 55.72, the prediction 7.99 / 4.89 held). Phase 1's GEMV
 is the bulk: a wave over 4096 elements is 128 dependent steps a token and 32 workgroups give ~3 waves a CU to hide them.
-aff45: a (token, row) a wave, 128 workgroups.
+aff45: a (token, row) a wave, 128 workgroups — 58 µs (p90 59, a fixed cost), the step 55.36, the prediction 7.72 / 4.89: level with the two launches it replaced. Its parts to be timed inside the kernel (stat clocks) before more guessing.
 
 ## The chain (2026-10-22)
 aff36 single-phase: the signal (missed 5.19 → 4.79) but the plan 98.6 µs late at the slot, step 57.84. aff37 two-phase,
