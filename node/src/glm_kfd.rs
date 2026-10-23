@@ -190,6 +190,8 @@ struct Card {
     /// `pred_step`'s per-token key terms and its workgroups' arrival count (093).
     pred_keys: Mem,
     pred_count: Mem,
+    /// The early pass's co-routing sums `[SPEC_TOKENS][E]` and thresholds `[SPEC_TOKENS]` for the rows pass (093).
+    pred_aux: Mem,
     mla_sel_split: crate::kfd::Kernel,
     mla_two_merge: crate::kfd::Kernel,
     word_wait: crate::kfd::Kernel,
@@ -542,6 +544,7 @@ impl Cards {
                     pred_s2: k.vram(STEP * ROUTE_ROWS * 4),
                     pred_word: k.vram(64),
                     pred_keys: k.vram(SPEC_TOKENS * glm_5_3_flash::E * 4),
+                    pred_aux: k.vram((SPEC_TOKENS * glm_5_3_flash::E + SPEC_TOKENS) * 4),
                     // host-visible: zeroed by an upload (a device-only `vram` buffer cannot be uploaded to — the node
                     // segfaulted in its card setup on the first try, 2026-10-22)
                     pred_count: {
@@ -2169,7 +2172,7 @@ impl Cards {
             // `hc_post` wrote the input (x + the whole FFN output); the next layer's router, the margins and the plan in
             // one launch (`pred_rows`: three launches were ~60 µs on the card's chain behind `hc_post`, 2026-10-22)
             let mut a = Args::new();
-            a.ptr(px).ptr(f.ln.va).ptr(router).ptr(ps2).ptr(st.va).ptr(self.tok(&c.scores_v, ROUTE_ROWS)).ptr(d.at(self.t0 * E * 4)).ptr(d2.at(self.t0 * E * 4)).ptr(slot(l));
+            a.ptr(px).ptr(f.ln.va).ptr(router).ptr(ps2).ptr(st.va).ptr(self.tok(&c.scores_v, ROUTE_ROWS)).ptr(d.at(self.t0 * E * 4)).ptr(d2.at(self.t0 * E * 4)).ptr(c.pred_aux.va);
             a.ptr(self.shared.plan2.va).ptr(self.shared.words.at(self.wd(W_PLAN2, f.card))).u32(self.half_seq[l][self.ch][1]).u32(n as u32).ptr(c.pred_keys.va).ptr(c.pred_count.va);
             c.k.launch(&c.pred_rows, glm_5_3_flash::plan::PRED_ROWS_WGS, PLAN_WG, PLAN_LDS, &a);
             return;
@@ -2204,7 +2207,8 @@ impl Cards {
         } else {
             a.ptr(0).ptr(0);
         }
-        a.u32(self.half_seq[l][self.ch][1]).u32(n as u32).ptr(c.pred_keys.va).ptr(c.pred_count.va);
+        // the early decode pass leaves its thresholds and co-routing sums for the rows pass; a long step's does not
+        a.u32(self.half_seq[l][self.ch][1]).u32(n as u32).ptr(c.pred_keys.va).ptr(c.pred_count.va).ptr(if decode && !rows { c.pred_aux.va } else { 0 });
         c.k.launch(&c.pred_step, if decode { n as u32 } else { PLAN_PRED_WGS as u32 }, PLAN_WG, PLAN_LDS, &a);
     }
 }

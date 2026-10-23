@@ -178,7 +178,7 @@ pub mod gfx11 {
     /// u32. `plan` (null in a long step): the decode plan and the host's `word`. Workgroups of `PLAN_WG`, a thread an
     /// expert; grid 1 for a decode step, `PLAN_PRED_WGS` for a long one.
     #[no_mangle]
-    pub extern "gpu-kernel" fn pred_step(pred: *const f32, scores: *const f32, scores2: *const f32, p_d: *mut f32, p_d2: *mut f32, p_picks: *const u32, plan: *mut u32, word: *mut u32, value: u32, n: u32, keys: *mut f32, count: *mut u32) {
+    pub extern "gpu-kernel" fn pred_step(pred: *const f32, scores: *const f32, scores2: *const f32, p_d: *mut f32, p_d2: *mut f32, p_picks: *const u32, plan: *mut u32, word: *mut u32, value: u32, n: u32, keys: *mut f32, count: *mut u32, aux: *mut f32) {
         unsafe {
             const RR: usize = crate::hc::gfx11_consts::ROUTE_ROWS;
             let e = workitem_id_x() as usize;
@@ -207,12 +207,21 @@ pub mod gfx11 {
                 *p_d.add(i * E + e) = d;
                 *p_d2.add(i * E + e) = d2;
                 if decode {
-                    let mut z = ca * d + ca2 * d2 + cc + bias;
+                    let mut co = 0f32;
                     let mut q = 0;
                     while q < TOP_K {
-                        z += *pred.add(CO + *p_picks.add(i * TOP_K + q) as usize * E + e);
+                        co += *pred.add(CO + *p_picks.add(i * TOP_K + q) as usize * E + e);
                         q += 1;
                     }
+                    // for the rows pass (093): this token's co-routing sum an expert and its first margin's threshold
+                    // (the same scores), so it needs neither the eight dependent table loads nor that `eighth`
+                    if !aux.is_null() {
+                        *aux.add(i * E + e) = co;
+                        if e == 0 {
+                            *aux.add(SPEC_TOKENS * E + i) = t1;
+                        }
+                    }
+                    let z = ca * d + ca2 * d2 + cc + bias + co;
                     key *= 1.0 + exp(if z < 20.0 { z } else { 20.0 });
                 }
                 i += stride;
@@ -271,7 +280,7 @@ pub mod gfx11 {
     /// keys and ranks into `plan`, then `word`. Three launches (27 + 33 µs and a 10 µs add) were ~60 µs on the card's
     /// critical chain behind `hc_post`; the chain is the point, so the margins run a token a workgroup.
     #[no_mangle]
-    pub extern "gpu-kernel" fn pred_rows(x: *const f32, ln: *const u16, router: *const u16, scores2: *mut f32, pred: *const f32, scores: *const f32, p_d: *mut f32, p_d2: *mut f32, p_picks: *const u32, plan: *mut u32, word: *mut u32, value: u32, n: u32, keys: *mut f32, count: *mut u32) {
+    pub extern "gpu-kernel" fn pred_rows(x: *const f32, ln: *const u16, router: *const u16, scores2: *mut f32, pred: *const f32, scores: *const f32, p_d: *mut f32, p_d2: *mut f32, aux: *const f32, plan: *mut u32, word: *mut u32, value: u32, n: u32, keys: *mut f32, count: *mut u32) {
         unsafe {
             const RR: usize = crate::hc::gfx11_consts::ROUTE_ROWS;
             let e = workitem_id_x() as usize;
@@ -325,19 +334,16 @@ pub mod gfx11 {
             let i = wg;
             let (ca, cc, ca2) = (*pred.add(HDR), *pred.add(HDR + 1), *pred.add(HDR + 2));
             let (bn, bias) = (*pred.add(BN + e), *pred.add(BIAS + e));
+            // the first margin's threshold and the co-routing sum from the early pass (the same tokens, the same scores)
             let g1 = sigmoid(*scores.add(i * RR + E + e)) + bn;
-            let t1 = eighth(g1, lane, wave, cand, red);
+            let t1 = *aux.add(SPEC_TOKENS * E + i);
+            let co = *aux.add(i * E + e);
             let g2 = sigmoid(*scores2.add(i * RR + E + e)) + bn;
             let t2 = eighth(g2, lane, wave, cand, red);
             let (d, d2) = ((g1 - t1) * 10.0, (g2 - t2) * 10.0);
             *p_d.add(i * E + e) = d;
             *p_d2.add(i * E + e) = d2;
-            let mut z = ca * d + ca2 * d2 + cc + bias;
-            let mut q = 0;
-            while q < TOP_K {
-                z += *pred.add(CO + *p_picks.add(i * TOP_K + q) as usize * E + e);
-                q += 1;
-            }
+            let z = ca * d + ca2 * d2 + cc + bias + co;
             *keys.add(i * E + e) = 1.0 + exp(if z < 20.0 { z } else { 20.0 });
             fence(Ordering::Release);
             workgroup_sync();
