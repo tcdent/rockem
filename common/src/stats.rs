@@ -43,6 +43,23 @@ pub unsafe fn cycles() -> u32 {
 }
 /// The difference of two `cycles()` readings, modulo the register's width.
 pub const CYCLES_MASK: u32 = (1 << 20) - 1;
+/// Every load of this wave landed (`s_waitcnt vmcnt(0)`), so a stamp after it times the loads and not the compiler's
+/// placement of the wait; the compiler treats it as touching memory, so no load moves across it.
+#[cfg(all(target_arch = "amdgpu", feature = "stats"))]
+#[inline(always)]
+pub unsafe fn loads_landed() {
+    core::arch::asm!("s_waitcnt vmcnt(0)", options(nostack, preserves_flags));
+}
+
+/// Where the wave runs: HW_ID1 with the wave and SIMD fields masked off — the WGP, the shader array and the shader
+/// engine (gfx11: wave 0–4, SIMD 8–9, WGP 10–13, SA 16, SE 18–20). Equal values from two workgroups: the same WGP.
+#[cfg(all(target_arch = "amdgpu", feature = "stats"))]
+#[inline(always)]
+pub unsafe fn hw_id() -> u32 {
+    let c: u32;
+    core::arch::asm!("s_getreg_b32 {c}, hwreg(HW_REG_HW_ID1)", c = out(sgpr32) c, options(nostack, nomem, preserves_flags));
+    c & 0x001F_FC00
+}
 
 /// The difference of two `clock()` readings: the 64-bit real-time counter never wraps in a launch.
 pub const CLOCK_MASK: u64 = u64::MAX;
@@ -75,6 +92,32 @@ macro_rules! stat {
         }
     };
 }
+/// `stat_loads_landed!()`: wait for this wave's loads (see `loads_landed`); nothing without stats.
+#[macro_export]
+macro_rules! stat_loads_landed {
+    () => {{
+        #[cfg(feature = "stats")]
+        {
+            $crate::stats::loads_landed()
+        }
+    }};
+}
+
+/// `stat_hwid!()`: the wave's placement (see `hw_id`); 0 without stats.
+#[macro_export]
+macro_rules! stat_hwid {
+    () => {{
+        #[cfg(feature = "stats")]
+        {
+            $crate::stats::hw_id()
+        }
+        #[cfg(not(feature = "stats"))]
+        {
+            0u32
+        }
+    }};
+}
+
 /// `stat_cycles!()`: the shader clock in core cycles (see `cycles`); 0 without stats.
 #[macro_export]
 macro_rules! stat_cycles {

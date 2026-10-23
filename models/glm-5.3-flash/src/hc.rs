@@ -278,6 +278,7 @@ pub mod gfx11 {
     //! add, streams in order.
     pub use super::gfx11_consts::*;
     use crate::*;
+    use common::gemv::gfx11::to_bf16;
     use common::gemv::widen;
     use common::gfx11::{await_word, group_max, group_sum, lane_read, lds, nap, wave_sum, workgroup_sync};
     use common::math::{exp, sqrt};
@@ -919,7 +920,7 @@ pub mod gfx11 {
     /// pick order in place of `yb`, the sums written to `fwd` (the peer's receiving buffer) and, once every
     /// workgroup's are out, `value` to `fwd_word` (the peer's copy of the experts' word). Grid: CHANNEL_GRID.
     #[no_mangle]
-    pub extern "gpu-kernel" fn hc_post(mix: *const f32, ya: *const f32, yb: *const f32, streams: *mut f32, src: *const f32, dst: *mut f32, dst2: *mut f32, n: u32, mine: *mut u32, mine2: *mut u32, w0: *const u32, w1: *const u32, value: u32, go: *mut u32, tokens: u32, rows: *const f32, wts: *const f32, fwd: *mut f32, fwd_word: *mut u32, x: *const f32, pred_x: *mut f32) {
+    pub extern "gpu-kernel" fn hc_post(mix: *const f32, ya: *const f32, yb: *const f32, streams: *mut f32, src: *const f32, dst: *mut f32, dst2: *mut f32, n: u32, mine: *mut u32, mine2: *mut u32, w0: *const u32, w1: *const u32, value: u32, go: *mut u32, tokens: u32, rows: *const f32, wts: *const f32, fwd: *mut f32, fwd_word: *mut u32, x: *const f32, pred_x: *mut f32, pred_ln: *const u16, pred_xn: *mut u16, pred_ss: *mut f32) {
         unsafe {
             let t = workitem_id_x();
             if workgroup_id_x() == 0 {
@@ -989,10 +990,19 @@ pub mod gfx11 {
                     *yb.add(i * H + d)
                 };
                 let yd = *ya.add(i * H + d) + ybv;
-                // the predictor's rows pass (093): the block input plus the whole FFN output, written here where every
-                // term is in hand (a launch of its own was ~10 µs on the card's path)
+                // the predictor's rows pass (093): its input — the block input plus the whole FFN output — written here
+                // where every term is in hand (a launch of its own was ~10 µs on the card's path): as f32 for a long
+                // step's rows kernel, and for a decode step's `pred_rows` already times the next layer's norm weights as
+                // bf16 with the wave's partial sum of squares (`[tokens][PRED_SS]`), so that pass has nothing to stage
+                // (its own normed-input phase was 3–10 µs a workgroup, aff55, 2026-10-22)
                 if !pred_x.is_null() {
-                    *pred_x.add(i * H + d) = *x.add(i * H + d) + yd;
+                    let v = *x.add(i * H + d) + yd;
+                    *pred_x.add(i * H + d) = v;
+                    *pred_xn.add(i * H + d) = to_bf16(v * widen(*pred_ln.add(d)));
+                    let ss = wave_sum(t % 32, v * v);
+                    if t % 32 == 0 {
+                        *pred_ss.add(i * crate::plan::PRED_SS + d / 32) = ss;
+                    }
                 }
                 let mut j = 0;
                 while j < HC {

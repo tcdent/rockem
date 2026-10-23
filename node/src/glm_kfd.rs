@@ -184,7 +184,11 @@ struct Card {
     pred_rows: crate::kfd::Kernel,
     pred_learn: crate::kfd::Kernel,
     pred_input: crate::kfd::Kernel,
+    /// The rows pass's input from `hc_post`: `[STEP][H]` f32 (a long step's rows kernel), the same normed as bf16 with
+    /// the waves' partial sums of squares (a decode step's `pred_rows`) (093).
     pred_x: Mem,
+    pred_xn: Mem,
+    pred_ss: Mem,
     pred_s2: Mem,
     pred_word: Mem,
     /// `pred_step`'s per-token key terms and its workgroups' arrival count (093).
@@ -541,6 +545,8 @@ impl Cards {
                     pred_learn: k.kernel("pred_learn"),
                     pred_input: k.kernel("pred_input"),
                     pred_x: k.vram(STEP * H * 4),
+                    pred_xn: k.vram(STEP * H * 2),
+                    pred_ss: k.vram(STEP * glm_5_3_flash::plan::PRED_SS * 4),
                     pred_s2: k.vram(STEP * ROUTE_ROWS * 4),
                     pred_word: k.vram(64),
                     pred_keys: k.vram(SPEC_TOKENS * glm_5_3_flash::E * 4),
@@ -982,10 +988,11 @@ impl Cards {
                 let wg0 = |k: usize| slots[k].iter().step_by(common::stats::STAT_WAVES_PER_WG as usize).copied();
                 let wgmin = |k: usize| wg0(k).fold(f32::INFINITY, f32::min) as f64;
                 let wgmax = |k: usize| wg0(k).fold(0f32, f32::max) as f64;
+                let wgdistinct = |k: usize| { let mut v: Vec<u32> = wg0(k).map(f32::to_bits).collect(); v.sort_unstable(); v.dedup(); v.len() };
                 prow::row!("track-launches", "kernel_stats", { "lane" => lane.as_str(), "kernel" => name, "dur_us" => dur_us, "waves" => slots[0].len(),
                     "s0_w0" => w0(0), "s0_mean" => mean(0), "s0_max" => max(0), "s1_w0" => w0(1), "s1_mean" => mean(1), "s1_max" => max(1),
                     "s2_w0" => w0(2), "s2_mean" => mean(2), "s2_max" => max(2), "s3_w0" => w0(3), "s3_mean" => mean(3), "s3_max" => max(3),
-                    "s0_wgmin" => wgmin(0), "s0_wgmax" => wgmax(0), "s1_wgmin" => wgmin(1), "s1_wgmax" => wgmax(1), "s2_wgmin" => wgmin(2), "s2_wgmax" => wgmax(2) });
+                    "s0_wgmin" => wgmin(0), "s0_wgmax" => wgmax(0), "s1_wgmin" => wgmin(1), "s1_wgmax" => wgmax(1), "s2_wgmin" => wgmin(2), "s2_wgmax" => wgmax(2), "s2_wgdistinct" => wgdistinct(2) });
             }
         }
     }
@@ -1047,7 +1054,7 @@ impl Cards {
     /// a few tokens' inside `hc_post`. `mine`: this card's word, written to its own copy and the peer's.
     /// `w0`, `w1`: words read from this card's own copy. `ya`, `yb`: the shares, in this card's VRAM.
     #[allow(clippy::too_many_arguments)]
-    fn hc_post(&self, c: &Card, copy: Option<(usize, usize, usize)>, mine: Option<(usize, usize)>, w0: Option<(usize, usize)>, w1: Option<(usize, usize)>, value: u32, ya: usize, yb: Option<usize>, tokens: usize, routed: Option<(usize, usize, usize, usize)>, pred: Option<(usize, usize)>) {
+    fn hc_post(&self, c: &Card, copy: Option<(usize, usize, usize)>, mine: Option<(usize, usize)>, w0: Option<(usize, usize)>, w1: Option<(usize, usize)>, value: u32, ya: usize, yb: Option<usize>, tokens: usize, routed: Option<(usize, usize, usize, usize)>, pred: Option<(usize, usize, usize, usize, usize)>) {
         let me = c.k.index;
         let own = |w: Option<(usize, usize)>| w.map_or(0, |(k, d)| self.peers[me].words.at(self.wd(k, d)));
         let peer = (0..self.cards.len()).find(|&j| j != me);
@@ -1066,8 +1073,10 @@ impl Cards {
         a.ptr(self.tok(&c.mix, HC_MIX)).ptr(ya).ptr(yb.unwrap_or(0)).ptr(self.tok(&c.streams, HC * H)).ptr(src).ptr(0usize).ptr(dst2).u32(n as u32).ptr(own(mine)).ptr(mine2).ptr(own(w0)).ptr(own(w1)).u32(value).ptr(c.go.va).u32(tokens as u32);
         let (rows, wts, fwd, fwd_word) = routed.unwrap_or((0, 0, 0, 0));
         a.ptr(rows).ptr(wts).ptr(fwd).ptr(fwd_word);
-        let (px_in, px_out) = pred.unwrap_or((0, 0));
-        a.ptr(px_in).ptr(px_out);
+        // the predictor's rows pass behind this launch: its input written here (the block input in; the f32 input, the
+        // next layer's norm weights, the normed bf16 input and the partial sums of squares out)
+        let (x, px, pln, pxn, pss) = pred.unwrap_or((0, 0, 0, 0, 0));
+        a.ptr(x).ptr(px).ptr(pln).ptr(pxn).ptr(pss);
         c.k.launch(&c.hc_post, CHANNEL_GRID, g::WG, 0, &a);
     }
     /// The FFN router's place: on the FFN card of a MoE layer, `hc_pre` runs layer `l`'s FFN router (and the
@@ -1938,7 +1947,7 @@ impl Placed for Cards {
                 let fwd = peer.map(|j| (self.tok(&self.peers[j].yr[parity], H), self.peers[j].words.at(self.wd(W_EXPERTS, 0))));
                 let (fwd, fwd_word) = fwd.unwrap_or((0, 0));
                 // the leader writes the predictor's rows-pass input too (x + the whole FFN output) where it has every term
-                let pred = f.pred.as_ref().map(|_| (self.tok(&o.x, H), self.tok(&o.pred_x, H)));
+                let pred = f.pred.as_ref().map(|_| (self.tok(&o.x, H), self.tok(&o.pred_x, H), f.ln.va, self.tokb(&o.pred_xn, H * 2), self.tok(&o.pred_ss, glm_5_3_flash::plan::PRED_SS)));
                 self.hc_post(o, copy, mine, Some((W_FFN, f.card)), Some((W_EXPERTS, 0)), value, fy, None, n, Some((rows, self.tok(&o.wv, TOP_K), fwd, fwd_word)), pred);
             } else {
                 self.hc_post(o, copy, mine, Some((W_FFN, f.card)), Some((W_EXPERTS, 0)), value, fy, Some(self.tok(&self.peers[me].yr[parity], H)), n, None, None);
@@ -2170,7 +2179,7 @@ impl Cards {
         let Some(f) = self.ffns[l].as_ref().filter(|f| f.pred.is_some()) else { return };
         let (st, d, d2) = f.pred.as_ref().unwrap();
         let c = &self.cards[f.card];
-        let (px, ps2) = (self.tok(&c.pred_x, H), self.tok(&c.pred_s2, ROUTE_ROWS));
+        let (px, pxn, pss, ps2) = (self.tok(&c.pred_x, H), self.tokb(&c.pred_xn, H * 2), self.tok(&c.pred_ss, glm_5_3_flash::plan::PRED_SS), self.tok(&c.pred_s2, ROUTE_ROWS));
         // the routed rows: the host's experts' rows as the leader holds them once its word is in (this pass runs behind
         // `hc_post`, which waited for it), weighted in pick order (093); null for the early pass
         let router = f.router.as_ref().unwrap().va;
@@ -2178,9 +2187,9 @@ impl Cards {
             // `hc_post` wrote the input (x + the whole FFN output); the next layer's router, the margins and the plan in
             // one launch (`pred_rows`: three launches were ~60 µs on the card's chain behind `hc_post`, 2026-10-22)
             let mut a = Args::new();
-            a.ptr(px).ptr(f.ln.va).ptr(router).ptr(ps2).ptr(st.va).ptr(self.tok(&c.scores_v, ROUTE_ROWS)).ptr(d.at(self.t0 * E * 4)).ptr(d2.at(self.t0 * E * 4)).ptr(c.pred_aux.va);
+            a.ptr(pxn).ptr(pss).ptr(router).ptr(ps2).ptr(st.va).ptr(self.tok(&c.scores_v, ROUTE_ROWS)).ptr(d.at(self.t0 * E * 4)).ptr(d2.at(self.t0 * E * 4)).ptr(c.pred_aux.va);
             a.ptr(self.shared.plan2.va).ptr(self.shared.words.at(self.wd(W_PLAN2, f.card))).u32(self.half_seq[l][self.ch][1]).u32(n as u32).ptr(c.pred_keys.va).ptr(c.pred_count.va);
-            c.k.launch(&c.pred_rows, glm_5_3_flash::plan::PRED_ROWS_BLOCKS, PLAN_WG, glm_5_3_flash::plan::PRED_ROWS_LDS, &a);
+            c.k.launch(&c.pred_rows, glm_5_3_flash::plan::PRED_ROWS_BLOCKS, PLAN_WG, PLAN_LDS, &a);
             return;
         }
         if rows {

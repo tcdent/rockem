@@ -1,11 +1,14 @@
 # 093 — The routed rows as the predictor's signal
 
-**Status:** Built and kept (aff41, 170474a, 2026-10-22) — the two-phase plan: the early pass before `hc_post`, the
-rows pass behind it with the whole FFN output as the margin's input, the running prefetch amended from the next layer's
-card wait. Complete host experts a layer 7.73 → 7.86, missed 5.19 → 4.89, no lateness at the slot; the pass costs the
-card ~60 µs a layer behind `hc_post` (verify step 52.73 → 55.23 ms on the 96-token read). tcdent 2026-10-22: "it still
-doesn't look like it's slowing us down. The accuracy is worth keeping. I think we're gonna stay with this." The free
-form — one fused launch on the peer card — is the recorded next step.
+**Status:** Built and kept (aff41, 170474a, 2026-10-22; the pass fused and shrunk through aff60, 2026-10-23) — the
+two-phase plan: the early pass before `hc_post`, the rows pass behind it with the whole FFN output as the margin's
+input, the running prefetch amended from the next layer's card wait. Complete host experts a layer 7.73 → 7.86, missed
+5.19 → 4.89, no lateness at the slot. The rows pass is one launch, `pred_rows`, **24.7 µs (p90 28.3) in the release
+object** (aff60) — from ~60 as two launches (aff41) and 58 as the first fused form (aff45); the verify step 55.23 (aff41)
+→ **52.0 ms** on the 96-token read (aff34, before the pass: 52.73), the prediction 7.3 / 3.4 / 4.94, SCORE bit-identical.
+tcdent 2026-10-22: "it still doesn't look like it's slowing us down. The accuracy is worth keeping. I think we're
+gonna stay with this." Its floor is the router rows' 2.4 MB burst into a cold L2 (aff59); what is left to take: FP8
+rows (half the burst) or the pass on the peer card (off the leader's chain).
 **Area:** decode
 **Gain:** offline, the route-ahead over the FFN input plus the whole FFN output as the second margin settled recall@13
 .6205 → .647 (phase3b, +.027, nearly the full attention-ahead's +.038 of queue 092) for 2.4 MB of router weights and
@@ -112,7 +115,57 @@ spends 8–14 µs on two tokens' normed inputs into LDS, sixteen row loads, two 
 pred_rows 28.3, the prediction 7.41 / 3.01 / 4.89. **aff55** stamps that phase's three parts (the inputs into LDS up to
 the sync; the sync's wait; the row loads and dots to the store) per workgroup. (aff54 re-ran aff53's code object: the
 stats build had failed on a stamp's scope and the chain went on to install the stale ELF — a build's exit code, not its
-grep, gates the install from here; the deploy log's manifest hash is the check.)
+grep, gates the install from here; the deploy log's manifest hash is the check.) **Read (aff55), per workgroup
+(fastest / workgroup 0 / slowest):** the inputs into LDS 2.8 / 3.8 / 10.1 µs; the sync's wait 0.2 / 0.2 / 0.4; the
+row loads and dots 3.4 / 5.8 / 6.6; the rank 5.2; pred_rows 28.3. Forty kilobytes every workgroup shares taking up to
+10 µs, with a 7 µs spread, is a queue: all 288 waves' sixteen row loads (2.4 MB, cold in VRAM — a different layer's
+router every launch) are in flight in the same burst, and the inputs wait behind them. The bytes are the floor, but
+the card spends 150–280 µs in `hc_post`'s spin on the host's experts right before this launch.
+
+**aff56 (2026-10-22):** `hc_post`'s workgroups 1–15 touch the next layer's router rows (the stacked router's rows
+E..2E, 2.4 MB, 16 bytes a thread a round) into L2 under the wait, the loads volatile and their values dropped; the
+host passes the rows beside the predictor's input. The L2 is 6 MB and hc_post's own phase reads ~0.4 MB after the
+wait, so the rows should still be there when pred_rows reads them. A touch, no arithmetic: SCORE stays bit-identical. **Read:** 28.2 µs, every per-workgroup number the same (inputs 2.7 / 4.0 / 10.1, dots 3.4 / 5.5 / 6.6).
+Removed: the rows' source is not the cost. What the stamps describe instead is a chain of dependent latency steps
+a wave — the input loads, the converts, the LDS stores and a sync, the row loads, two serial LDS reads of eight
+partial sums each, two wave sums — and a per-workgroup spread (2.7 → 10.1 on the same 40 KB) that looks like
+workgroups sharing a WGP's SIMDs rather than memory.
+
+**aff57 (2026-10-23):** `hc_post` prepares the pass's input in the form the GEMV wants, where it already writes
+`pred_x`: the input times the next layer's norm weights as bf16 (`pred_xn`) and each wave's partial sum of squares
+(`pred_ss: [tokens][128]`); the f32 `pred_x` stays for a long step's rows kernel. `pred_rows` is then loads, FMAs and
+two wave sums: the row's sixteen 16-byte loads held, a token's in two rounds of eight at constant offsets (a loop
+variable in the held row's index put it in scratch; 192 VGPRs and 76 bytes of scratch before `dot_half::<OFF>`), its
+partials one 16-byte load a lane. No LDS staging, one barrier fewer (10 → 9), 184 VGPRs, no scratch. **Read:** pred_rows
+28.2 → **27.0** µs (p90 30); the GEMV phase 6.2 / 7.0 / 12.1 (fastest / workgroup 0 / slowest), workgroup 0's barrier
+wait 6.0 (the lift set by the slowest workgroup's 12.1), the margins 6.3, the rank 5.3; the prediction 7.40 / 3.02 /
+4.89, SCORE bit-identical. The GEMV's remaining dependent steps: the row's loads, then two rounds of eight a token and
+two wave sums. All sixteen of a token in one round beside the held row is 192 VGPRs and scratch, with or without the
+row's base read first-lane into a scalar register (`v_readfirstlane` did not turn the loads scalar-based; the helper
+was removed again). The 2× spread between the fastest and the slowest workgroup on identical work survives every
+change so far; **aff58** stamps each workgroup's HW_ID1 (WGP, shader array, shader engine) and the host counts the
+distinct placements over the grid (`s2_wgdistinct`): 32 means every workgroup alone on its WGP, fewer means sharing. **Read:** 32 distinct in every one of 2009 launches — no sharing; pred_rows 26.7, the GEMV 6.2 / 7.0 / 12.0.
+The spread is memory-side then: the workgroups' row loads (2.4 MB, all in flight at once) are served in some order and
+the last-served workgroup sets the lift — 6 µs of spread on 2.4 MB is ~400 GB/s, a cold burst from VRAM, which the
+aff56 touch should have turned into L2 or MALL hits and did not. **aff59** stamps the moment a wave's row loads land
+(a `vmcnt(0)` wait before the stamp, stats build only) to see the rows' round alone, fastest to slowest. **Read:** the row
+loads land after **0.4 / 2.8 / 8.6 µs** (fastest / workgroup 0 / slowest) — a queue: 2.4 MB in flight at once drains at
+~280 GB/s, the outstanding-miss capacity times the latency, not the bus. And with the wait in place the GEMV phase
+became 14.2 / 14.6 / 15.0 in every workgroup: the token's loads, hot or not, enter the same queue and wait for the
+burst to drain, so the fastest workgroup gains nothing from its rows landing first. The whole phase is the burst.
+Why the aff56 touch did nothing: the launcher acquires at system scope — an L2 invalidate — on the first dispatch
+after the host wrote, and the host writes the experts' rows and word during `hc_post`, so pred_rows always starts
+with an empty L2 (kfd.rs: `host_wrote`). What would move the burst: half the bytes (FP8 rows, 1.2 MB, the
+bit-transplant decode of [[fp8-rows-decode]]), or the pass off the leader's chain onto the peer card (the free form
+noted at aff41), which removes all 27 µs from the card's path between `hc_post` and the next attention rather than
+shaving it. pred_rows 29.3 with the measuring wait (the wait itself costs the overlap of the token's loads with the
+rows'); the wait is in the stats build only.
+
+**aff60 (release object, the full 18k workload, 2026-10-23):** pred_rows 24.7 µs p50 / 28.3 p90 over 5494 launches
+(the stats object's stamps cost ~2.5); the verify step 52.01 ms (laps median; aff45 55.36, aff41 55.23, aff34 52.73
+without the pass); the verify profile's per-token total 22.61 (aff47 24.14); the prediction 7.30 / 3.40 / 4.94; SCORE
+bit-identical. The two-phase plan's card cost is paid back: the step is where it was before the pass existed, with the
+prediction's gain kept.
 
 ## The chain (2026-10-22)
 aff36 single-phase: the signal (missed 5.19 → 4.79) but the plan 98.6 µs late at the slot, step 57.84. aff37 two-phase,
