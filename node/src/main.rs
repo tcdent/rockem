@@ -705,6 +705,11 @@ fn serve(listen: &str, sessions: &mut [Session], identity: u64) {
             continue;
         }
         session.started = false;
+        // a new connection inherits nothing of the last one's audio: rows a sequence left queued when its connection
+        // closed mid-way are dropped here, not refused at the next BOS (which refused every transcription after one
+        // abandoned, 2026-10-23)
+        session.e.audio_reset();
+        (session.audio_salt, session.audio_fed, session.audio_rows) = (0, 0, 0);
         let mut word = [0u8; 4];
         let mut ids: Vec<u32> = Vec::new();
         // ids are fed as they arrive, in whatever steps arrive: a prompt that is already in the

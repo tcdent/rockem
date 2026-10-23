@@ -1,8 +1,11 @@
 # 095 — Voxtral-Small-24B in the node
 
-**Status:** Built and verified in the gate (2026-10-23); deploying beside GLM (aff65). Transcription of three
-LibriSpeech clips through our own encoder and INT4 decoder matches their ground truth word for word (casing and
-punctuation aside), ending at EOS on its own; the decoder's top-1 against the reference's own transcript 37/38.
+**Status:** LIVE beside GLM on metatron (aff68, 2026-10-23 15:24: `models glm-5.3-flash voxtral-small-24b`; GLM's
+18k workload and long SCORE bit-identical beside it; `/rockem/v1/transcribe` answered three LibriSpeech clips word for
+word in ~18 s each — one 30 s window: encoder + prefill ~15 s, then ~90 ms a token). aff69 fixes a refusal: a
+connection closed with audio rows still queued left them in the engine and the next BOS refused every later
+transcription; a new connection drops them now. In the gate: the decoder's top-1 against the reference's own
+transcript 37/38; the three clips transcribed exactly (casing and punctuation aside), ending at EOS on their own.
 **Area:** node, bundle, bring-up
 **Gain:** transcription as a separate API step (docs/queue/094), audio in and reviewable text out, on the CPU beside
 GLM — both resident, the wire selecting (tcdent 2026-10-23: "not parallel but in ram", "same node process").
