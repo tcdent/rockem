@@ -196,6 +196,21 @@ unsafe impl GlobalAlloc for Classes {
         p
     }
     #[inline]
+    /// Zeroed: a classed block is written (small); anything larger is the system's `calloc`, whose fresh pages
+    /// are zero without being touched. The default (`alloc` then `write_bytes`) touched every page of a context
+    /// store's 20 GB active region on each open — 10 s a request, and 20 GB resident per kept context until the
+    /// box ran out of memory after ~15 requests (2026-10-23).
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        if class_of(&layout).is_none() {
+            return std::alloc::System.alloc_zeroed(layout);
+        }
+        let p = self.alloc(layout);
+        if !p.is_null() {
+            ptr::write_bytes(p, 0, layout.size());
+        }
+        p
+    }
+    #[inline]
     unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
         let Some(c) = class_of(&layout) else { return std::alloc::System.dealloc(p, layout) };
         let size = 1 << (c + MIN_SHIFT);

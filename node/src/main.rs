@@ -405,7 +405,7 @@ impl Session {
         self.pos = at;
         self.hits = at - first;
         prow::row!("track-store", "store_resume", { "matched" => n, "transcript" => self.store.contexts[src].as_ref().unwrap().ids.len(), "at" => at, "drawn" => drawn, "replayed" => replay.len() });
-        replay.is_empty() || self.feed_many(&replay, &mut |_| {})
+        replay.is_empty() || self.feed_many(&replay, &mut |_| {}, &|| false)
     }
     /// The sequence state now, kept with the active context at this position (the end of a
     /// prompt): what a later turn resumes from. Nothing for a model whose state is all rows.
@@ -437,7 +437,10 @@ impl Session {
     /// nothing, and from the first that does not, the rest are computed in
     /// steps. In scoring mode every id's ln p is given to `emit` before it is
     /// fed, in order. False when the context is full or the prefix is not the model's.
-    fn feed_many(&mut self, ids: &[u32], emit: &mut dyn FnMut(f32)) -> bool {
+    /// `gone` is asked before every computed step: a peer that closed during a long prompt's prefill is noticed
+    /// there, not at the first write after it (an abandoned 18k prompt held the node — and every connection
+    /// waiting behind it — for the whole prefill, 2026-10-23), so abort is closing the connection in prefill too.
+    fn feed_many(&mut self, ids: &[u32], emit: &mut dyn FnMut(f32), gone: &dyn Fn() -> bool) -> bool {
         let mut at = 0;
         while at < ids.len() {
             let id = ids[at];
@@ -465,7 +468,7 @@ impl Session {
             }
             // the rest of the ids are computed: a step of up to `tokens()` at a time
             let n = (ids.len() - at).min(self.e.tokens()).min(self.max_ctx.saturating_sub(self.pos));
-            if n == 0 {
+            if n == 0 || gone() {
                 return false;
             }
             if self.scoring {
@@ -564,7 +567,7 @@ impl Session {
     }
     /// One token through the model at the next position. False when the context is full.
     fn feed(&mut self, id: u32) -> bool {
-        self.feed_many(&[id], &mut |_| {})
+        self.feed_many(&[id], &mut |_| {}, &|| false)
     }
     /// GENERATE: sample, emit, feed, until EOS or `limit` tokens. Every emitted
     /// id goes through the model, so the sequence can continue from it. False
@@ -692,7 +695,12 @@ fn serve(listen: &str, sessions: &mut [Session], identity: u64) {
                 return true;
             }
             let mut ok = true;
-            let done = session.started && session.feed_many(ids, &mut |lp| ok &= s.write_all(&lp.to_bits().to_le_bytes()).is_ok());
+            // the peer closed? `poll` for POLLRDHUP: the peer's shutdown shows even with its prompt still unread
+            // in the socket (a peek sees those bytes, not the FIN queued behind them — the first form of this,
+            // aff62, let an aborted 18k prompt run its whole prefill)
+            let fd = { use std::os::fd::AsRawFd; s.as_raw_fd() };
+            let gone = || peer_hung_up(fd);
+            let done = session.started && session.feed_many(ids, &mut |lp| ok &= s.write_all(&lp.to_bits().to_le_bytes()).is_ok(), &gone);
             ids.clear();
             done && ok
         };
@@ -765,6 +773,26 @@ fn serve(listen: &str, sessions: &mut [Session], identity: u64) {
         }
         session.e.idle();
     }
+}
+
+/// Whether the peer has shut down its side of `s` (Linux `poll` with POLLRDHUP, no wait): true on hang-up or
+/// error, false while it lives, whatever is still unread.
+fn peer_hung_up(fd: i32) -> bool {
+    #[repr(C)]
+    struct PollFd {
+        fd: i32,
+        events: i16,
+        revents: i16,
+    }
+    extern "C" {
+        fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
+    }
+    const POLLERR: i16 = 0x008;
+    const POLLHUP: i16 = 0x010;
+    const POLLRDHUP: i16 = 0x2000;
+    let mut p = PollFd { fd, events: POLLRDHUP, revents: 0 };
+    let n = unsafe { poll(&mut p, 1, 0) };
+    n < 0 || (n > 0 && p.revents & (POLLRDHUP | POLLHUP | POLLERR) != 0)
 }
 
 /// A generated continuation: the prompt's positions past the prefix (`hits` of them from the store),
@@ -907,7 +935,7 @@ fn main() {
             continue;
         }
         session.start();
-        if !session.feed_many(&ids[1..], &mut |_| {}) {
+        if !session.feed_many(&ids[1..], &mut |_| {}, &|| false) {
             println!("[the context is full, or the prefix is not the model's]");
             continue;
         }
