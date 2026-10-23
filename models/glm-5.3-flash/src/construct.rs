@@ -638,7 +638,11 @@ impl Threads {
         let current = sh.job.load(Ordering::Acquire);
         if !current.is_null() {
             let c = unsafe { &*current };
-            c.stop.store(true, Ordering::Relaxed);
+            // a prefetch amended by a prefetch (093): the items in flight finish (their lines are the point, their takers
+            // kept by the new plan), the unclaimed are simply never claimed. A run stops everything.
+            if !(c.light && unsafe { (*job).light }) {
+                c.stop.store(true, Ordering::Relaxed);
+            }
             c.stopped.store(c.t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
             if c.light {
                 // a prefetch it overtook: what it managed so far, and its row once its workers have left it
@@ -1023,6 +1027,134 @@ impl<'a> CpuExperts<'a> {
         }
         this
     }
+    /// The prefetch posted: an item a run of consecutive slices on one queue (the static `slice_runs`), in plan order.
+    /// With a `prior` (the early plan's job, 093): its items already taken are skipped — their lines are in their
+    /// takers' caches — and keep their takers in the merged `Planned`; the rest are reposted in the new order.
+    fn prefetch_with(&self, l: usize, idx: &[usize], prior: Option<Planned>) {
+        // the stream lives as long as the process (the node leaks it; the gate's outlives every token):
+        // the job that owns these closures is gone within the token
+        let stream: &'static expert::Stream<'static> = unsafe { std::mem::transmute::<&expert::Stream, &'static expert::Stream<'static>>(self.stream) };
+        let pool = self.pool;
+        // an item an (expert, node, CCD): the slices of that expert the compute will slot there, in the
+        // compute's order — a slice's node from its rows' page, its CCD from the expert's id and the slice
+        let (n_gu, n_down) = (GU_ITEMS, DOWN_ITEMS);
+        let z = prow::Timestamp::now();
+        let idx: Vec<usize> = idx.to_vec();
+        let idx_plan = idx.clone();
+        let tables = self.tables.read().unwrap();
+        // the items cut from `slice_order` (each expert's slices already in queue order): an item is (expert position,
+        // queue, its run in `slices`), every item's slice ids in one flat copy the job owns
+        let mut items: Vec<(usize, usize, u16, u16)> = Vec::with_capacity(idx.len() * 16);
+        let mut slices: Vec<u8> = Vec::with_capacity(idx.len() * (n_gu + n_down));
+        let mut item_of = vec![u16::MAX; idx.len() * (n_gu + n_down)];
+        let mut taken_out: Vec<u8> = Vec::new();
+        // the early plan's taken items (093): by slice, the taker's index into `taken`
+        let (prior_pos, taken): (Vec<u16>, Vec<u8>) = match &prior {
+            Some(pp) => {
+                let mut pos = vec![u16::MAX; E];
+                for (k, &e) in pp.idx.iter().enumerate() {
+                    pos[e] = k as u16;
+                }
+                let tk: Vec<u8> = pp.takers.as_ref().map_or(Vec::new(), |t| t.iter().map(|a| a.load(Ordering::Relaxed)).collect());
+                (pos, tk)
+            }
+            None => (Vec::new(), Vec::new()),
+        };
+        #[cfg(feature = "track-experts")]
+        let mut fin0 = vec![0u16; idx.len()];
+        for (k, &e) in idx.iter().enumerate() {
+            let rec = ((l - FIRST_K_DENSE_REPLACE) * E + e) * (n_gu + n_down);
+            let (order, runs) = (&tables.slice_order[rec..rec + n_gu + n_down], &tables.slice_runs[rec..rec + n_gu + n_down]);
+            // an item a slice (272 KB, ~70 µs a core): a CCD's 13 experts' worth packs its cores to the window's end. As one
+            // item an (expert, CCD) — four slices, ~290 µs — a CCD's 13 items over ~7 takers went in two waves, the second
+            // ending at the cutoff with ~2 items in flight and cores idle a quarter of the window (busy 464 of 617 µs,
+            // done 133 of 156, the CCD at 19.6 GB/s against the cleanroom's 32; 2026-10-22)
+            // an item: a run of consecutive slice ids on one queue — contiguous bytes in the stream (a gate/up pair, 544 KB,
+            // or a down pair), touched as one stream. One item a slice (272 KB) and one an (expert, CCD) with four
+            // scattered slices both measured below the contiguous stream's rate (2026-10-22)
+            let base = slices.len() as u16;
+            slices.extend_from_slice(order);
+            let pk = prior.as_ref().and_then(|_| prior_pos.get(e).copied()).filter(|&k| k != u16::MAX);
+            for &[a, len, q] in runs {
+                if len == 0 {
+                    break;
+                }
+                let (a, len) = (a as usize, len as usize);
+                // the same run in the early plan, taken already (093): its taker kept, the item not reposted
+                if let Some(pk) = pk {
+                    let pp = prior.as_ref().unwrap();
+                    let t = pp.item_of[pk as usize * (n_gu + n_down) + order[a] as usize];
+                    let w = if t == u16::MAX { u8::MAX } else if t & 0x8000 != 0 { pp.taken.get((t & 0x7fff) as usize).copied().unwrap_or(u8::MAX) } else { taken.get(t as usize).copied().unwrap_or(u8::MAX) };
+                    if w != u8::MAX {
+                        let ti = taken_out.len() as u16;
+                        taken_out.push(w);
+                        for &j in &order[a..a + len] {
+                            item_of[k * (n_gu + n_down) + j as usize] = 0x8000 | ti;
+                        }
+                        #[cfg(feature = "track-experts")]
+                        {
+                            fin0[k] += 1;
+                        }
+                        continue;
+                    }
+                }
+                for &j in &order[a..a + len] {
+                    item_of[k * (n_gu + n_down) + j as usize] = items.len() as u16;
+                }
+                items.push((k, q as usize, base + a as u16, len as u16));
+            }
+        }
+        drop(tables);
+        let n = items.len();
+        let z = draft_zone("pf.cut", z);
+        #[cfg(feature = "track-experts")]
+        let finished = {
+            let mut per = fin0.clone();
+            for it in &items {
+                per[it.0] += 1;
+            }
+            let fin = std::sync::Arc::new(fin0.iter().map(|&f| std::sync::atomic::AtomicU16::new(f)).collect::<Vec<_>>());
+            *self.pf.lock().unwrap() = Some((l, idx.clone(), per, fin.clone()));
+            fin
+        };
+        let items = std::sync::Arc::new((items, slices));
+        let (i1, i3) = (items.clone(), items);
+        let slot = move |i: usize| i1.0[i].1;
+        // the touch reads the abandon flag every 4 KB inside its stream: the run that overtakes this job waits only for
+        // the chunks in flight
+        let pool_s: &'static dyn Pool = unsafe { std::mem::transmute::<&dyn Pool, &'static dyn Pool>(pool) };
+        let f = move |i: usize| {
+            let (it, slices) = (&i3.0[i], &i3.1);
+            let w = expert::Weights::at(stream, l, idx[it.0]);
+            // the item's slices as one byte range where adjacent in memory, else one by one
+            let run = &slices[it.2 as usize..(it.2 + it.3) as usize];
+            let bytes_of = |j: usize| if j < n_gu { w.gu_bytes(j) } else { w.down_bytes(j - n_gu) };
+            let mut a = 0;
+            while a < run.len() {
+                let first = bytes_of(run[a] as usize);
+                let (start, mut end) = (first.as_ptr() as usize, first.as_ptr() as usize + first.len());
+                let mut b = a + 1;
+                while b < run.len() {
+                    let nb = bytes_of(run[b] as usize);
+                    if nb.as_ptr() as usize != end {
+                        break;
+                    }
+                    end += nb.len();
+                    b += 1;
+                }
+                if !touch(unsafe { std::slice::from_raw_parts(start as *const u8, end - start) }, &|| pool_s.abandoned()) {
+                    return;
+                }
+                a = b;
+            }
+            #[cfg(feature = "track-experts")]
+            finished[it.0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        };
+        let takers = self.pool.prefetch_slotted(n, Box::new(slot), Box::new(f));
+        let z = draft_zone("pf.post", z);
+        *self.planned.lock().unwrap() = Some(Planned { l, idx: idx_plan, item_of, takers, taken: taken_out });
+        draft_zone("pf.planned", z);
+    }
     /// The slices' nodes read again from the placement: after the stream's items were re-placed.
     pub fn relearn(&mut self) {
         let (stream, pool) = (self.stream, self.pool);
@@ -1254,10 +1386,27 @@ struct Planned {
     l: usize,
     /// The experts posted, in order.
     idx: Vec<usize>,
-    /// Each slice's prefetch item, `[k][GU_ITEMS + DOWN_ITEMS]` (`u16::MAX`: none).
+    /// Each slice's prefetch item, `[k][GU_ITEMS + DOWN_ITEMS]` (`u16::MAX`: none); bit 15 set: an item of the early
+    /// plan taken before the amendment, its taker in `taken` (093).
     item_of: Vec<u16>,
     /// Each item's taker (the pool's worker index; `u8::MAX`: not taken), filled in as the prefetch runs.
     takers: Option<std::sync::Arc<Vec<std::sync::atomic::AtomicU8>>>,
+    /// The early plan's items taken before the amendment, by their index there.
+    taken: Vec<u8>,
+}
+impl Planned {
+    /// Slice `j` of expert position `k`'s taker: a worker index, or `u8::MAX`.
+    fn taker(&self, k: usize, j: usize) -> u8 {
+        const SL: usize = GU_ITEMS + DOWN_ITEMS;
+        let t = self.item_of[k * SL + j];
+        if t == u16::MAX {
+            u8::MAX
+        } else if t & 0x8000 != 0 {
+            self.taken.get((t & 0x7fff) as usize).copied().unwrap_or(u8::MAX)
+        } else {
+            self.takers.as_ref().map_or(u8::MAX, |tk| tk[t as usize].load(Ordering::Relaxed))
+        }
+    }
 }
 /// Plan a layer's expert run from its picks (`idx`, the residents marked `E`) and the prefetch's plan: the experts and
 /// their (token, pick) pairs, in the plan's order; each slice's slot (a planned slice to its taker's own queue); the
@@ -1337,16 +1486,10 @@ fn plan_run(ctx: &Ctx, l: usize, idx: &[[usize; TOP_K]], xq: &[i8], xs: &[f32], 
             if let Some(p) = &planned {
                 let k = pos_of[e];
                 if k != u16::MAX {
-                    if let Some(tk) = &p.takers {
-                        let item_of = &p.item_of[k as usize * SL..(k as usize + 1) * SL];
-                        for x in 0..SL {
-                            let t = item_of[x];
-                            if t != u16::MAX {
-                                let w = tk[t as usize].load(Ordering::Relaxed);
-                                if w != u8::MAX {
-                                    row[x] = (CORE + w as usize) as u8;
-                                }
-                            }
+                    for x in 0..SL {
+                        let w = p.taker(k as usize, x);
+                        if w != u8::MAX {
+                            row[x] = (CORE + w as usize) as u8;
                         }
                     }
                 }
@@ -1538,95 +1681,12 @@ impl Routed for CpuExperts<'_> {
         std::mem::take(&mut self.elapsed)
     }
     fn prefetch(&self, l: usize, idx: &[usize]) {
-        // the stream lives as long as the process (the node leaks it; the gate's outlives every token):
-        // the job that owns these closures is gone within the token
-        let stream: &'static expert::Stream<'static> = unsafe { std::mem::transmute::<&expert::Stream, &'static expert::Stream<'static>>(self.stream) };
-        let pool = self.pool;
-        // an item an (expert, node, CCD): the slices of that expert the compute will slot there, in the
-        // compute's order — a slice's node from its rows' page, its CCD from the expert's id and the slice
-        let (n_gu, n_down) = (GU_ITEMS, DOWN_ITEMS);
-        let z = prow::Timestamp::now();
-        let idx: Vec<usize> = idx.to_vec();
-        let idx_plan = idx.clone();
-        let tables = self.tables.read().unwrap();
-        // the items cut from `slice_order` (each expert's slices already in queue order): an item is (expert position,
-        // queue, its run in `slices`), every item's slice ids in one flat copy the job owns
-        let mut items: Vec<(usize, usize, u16, u16)> = Vec::with_capacity(idx.len() * 16);
-        let mut slices: Vec<u8> = Vec::with_capacity(idx.len() * (n_gu + n_down));
-        let mut item_of = vec![u16::MAX; idx.len() * (n_gu + n_down)];
-        for (k, &e) in idx.iter().enumerate() {
-            let rec = ((l - FIRST_K_DENSE_REPLACE) * E + e) * (n_gu + n_down);
-            let (order, runs) = (&tables.slice_order[rec..rec + n_gu + n_down], &tables.slice_runs[rec..rec + n_gu + n_down]);
-            // an item a slice (272 KB, ~70 µs a core): a CCD's 13 experts' worth packs its cores to the window's end. As one
-            // item an (expert, CCD) — four slices, ~290 µs — a CCD's 13 items over ~7 takers went in two waves, the second
-            // ending at the cutoff with ~2 items in flight and cores idle a quarter of the window (busy 464 of 617 µs,
-            // done 133 of 156, the CCD at 19.6 GB/s against the cleanroom's 32; 2026-10-22)
-            // an item: a run of consecutive slice ids on one queue — contiguous bytes in the stream (a gate/up pair, 544 KB,
-            // or a down pair), touched as one stream. One item a slice (272 KB) and one an (expert, CCD) with four
-            // scattered slices both measured below the contiguous stream's rate (2026-10-22)
-            let base = slices.len() as u16;
-            slices.extend_from_slice(order);
-            for &[a, len, q] in runs {
-                if len == 0 {
-                    break;
-                }
-                let (a, len) = (a as usize, len as usize);
-                for &j in &order[a..a + len] {
-                    item_of[k * (n_gu + n_down) + j as usize] = items.len() as u16;
-                }
-                items.push((k, q as usize, base + a as u16, len as u16));
-            }
-        }
-        drop(tables);
-        let n = items.len();
-        let z = draft_zone("pf.cut", z);
-        #[cfg(feature = "track-experts")]
-        let finished = {
-            let mut per = vec![0u16; idx.len()];
-            for it in &items {
-                per[it.0] += 1;
-            }
-            let fin = std::sync::Arc::new((0..idx.len()).map(|_| std::sync::atomic::AtomicU16::new(0)).collect::<Vec<_>>());
-            *self.pf.lock().unwrap() = Some((l, idx.clone(), per, fin.clone()));
-            fin
-        };
-        let items = std::sync::Arc::new((items, slices));
-        let (i1, i3) = (items.clone(), items);
-        let slot = move |i: usize| i1.0[i].1;
-        // the touch reads the abandon flag every 4 KB inside its stream: the run that overtakes this job waits only for
-        // the chunks in flight
-        let pool_s: &'static dyn Pool = unsafe { std::mem::transmute::<&dyn Pool, &'static dyn Pool>(pool) };
-        let f = move |i: usize| {
-            let (it, slices) = (&i3.0[i], &i3.1);
-            let w = expert::Weights::at(stream, l, idx[it.0]);
-            // the item's slices as one byte range where adjacent in memory, else one by one
-            let run = &slices[it.2 as usize..(it.2 + it.3) as usize];
-            let bytes_of = |j: usize| if j < n_gu { w.gu_bytes(j) } else { w.down_bytes(j - n_gu) };
-            let mut a = 0;
-            while a < run.len() {
-                let first = bytes_of(run[a] as usize);
-                let (start, mut end) = (first.as_ptr() as usize, first.as_ptr() as usize + first.len());
-                let mut b = a + 1;
-                while b < run.len() {
-                    let nb = bytes_of(run[b] as usize);
-                    if nb.as_ptr() as usize != end {
-                        break;
-                    }
-                    end += nb.len();
-                    b += 1;
-                }
-                if !touch(unsafe { std::slice::from_raw_parts(start as *const u8, end - start) }, &|| pool_s.abandoned()) {
-                    return;
-                }
-                a = b;
-            }
-            #[cfg(feature = "track-experts")]
-            finished[it.0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        };
-        let takers = self.pool.prefetch_slotted(n, Box::new(slot), Box::new(f));
-        let z = draft_zone("pf.post", z);
-        *self.planned.lock().unwrap() = Some(Planned { l, idx: idx_plan, item_of, takers });
-        draft_zone("pf.planned", z);
+        self.prefetch_with(l, idx, None);
+    }
+    fn prefetch_amend(&self, l: usize, idx: &[usize]) {
+        // the early plan's job as it stands: its items taken so far keep their takers and are not reposted
+        let prior = self.planned.lock().unwrap().take().filter(|p| p.l == l);
+        self.prefetch_with(l, idx, prior);
     }
     fn run(&mut self, l: usize, idx: &[usize; TOP_K], x: &[f32], out: &mut [f32]) {
         self.run_batch(l, std::slice::from_ref(idx), x, out)
@@ -1899,11 +1959,17 @@ pub trait Placed {
     /// The prefetch predictor's step on the cards (`plan::gfx11`), posted right ahead of a MoE layer's output half: pair
     /// l predicts the next layer (a decode step's prediction is a plan, `plan`), pair l − 1 learns from the picks.
     fn plan_step(&mut self, l: usize, n: usize, picks: &[[usize; TOP_K]]);
+    /// The predictor's second pass, posted behind the output half (093): its margin's input is the whole FFN output
+    /// (the routed rows are in once `hc_post`'s wait is over); the margins the pairs learn from are this pass's, and a
+    /// decode step's plan goes to `plan2` with its own word.
+    fn plan_step_rows(&mut self, l: usize, n: usize);
     /// The step's predictor updates, once its layers are done: every pair over the step's `n` tokens at once, a
     /// workgroup a pair (in the layers' waits a decode step's took 23 µs a layer of a ~180 µs wait, 2026-10-21).
     fn plan_learn(&mut self, n: usize);
     /// A decode step's plan for the layer after l, best first (`plan::PLAN` experts), once the card's word says it is in.
     fn plan(&mut self, l: usize, out: &mut [usize]);
+    /// The second pass's plan (093), once its word is in.
+    fn plan2(&mut self, l: usize, out: &mut [usize]);
     /// Bring-up: a MoE layer's FFN input (`x: [n][H]`) and its router's logits (`[n][ROUTE_ROWS]`) as the card
     /// made them, for forced picks and the traces' edges; serving reads `ffn_input`'s quantized form instead.
     fn ffn_logits(&mut self, l: usize, n: usize, x: &mut [f32], logits: &mut [f32]);
@@ -2072,6 +2138,8 @@ pub struct CpuModel<'p, R: Routed> {
     /// `dump-pred`: the step's tokens' residual streams at a layer's dispatch, `[STEP][HC · H]`.
     #[cfg(feature = "dump-pred")]
     b_streams: Vec<f32>,
+    /// The layer whose early plan was posted at its slot and whose rows plan amends it at the next dispatch (093).
+    amend: Option<usize>,
 }
 
 impl<'p, R: Routed> CpuModel<'p, R> {
@@ -2147,6 +2215,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             b_score: vec![0.0; STEP * ROUTE_ROWS],
             #[cfg(feature = "dump-pred")]
             b_streams: vec![0.0; STEP * HC * H],
+            amend: None,
             b_out: vec![0.0; STEP * TOP_K * H],
         }
     }
@@ -2724,6 +2793,18 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                         cpu_zone!("prewarm");
                         common::alloc::prewarm(16 << 10);
                     }
+                    // the rows plan (093): the previous layer's second pass, ready ~100 µs after its slot, amends the running
+                    // prefetch for this layer — the items already taken stay, the rest are reposted in the new order — here,
+                    // under this layer's card wait, so the main thread never waits for it at the slot
+                    if let Some(lp) = s.amend.take() {
+                        if lp + 1 == l {
+                            cpu_zone!("amend");
+                            let mut pre2 = [E; plan::PLAN];
+                            pl.plan2(lp, &mut pre2);
+                            let ranked2: Vec<usize> = pre2.iter().copied().filter(|&e| !pl.resident(l, e)).take(PREFETCH_CAP).collect();
+                            s.routed.prefetch_amend(l, &ranked2);
+                        }
+                    }
                     pl.ffn_input(l, n, &mut s.b_xq[t0 * H..(t0 + n) * H], &mut s.b_xs[t0 * HG..(t0 + n) * HG], &mut s.b_xg[t0 * HG..(t0 + n) * HG], &mut s.b_picks[t0..t0 + n], &mut s.b_wts[t0..t0 + n], s.pool);
                     lap(&mut p.kda_card, "kda_card");
                     #[cfg(feature = "dump-pred")]
@@ -2780,16 +2861,19 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 // the prefetch predictor on the cards, right ahead of the FFN's output half, which spins until the host's
                 // experts are in: this layer's pair predicts the next (a decode step's prediction is the plan); the pairs
                 // learn from the picks at the step's end
-                {
-                    cpu_zone!("ffn_post");
-                    pl.ffn_post(l, n);
-                }
-                // the predictor behind the output half (093): its router input is the whole FFN output, which exists once
-                // `hc_post`'s wait for the host's experts is over; the plan's word comes that much later at the slot
+                // the early plan ahead of the output half (a decode step's), then the output half, then the predictor's
+                // rows pass behind it (093): its margin's input is the whole FFN output, which exists once `hc_post`'s wait
+                // for the host's experts is over. The slot posts the early plan; the rows plan amends it from the next
+                // layer's card wait (`prefetch_amend`)
                 {
                     cpu_zone!("plan_step");
                     pl.plan_step(l, n, &s.b_routed[t0..t0 + n]);
                 }
+                {
+                    cpu_zone!("ffn_post");
+                    pl.ffn_post(l, n);
+                }
+                pl.plan_step_rows(l, n);
                 // the outputs: the layer's leader card's rows in its VRAM (002) — the host's experts write theirs through
                 // the BAR, the cards' jobs theirs directly; the leader sums them
                 let out: &mut [f32] = unsafe { std::slice::from_raw_parts_mut(pl.expert_out(l).add(t0 * TOP_K * H), n * TOP_K * H) };
@@ -2866,6 +2950,7 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     let ranked: Vec<usize> = pre_next.iter().copied().filter(|&e| !pl.resident(l + 1, e)).take(PREFETCH_CAP).collect();
                     let z = draft_zone("slot.pick", z);
                     s.routed.prefetch(l + 1, &ranked);
+                    s.amend = Some(l);
                     draft_zone("slot.post", z);
                     lap(&mut p.slot, "slot");
                 }

@@ -258,6 +258,7 @@ struct Shared {
     scores_ffn: Mem, // [STEP][ROUTE_ROWS] f32: the FFN half's router over its input (this layer's rows, then the next layer's: the prefetch's predictor), for the host's picks
     labels: Mem,   // [NUM_HIDDEN_LAYERS][STEP][TOP_K] u32: each MoE layer's picks, for the prefetch predictor's pairs on the cards
     plan: Mem,     // [plan::PLAN] u32: a decode step's plan for the next layer, best first (`pred_step`)
+    plan2: Mem,    // [plan::PLAN] u32: the same from the second pass, behind `hc_post`, over the whole FFN output (093)
     words: Mem,    // the handoff words, a cache line each: `word()`
 }
 /// A handoff word's byte offset in `Shared::words`: the kind, and the card for a block output.
@@ -294,7 +295,9 @@ const W_HD: usize = 8;
 const W_XQ: usize = 9;
 /// A decode step's prefetch plan is in (the FFN card's `pred_step`, for the host).
 const W_PLAN: usize = 10;
-const W_KINDS: usize = 11;
+/// The rows-based plan (093): the predictor's second pass behind `hc_post`, over the whole FFN output.
+const W_PLAN2: usize = 11;
+const W_KINDS: usize = 12;
 /// The resident experts' completion line (`Kfd::fence_line`): a prefill chunk's residents are waited for after the
 /// other chunk's card half has posted and waited for its own fences (037).
 const XPT_LINE: usize = 1;
@@ -628,6 +631,7 @@ impl Cards {
                 scores_ffn: k0.host_shared(STEP * ROUTE_ROWS * 4, &others),
                 labels: k0.host_shared(NUM_HIDDEN_LAYERS * STEP * TOP_K * 4, &others),
                 plan: k0.host_shared(glm_5_3_flash::plan::PLAN * 4, &others),
+                plan2: k0.host_shared(glm_5_3_flash::plan::PLAN * 4, &others),
                 words: {
                     let m = k0.host_shared(CHUNKS * WORD_SET, &others);
                     unsafe { std::ptr::write_bytes(m.ptr() as *mut u8, 0, m.size) };
@@ -1916,8 +1920,6 @@ impl Placed for Cards {
         }
     }
     fn plan_step(&mut self, l: usize, n: usize, picks: &[[usize; TOP_K]]) {
-        use glm_5_3_flash::plan::{PLAN_LDS, PLAN_PRED_WGS, PLAN_WG};
-        const E: usize = glm_5_3_flash::E;
         // this layer's picks into its label slot: pair l − 1's labels, pair l's co-routing input
         let slot = |l: usize| self.shared.labels.at((l * STEP + self.t0) * TOP_K * 4);
         let lab = unsafe { std::slice::from_raw_parts_mut(slot(l) as *mut u32, n * TOP_K) };
@@ -1926,41 +1928,14 @@ impl Placed for Cards {
                 lab[i * TOP_K + k] = p[k] as u32;
             }
         }
-        let decode = n <= SPEC_TOKENS;
-        // pair l predicts the next layer, in the main queue (a decode step's plan and word for the host)
-        if let Some(f) = self.ffns[l].as_ref().filter(|f| f.pred.is_some()) {
-            let (st, d, d2) = f.pred.as_ref().unwrap();
-            let c = &self.cards[f.card];
-            // the second margin's logits: layer l + 1's router rows over the FFN input plus the shared expert's output
-            // (a few tokens through the route-ahead's own kernel: the matrix path took ~300 µs a layer at 4 tokens; a long
-            // step's on the matrix path, every router row, so both leave layer l + 1's logits from `E` of `ROUTE_ROWS`)
-            let (px, ps2) = (self.tok(&c.pred_x, H), self.tok(&c.pred_s2, ROUTE_ROWS));
-            // the routed rows: the host's experts' rows as the leader holds them once its word is in (`plan_step` runs
-            // after `hc_post`, which waited for it), weighted in pick order (093)
-            let rows = self.peers[f.card].rows.at(self.t0 * TOP_K * H * 4);
-            let mut a = Args::new();
-            a.ptr(px).ptr(self.tok(&c.x, H)).ptr(self.tok(&c.fyv, H)).ptr(rows).ptr(self.tok(&c.wv, TOP_K)).u32((n * H) as u32);
-            c.k.launch(&c.pred_input, (n * H).div_ceil(256) as u32, g::WG, 0, &a);
-            let router = f.router.as_ref().unwrap().va;
-            let mut a = Args::new();
-            if decode {
-                a.ptr(px).ptr(f.ln.va).ptr(router).ptr(ps2).ptr(ps2).ptr(c.pred_word.va).ptr(c.count.va).u32(0).u32(n as u32);
-                c.k.launch(&c.hc_route_ahead, PRE_GRID, g::WG, 64, &a);
-            } else {
-                a.ptr(px).ptr(f.ln.va).ptr(router).ptr(ps2).u32(ROUTE_ROWS as u32).u32(n as u32);
-                c.k.launch(&c.rows_h_w, g::wmma_grid(ROUTE_ROWS, n), g::WG, g::WMMA_LDS, &a);
-            }
-            let mut a = Args::new();
-            a.ptr(st.va).ptr(self.tok(&c.scores_v, ROUTE_ROWS)).ptr(ps2).ptr(d.at(self.t0 * E * 4)).ptr(d2.at(self.t0 * E * 4)).ptr(slot(l));
-            if decode {
-                a.ptr(self.shared.plan.va).ptr(self.shared.words.at(self.wd(W_PLAN, f.card)));
-            } else {
-                a.ptr(0).ptr(0);
-            }
-            a.u32(self.half_seq[l][self.ch][1]).u32(n as u32);
-            c.k.launch(&c.pred_step, if decode { 1 } else { PLAN_PRED_WGS as u32 }, PLAN_WG, PLAN_LDS, &a);
+        // the early plan: a decode step's, ahead of the output half, from the FFN input plus the shared output
+        if n <= SPEC_TOKENS {
+            self.pred_pass(l, n, false);
         }
-        // the pairs learn at the step's end (`plan_learn`), before any of them predicts again
+    }
+    fn plan_step_rows(&mut self, l: usize, n: usize) {
+        // behind `hc_post`: the routed rows are in; the margins stored for the learning are this pass's
+        self.pred_pass(l, n, true);
     }
     fn plan_learn(&mut self, n: usize) {
         use glm_5_3_flash::plan::{LEARN_LDS, LEARN_WG};
@@ -1978,6 +1953,15 @@ impl Placed for Cards {
         crate::kfd::wait_word(self.word_ptr(W_PLAN, f.card), self.half_seq[l][self.ch][1]);
         let mut p = [0u32; glm_5_3_flash::plan::PLAN];
         read(&self.shared.plan, 0, &mut p);
+        for (o, &e) in out.iter_mut().zip(&p) {
+            *o = e as usize;
+        }
+    }
+    fn plan2(&mut self, l: usize, out: &mut [usize]) {
+        let f = self.ffns[l].as_ref().unwrap();
+        crate::kfd::wait_word(self.word_ptr(W_PLAN2, f.card), self.half_seq[l][self.ch][1]);
+        let mut p = [0u32; glm_5_3_flash::plan::PLAN];
+        read(&self.shared.plan2, 0, &mut p);
         for (o, &e) in out.iter_mut().zip(&p) {
             *o = e as usize;
         }
@@ -2147,3 +2131,44 @@ impl Placed for Cards {
 }
 
 const _: () = assert!(CONV_DIM == 3 * KDA_QKV && CONV_TAPS == 4);
+
+impl Cards {
+    /// One pass of pair l's predictor on the FFN card: the second margin's input (the FFN input plus the shared output,
+    /// plus the weighted routed rows when `rows`), the next layer's router over it, `pred_step` — a decode step's plan
+    /// into `plan` (early) or `plan2` (rows) with its word; a long step's into the margins only.
+    fn pred_pass(&mut self, l: usize, n: usize, rows: bool) {
+        use glm_5_3_flash::plan::{PLAN_LDS, PLAN_PRED_WGS, PLAN_WG};
+        const E: usize = glm_5_3_flash::E;
+        let slot = |l: usize| self.shared.labels.at((l * STEP + self.t0) * TOP_K * 4);
+        let decode = n <= SPEC_TOKENS;
+        let Some(f) = self.ffns[l].as_ref().filter(|f| f.pred.is_some()) else { return };
+        let (st, d, d2) = f.pred.as_ref().unwrap();
+        let c = &self.cards[f.card];
+        let (px, ps2) = (self.tok(&c.pred_x, H), self.tok(&c.pred_s2, ROUTE_ROWS));
+        // the routed rows: the host's experts' rows as the leader holds them once its word is in (this pass runs behind
+        // `hc_post`, which waited for it), weighted in pick order (093); null for the early pass
+        let (rp, wp) = if rows { (self.peers[f.card].rows.at(self.t0 * TOP_K * H * 4), self.tok(&c.wv, TOP_K)) } else { (0, 0) };
+        let mut a = Args::new();
+        a.ptr(px).ptr(self.tok(&c.x, H)).ptr(self.tok(&c.fyv, H)).ptr(rp).ptr(wp).u32((n * H) as u32);
+        c.k.launch(&c.pred_input, (n * H).div_ceil(256) as u32, g::WG, 0, &a);
+        let router = f.router.as_ref().unwrap().va;
+        let mut a = Args::new();
+        if decode {
+            a.ptr(px).ptr(f.ln.va).ptr(router).ptr(ps2).ptr(ps2).ptr(c.pred_word.va).ptr(c.count.va).u32(0).u32(n as u32);
+            c.k.launch(&c.hc_route_ahead, PRE_GRID, g::WG, 64, &a);
+        } else {
+            a.ptr(px).ptr(f.ln.va).ptr(router).ptr(ps2).u32(ROUTE_ROWS as u32).u32(n as u32);
+            c.k.launch(&c.rows_h_w, g::wmma_grid(ROUTE_ROWS, n), g::WG, g::WMMA_LDS, &a);
+        }
+        let mut a = Args::new();
+        a.ptr(st.va).ptr(self.tok(&c.scores_v, ROUTE_ROWS)).ptr(ps2).ptr(d.at(self.t0 * E * 4)).ptr(d2.at(self.t0 * E * 4)).ptr(slot(l));
+        if decode {
+            let (plan, word) = if rows { (self.shared.plan2.va, self.shared.words.at(self.wd(W_PLAN2, f.card))) } else { (self.shared.plan.va, self.shared.words.at(self.wd(W_PLAN, f.card))) };
+            a.ptr(plan).ptr(word);
+        } else {
+            a.ptr(0).ptr(0);
+        }
+        a.u32(self.half_seq[l][self.ch][1]).u32(n as u32);
+        c.k.launch(&c.pred_step, if decode { 1 } else { PLAN_PRED_WGS as u32 }, PLAN_WG, PLAN_LDS, &a);
+    }
+}

@@ -20,7 +20,9 @@
 //! before `hc_post`: `pred_input` and the router rows, then `pred_step`). The second margin, measured offline: settled
 //! recall@13 .6205 → .6255 (bringup/expert-cache/phase3b, 2026-10-21).
 
-use crate::{E, H, SPEC_TOKENS, TOP_K};
+use crate::{E, SPEC_TOKENS, TOP_K};
+#[cfg(target_arch = "amdgpu")]
+use crate::H;
 
 /// Adam's learning rates: the co-routing table; the calibration (ca, cc) and the bias.
 pub const LR_CO: f32 = 3e-3;

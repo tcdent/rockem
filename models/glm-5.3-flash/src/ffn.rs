@@ -51,6 +51,11 @@ pub trait Routed {
     fn prefetch(&self, l: usize, idx: &[usize]) {
         let _ = (l, idx);
     }
+    /// A better list for the same layer once the prefetch is running (093): what it has taken stays, the rest follows
+    /// this order.
+    fn prefetch_amend(&self, l: usize, idx: &[usize]) {
+        self.prefetch(l, idx)
+    }
     /// Seconds spent in `run` since the last call of this (bring-up: the token's profile); 0 if unmeasured.
     fn elapsed(&mut self) -> f64 {
         0.0
@@ -75,6 +80,9 @@ impl<R: Routed + ?Sized> Routed for Box<R> {
     }
     fn prefetch(&self, l: usize, idx: &[usize]) {
         (**self).prefetch(l, idx)
+    }
+    fn prefetch_amend(&self, l: usize, idx: &[usize]) {
+        (**self).prefetch_amend(l, idx)
     }
 }
 
