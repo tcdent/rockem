@@ -62,19 +62,30 @@ class Spectrogram:
         return np.ascontiguousarray(x, dtype=np.float32)
 
     def log_mel(self, x: np.ndarray) -> np.ndarray:
-        """Whisper's log-mel over the clip padded to whole windows: [bins][frames · windows]."""
+        """Whisper's log-mel over the clip padded to whole windows: [bins][frames · windows].
+
+        Framed a window at a time, so memory stays near the mel itself (184 MB for 30 minutes)
+        rather than the whole clip's frames (about 1.7 GB at 30 minutes, measured 2026-10-23).
+        The normalization needs the clip's maximum, so it runs once over the whole mel."""
         n = -(-x.size // self.window_samples) * self.window_samples
-        x = np.pad(x.astype(np.float64), (0, n - x.size))
         half = self.fft_window // 2
-        x = np.pad(x, (half, half), mode="reflect")  # centered frames
-        count = 1 + (x.size - self.fft_window) // self.hop
-        idx = np.arange(self.fft_window)[None, :] + self.hop * np.arange(count)[:, None]
+        x = np.pad(np.pad(x.astype(np.float32), (0, n - x.size)), (half, half), mode="reflect")  # centered frames
+        frames = n // self.hop  # one per hop; Whisper drops the last of the n/hop + 1
         window = np.hanning(self.fft_window + 1)[:-1]  # periodic Hann
-        power = np.abs(np.fft.rfft(x[idx] * window, axis=1)) ** 2  # [frames][freq]
-        mel = self.filters.astype(np.float64) @ power[:-1].T  # the last frame dropped, as Whisper does
-        log = np.log10(np.maximum(mel, 1e-10))
-        log = np.maximum(log, log.max() - 8.0)
-        return ((log + 4.0) / 4.0).astype(np.float32)
+        filters = self.filters.astype(np.float64)
+        mel = np.empty((self.bins, frames), dtype=np.float64)
+        offsets = np.arange(self.fft_window)[None, :]
+        for start in range(0, frames, self.frames):
+            stop = min(start + self.frames, frames)
+            idx = offsets + self.hop * np.arange(start, stop)[:, None]
+            power = np.abs(np.fft.rfft(x[idx].astype(np.float64) * window, axis=1)) ** 2  # [frames][freq]
+            mel[:, start:stop] = filters @ power.T
+        np.maximum(mel, 1e-10, out=mel)  # in place: the clip's mel is the one large array
+        np.log10(mel, out=mel)
+        np.maximum(mel, mel.max() - 8.0, out=mel)
+        mel += 4.0
+        mel /= 4.0
+        return mel.astype(np.float32)
 
     def windows(self, data: bytes) -> list[bytes]:
         """The clip as the node takes it: one f32 little-endian [bins][frames] block a window."""
