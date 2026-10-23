@@ -1,6 +1,10 @@
 # 092 — Attention-ahead: layer l + 1's own attention as the predictor's margin
 
-**Status:** Ceilings measured (2026-10-22, lab dump pred3: 8 requests × 450 tokens, 1,690 steps, 4,603 tokens) — the kernel's form to decide against the window
+**Status:** Quantified, on the shelf — +.038 recall@13 (settled, with the deployed model's learned terms) for ~128–150 MB
+of weight reads a layer at the window's edge, or 2.2 GB of VRAM for an int8 copy; the read-out form +.015 for ~37 MB.
+tcdent 2026-10-22: "the difference in processing and memory … is not proportional to the gains in accuracy." The
+proportional path is the routed rows as the signal (queue 093). Ceilings measured on lab dump pred3 (8 × 450 tokens,
+1,690 steps, 4,603 tokens).
 **Area:** decode
 **Gain:** raw recall@13 at KDA layers .561 → .648 (the card-runnable form measured so far), .690 with the exact FFN
 output; the exact-input ceiling is .705. Every expert predicted right is 13.4 MB not streamed for nothing: the
