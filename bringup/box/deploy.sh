@@ -6,6 +6,8 @@ set -u; V=$1; ROOT=/home/slomp/Work/rockem; BOX=$ROOT/bringup/box; LOG=$BOX/logs
 # a second argument "short": the cold 18k prompt, the 96-token decode and long SCORE only (a CPU-side change)
 SHORT=${2:-}
 cd /home/slomp/Work/rockem
+# the production command line, always (a lab boot leaves its own in os/release/dev.cmdline)
+cp bringup/box/dev.cmdline.serving os/release/dev.cmdline
 /usr/bin/grep -E "kernels" bundles/glm-5.3-flash-q4rtn/manifest.toml | cut -c1-100
 timeout 500 make initramfs NODE_FEATURES="${NODE_FEATURES---features track-launches}" 2>&1 | tail -n 2 | cut -c1-100
 timeout 180 make publish 2>&1 | /usr/bin/grep -E 'pushed|error|missing'
