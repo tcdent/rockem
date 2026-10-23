@@ -38,6 +38,22 @@ mixes, and its exact-FFN variant reaches .694 of a .705 ceiling, so the lab's bu
 are a bad construction, not bad data. Production's second margin on the same construction has a learned weight to
 neutralise it (+.005).
 
+**With the deployed model's learned terms on top** (phase3/sim.py on this dump: the causal online simulation of the
+shipped shape — bias, co-routing, calibration, a second margin with its own weight — recall@13 over all 1,690 steps /
+settled over the last third):
+
+| shape | all | settled |
+|---|---|---|
+| today: route-ahead + the x+shared margin | .605 | .598 |
+| today + the read-out-only attention-ahead as the margin | .620 | .613 |
+| today + the full-step attention-ahead as the margin | .635 | .633 |
+| the full-step attention-ahead as the primary, route-ahead as the margin | .643 | .636 |
+
+So the full form is worth **+.038 recall@13 over the deployed model** (.598 → .636 settled; recall@16 .680 → .728),
+the read-out +.015. Against ~15.3 host experts a layer that is ~0.6 more of them in the plan and ~0.6 fewer of the 13
+planned wasted — a tenth of the 5.2 unplanned. The learned terms add less on top of attention-ahead than on route-ahead
+(raw .593 → .643; route-ahead raw .576 → .605): the signal already carries what the bias and co-routing were learning.
+
 **What the update is worth.** The read-out alone (q against the step-start memory: no forget gate, no delta update, no
 k/v) recovers +.040 of the route-ahead's gap at KDA layers; the token's own update and the carry across the step's
 tokens add another +.045 (.608 → .653); the exact FFN output another +.041 (→ .694). In the delta rule the read-out
