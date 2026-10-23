@@ -36,3 +36,4 @@ bringup/box/logs/
 bringup/voxtral/.venv/
 bringup/voxtral/edge/
 bringup/voxtral/logs/
+bringup/voxtral/data/

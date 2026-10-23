@@ -76,8 +76,7 @@ pub struct Decoder<'a> {
     xn: Vec<f32>,   // [STEP][H]
     qkv: Vec<f32>,  // [STEP][QKV rows]
     attn: Vec<f32>, // [STEP][Q_DIM]
-    gate: Vec<f32>, // [STEP][D_FF]
-    up: Vec<f32>,   // [STEP][D_FF]
+    gu: Vec<f32>,   // [2][STEP][D_FF]: the gate rows, then the up rows
     hid: Vec<f32>,  // [STEP][D_FF]
     act_h: Acts,
     act_q: Acts,
@@ -121,8 +120,7 @@ impl<'a> Decoder<'a> {
             xn: vec![0.0; STEP * H],
             qkv: vec![0.0; STEP * layout::QKV.rows],
             attn: vec![0.0; STEP * Q_DIM],
-            gate: vec![0.0; STEP * D_FF],
-            up: vec![0.0; STEP * D_FF],
+            gu: vec![0.0; 2 * STEP * D_FF],
             hid: vec![0.0; STEP * D_FF],
             act_h: Acts::new(H),
             act_q: Acts::new(Q_DIM),
@@ -244,7 +242,7 @@ impl<'a> Decoder<'a> {
             let scale = 1.0 / sqrt(HEAD_DIM as f32);
             self.pool.run(n * HEADS, &move |i| {
                 let (t, h) = (i / HEADS, i % HEADS);
-                let kvh = h / GROUP;
+                let kvh = h / KV_GROUP;
                 let q = &qkv[t * stride + h * HEAD_DIM..t * stride + (h + 1) * HEAD_DIM];
                 let len = pos + t + 1;
                 let mut s = vec![0f32; len];
@@ -285,13 +283,13 @@ impl<'a> Decoder<'a> {
             rmsnorm::<H>(&self.x[t * H..(t + 1) * H], ln1, RMS_NORM_EPS, &mut self.xn[t * H..(t + 1) * H]);
             self.act_h.quantize(t, &self.xn[t * H..(t + 1) * H]);
         }
-        // gate rows into `gate`, up rows into the buffer `STEP · D_FF` floats past it: `gate` and `up` are one allocation
-        debug_assert_eq!(unsafe { self.gate.as_ptr().add(STEP * D_FF) }, self.up.as_ptr(), "gate|up buffers adjacent");
-        let out = Out(self.gate.as_mut_ptr());
+        // the gate rows into `gu`'s first half, the up rows into its second (`STEP · D_FF` floats on)
+        let out = Out(self.gu.as_mut_ptr());
         self.gemv(l, Which::Gu, n, &self.act_h, out, D_FF);
+        let (gate, up) = self.gu.split_at(STEP * D_FF);
         for t in 0..n {
             for i in 0..D_FF {
-                self.hid[t * D_FF + i] = silu(self.gate[t * D_FF + i]) * self.up[t * D_FF + i];
+                self.hid[t * D_FF + i] = silu(gate[t * D_FF + i]) * up[t * D_FF + i];
             }
             self.act_ff.quantize(t, &self.hid[t * D_FF..(t + 1) * D_FF]);
         }

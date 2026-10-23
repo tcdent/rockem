@@ -785,13 +785,20 @@ pub fn node_count() -> usize {
 pub fn first_core_of(node: usize) -> usize {
     physical_cores().into_iter().find(|&c| node_of_core(c) == node).unwrap_or(0)
 }
-/// A kernel cpu list ("1-23,25-47") as the cores it names.
+/// A kernel cpu list ("1-23,25-47") as the cores it names; anything that is not one (a dev host's
+/// `nohz_full` reads "(null)") is no cores.
 pub fn cpu_list(s: &str) -> Vec<usize> {
     let mut v = Vec::new();
     for part in s.trim().split(',').filter(|p| !p.is_empty()) {
         match part.split_once('-') {
-            Some((a, b)) => v.extend(a.parse::<usize>().unwrap()..=b.parse::<usize>().unwrap()),
-            None => v.push(part.parse().unwrap()),
+            Some((a, b)) => match (a.parse::<usize>(), b.parse::<usize>()) {
+                (Ok(a), Ok(b)) => v.extend(a..=b),
+                _ => return Vec::new(),
+            },
+            None => match part.parse() {
+                Ok(c) => v.push(c),
+                Err(_) => return Vec::new(),
+            },
         }
     }
     v

@@ -25,6 +25,9 @@ ap.add_argument("--audio", required=True)
 ap.add_argument("--out", required=True)
 ap.add_argument("--lang", default="en")
 ap.add_argument("--new", type=int, default=48, help="transcript tokens the bf16 reference generates (then teacher-forced in f32)")
+ap.add_argument("--q4", action="store_true", help="the decoder's matrices (q, k, v, o, gate, up, down, lm_head) INT4 round-to-nearest per 128 (the bundle's recipe) in f32: the recipe's own goldens, so a kernel's error shows apart from the recipe's")
+ap.add_argument("--w8", action="store_true", help="the same with INT8 per 128 (absmax/127) instead")
+ap.add_argument("--fp8", action="store_true", help="the same with e4m3 and an f32 scale per 128×128 block (GLM's dense format) instead")
 a = ap.parse_args()
 os.makedirs(a.out, exist_ok=True)
 t0 = time.time()
@@ -43,34 +46,67 @@ placeholders = [i for i, t in enumerate(ids) if t == aud]
 print(f"prompt {len(ids)} ids, {n_win} windows, {len(placeholders)} placeholders", flush=True)
 feats.float().contiguous().numpy().tofile(os.path.join(a.out, "windows.f32"))
 
-# the transcript: the bf16 reference's own greedy continuation
-t1 = time.time()
-gen = model.generate(**req, max_new_tokens=a.new, do_sample=False)
-cont = gen[0][len(ids):].tolist()
+# the transcript: the bf16 reference's own greedy continuation (minutes on the CPU: kept beside the goldens for reruns)
+cache = os.path.join(a.out, "transcript.json")
+if os.path.exists(cache):
+    cont = json.load(open(cache))["ids"]
+else:
+    t1 = time.time()
+    gen = model.generate(**req, max_new_tokens=a.new, do_sample=False)
+    cont = gen[0][len(ids):].tolist()
+    json.dump({"ids": cont, "seconds": time.time() - t1}, open(cache, "w"))
 text = proc.tokenizer.decode(cont, skip_special_tokens=False)
-print(f"transcript ({len(cont)} ids, {time.time()-t1:.0f}s): {text!r}", flush=True)
+print(f"transcript ({len(cont)} ids): {text!r}", flush=True)
 seq = ids + cont
 T = len(seq)
 
 # f32: the encoder and the projector whole
 t2 = time.time()
-model.audio_tower.float(); model.multi_modal_projector.float()
-enc = model.audio_tower(feats.float()).last_hidden_state  # [N][1500][1280]
-rows = model.multi_modal_projector(enc.reshape(-1, model.config.audio_config.intermediate_size))  # [375·N][5120]
-model.audio_tower.to(torch.bfloat16); model.multi_modal_projector.to(torch.bfloat16)
+mm = model.model  # transformers 5: audio_tower, multi_modal_projector and language_model under the base model
+mm.audio_tower.float(); mm.multi_modal_projector.float()
+enc = mm.audio_tower(feats.float()).last_hidden_state  # [N][1500][1280]
+rows = mm.multi_modal_projector(enc.reshape(-1, model.config.audio_config.intermediate_size))  # [375·N][5120]
+mm.audio_tower.to(torch.bfloat16); mm.multi_modal_projector.to(torch.bfloat16)
 edges = {"enc_out": enc.reshape(-1, enc.shape[-1]).contiguous(), "rows": rows.contiguous()}
 print(f"encoder {time.time()-t2:.0f}s", flush=True)
 
 # the decoder: embeddings f32 with the rows spliced in, each layer f32 for its turn
-lm = model.language_model
-emb = lm.model.embed_tokens.weight[torch.tensor(seq)].float()
+lm = mm.language_model  # the decoder stack (embed_tokens, layers, norm); the head is model.lm_head
+emb = lm.embed_tokens.weight[torch.tensor(seq)].float()
 assert len(placeholders) == rows.shape[0]
 emb[placeholders] = rows
 edges["embed"] = emb.clone()
 outs = {}
+def q4_rtn(w):
+    """INT4 RTN per group of 128 along k, scale amax/7, as bundle/src/shared.rs quantizes (then packs)."""
+    r, k = w.shape
+    g = w.reshape(r, k // 128, 128)
+    scale = g.abs().amax(-1, keepdim=True) / 7.0
+    q = torch.where(scale > 0, (g / scale).round().clamp(-8, 7), torch.zeros_like(g))
+    return (q * scale).reshape(r, k)
+def w8_rtn(w):
+    r, k = w.shape
+    g = w.reshape(r, k // 128, 128)
+    scale = g.abs().amax(-1, keepdim=True) / 127.0
+    q = torch.where(scale > 0, (g / scale).round().clamp(-127, 127), torch.zeros_like(g))
+    return (q * scale).reshape(r, k)
+def fp8_block(w):
+    """e4m3 with an f32 scale per 128×128 block: scale = amax / 448 (e4m3's max), the quotient cast to e4m3 and back."""
+    r, k = w.shape
+    g = w.reshape(r // 128, 128, k // 128, 128)
+    amax = g.abs().amax(dim=(1, 3), keepdim=True)
+    scale = torch.where(amax > 0, amax / 448.0, torch.ones_like(amax))
+    q = (g / scale).to(torch.float8_e4m3fn).float()
+    return (q * scale).reshape(r, k)
+def quant(w):
+    return q4_rtn(w) if a.q4 else w8_rtn(w) if a.w8 else fp8_block(w)
 def pre(i):
     def f(m, args, kwargs):
         m.float()
+        if a.q4 or a.w8 or a.fp8:
+            for name in ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"):
+                lin = m.get_submodule(name)
+                lin.weight.data = quant(lin.weight.data)
     return f
 def post(i):
     def f(m, args, kwargs, out):
@@ -79,16 +115,18 @@ def post(i):
         m.to(torch.bfloat16)
     return f
 hooks = []
-for i, layer in enumerate(lm.model.layers):
+for i, layer in enumerate(lm.layers):
     hooks.append(layer.register_forward_pre_hook(pre(i), with_kwargs=True))
     hooks.append(layer.register_forward_hook(post(i), with_kwargs=True))
-lm.model.norm.float(); lm.lm_head.float()
+lm.norm.float(); model.lm_head.float()
+if a.q4 or a.w8 or a.fp8:
+    model.lm_head.weight.data = quant(model.lm_head.weight.data)
 t3 = time.time()
 out = lm(inputs_embeds=emb[None], use_cache=False)
-logits = out.logits[0].float()
+logits = model.lm_head(out.last_hidden_state[0].float()).float()
 for h in hooks:
     h.remove()
-for i in range(len(lm.model.layers)):
+for i in range(len(lm.layers)):
     edges[f"l{i}.out"] = outs[i]
 edges["logits"] = logits.contiguous()
 print(f"decoder {time.time()-t3:.0f}s", flush=True)
@@ -99,6 +137,6 @@ nll = -torch.log_softmax(logits[len(ids) - 1:T - 1], -1).gather(1, torch.tensor(
 save_file({k: v.contiguous() for k, v in edges.items()}, os.path.join(a.out, "edges.safetensors"))
 meta = {"model": "voxtral-small-24b", "ckpt": a.ckpt, "audio": a.audio, "audio_sha256": hashlib.sha256(open(a.audio, "rb").read()).hexdigest(),
         "lang": a.lang, "windows": n_win, "ids": seq, "prompt_len": len(ids), "placeholders": [placeholders[0], placeholders[-1]],
-        "transcript": text, "top1_agreement": agree, "nll": nll, "layers": len(lm.model.layers), "seconds": time.time() - t0}
+        "transcript": text, "top1_agreement": agree, "nll": nll, "layers": len(lm.layers), "q4": a.q4, "w8": a.w8, "fp8": a.fp8, "seconds": time.time() - t0}
 json.dump(meta, open(os.path.join(a.out, "meta.json"), "w"), indent=1)
 print(f"done in {time.time()-t0:.0f}s: top-1 {agree:.3f}, nll {nll:.3f}", flush=True)

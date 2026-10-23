@@ -80,6 +80,9 @@ impl Engine for Voxtral {
     fn position(&self) -> usize {
         POSITION
     }
+    fn context_limit(&self) -> usize {
+        self.dec.max_ctx()
+    }
     fn snapshot_len(&self) -> usize {
         0
     }

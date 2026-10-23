@@ -22,8 +22,9 @@ pub const H: usize = HIDDEN_SIZE;
 pub const D_FF: usize = INTERMEDIATE_SIZE;
 pub const HEADS: usize = NUM_ATTENTION_HEADS;
 pub const KV_HEADS: usize = NUM_KEY_VALUE_HEADS;
-/// Query heads a key/value head serves.
-pub const GROUP: usize = HEADS / KV_HEADS;
+/// Query heads a key/value head serves (not `q4::GROUP`, the quantization group a kernel file also imports: the clash
+/// sent every query head to kv head 0 for an afternoon, 2026-10-23).
+pub const KV_GROUP: usize = HEADS / KV_HEADS;
 pub const Q_DIM: usize = HEADS * HEAD_DIM;
 pub const KV_DIM: usize = KV_HEADS * HEAD_DIM;
 
@@ -39,7 +40,7 @@ pub const ROWS_PER_WINDOW: usize = ENC_POSITIONS / DOWNSAMPLE;
 pub const AUDIO_ID: u32 = AUDIO_TOKEN_ID as u32;
 
 const _: () = assert!(HEADS % KV_HEADS == 0 && ENC_HEADS * ENC_HEAD_DIM == ENC_H && DOWNSAMPLE * ENC_H == ENC_INTERMEDIATE_SIZE && ENC_INTERMEDIATE_SIZE == H && ENC_POSITIONS % DOWNSAMPLE == 0);
-const _: () = assert!(ROWS_PER_WINDOW == 375 && MEL_FRAMES == 3000 && GROUP == 4);
+const _: () = assert!(ROWS_PER_WINDOW == 375 && MEL_FRAMES == 3000 && KV_GROUP == 4);
 
 /// tekken: `<s>` 1, `</s>` 2, `[INST]` 3, `[/INST]` 4 (the instruct tokenizer's control ids; `[AUDIO]` 24).
 pub const BOS_TOKEN: u32 = 1;

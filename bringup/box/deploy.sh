@@ -16,7 +16,7 @@ sleep 60
 until timeout 2 bash -c 'echo > /dev/tcp/192.168.88.6/7332' 2>/dev/null; do sleep 5; done; echo "node up $(date +%H:%M:%S)"
 /usr/bin/grep -E "spec     :|panicked|cmdline|prow" $LOG/metatron-console.log | sed -E 's/.*\] //' | cut -c1-200
 tmux send-keys -t rockem:2.10 C-c; sleep 3; tmux send-keys -t rockem:2.10 C-c; sleep 2
-tmux send-keys -t rockem:2.10 "cd /home/slomp/Work/rockem/api && ROCKEM_BUNDLE=/home/slomp/Work/rockem/bundles/glm-5.3-flash-q4rtn ROCKEM_MODEL=glm-5.3-flash ROCKEM_NODES=192.168.88.6:7332 uv run uvicorn rockem.app:app --host 192.168.88.2 --port 8765" Enter; sleep 10
+tmux send-keys -t rockem:2.10 "cd /home/slomp/Work/rockem/api && ROCKEM_BUNDLE=/home/slomp/Work/rockem/bundles/glm-5.3-flash-q4rtn ROCKEM_MODEL=glm-5.3-flash ROCKEM_TRANSCRIBE_MODEL=voxtral-small-24b ROCKEM_NODES=192.168.88.6:7332 uv run uvicorn rockem.app:app --host 192.168.88.2 --port 8765" Enter; sleep 10
 T0=$(date -u +'%Y-%m-%d %H:%M:%S')
 req() { # req <label> <json>: one request, wall time, the hardware watch over the console
   L=$LOG/metatron-console.log; n0=$(wc -l < $L); t0=$(date +%s.%N)

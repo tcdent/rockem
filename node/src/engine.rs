@@ -34,6 +34,10 @@ pub trait Engine {
     }
     /// f32s of per-position state (one position's rows).
     fn position(&self) -> usize;
+    /// The most positions this model can hold (its own limit, e.g. a rotary table's); the node's budget is capped by it.
+    fn context_limit(&self) -> usize {
+        usize::MAX
+    }
     /// f32s of sequence state that is not per position; 0 when every state is a row.
     fn snapshot_len(&self) -> usize;
     fn seed_value(&self) -> u64;

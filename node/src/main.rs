@@ -927,6 +927,8 @@ fn main() {
             "voxtral-small-24b" => voxtral::Voxtral::open(&dir, mem, max_ctx),
             other => halt(&format!("the manifest lists model {other:?}, which this node does not carry")),
         };
+        // the node's budget, capped by what the model itself can hold
+        let max_ctx = max_ctx.min(e.context_limit());
         assert!(max_ctx > e.first_pos(), "rockem.ctx must leave room after the prefix");
         let position = e.position();
         let state_cost = ((e.snapshot_len() + e.vocab_size()) * 4).div_ceil(position * 4);
