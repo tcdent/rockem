@@ -24,7 +24,7 @@ Then depend on it by naming the registry:
 
 ```toml
 [dependencies]
-rockem-client = { version = "1", registry = "a10k" }
+rockem-client = { version = "0.1", registry = "a10k" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -137,6 +137,8 @@ event stream closes the connection, which aborts the request and frees the node.
 
 ## Versions
 
-The crate's major version is the API version it speaks: `1.x` speaks `/rockem/v1`. Within a
-version, events and optional request fields may be added, and this crate ignores what it does
-not know. The API's full description is `docs/api.md` in the rockem repository.
+Until rockem's first public release, the crate is `0.1.x`, and only the last number moves.
+Depend on `"0.1"` and you get every release. It speaks `/rockem/v1`, which is still a
+development version: events and optional request fields may be added, and this crate ignores
+what it does not know. Every published version stays available. The API's full description is
+`docs/api.md` in the rockem repository.

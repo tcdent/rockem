@@ -258,8 +258,9 @@ audio a request. It shares the nodes, and their one line, with the generation mo
 
 ## Versioning
 
-The version is in the path, `/rockem/v1/`, and the Rust client's major version names the
-API version it speaks. A change a client must know about is a new version beside the old
+The version is in the path, `/rockem/v1/`. The Rust client is published to the house registry
+(crates.a10k.co) as `rockem-client` 0.1.x until rockem's first public release, only the last
+number moving (tcdent, 2026-10-23). A change a client must know about is a new version beside the old
 one. Fields may be added to events and to a request's optional fields within a version; a
 client ignores fields and event types it does not know. The Rust client's `Event` and
 `Reason` are non-exhaustive for this reason: a match on them keeps a `_` arm.
