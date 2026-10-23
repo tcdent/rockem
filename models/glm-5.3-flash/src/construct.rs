@@ -1686,7 +1686,24 @@ impl Routed for CpuExperts<'_> {
     fn prefetch_amend(&self, l: usize, idx: &[usize]) {
         // the early plan's job as it stands: its items taken so far keep their takers and are not reposted
         let prior = self.planned.lock().unwrap().take().filter(|p| p.l == l);
-        self.prefetch_with(l, idx, prior);
+        let Some(prior) = prior else { return self.prefetch_with(l, idx, None) };
+        // the tail re-ranked, the head kept (093): every early expert the rows plan still names, or that has items taken
+        // already, stays in its place; the rows plan's new experts fill the rest of the same cap in its order. Replacing
+        // the list whole threw the first ~100 µs of touching away and touched more than the window holds (aff37:
+        // complete experts 7.7 → 4.2, the gate/up run 284 → 342 µs a layer)
+        const SL: usize = GU_ITEMS + DOWN_ITEMS;
+        let cap = idx.len().max(prior.idx.len());
+        let taken_any = |k: usize| (0..SL).any(|j| prior.taker(k, j) != u8::MAX);
+        let mut merged: Vec<usize> = prior.idx.iter().enumerate().filter(|&(k, e)| idx.contains(e) || taken_any(k)).map(|(_, &e)| e).collect();
+        for &e in idx {
+            if merged.len() >= cap {
+                break;
+            }
+            if !merged.contains(&e) {
+                merged.push(e);
+            }
+        }
+        self.prefetch_with(l, &merged, Some(prior));
     }
     fn run(&mut self, l: usize, idx: &[usize; TOP_K], x: &[f32], out: &mut [f32]) {
         self.run_batch(l, std::slice::from_ref(idx), x, out)
