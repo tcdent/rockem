@@ -1,11 +1,10 @@
 # 094 — AUDIO: an encoder's input on the wire
 
-**Status:** Landed in part (aff61, 2026-10-23) — wire v5 is deployed: the hello names the model, the
-manifest is a `[[model]]` list with each model's files under `<name>/`, a session per model on the
-node, the API speaking v5 with `ROCKEM_MODEL` (the 18k workload served, long SCORE bit-identical).
-AUDIO is reserved and refused by a model without an encoder. Still to build: the Voxtral bundle and
-engine with AUDIO's receive (rockem.lead); the spectrogram, the transcription prompt and
-`POST /rockem/v1/transcribe` (rockem.api).
+**Status:** Landed (aff61 → aff71, 2026-10-23). Wire v5 with the hello naming the model; GLM and
+Voxtral resident in one node; AUDIO; audio uncached (a per-connection salt) and leftover rows
+dropped at a new connection. `POST /rockem/v1/transcribe` serves at https://rockem.a10k.co from the
+rockem-api container: libri0 transcribed word for word twice in a row (16.6 s, 16.5 s), and a
+generation streamed beside it (3.6 s).
 **Area:** wire, node, bundle, API
 **Gain:** a transcription model behind the same protocol as every other node (Voxtral Small 24B,
 tentatively); the same verb carries any model's encoder input later (images)
