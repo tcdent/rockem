@@ -919,7 +919,7 @@ pub mod gfx11 {
     /// pick order in place of `yb`, the sums written to `fwd` (the peer's receiving buffer) and, once every
     /// workgroup's are out, `value` to `fwd_word` (the peer's copy of the experts' word). Grid: CHANNEL_GRID.
     #[no_mangle]
-    pub extern "gpu-kernel" fn hc_post(mix: *const f32, ya: *const f32, yb: *const f32, streams: *mut f32, src: *const f32, dst: *mut f32, dst2: *mut f32, n: u32, mine: *mut u32, mine2: *mut u32, w0: *const u32, w1: *const u32, value: u32, go: *mut u32, tokens: u32, rows: *const f32, wts: *const f32, fwd: *mut f32, fwd_word: *mut u32) {
+    pub extern "gpu-kernel" fn hc_post(mix: *const f32, ya: *const f32, yb: *const f32, streams: *mut f32, src: *const f32, dst: *mut f32, dst2: *mut f32, n: u32, mine: *mut u32, mine2: *mut u32, w0: *const u32, w1: *const u32, value: u32, go: *mut u32, tokens: u32, rows: *const f32, wts: *const f32, fwd: *mut f32, fwd_word: *mut u32, x: *const f32, pred_x: *mut f32) {
         unsafe {
             let t = workitem_id_x();
             if workgroup_id_x() == 0 {
@@ -989,6 +989,11 @@ pub mod gfx11 {
                     *yb.add(i * H + d)
                 };
                 let yd = *ya.add(i * H + d) + ybv;
+                // the predictor's rows pass (093): the block input plus the whole FFN output, written here where every
+                // term is in hand (a launch of its own was ~10 µs on the card's path)
+                if !pred_x.is_null() {
+                    *pred_x.add(i * H + d) = *x.add(i * H + d) + yd;
+                }
                 let mut j = 0;
                 while j < HC {
                     let mut acc = 0f32;

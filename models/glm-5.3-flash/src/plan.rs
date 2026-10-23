@@ -173,7 +173,7 @@ pub mod gfx11 {
     /// u32. `plan` (null in a long step): the decode plan and the host's `word`. Workgroups of `PLAN_WG`, a thread an
     /// expert; grid 1 for a decode step, `PLAN_PRED_WGS` for a long one.
     #[no_mangle]
-    pub extern "gpu-kernel" fn pred_step(pred: *const f32, scores: *const f32, scores2: *const f32, p_d: *mut f32, p_d2: *mut f32, p_picks: *const u32, plan: *mut u32, word: *mut u32, value: u32, n: u32) {
+    pub extern "gpu-kernel" fn pred_step(pred: *const f32, scores: *const f32, scores2: *const f32, p_d: *mut f32, p_d2: *mut f32, p_picks: *const u32, plan: *mut u32, word: *mut u32, value: u32, n: u32, keys: *mut f32, count: *mut u32) {
         unsafe {
             const RR: usize = crate::hc::gfx11_consts::ROUTE_ROWS;
             let e = workitem_id_x() as usize;
@@ -185,8 +185,9 @@ pub mod gfx11 {
             let red = l; // [16]
             let cand = red.add(16); // [E / 32 · TOP_K]
             let sk = cand.add(E / 32 * TOP_K); // [E]
-            // the tokens this workgroup predicts: a decode step's all in one, a long step's striped
-            let (first, stride) = if decode { (0, 1) } else { (wg, PLAN_PRED_WGS) };
+            // the tokens this workgroup predicts: a decode step's one a workgroup (the workgroups' keys multiplied by the
+            // last to finish — one workgroup over four tokens was 35 µs on the card's path, 2026-10-22), a long step's striped
+            let (first, stride) = if decode { (wg, n) } else { (wg, PLAN_PRED_WGS) };
             let (ca, cc, ca2) = (*pred.add(HDR), *pred.add(HDR + 1), *pred.add(HDR + 2));
             let (bn, bias) = (*pred.add(BN + e), *pred.add(BIAS + e));
             // the plan's key of this thread's expert
@@ -213,6 +214,28 @@ pub mod gfx11 {
             }
             if !decode || plan.is_null() {
                 return;
+            }
+            // this token's key term out; the last workgroup to arrive multiplies the step's terms and ranks
+            *keys.add(wg * E + e) = key;
+            fence(Ordering::Release);
+            workgroup_sync();
+            if e == 0 {
+                let last = AtomicU32::from_ptr(count).fetch_add(1, Ordering::AcqRel) == n as u32 - 1;
+                *red.add(15) = if last { 1.0 } else { 0.0 };
+                if last {
+                    AtomicU32::from_ptr(count).store(0, Ordering::Relaxed);
+                }
+            }
+            workgroup_sync();
+            if *red.add(15) == 0.0 {
+                return;
+            }
+            fence(Ordering::Acquire);
+            let mut key = 1f32;
+            let mut w = 0;
+            while w < n {
+                key *= *keys.add(w * E + e);
+                w += 1;
             }
             // the plan: each expert's place among the keys (the greater first, between equals the lower expert)
             *sk.add(e) = key;

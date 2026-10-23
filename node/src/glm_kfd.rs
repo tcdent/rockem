@@ -186,6 +186,9 @@ struct Card {
     pred_x: Mem,
     pred_s2: Mem,
     pred_word: Mem,
+    /// `pred_step`'s per-token key terms and its workgroups' arrival count (093).
+    pred_keys: Mem,
+    pred_count: Mem,
     mla_sel_split: crate::kfd::Kernel,
     mla_two_merge: crate::kfd::Kernel,
     word_wait: crate::kfd::Kernel,
@@ -536,6 +539,12 @@ impl Cards {
                     pred_x: k.vram(STEP * H * 4),
                     pred_s2: k.vram(STEP * ROUTE_ROWS * 4),
                     pred_word: k.vram(64),
+                    pred_keys: k.vram(SPEC_TOKENS * glm_5_3_flash::E * 4),
+                    pred_count: {
+                        let m = k.vram(64);
+                        k.upload(&m, 0, &[0u8; 64]);
+                        m
+                    },
                     mla_sel_split: k.kernel("mla_sel_split"),
                     mla_two_merge: k.kernel("mla_two_merge"),
                     word_wait: k.kernel("word_wait"),
@@ -1025,7 +1034,7 @@ impl Cards {
     /// a few tokens' inside `hc_post`. `mine`: this card's word, written to its own copy and the peer's.
     /// `w0`, `w1`: words read from this card's own copy. `ya`, `yb`: the shares, in this card's VRAM.
     #[allow(clippy::too_many_arguments)]
-    fn hc_post(&self, c: &Card, copy: Option<(usize, usize, usize)>, mine: Option<(usize, usize)>, w0: Option<(usize, usize)>, w1: Option<(usize, usize)>, value: u32, ya: usize, yb: Option<usize>, tokens: usize, routed: Option<(usize, usize, usize, usize)>) {
+    fn hc_post(&self, c: &Card, copy: Option<(usize, usize, usize)>, mine: Option<(usize, usize)>, w0: Option<(usize, usize)>, w1: Option<(usize, usize)>, value: u32, ya: usize, yb: Option<usize>, tokens: usize, routed: Option<(usize, usize, usize, usize)>, pred: Option<(usize, usize)>) {
         let me = c.k.index;
         let own = |w: Option<(usize, usize)>| w.map_or(0, |(k, d)| self.peers[me].words.at(self.wd(k, d)));
         let peer = (0..self.cards.len()).find(|&j| j != me);
@@ -1044,6 +1053,8 @@ impl Cards {
         a.ptr(self.tok(&c.mix, HC_MIX)).ptr(ya).ptr(yb.unwrap_or(0)).ptr(self.tok(&c.streams, HC * H)).ptr(src).ptr(0usize).ptr(dst2).u32(n as u32).ptr(own(mine)).ptr(mine2).ptr(own(w0)).ptr(own(w1)).u32(value).ptr(c.go.va).u32(tokens as u32);
         let (rows, wts, fwd, fwd_word) = routed.unwrap_or((0, 0, 0, 0));
         a.ptr(rows).ptr(wts).ptr(fwd).ptr(fwd_word);
+        let (px_in, px_out) = pred.unwrap_or((0, 0));
+        a.ptr(px_in).ptr(px_out);
         c.k.launch(&c.hc_post, CHANNEL_GRID, g::WG, 0, &a);
     }
     /// The FFN router's place: on the FFN card of a MoE layer, `hc_pre` runs layer `l`'s FFN router (and the
@@ -1076,7 +1087,7 @@ impl Cards {
                 (Some(&p0), Some(j)) => Some((c.yv.at((p0 * STEP + self.t0) * H * 4), self.tok(&self.peers[j].ys[parity], H), n * H)),
                 _ => None,
             };
-            self.hc_post(c, copy, (!mine.is_empty()).then_some((W_Y, me)), Some((W_Y, producers[0])), producers.get(1).map(|&p| (W_Y, p)), value, ya, yb, n, None);
+            self.hc_post(c, copy, (!mine.is_empty()).then_some((W_Y, me)), Some((W_Y, producers[0])), producers.get(1).map(|&p| (W_Y, p)), value, ya, yb, n, None, None);
         }
     }
 
@@ -1857,10 +1868,10 @@ impl Placed for Cards {
         }
         let copy = (0..self.cards.len()).find(|&j| j != m.card).map(|j| (myv, self.tok(&self.peers[j].my[l % 2], H), n * H));
         let value = self.half_seq[l][self.ch][0];
-        self.hc_post(c, copy, Some((W_Y, m.card)), None, None, value, myv, None, n, None);
+        self.hc_post(c, copy, Some((W_Y, m.card)), None, None, value, myv, None, n, None, None);
         // the other card folds the output in once it is there (posted after its half of the attend, which its queue runs first)
         let o = &self.cards[m.other];
-        self.hc_post(o, None, None, Some((W_Y, m.card)), None, value, self.tok(&self.peers[m.other].my[l % 2], H), None, n, None);
+        self.hc_post(o, None, None, Some((W_Y, m.card)), None, value, self.tok(&self.peers[m.other].my[l % 2], H), None, n, None, None);
     }
     fn mla_seed(&mut self, l: usize, pos: usize, latent: &[u16]) {
         let m = self.mlas[l].as_ref().unwrap();
@@ -1906,16 +1917,18 @@ impl Placed for Cards {
             let fy = if producer { self.tok(&o.fyv, H) } else { self.tok(&self.peers[me].fy[parity], H) };
             let mine = producer.then_some((W_FFN, f.card));
             if f.dense {
-                self.hc_post(o, copy, mine, Some((W_FFN, f.card)), None, value, fy, None, n, None);
+                self.hc_post(o, copy, mine, Some((W_FFN, f.card)), None, value, fy, None, n, None, None);
             } else if producer {
                 // the leader (002): once the host's word says every expert row is in its VRAM, the routed sum of
                 // the rows in pick order, folded in and forwarded to the peer with the peer's copy of the word
                 let rows = self.peers[me].rows.at(self.t0 * TOP_K * H * 4);
                 let fwd = peer.map(|j| (self.tok(&self.peers[j].yr[parity], H), self.peers[j].words.at(self.wd(W_EXPERTS, 0))));
                 let (fwd, fwd_word) = fwd.unwrap_or((0, 0));
-                self.hc_post(o, copy, mine, Some((W_FFN, f.card)), Some((W_EXPERTS, 0)), value, fy, None, n, Some((rows, self.tok(&o.wv, TOP_K), fwd, fwd_word)));
+                // the leader writes the predictor's rows-pass input too (x + the whole FFN output) where it has every term
+                let pred = f.pred.as_ref().map(|_| (self.tok(&o.x, H), self.tok(&o.pred_x, H)));
+                self.hc_post(o, copy, mine, Some((W_FFN, f.card)), Some((W_EXPERTS, 0)), value, fy, None, n, Some((rows, self.tok(&o.wv, TOP_K), fwd, fwd_word)), pred);
             } else {
-                self.hc_post(o, copy, mine, Some((W_FFN, f.card)), Some((W_EXPERTS, 0)), value, fy, Some(self.tok(&self.peers[me].yr[parity], H)), n, None);
+                self.hc_post(o, copy, mine, Some((W_FFN, f.card)), Some((W_EXPERTS, 0)), value, fy, Some(self.tok(&self.peers[me].yr[parity], H)), n, None, None);
             }
         }
     }
@@ -2147,18 +2160,29 @@ impl Cards {
         let (px, ps2) = (self.tok(&c.pred_x, H), self.tok(&c.pred_s2, ROUTE_ROWS));
         // the routed rows: the host's experts' rows as the leader holds them once its word is in (this pass runs behind
         // `hc_post`, which waited for it), weighted in pick order (093); null for the early pass
-        let (rp, wp) = if rows { (self.peers[f.card].rows.at(self.t0 * TOP_K * H * 4), self.tok(&c.wv, TOP_K)) } else { (0, 0) };
-        let mut a = Args::new();
-        a.ptr(px).ptr(self.tok(&c.x, H)).ptr(self.tok(&c.fyv, H)).ptr(rp).ptr(wp).u32((n * H) as u32);
-        c.k.launch(&c.pred_input, (n * H).div_ceil(256) as u32, g::WG, 0, &a);
         let router = f.router.as_ref().unwrap().va;
-        let mut a = Args::new();
-        if decode {
-            a.ptr(px).ptr(f.ln.va).ptr(router).ptr(ps2).ptr(ps2).ptr(c.pred_word.va).ptr(c.count.va).u32(0).u32(n as u32);
-            c.k.launch(&c.hc_route_ahead, PRE_GRID, g::WG, 64, &a);
+        if rows {
+            // `hc_post` wrote the input (x + the whole FFN output); the stacked router (this layer's rows, then the
+            // next's) over it through the rows kernel — `hc_route_ahead` on hc_pre's grid was 27 µs for 1.2 M MACs
+            if decode {
+                self.rows(c, &c.rows_h, px, Some(f.ln.va), router, ps2, ROUTE_ROWS, H, n, ROWS);
+            } else {
+                let mut a = Args::new();
+                a.ptr(px).ptr(f.ln.va).ptr(router).ptr(ps2).u32(ROUTE_ROWS as u32).u32(n as u32);
+                c.k.launch(&c.rows_h_w, g::wmma_grid(ROUTE_ROWS, n), g::WG, g::WMMA_LDS, &a);
+            }
         } else {
-            a.ptr(px).ptr(f.ln.va).ptr(router).ptr(ps2).u32(ROUTE_ROWS as u32).u32(n as u32);
-            c.k.launch(&c.rows_h_w, g::wmma_grid(ROUTE_ROWS, n), g::WG, g::WMMA_LDS, &a);
+            let mut a = Args::new();
+            a.ptr(px).ptr(self.tok(&c.x, H)).ptr(self.tok(&c.fyv, H)).ptr(0usize).ptr(0usize).u32((n * H) as u32);
+            c.k.launch(&c.pred_input, (n * H).div_ceil(256) as u32, g::WG, 0, &a);
+            let mut a = Args::new();
+            if decode {
+                a.ptr(px).ptr(f.ln.va).ptr(router).ptr(ps2).ptr(ps2).ptr(c.pred_word.va).ptr(c.count.va).u32(0).u32(n as u32);
+                c.k.launch(&c.hc_route_ahead, PRE_GRID, g::WG, 64, &a);
+            } else {
+                a.ptr(px).ptr(f.ln.va).ptr(router).ptr(ps2).u32(ROUTE_ROWS as u32).u32(n as u32);
+                c.k.launch(&c.rows_h_w, g::wmma_grid(ROUTE_ROWS, n), g::WG, g::WMMA_LDS, &a);
+            }
         }
         let mut a = Args::new();
         a.ptr(st.va).ptr(self.tok(&c.scores_v, ROUTE_ROWS)).ptr(ps2).ptr(d.at(self.t0 * E * 4)).ptr(d2.at(self.t0 * E * 4)).ptr(slot(l));
@@ -2168,7 +2192,7 @@ impl Cards {
         } else {
             a.ptr(0).ptr(0);
         }
-        a.u32(self.half_seq[l][self.ch][1]).u32(n as u32);
-        c.k.launch(&c.pred_step, if decode { 1 } else { PLAN_PRED_WGS as u32 }, PLAN_WG, PLAN_LDS, &a);
+        a.u32(self.half_seq[l][self.ch][1]).u32(n as u32).ptr(c.pred_keys.va).ptr(c.pred_count.va);
+        c.k.launch(&c.pred_step, if decode { n as u32 } else { PLAN_PRED_WGS as u32 }, PLAN_WG, PLAN_LDS, &a);
     }
 }
