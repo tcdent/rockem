@@ -27,6 +27,20 @@ class TranscribeError(ValueError):
     """The request cannot be transcribed by this model."""
 
 
+class NoSpeech(Exception):
+    """The clip has less voice in it than a single short word: silence, hiss or noise. Sent to
+    the model, these come back as invented text (silence became a football season, hiss a
+    paragraph about the color pink, 2026-10-23), so they are answered without the node."""
+
+    def __init__(self, seconds: float):
+        super().__init__(f"{seconds:.2f} s of voiced audio")
+        self.seconds = seconds
+
+
+# Less voiced audio than this is no speech: a single short word measures ~0.34 s
+MIN_VOICED_SECONDS = 0.2
+
+
 def _voxtral(m: Model, placeholders: int, language: str | None) -> list[int]:
     tok = m.tokenizer
 
@@ -70,9 +84,14 @@ class Transcriber:
         return self.engine.edge.model
 
     def request(self, audio: bytes, language: str | None = None, max_tokens: int | None = None) -> core.Request:
-        """The clip's windows and the prompt they fill. `AudioError` for bytes that are not audio."""
+        """The clip's windows and the prompt they fill. `AudioError` for bytes that are not audio,
+        `NoSpeech` for a clip with no voice in it."""
         if language is not None and not LANGUAGE.match(language):
             raise TranscribeError(f"language {language!r}: a code like en or fr")
-        windows = self.spectrogram.windows(audio)
+        signal = self.spectrogram.signal(audio)
+        voiced = self.spectrogram.voiced_seconds(signal)
+        if voiced < MIN_VOICED_SECONDS:
+            raise NoSpeech(voiced)
+        windows = self.spectrogram.windows_of(signal)
         ids = self.prompt(self.model, len(windows) * self.model.audio["rows"], language)
         return core.Request(ids=ids, windows=windows, max_tokens=max_tokens)

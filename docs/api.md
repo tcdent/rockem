@@ -103,7 +103,7 @@ data: {"type": "done", "reason": "tool_use", "stop_sequence": null, "usage": {"p
 
 | type | fields | meaning |
 |---|---|---|
-| `started` | `prompt_tokens` | a node took the request and has its prompt. Always first: before it the request waited in line, after it the node computes the prompt and then generates |
+| `started` | `prompt_tokens` | a node took the request and has its prompt. First, whenever a node is asked (a transcription with no speech never asks one): before it the request waited in line, after it the node computes the prompt and then generates |
 | `thinking` | `text`, `ids` | the model's reasoning, before its reply, for a model that reasons (generate only). Never parsed for calls and never matched against `stop`. Send it back as the assistant message's `thinking` |
 | `text` | `text`, `ids` | generated text, in order. `ids` are the token ids behind it; text that could still turn out to be a stop sequence or a call is held until it resolves, so `ids` can arrive with empty `text` |
 | `tool_call` | `id`, `name`, `arguments`, `ids` | one complete call, arguments an object (generate only). The id is the service's; send it back as the result's `tool_call_id` |
@@ -122,6 +122,7 @@ by the network.
 | `stop_sequence` | one of the request's `stop` strings appeared; `stop_sequence` names it, and the text stops before it |
 | `max_tokens` | the request's `max_tokens` was reached |
 | `context_full` | the node's budget was reached: the conversation is as long as this node can hold |
+| `no_speech` | transcription only: the recording has no voice in it, so the service answered without the model. The stream is this `done` alone |
 
 `usage` counts ids: `prompt_tokens` fed after the model's start ids, `completion_tokens`
 generated (the end id included), and `positions`, the node's budget for a whole sequence.
@@ -242,6 +243,13 @@ of a conversation. The audio itself never enters a conversation.
 | `max_tokens` | optional: ids to generate at most |
 
 The text arrives as `started`, then `text` events, then `done` with `end_turn`.
+
+A recording with no voice in it ends at once with `done` and `no_speech`, and nothing else: no
+node is asked. Sent to the model, silence and noise come back as invented text (one second of
+silence became "The 2019–20 season was the 117th season of competitive football by Rangers.").
+The service counts the clip's voiced frames, those whose spectrum over 120 Hz–4 kHz is peaked
+rather than flat, and needs 0.2 s of them; a single short word measures about 0.34 s. Loudness
+only drops near-digital silence (−70 dBFS), so quiet speech still goes through.
 
 ### What the service does
 

@@ -87,7 +87,33 @@ class Spectrogram:
         mel /= 4.0
         return mel.astype(np.float32)
 
+    def voiced_seconds(self, x: np.ndarray) -> float:
+        """How much of the clip sounds like a voice: frames whose spectrum is peaked, not flat.
+
+        Speech puts its energy in harmonics and formants; silence, hiss and broadband noise are
+        flat at any level. Per 25 ms frame (the model's window and hop), the spectral flatness
+        over 120 Hz–4 kHz is below 0.35 for voiced speech and 0.5–1.0 for silence and noise
+        (measured 2026-10-23: speech 0.02–0.03 median, speech under -30 dBFS noise 0.29, noise and
+        hiss 0.5–0.57 at -20…-60 dBFS). Loudness gates only near-digital silence (-70 dBFS):
+        quiet speech at -71 dBFS still counts, so a quiet recording is never dropped."""
+        n, hop = self.fft_window, self.hop
+        count = 1 + (x.size - n) // hop if x.size >= n else 0
+        lo, hi = round(120 * n / self.sample_rate), round(4000 * n / self.sample_rate) + 1
+        window = np.hanning(n)
+        voiced = 0
+        for start in range(0, count, self.frames):  # a window's frames at a time, as log_mel
+            idx = np.arange(n)[None, :] + hop * np.arange(start, min(start + self.frames, count))[:, None]
+            f = x[idx].astype(np.float64) * window
+            loud = np.mean(f**2, axis=1) > 1e-7  # -70 dBFS
+            band = np.abs(np.fft.rfft(f, axis=1))[:, lo:hi] ** 2 + 1e-12
+            flat = np.exp(np.mean(np.log(band), axis=1)) / np.mean(band, axis=1)
+            voiced += int(np.sum(loud & (flat < 0.35)))
+        return voiced * hop / self.sample_rate
+
     def windows(self, data: bytes) -> list[bytes]:
         """The clip as the node takes it: one f32 little-endian [bins][frames] block a window."""
-        mel = self.log_mel(self.signal(data))
+        return self.windows_of(self.signal(data))
+
+    def windows_of(self, x: np.ndarray) -> list[bytes]:
+        mel = self.log_mel(x)
         return [np.ascontiguousarray(mel[:, i : i + self.frames]).astype("<f4").tobytes() for i in range(0, mel.shape[1], self.frames)]

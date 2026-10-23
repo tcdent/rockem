@@ -229,6 +229,9 @@ pub enum Reason {
     MaxTokens,
     /// The node's budget was reached.
     ContextFull,
+    /// Transcription only: the recording has no voice in it (silence, hiss or noise), so it was
+    /// answered without the model, which would have invented text. No `Started`, no `Text`.
+    NoSpeech,
     #[serde(other)]
     Unknown,
 }

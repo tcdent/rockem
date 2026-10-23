@@ -41,6 +41,7 @@ class Reason(enum.Enum):
     STOP_SEQUENCE = "stop_sequence"  # one of the request's stop sequences appeared
     MAX_TOKENS = "max_tokens"  # the request's limit
     CONTEXT_FULL = "context_full"  # the node's budget
+    NO_SPEECH = "no_speech"  # transcription: the clip has no voice in it; the node was not asked
 
 
 @dataclass

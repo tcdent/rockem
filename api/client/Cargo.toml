@@ -2,7 +2,7 @@
 name = "rockem-client"
 # 0.1.x until the first public release, only the last number moving (tcdent 2026-10-23); it speaks
 # /rockem/v1 (docs/api.md).
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Client for rockem's own API: transcription and generation, each a request in and a stream of events out."
 readme = "README.md"

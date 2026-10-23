@@ -59,6 +59,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+A recording with no voice in it, such as silence, hiss or noise, ends at once with
+`Reason::NoSpeech` and no text: the service checks before sending it to the model, which would
+otherwise invent a transcript. A single short word is enough to pass.
+
 The model is Voxtral Small 24B, which handles up to 30 minutes of audio a request. The
 transcript is text for a person to review: the audio never enters a conversation.
 
@@ -110,13 +114,13 @@ sets how much the model reasons. It defaults to low; keep it fixed for a convers
 
 | event | meaning |
 |---|---|
-| `Started { prompt_tokens }` | a node took the request. Always first: before it, the request waited in line |
+| `Started { prompt_tokens }` | a node took the request. First, whenever a node is asked: before it, the request waited in line |
 | `Thinking { text, ids }` | the model's reasoning, before its reply (generation only) |
 | `Text { text, ids }` | text, in order; `ids` are the token ids behind it |
 | `ToolCall(call)` | one complete tool call (generation only) |
 | `Done(done)` | the end: `done.reason`, `done.usage`, the model's name. Always last |
 
-`Reason` is `EndTurn`, `ToolUse`, `StopSequence`, `MaxTokens` or `ContextFull`. `Usage`
+`Reason` is `EndTurn`, `ToolUse`, `StopSequence`, `MaxTokens`, `ContextFull` or (transcription) `NoSpeech`. `Usage`
 counts token ids: `prompt_tokens`, `completion_tokens`, and `positions`, the context budget.
 
 `Event` and `Reason` are non-exhaustive. The service may add event types within this

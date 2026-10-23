@@ -19,7 +19,7 @@ from . import core
 from .adapters import anthropic, internal, openai
 from .edge import TemplateError
 from .audio import AudioError
-from .transcribe import Transcriber
+from .transcribe import NoSpeech, Transcriber
 from .wire import ContextFull, Refused, WireError
 
 
@@ -133,6 +133,11 @@ class AnthropicMessagesView(GenerationView):
         return anthropic.fold(text, done, self.model)
 
 
+async def no_speech() -> AsyncIterator[core.Event]:
+    """A transcription of a clip with no voice: the end at once, no text, no node taken."""
+    yield core.Done(core.Reason.NO_SPEECH, None, 0, 0, 0)
+
+
 class TranscribeView(BaseView):
     transcriber: Annotated[Transcriber, Depends(get_transcriber)]
 
@@ -146,6 +151,8 @@ class TranscribeView(BaseView):
         t = self.transcriber
         try:
             req = t.request(audio, body.language, body.max_tokens)
+        except NoSpeech:
+            return sse(internal.stream(no_speech(), t.model.name, f"{t.model.identity:016x}"))
         except (AudioError, ValueError) as e:
             raise HTTPException(400, str(e)) from e
         run = await start(t.engine, req)

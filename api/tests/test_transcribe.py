@@ -75,3 +75,48 @@ def test_session_counts_rows_against_placeholders():
     plain.start()
     with pytest.raises(WireError):
         plain.audio(b"\0" * 16)  # a model without an encoder
+
+
+def clip(x, rate=16000) -> bytes:
+    import io
+
+    import numpy as np
+    import soundfile as sf
+
+    buf = io.BytesIO()
+    sf.write(buf, np.asarray(x, dtype=np.float32), rate, format="WAV", subtype="PCM_16")
+    return buf.getvalue()
+
+
+def voice(seconds: float, level: float = 0.2):
+    """A voice-like sound: harmonics of 150 Hz with a syllable-rate envelope."""
+    import numpy as np
+
+    t = np.arange(int(16000 * seconds)) / 16000
+    tone = sum(np.sin(2 * np.pi * 150 * k * t) / k for k in range(1, 20))
+    return level * tone / np.abs(tone).max() * (0.6 + 0.4 * np.sin(2 * np.pi * 4 * t))
+
+
+def test_voiced_seconds_tells_voice_from_silence_and_noise(transcribing):
+    import numpy as np
+
+    spec, rng = transcribing.spectrogram, np.random.default_rng(0)
+    assert spec.voiced_seconds(np.zeros(16000, np.float32)) == 0
+    assert spec.voiced_seconds((rng.standard_normal(48000) * 0.1).astype(np.float32)) == 0  # noise at -20 dBFS
+    assert spec.voiced_seconds((rng.standard_normal(16000) * 0.001).astype(np.float32)) == 0  # hiss at -60
+    assert spec.voiced_seconds(voice(1.0).astype(np.float32)) > 0.9
+    assert spec.voiced_seconds((voice(1.0) * 0.01).astype(np.float32)) > 0.5  # very quiet (~ -60 dBFS): well over the 0.2 s minimum
+    assert spec.voiced_seconds(np.concatenate([rng.standard_normal(32000) * 0.1, voice(0.4)]).astype(np.float32)) > 0.3
+
+
+async def test_no_speech_never_reaches_the_node(client, transcribing, node):
+    import numpy as np
+
+    hellos = len(node.hellos)
+    for x in (np.zeros(16000), np.random.default_rng(0).standard_normal(48000) * 0.1):
+        evs = events(await client.post("/rockem/v1/transcribe", json={"audio": base64.b64encode(clip(x)).decode()}))
+        assert [e["type"] for e in evs] == ["done"] and evs[0]["reason"] == "no_speech" and evs[0]["usage"]["completion_tokens"] == 0
+    assert len(node.hellos) == hellos  # the node was never asked
+    node.max_ctx = 64
+    evs = events(await client.post("/rockem/v1/transcribe", json={"audio": base64.b64encode(clip(voice(0.4))).decode()}))
+    assert evs[0]["type"] == "started" and evs[-1]["reason"] == "end_turn"  # a short word still goes through
