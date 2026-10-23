@@ -1,6 +1,8 @@
 # rockem API: the inference node's scheduler, FastAPI under uvicorn. Built by infra.lead
 # (tcdent's request, 2026-10-23); runs as the Nomad job in api.nomad.hcl, at https://rockem.a10k.co.
-#   podman build -t registry.a10k.co/rockem/api:<git sha> -f Containerfile . && podman push …
+#   podman build --network host -t registry.a10k.co/rockem/api:<git sha> -f Containerfile . && podman push …
+# --network host: under rootless podman (pasta) the build shares elsenor's address, so pypi.a10k.co
+# (Caddy on .2) is the build container itself and refuses the connection.
 # The bundle is not in the image: the job mounts it read-only, so the API's manifest is always the
 # node's.
 FROM registry.a10k.co/library/python:3.13-slim
