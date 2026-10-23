@@ -1,13 +1,11 @@
 # 093 — The routed rows as the predictor's signal
 
-**Status:** Measured two-phase (aff39, 2026-10-22): the rows plan amends the running prefetch under the next layer's card
-wait — complete host experts a layer 7.73 → 8.06, missed 5.19 → 4.89, no lateness at the slot (0.4 µs), the amend 35 µs
-a layer under the wait, gate/up 284 → 282 µs — but the rows pass itself (pred_input + route-ahead + pred_step, ~85 µs)
-sits behind `hc_post` on the card's one queue where nothing hides it: the card's attention phase +55 µs a layer
-(`kda_card` 496 → 550), the verify step 52.73 → 56.31 ms. The run gains ~0.1 ms a step; the card loses 2. Decision
-pending (tcdent): shelve as built, or fuse the router-and-rank into `hc_post`'s kernel (its grid holds the summed rows)
-— the one near-free form, for ≤ 0.3 ms a step of upside. The whole prediction direction caps at ~2.5 ms a step (the
-unplanned experts' DRAM reads); the run's floor is the L3 delivery itself.
+**Status:** Built and kept (aff41, 170474a, 2026-10-22) — the two-phase plan: the early pass before `hc_post`, the
+rows pass behind it with the whole FFN output as the margin's input, the running prefetch amended from the next layer's
+card wait. Complete host experts a layer 7.73 → 7.86, missed 5.19 → 4.89, no lateness at the slot; the pass costs the
+card ~60 µs a layer behind `hc_post` (verify step 52.73 → 55.23 ms on the 96-token read). tcdent 2026-10-22: "it still
+doesn't look like it's slowing us down. The accuracy is worth keeping. I think we're gonna stay with this." The free
+form — one fused launch on the peer card — is the recorded next step.
 **Area:** decode
 **Gain:** offline, the route-ahead over the FFN input plus the whole FFN output as the second margin settled recall@13
 .6205 → .647 (phase3b, +.027, nearly the full attention-ahead's +.038 of queue 092) for 2.4 MB of router weights and
