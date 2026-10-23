@@ -110,6 +110,9 @@ struct Job {
     /// Set when the job is superseded (a prefetch the next run overtakes): no more items are claimed, and an item
     /// inside `abandoned()` gives up. `stopped` is when (ns after the post).
     stop: std::sync::atomic::AtomicBool,
+    /// Set when a prefetch is amended by a prefetch (093): no more items are claimed here — the new job lists them —
+    /// but the item in hand finishes (its lines are the point; its taker is kept by the new plan).
+    drain: std::sync::atomic::AtomicBool,
     stopped: std::sync::atomic::AtomicU64,
     n: usize,
     /// A prefetch: drained from the CCD slot only, by `PREFETCH_CORES` a CCD; `taker[i]` the worker that took item
@@ -251,7 +254,7 @@ unsafe fn work(job: *const Job, order: &[usize], node: usize, who: usize) {
             continue;
         }
         loop {
-            if j.stop.load(Ordering::Relaxed) {
+            if j.stop.load(Ordering::Relaxed) || j.drain.load(Ordering::Relaxed) {
                 break;
             }
             let i = if s < CORE {
@@ -638,9 +641,13 @@ impl Threads {
         let current = sh.job.load(Ordering::Acquire);
         if !current.is_null() {
             let c = unsafe { &*current };
-            // a prefetch amended by a prefetch (093): the items in flight finish (their lines are the point, their takers
-            // kept by the new plan), the unclaimed are simply never claimed. A run stops everything.
-            if !(c.light && unsafe { (*job).light }) {
+            // a prefetch amended by a prefetch (093): its workers claim nothing more here — the new job lists what is
+            // left — but finish the item in hand (its lines are the point, its taker kept by the new plan). A run stops
+            // everything, items in hand included. (Leaving the old job unstopped let its workers drain its whole queue
+            // while the new job re-listed the same items: everything touched twice, aff37/38.)
+            if c.light && unsafe { (*job).light } {
+                c.drain.store(true, Ordering::Relaxed);
+            } else {
                 c.stop.store(true, Ordering::Relaxed);
             }
             c.stopped.store(c.t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
