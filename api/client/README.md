@@ -28,9 +28,9 @@ rockem-client = { version = "0.1", registry = "a10k" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-The service is at `http://192.168.88.2:8765`. The crate uses `reqwest` without TLS by
-default. To reach the service over https, enable a TLS feature of `reqwest` in your own
-build and pass your client to `Client::with_http`.
+The service is at `https://rockem.a10k.co`, on the LAN. TLS is built in (rustls, with
+its bundled public roots), so the address works with no setup. If your build has no use for
+it, depend with `default-features = false`.
 
 ## Transcription
 
@@ -43,7 +43,7 @@ use rockem_client::{Client, Event, StreamExt, TranscribeRequest};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = Client::new("http://192.168.88.2:8765");
+    let client = Client::new("https://rockem.a10k.co");
     let audio = std::fs::read("note.wav")?;
     // The language is optional; without it the model detects the language.
     let mut events = client.transcribe(&TranscribeRequest::new(audio).language("en")).await?;
@@ -77,7 +77,7 @@ use rockem_client::{Client, Event, Message, Request, StreamExt};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = Client::new("http://192.168.88.2:8765");
+    let client = Client::new("https://rockem.a10k.co");
     let req = Request::chat(vec![
         Message::system("You are a terse assistant."),
         Message::user("Name three primary colors."),

@@ -2,7 +2,7 @@
 name = "rockem-client"
 # 0.1.x until the first public release, only the last number moving (tcdent 2026-10-23); it speaks
 # /rockem/v1 (docs/api.md).
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Client for rockem's own API: transcription and generation, each a request in and a stream of events out."
 readme = "README.md"
@@ -11,12 +11,17 @@ keywords = ["rockem", "transcription", "inference", "streaming"]
 publish = ["a10k"]
 
 [dependencies]
-# TLS is the consumer's choice: enable a reqwest TLS feature in your own build to reach https.
 reqwest = { version = "0.12", default-features = false, features = ["stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 futures-util = "0.3"
+
+[features]
+# https://rockem.a10k.co is TLS (Caddy, Let's Encrypt): rustls with its bundled public roots, on
+# by default so the service's address works with no setup. `default-features = false` drops it.
+default = ["rustls"]
+rustls = ["reqwest/rustls-tls"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

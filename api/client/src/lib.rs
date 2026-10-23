@@ -343,7 +343,7 @@ pub struct Client {
 pub type Events = Pin<Box<dyn Stream<Item = Result<Event, Error>> + Send>>;
 
 impl Client {
-    /// `base` is the service's root, e.g. `http://192.168.88.2:8765`.
+    /// `base` is the service's root, e.g. `https://rockem.a10k.co`.
     pub fn new(base: &str) -> Self {
         Self::with_http(reqwest::Client::new(), base)
     }

@@ -6,7 +6,7 @@ use serde_json::json;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let base = args.next().unwrap_or_else(|| "http://localhost:8765".into());
+    let base = args.next().unwrap_or_else(|| "https://rockem.a10k.co".into());
     let question = args.next().unwrap_or_else(|| "List the files in the current directory.".into());
     let tools = vec![
         Tool { name: "read_file".into(), description: "Read a file's contents.".into(), parameters: json!({"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}) },
