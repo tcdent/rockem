@@ -1,26 +1,7 @@
-//! rockem's own API, from Rust (`docs/api.md`): `POST /rockem/v1/generate`, a JSON request
-//! in, a chunked stream of `data: {json}` events out. This crate, that document and the
-//! service's `api/rockem/adapters/internal.py` say the same thing; if they disagree, the
-//! code is wrong. The crate's major version is the API version it speaks.
-//!
-//! The service holds no state: a request carries the whole conversation, and the caller
-//! keeps it. Repeating it is free on the node as long as its front stays the same.
-//!
-//! ```no_run
-//! # async fn run() -> Result<(), rockem_client::Error> {
-//! use rockem_client::{Client, Event, Message, Request, StreamExt};
-//! let client = Client::new("http://192.168.88.2:8765");
-//! let mut events = client.generate(&Request::chat(vec![Message::user("hello")])).await?;
-//! while let Some(event) = events.next().await {
-//!     match event? {
-//!         Event::Thinking { text, .. } | Event::Text { text, .. } => print!("{text}"),
-//!         Event::ToolCall(call) => println!("\n{} {}", call.name, serde_json::Value::Object(call.arguments)),
-//!         Event::Done(done) => println!("\n[{:?}]", done.reason),
-//!         _ => {}
-//!     }
-//! }
-//! # Ok(()) }
-//! ```
+#![doc = include_str!("../README.md")]
+// In the rockem repository this crate, docs/api.md and the service's
+// api/rockem/adapters/internal.py say the same thing; if they disagree, the code is wrong.
+// The README above is the crate's documentation for the teams that build against it.
 
 use std::pin::Pin;
 

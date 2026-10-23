@@ -3,8 +3,11 @@ name = "rockem-client"
 # The major version is the API version it speaks: 1.x.y speaks /rockem/v1 (docs/api.md).
 version = "1.0.0"
 edition = "2021"
-description = "Client for rockem's own API (docs/api.md): a request in, a stream of events out."
-publish = false
+description = "Client for rockem's own API: transcription and generation, each a request in and a stream of events out."
+readme = "README.md"
+keywords = ["rockem", "transcription", "inference", "streaming"]
+# The house registry only (docs: ~/docs/packages.md); never crates.io.
+publish = ["a10k"]
 
 [dependencies]
 # TLS is the consumer's choice: enable a reqwest TLS feature in your own build to reach https.
