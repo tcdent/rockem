@@ -73,9 +73,9 @@ pub const PLAN_LDS: u32 = (4 * (16 + E / 32 * TOP_K + E)) as u32;
 pub const PLAN_WG: u32 = E as u32;
 /// Workgroups that predict a long step's tokens, a token a workgroup at a time.
 pub const PLAN_PRED_WGS: usize = 64;
-/// `pred_rows`' grid: 8 of the next layer's router rows a workgroup, then a token a workgroup (093).
-pub const PRED_ROWS_WGS: u32 = (E / 8) as u32;
-const _: () = assert!(E % 8 == 0 && PRED_ROWS_WGS as usize >= SPEC_TOKENS);
+/// `pred_rows`' grid: a row of the next layer's router a wave (nine a workgroup), then a token a workgroup (093).
+pub const PRED_ROWS_WGS: u32 = (E / 9) as u32;
+const _: () = assert!(E % 9 == 0 && E / 32 == 9 && PRED_ROWS_WGS as usize >= SPEC_TOKENS);
 
 #[cfg(target_arch = "amdgpu")]
 pub mod gfx11 {
@@ -282,63 +282,30 @@ pub mod gfx11 {
             let red = l; // [16]
             let cand = red.add(16); // [E / 32 · TOP_K]
             let sk = cand.add(E / 32 * TOP_K); // [E]
-            // phase 1: this workgroup's 8 rows of the next layer's router, over every token's normed input (the first 8
-            // waves; the ninth idles)
-            let mut i = 0;
-            while i < n {
-                let xt = x.add(i * H);
-                let mut ss = 0f32;
-                if e < 256 {
-                    let mut k = e;
+            // phase 1: a row of the next layer's router a wave — lane k takes elements k, k + 32, … of the token's input
+            // (its norm the wave's own sum of squares) and the row; one wave sum, no workgroup barrier (eight rows a
+            // workgroup through 256-thread dots with two barriers each took 84 µs a launch, 2026-10-22)
+            {
+                let row = E + wg * 9 + wave;
+                let wr = router.add(row * H);
+                let mut i = 0;
+                while i < n {
+                    let xt = x.add(i * H);
+                    let (mut ss, mut acc) = (0f32, 0f32);
+                    let mut k = lane as usize;
                     while k < H {
                         let v = *xt.add(k);
                         ss += v * v;
-                        k += 256;
+                        acc += v * widen(*ln.add(k)) * widen(*wr.add(k));
+                        k += 32;
                     }
-                }
-                ss = wave_sum(lane, ss);
-                if lane == 0 && wave < 8 {
-                    *red.add(wave) = ss;
-                }
-                workgroup_sync();
-                let mut tot = 0f32;
-                let mut k = 0;
-                while k < 8 {
-                    tot += *red.add(k);
-                    k += 1;
-                }
-                let rr = 1.0 / sqrt(tot / H as f32 + RMS_NORM_EPS);
-                workgroup_sync();
-                let mut r = 0;
-                while r < 8 {
-                    let row = E + wg * 8 + r;
-                    let wr = router.add(row * H);
-                    let mut acc = 0f32;
-                    if e < 256 {
-                        let mut k = e;
-                        while k < H {
-                            acc += *xt.add(k) * widen(*ln.add(k)) * widen(*wr.add(k));
-                            k += 256;
-                        }
-                    }
+                    ss = wave_sum(lane, ss);
                     acc = wave_sum(lane, acc);
-                    if lane == 0 && wave < 8 {
-                        *red.add(wave) = acc;
+                    if lane == 0 {
+                        *scores2.add(i * RR + row) = acc / sqrt(ss / H as f32 + RMS_NORM_EPS);
                     }
-                    workgroup_sync();
-                    if e == 0 {
-                        let mut sum = 0f32;
-                        let mut k = 0;
-                        while k < 8 {
-                            sum += *red.add(k);
-                            k += 1;
-                        }
-                        *scores2.add(i * RR + row) = sum * rr;
-                    }
-                    workgroup_sync();
-                    r += 1;
+                    i += 1;
                 }
-                i += 1;
             }
             // the grid barrier: every workgroup's rows are in before any token's margins read them
             fence(Ordering::Release);
