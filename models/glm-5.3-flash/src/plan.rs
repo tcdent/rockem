@@ -20,7 +20,7 @@
 //! before `hc_post`: `pred_input` and the router rows, then `pred_step`). The second margin, measured offline: settled
 //! recall@13 .6205 → .6255 (bringup/expert-cache/phase3b, 2026-10-21).
 
-use crate::{E, SPEC_TOKENS, TOP_K};
+use crate::{E, H, SPEC_TOKENS, TOP_K};
 
 /// Adam's learning rates: the co-routing table; the calibration (ca, cc) and the bias.
 pub const LR_CO: f32 = 3e-3;
@@ -95,13 +95,23 @@ pub mod gfx11 {
         *p -= lr_c1 * mm / (sqrt(vv) / c2 + 1e-8);
     }
 
-    /// `out = a + b`, `n` floats: the second margin's router input (the FFN input plus the shared expert's output).
+    /// `out = a + b + Σₖ wts[i][k] · rows[i][k]`, `n` floats over `[tokens][H]`: the second margin's router input — the
+    /// FFN input plus the whole FFN output (the shared expert's and the routed experts' rows in pick order, the host's
+    /// in the leader's VRAM once its word is in; `rows` null: the shared output alone). Offline, the routed rows as the
+    /// margin's input settled recall@13 .6205 → .647 (phase3b, 2026-10-21); run after `hc_post`, they exist (093).
     #[no_mangle]
-    pub extern "gpu-kernel" fn pred_input(out: *mut f32, a: *const f32, b: *const f32, n: u32) {
+    pub extern "gpu-kernel" fn pred_input(out: *mut f32, a: *const f32, b: *const f32, rows: *const f32, wts: *const f32, n: u32) {
         unsafe {
             let i = workgroup_id_x() as usize * 256 + workitem_id_x() as usize;
             if i < n as usize {
-                *out.add(i) = *a.add(i) + *b.add(i);
+                let mut s = *a.add(i) + *b.add(i);
+                if !rows.is_null() {
+                    let (t, d) = (i / H, i % H);
+                    for k in 0..TOP_K {
+                        s += *wts.add(t * TOP_K + k) * *rows.add((t * TOP_K + k) * H + d);
+                    }
+                }
+                *out.add(i) = s;
             }
         }
     }

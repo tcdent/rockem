@@ -2781,12 +2781,14 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                 // experts are in: this layer's pair predicts the next (a decode step's prediction is the plan); the pairs
                 // learn from the picks at the step's end
                 {
-                    cpu_zone!("plan_step");
-                    pl.plan_step(l, n, &s.b_routed[t0..t0 + n]);
-                }
-                {
                     cpu_zone!("ffn_post");
                     pl.ffn_post(l, n);
+                }
+                // the predictor behind the output half (093): its router input is the whole FFN output, which exists once
+                // `hc_post`'s wait for the host's experts is over; the plan's word comes that much later at the slot
+                {
+                    cpu_zone!("plan_step");
+                    pl.plan_step(l, n, &s.b_routed[t0..t0 + n]);
                 }
                 // the outputs: the layer's leader card's rows in its VRAM (002) — the host's experts write theirs through
                 // the BAR, the cards' jobs theirs directly; the leader sums them

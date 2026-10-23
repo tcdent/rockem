@@ -160,6 +160,7 @@ the index. Reorganized 2026-10-18 from the single-page version (in git history b
 | [090](queue/090-prefetch-streamed-into-the-run.md) | The prefetch streamed into the run | Open — a direction: arrival timed to the run's consumption order | decode |
 | [091](queue/091-prefetch-inside-the-window.md) | The prefetch inside the window | Measured to the box's ceiling (316 GB/s on fresh bytes against a STREAM Triad of ~293): the rate is the box's, the lever is bytes | decode |
 | [092](queue/092-attention-ahead-predictor.md) | Attention-ahead: layer l+1's own attention as the predictor's margin | Quantified, on the shelf — +.038 settled recall@13 for ~150 MB a layer; the small model is within .02 of any learned model on these inputs | decode |
+| [093](queue/093-routed-rows-as-the-signal.md) | The routed rows as the predictor's signal | Built (aff36): pred_step behind hc_post with the whole FFN output as the margin's input; offline +.027 settled | decode |
 
 ## Order (2026-10-18, evening — the 20 ms path)
 

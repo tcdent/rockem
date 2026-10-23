@@ -1935,8 +1935,11 @@ impl Placed for Cards {
             // (a few tokens through the route-ahead's own kernel: the matrix path took ~300 µs a layer at 4 tokens; a long
             // step's on the matrix path, every router row, so both leave layer l + 1's logits from `E` of `ROUTE_ROWS`)
             let (px, ps2) = (self.tok(&c.pred_x, H), self.tok(&c.pred_s2, ROUTE_ROWS));
+            // the routed rows: the host's experts' rows as the leader holds them once its word is in (`plan_step` runs
+            // after `hc_post`, which waited for it), weighted in pick order (093)
+            let rows = self.peers[f.card].rows.at(self.t0 * TOP_K * H * 4);
             let mut a = Args::new();
-            a.ptr(px).ptr(self.tok(&c.x, H)).ptr(self.tok(&c.fyv, H)).u32((n * H) as u32);
+            a.ptr(px).ptr(self.tok(&c.x, H)).ptr(self.tok(&c.fyv, H)).ptr(rows).ptr(self.tok(&c.wv, TOP_K)).u32((n * H) as u32);
             c.k.launch(&c.pred_input, (n * H).div_ceil(256) as u32, g::WG, 0, &a);
             let router = f.router.as_ref().unwrap().va;
             let mut a = Args::new();
