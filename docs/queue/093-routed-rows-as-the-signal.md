@@ -32,6 +32,17 @@ models/glm-5.3-flash/src/plan.rs (`pred_input` with rows and weights), node/src/
 leader's rows and `wv`), construct.rs (`plan_step` after `ffn_post`), bringup/gates/install_elf.sh (the kernels into
 the bundle); phase3b's sim rows (`--lg2 LG3`); the lab's pred3 columns in phase3c.
 
+**aff41 (the pass shrunk, 2026-10-22):** `hc_post` writes the pass's input as it sums, the stacked router through
+`rows_h` (27 µs — the rows kernel's floor at 576 rows over 2–4 tokens, launch-and-latency-bound, as `hc_route_ahead`'s
+32 was), `pred_step` a workgroup a token (32.6 µs — unchanged: its cost is the serial reductions inside a workgroup,
+not the token count). The pass 85 → ~60 µs; the card's per-layer phase 583 → 552 µs; the verify step 56.31 → 55.23
+ms (aff34 52.73); the prediction kept (complete 7.86, partial 2.56, missed 4.89). aff40 segfaulted in the card setup
+(an upload into a device-only buffer) and was replaced. Small launches on this card cost 10–30 µs each regardless of
+their work, so the pass's floor as separate launches is ~60; one fused launch (router GEMV over workgroups, the last
+to arrive taking the margins and the rank) is ~35, which fits the ~40 µs the *peer* card idles on KDA layers when the
+FFN card carries the act — the free form is fused + on the peer (its `x`, `fy` and the routed sum are there; the
+router rows and the pair state would move).
+
 ## The chain (2026-10-22)
 aff36 single-phase: the signal (missed 5.19 → 4.79) but the plan 98.6 µs late at the slot, step 57.84. aff37 two-phase,
 the amend replacing the list whole: complete 7.7 → 4.2, step 58.15. aff38 the head kept: unchanged — the fault was the
