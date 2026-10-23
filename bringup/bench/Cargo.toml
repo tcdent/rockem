@@ -139,3 +139,7 @@ path = "src/pred.rs"
 [[bin]]
 name = "bench-touch"
 path = "src/touch.rs"
+
+[[bin]]
+name = "bench-pool"
+path = "src/pool.rs"

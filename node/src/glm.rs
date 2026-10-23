@@ -11,7 +11,7 @@
 use crate::engine::{Engine, Sampling};
 use crate::loader;
 use common::trace::{NoTrace, Trace, NONE};
-use glm_5_3_flash::construct::{Logits, physical_cores, CpuExperts, CpuModel, Threads};
+use glm_5_3_flash::construct::{Logits, CpuExperts, CpuModel, Threads};
 use glm_5_3_flash::layout::{self, MLA_ROW, MLA_ROW_U16, POSITION, POSITION_W, SNAPSHOT};
 use glm_5_3_flash::weights::Weights;
 use glm_5_3_flash::{EOS_TOKENS, FIRST_POS, H, NUM_HIDDEN_LAYERS, PREFIX_IDS, SAMPLING, SEED, STEP, TOP_K, VOCAB_SIZE};
@@ -63,7 +63,9 @@ pub struct Glm {
 }
 
 impl Glm {
-    pub fn open(bundle: &std::path::Path, mem: loader::Mem, max_ctx: usize, gpu: bool, resident_bytes: usize) -> Box<dyn Engine> {
+    /// `pool` is the node's one pinned pool (every host engine shares it: two pools on the same cores hung the
+    /// node and the box reset, 2026-10-23), `builder` the core kept out of it for the run builder (083).
+    pub fn open(bundle: &std::path::Path, mem: loader::Mem, max_ctx: usize, gpu: bool, resident_bytes: usize, pool: &'static Threads, builder: Option<usize>) -> Box<dyn Engine> {
         let t0 = std::time::Instant::now();
         let dense = loader::load(&bundle.join(layout::DENSE_FILE), mem);
         // the experts, placed equally first; the pool then measures where each node ends its runs
@@ -75,13 +77,7 @@ impl Glm {
         let prefix_b = loader::load(&bundle.join(layout::PREFIX_FILE), loader::Mem::Anon);
         let (p, prefix, q) = unsafe { prefix_b.align_to::<f32>() };
         assert!(p.is_empty() && q.is_empty() && prefix.len() == layout::PREFIX_LEN, "prefix file");
-        // the pool: a thread per physical core, every socket, told where every page of the weights lives
-        // the run builder's core (083): the last core of the main thread's CCD, out of the pool (its CCD's cores past
-        // three do not touch anyway); a box with one CCD keeps every core in the pool and plans inline
-        let mut cores = physical_cores();
-        let main_ccd = glm_5_3_flash::construct::ccd_key(cores[0]);
-        let builder = if cores.len() > 16 { cores.iter().rposition(|&c| glm_5_3_flash::construct::ccd_key(c) == main_ccd).filter(|&i| i > 0).map(|i| cores.remove(i)) } else { None };
-        let pool: &'static Threads = Box::leak(Box::new(Threads::new(&cores)));
+        // the pool is told where every page of the weights lives
         let mut by_node = [0usize; 8];
         for buf in [dense, stream.bytes] {
             let nodes = loader::placement(buf);
@@ -91,7 +87,7 @@ impl Glm {
             pool.place(buf.as_ptr() as usize, buf.len(), nodes);
         }
         let used: Vec<String> = by_node.iter().filter(|&&n| n > 0).map(|&n| format!("{:.1}", n as f64 * 2.0 / 1024.0)).collect();
-        println!("threads  : {} pinned, one per physical core; the weights' 2 MiB pages by node: {} GB", cores.len(), used.join(" / "));
+        println!("weights  : 2 MiB pages by node: {} GB", used.join(" / "));
         let experts: &'static glm_5_3_flash::expert::Stream<'static> = Box::leak(Box::new(stream));
         // the placement trained on the pool itself: the rates its nodes show on real expert runs, at
         // start on random picks (below), then on serving's own runs between requests (`retrain`)

@@ -917,14 +917,29 @@ fn main() {
     // reports free — an assumed mean between the stores and everything else the node holds; `rockem.cache` sets it
     let avail_kb: usize = std::fs::read_to_string("/proc/meminfo").unwrap_or_default().lines().find_map(|l| l.strip_prefix("MemAvailable:")).and_then(|v| v.trim().split(' ').next()).and_then(|v| v.parse().ok()).unwrap_or(0);
     let budget_bytes = config("rockem.cache").and_then(|v| v.parse::<usize>().ok()).map(|gb| gb << 30).unwrap_or(avail_kb << 9) / names.len();
+    // the host pool: one, a thread per physical core on every socket, shared by every host engine (two pools pinned
+    // to the same cores hung the node, 2026-10-23); the run builder's core (083) is the last core of the main thread's
+    // CCD, out of the pool (its CCD's cores past three do not touch anyway) — a box with one CCD keeps every core in
+    let host_pool = || -> (&'static glm_5_3_flash::construct::Threads, Option<usize>) {
+        let mut cores = glm_5_3_flash::construct::physical_cores();
+        let main_ccd = glm_5_3_flash::construct::ccd_key(cores[0]);
+        let builder = if cores.len() > 16 { cores.iter().rposition(|&c| glm_5_3_flash::construct::ccd_key(c) == main_ccd).filter(|&i| i > 0).map(|i| cores.remove(i)) } else { None };
+        println!("threads  : {} pinned, one per physical core{}", cores.len(), builder.map_or(String::new(), |b| format!(", core {b} the run builder's")));
+        (Box::leak(Box::new(glm_5_3_flash::construct::Threads::new(&cores))), builder)
+    };
+    let mut pool: Option<(&'static glm_5_3_flash::construct::Threads, Option<usize>)> = None;
+    let host = |pool: &mut Option<(&'static glm_5_3_flash::construct::Threads, Option<usize>)>| *pool.get_or_insert_with(host_pool);
     // every model resident, each from its own directory of the bundle; a connection names the one it speaks
     let mut sessions: Vec<Session> = Vec::new();
     for name in &names {
         let dir = bundle.join(name);
         let e: Box<dyn Engine> = match name.as_str() {
             "deepseek-v2-lite" => v2lite::V2Lite::open(&dir, mem, max_ctx, gpu, experts_host),
-            "glm-5.3-flash" => glm::Glm::open(&dir, mem, max_ctx, gpu, config("rockem.resident").and_then(|v| v.parse::<usize>().ok()).map_or(glm_kfd::RESIDENT_BYTES, |gb| gb << 30)),
-            "voxtral-small-24b" => voxtral::Voxtral::open(&dir, mem, max_ctx),
+            "glm-5.3-flash" => {
+                let (p, b) = host(&mut pool);
+                glm::Glm::open(&dir, mem, max_ctx, gpu, config("rockem.resident").and_then(|v| v.parse::<usize>().ok()).map_or(glm_kfd::RESIDENT_BYTES, |gb| gb << 30), p, b)
+            }
+            "voxtral-small-24b" => voxtral::Voxtral::open(&dir, mem, max_ctx, host(&mut pool).0),
             other => halt(&format!("the manifest lists model {other:?}, which this node does not carry")),
         };
         // the node's budget, capped by what the model itself can hold

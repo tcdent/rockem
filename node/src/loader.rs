@@ -180,7 +180,11 @@ pub fn load_placed(path: &std::path::Path, mem: Mem, node_of_item: &[u8]) -> glm
 fn map_memory(path: &std::path::Path, len: usize, mem: Mem) -> *mut u8 {
     match mem {
         Mem::Hugetlb => {
-            let name = format!("{HUGEPAGES}/{}", path.file_name().unwrap().to_string_lossy());
+            // the hugetlbfs file named by the model's directory and the file: two models' `dense.bin` named the same
+            // file, and the second model's `set_len` cut the first's mapping short — the first's next read past it
+            // was a SIGBUS that took the node (pid 1) and the box with it, on every two-model boot (2026-10-23)
+            let dir = path.parent().and_then(|d| d.file_name()).map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
+            let name = format!("{HUGEPAGES}/{dir}.{}", path.file_name().unwrap().to_string_lossy());
             let f = fs::OpenOptions::new().read(true).write(true).create(true).open(&name).unwrap_or_else(|e| panic!("{name}: {e} (is hugetlbfs mounted?)"));
             let rounded = len.div_ceil(GB) * GB;
             f.set_len(rounded as u64).unwrap();

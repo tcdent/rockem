@@ -48,6 +48,26 @@ is not it.
 - A Vec's `as_ptr().add(len)` is not the next Vec: the gate|up GEMM wrote past `gate` into nothing until `gu` became one
   allocation (a release-mode segfault on the first step).
 
+## The two-model hang (aff65 → lab-fixed, 2026-10-23) — FOUND
+`loader::map_memory` named each hugetlbfs file by the bundle file's basename (`/dev/hugepages/dense.bin`); both
+models have a `dense.bin`, so Voxtral's load reopened the file GLM's 16 GB mapping was backed by and `set_len` it to
+3 GB — GLM's next read past that was a SIGBUS, which killed the node (pid 1), which panicked the kernel (the text
+never reached the console) and reset the box. The file is named by directory and file now
+(`glm-5.3-flash.dense.bin`). The hunt below stands as the record of what it looked like from outside.
+With both models resident the node answers its hello, Voxtral transcribes (libri2 over the wire on metatron: word for
+word, prompt + first token 14.9 s, 92 ms a token), and GLM's first step hangs: no token, the box's telnet dead within
+seconds, a silent reset minutes later. Reproduced on every boot with both; GLM alone and Voxtral alone are fine. Ruled
+out so far, one lab boot each (`bringup/box/lab_boot.sh`, the experimental `bundles/both` of symlinks, production
+untouched): two pools pinned to the same cores (one host pool shared by both engines now: `main` builds it, the
+engines take `&'static Threads` — still hangs), the cards (GLM on the CPU only — still hangs), the node's allocator
+(the system allocator — still hangs). The pool's call pattern (Voxtral's plain and node-placed runs, then GLM's
+prepared slotted jobs) completes on the dev host (`bench-pool`). Console prints
+(2026-10-23 13:35): GLM's two prefix steps at open complete (before Voxtral loads); the first request's step prints
+"layer 0" and nothing more, and a watchdog thread sleeping 5 s between prints of the pool's state never printed — the
+process (or the box) is frozen, not spinning in the pool. The box's telnet shell dies with it. Next: a GLM step at
+open after both models have loaded (the serve loop out of the picture), the watchdog on the housekeeping core.
+(The host's RAID array is reshaping, 2026-10-23 14:00: NFS reads at 120–170 MB/s, a lab boot ~25 min.)
+
 ## Open
 - Speed: the encoder's GEMM is a naive tile (43 s a window on the dev host, idle); the prefill and decode on the box to
   be measured (aff65). Expected: decode ~40 ms a token at the DRAM ceiling, prefill a 30 s window in ~1 s.

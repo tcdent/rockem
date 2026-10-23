@@ -6,7 +6,7 @@ node-side gate the forward-voxtral driver cannot give: the engine, AUDIO's recei
 import asyncio, json, os, sys, time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "api"))
 from rockem.bundle import Bundle  # noqa: E402
-from rockem.wire import Client  # noqa: E402
+from rockem.wire import AudioSpec, Client  # noqa: E402
 from tokenizers import Tokenizer  # noqa: E402
 
 async def main():
@@ -20,7 +20,8 @@ async def main():
     windows = [raw[i * per:(i + 1) * per] for i in range(n)]
     tok = Tokenizer.from_file(os.path.join(bundle, "voxtral-small-24b", "tokenizer.json"))
     t0 = time.time()
-    c = await Client.connect((host, 7332), m.prefix, m.eos_tokens, m.vocab_size, m.identity, model=m.name)
+    spec = AudioSpec(placeholder=m.audio["placeholder"], window_bytes=per, rows=m.audio["rows"])
+    c = await Client.connect((host, 7332), m.prefix, m.eos_tokens, m.vocab_size, m.identity, model=m.name, audio=spec)
     t1 = time.time()
     await c.prompt(ids, windows=windows)
     out, t_first = [], None

@@ -5,7 +5,7 @@
 
 use crate::engine::{Engine, Sampling};
 use crate::loader;
-use glm_5_3_flash::construct::{node_count, physical_cores, Threads};
+use glm_5_3_flash::construct::{node_count, Threads};
 use std::collections::VecDeque;
 use voxtral_small_24b::decoder::{Decoder, POSITION, STEP};
 use voxtral_small_24b::encoder::Encoder;
@@ -29,7 +29,8 @@ pub struct Voxtral {
 }
 
 impl Voxtral {
-    pub fn open(bundle: &std::path::Path, mem: loader::Mem, max_ctx: usize) -> Box<dyn Engine> {
+    /// `pool`: the node's one pinned pool, shared with every other host engine.
+    pub fn open(bundle: &std::path::Path, mem: loader::Mem, max_ctx: usize, pool: &'static Threads) -> Box<dyn Engine> {
         let t0 = std::time::Instant::now();
         let dense = loader::load(&bundle.join(layout::DENSE_FILE), mem);
         // the stream's runs bound to nodes: run r of every layer (and of the head) on node r mod nodes
@@ -45,7 +46,7 @@ impl Voxtral {
         }
         let stream = loader::load_bound(&bundle.join(layout::STREAM_FILE), mem, &ranges, nodes);
         println!("bundle   : {} loaded in {:.1}s ({:.1} GB)", bundle.display(), t0.elapsed().as_secs_f32(), (dense.len() + stream.len()) as f64 / 1e9);
-        let pool: &'static Threads = Box::leak(Box::new(Threads::new(&physical_cores())));
+        pool.place(stream.as_ptr() as usize, stream.len(), loader::placement(stream));
         let (dense, stream) = (Dense::new(dense), Stream::new(stream));
         let mut dec = Decoder::new(dense, stream, pool, nodes, max_ctx);
         let enc = Encoder::new(dense, pool);
