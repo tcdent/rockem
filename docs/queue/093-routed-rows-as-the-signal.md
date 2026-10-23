@@ -48,6 +48,72 @@ margin's threshold and the co-routing sums (aff44; the step 55.72, the predictio
 is the bulk: a wave over 4096 elements is 128 dependent steps a token and 32 workgroups give ~3 waves a CU to hide them.
 aff45: a (token, row) a wave, 128 workgroups — 58 µs (p90 59, a fixed cost), the step 55.36, the prediction 7.72 / 4.89: level with the two launches it replaced. Its parts to be timed inside the kernel (stat clocks) before more guessing.
 
+**aff46 (the phases timed in-kernel, 2026-10-22):** the four `stat!` slots of the stats code object, read from workgroup
+0's wave 0 (the only wave that stamps every slot; workgroups past the token count leave the barrier early and their
+later slots hold stale values — the slab means of slots 2 and 3 read as 1.3 ms, an artifact): GEMV 18.6 µs (the
+slowest workgroup 28.6 — the barrier lifts for everyone at the slowest wave), barrier wait 10, margins 8.2, rank 19.9
+(stamped only when workgroup 0 is the last to arrive); 56.7 of the 59.2 launch, the rest the launch itself. The ISA
+(bringup/box/logs/pred_rows.asm) shows both big phases as load-wait loops: the GEMV issued one `global_load` triple
+and a `s_waitcnt` an element — 128 dependent rounds a lane at H 4096, ~220 ns each; the rank one `ds_load_b32` and
+a wait a key, 288 rounds. Neither is bandwidth or arithmetic: 20 KB a row and 288 compares. **aff47:** the GEMV a
+lane's eight contiguous elements of a 256-chunk through 16-byte loads, four chunks (sixteen loads) in flight before
+the first wait (the ISA: 16 `global_load_b128` then `vmcnt(13)`); the rank 32 keys a round through eight
+`ds_load_b128` (the same loop in `pred_step`'s early pass). pred_rows 26 → 80 VGPRs, no scratch, barriers unchanged.
+The summation order changed, so `scores2` differs in its last bits from the serial dot; the plan is not gated bit-for-bit
+(only the forward is), the prediction's complete/missed is the check.
+**Read (aff47):** pred_rows 59.2 → 34.5 µs (p90 38.5); workgroup 0: GEMV 7.5, barrier 5.9, margins 6.1, rank 13.8;
+the slowest GEMV still 18.4. SCORE bit-identical, the prediction 7.6 / 3.09 / 4.94 (aff46 7.77 / 2.65 / 4.89 — the
+run-to-run spread of complete is ±0.2 across aff30–34). The deploy carried aff46's node binary (a host-side compile
+error in the new const assert, fixed after), which changes nothing: the ELF was the change.
+
+**aff48 (2026-10-22):** two more guesses, both wrong about where the time was. (1) The GEMV's L2 traffic: every wave
+re-read its token's `x` (16 KB) and `ln` (8 KB) beside its 8 KB row — 37 MB a launch; now the workgroup's 256 threads
+write the normed input `x · ln` once into LDS (`PRED_ROWS_LDS` = the plan's 1.5 KB + 16 KB) and the waves read their
+rows with all sixteen loads in flight. Workgroup 0's GEMV 7.5 → 5.7 — and the barrier wait rose 5.9 → 7.5: the sum
+13.3 is constant, so the barrier lifts at a fixed time after the first workgroup starts, set by the last workgroup to
+get going, not by GEMV work. (2) The rank's compares as one `v_cmp_gt_u64` a key (the keys positive finite, bits
+ordered; the tie by index in the low word) instead of the short-circuit `||` that branched on the exec mask (292 u64
+compares in the ISA, 23 exec branches left of hundreds): the rank slot 13.8 → 13.6. The slot's time is not the
+compare loop — it also holds the last-workgroup election (an atomic on `count`), the key product's loads from `keys`
+(written by the other token's workgroup) and the plan store; re-slotted to tell them apart. pred_rows 34.2 (p90
+38.1), the prediction 7.52 / 3.17 / 4.94, SCORE bit-identical.
+
+**aff49 (2026-10-22):** the grid `n · 32` workgroups instead of a fixed four tokens' worth (64 at a verify step, half
+the waves) — the barrier wait unchanged at 7.5 µs, so the lift is not the wave dispatch either. The re-slotted stamps:
+election + key product 0.8 µs; rank + plan store + the closing sync 12.7. pred_rows 33.9 (p90 37.8), the prediction
+7.64 / 3.06 / 4.94, SCORE bit-identical. Twelve microseconds for nine rounds of eight LDS reads and 32 compares a
+thread (~1.8k VALU instructions a wave, three waves a SIMD) is 3 µs at 2 GHz — four times too slow, as the ~6 µs for
+sixteen `wave_max` rounds and the 7.5 µs lift are. The common factor would be the core clock: the cards are held at
+`high`, but sysfs shows the sleep state (34 MHz) whenever a card is between launches, and a decode step leaves the
+card idle in short gaps. aff50 stamped the span in SHADER_CYCLES beside the real-time counter: **1.92 GHz** (p10 1.79, p90
+2.08) — the clock is not it (`stat_cycles!` stays in the channel for the next such question). The rank's ISA is: a
+`v_cmp_gt_u64`, a `v_cndmask` and a two-instruction 64-bit add a key — 64-bit integer VALU ops run at reduced rate on
+gfx11, which is the missing factor. **aff51:** a unique 32-bit key (the expert's index in the low nine mantissa bits,
+keys within 2⁻¹⁴ rank by index), a 32-bit count: 289 `v_cmp_gt_u32` in the ISA, instr 3674 → 2556. **Read:** the
+rank slot 12.7 → 5.6 µs (what is left of it: ~900 VALU a wave, the plan store into host memory and its `vscnt` wait, the
+closing sync and word); pred_rows 33.9 → **28.8** (p90 31.4) at 1.90 GHz; SCORE bit-identical; the prediction 7.33 /
+3.09 / 4.89 (complete at the low edge of its ±0.2 spread — to be watched across the next runs, the tie precision is the
+only numeric change).
+
+**aff52 (2026-10-22):** a router row a wave over every token: the grid `PRED_ROWS_BLOCKS` = 32 workgroups whatever
+`n`, the tokens' normed inputs in LDS as bf16 (`[SPEC_TOKENS][H]`, 32 KB, with their sums of squares), the row's
+sixteen loads in flight once and a dot a token from LDS. Each router row is read once a launch (2.4 MB) instead of once
+a token; 288 waves instead of 576. 152 VGPRs (from 89), no scratch. **Read:** 28.7 µs (p90 31.6), the span to the margins' end
+20.2 — unchanged; the prediction 7.34 / 3.09 / 4.89, SCORE bit-identical. Kept (one row read a launch, a fixed grid),
+but the lesson is that the ~13 µs from the first workgroup's start to the barrier's lift is insensitive to the GEMV's
+work (37 → 12 → 2.4 MB), to the wave count (1152 → 576 → 288) and to the clock (1.9 GHz). **aff53** stamps every
+workgroup's start and barrier arrival (the clock's low 24 bits, exact in f32) and its GEMV phase, with the host writing
+the min and max over the workgroups' wave 0 (`sN_wgmin/wgmax` — the slots every workgroup stamps read clean there,
+where the means and maxes over all waves hold stale entries): the dispatch spread and the slowest GEMV, measured
+instead of inferred from workgroup 0. **Read (aff53):** the 32 workgroups start within **0.6 µs** of each other
+(p90 0.8); the barrier lifts 13.7 µs after the first start; the GEMV phase takes **8.3 µs for the fastest workgroup,
+9.0 for workgroup 0, 13.6 for the slowest** — the phase itself, not dispatch and not stragglers: every workgroup
+spends 8–14 µs on two tokens' normed inputs into LDS, sixteen row loads, two dots and the stores, all of it in VRAM.
+pred_rows 28.3, the prediction 7.41 / 3.01 / 4.89. **aff55** stamps that phase's three parts (the inputs into LDS up to
+the sync; the sync's wait; the row loads and dots to the store) per workgroup. (aff54 re-ran aff53's code object: the
+stats build had failed on a stamp's scope and the chain went on to install the stale ELF — a build's exit code, not its
+grep, gates the install from here; the deploy log's manifest hash is the check.)
+
 ## The chain (2026-10-22)
 aff36 single-phase: the signal (missed 5.19 → 4.79) but the plan 98.6 µs late at the slot, step 57.84. aff37 two-phase,
 the amend replacing the list whole: complete 7.7 → 4.2, step 58.15. aff38 the head kept: unchanged — the fault was the

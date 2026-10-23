@@ -32,6 +32,18 @@ pub unsafe fn clock() -> u64 {
     core::arch::asm!("s_sendmsg_rtn_b64 {c}, sendmsg(MSG_RTN_GET_REALTIME)", "s_waitcnt lgkmcnt(0)", c = out(sgpr64) c, options(nostack, nomem, preserves_flags));
     c
 }
+/// The shader clock in core cycles: the 20-bit SHADER_CYCLES register, wrapping every ~0.5 ms at 2 GHz. Beside a
+/// `clock()` pair over the same span it gives the core clock the launch ran at (`stat_cycles!`).
+#[cfg(all(target_arch = "amdgpu", feature = "stats"))]
+#[inline(always)]
+pub unsafe fn cycles() -> u32 {
+    let c: u32;
+    core::arch::asm!("s_getreg_b32 {c}, hwreg(HW_REG_SHADER_CYCLES, 0, 20)", c = out(sgpr32) c, options(nostack, nomem, preserves_flags));
+    c
+}
+/// The difference of two `cycles()` readings, modulo the register's width.
+pub const CYCLES_MASK: u32 = (1 << 20) - 1;
+
 /// The difference of two `clock()` readings: the 64-bit real-time counter never wraps in a launch.
 pub const CLOCK_MASK: u64 = u64::MAX;
 /// `clock()` ticks a microsecond (the 100 MHz real-time counter).
@@ -63,7 +75,22 @@ macro_rules! stat {
         }
     };
 }
-/// `stat_clock!()`: the 100 MHz clock, for phase deltas; 0 without stats.
+/// `stat_cycles!()`: the shader clock in core cycles (see `cycles`); 0 without stats.
+#[macro_export]
+macro_rules! stat_cycles {
+    () => {{
+        #[cfg(feature = "stats")]
+        {
+            $crate::stats::cycles()
+        }
+        #[cfg(not(feature = "stats"))]
+        {
+            0u32
+        }
+    }};
+}
+
+/// `stat_clock!()`: the real-time counter (see `clock`).
 #[macro_export]
 macro_rules! stat_clock {
     () => {{

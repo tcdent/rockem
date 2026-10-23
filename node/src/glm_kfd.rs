@@ -977,9 +977,15 @@ impl Cards {
                 let w0 = |k: usize| slots[k].first().copied().unwrap_or(0.0) as f64;
                 let mean = |k: usize| if slots[k].is_empty() { 0.0 } else { slots[k].iter().map(|&v| v as f64).sum::<f64>() / slots[k].len() as f64 };
                 let max = |k: usize| slots[k].iter().copied().fold(0f32, f32::max) as f64;
+                // over the workgroups' wave 0 only (every `STAT_WAVES_PER_WG`th entry): the slots a kernel stamps from
+                // wave 0 of every workgroup read clean here, where the mean and max over all waves hold stale entries
+                let wg0 = |k: usize| slots[k].iter().step_by(common::stats::STAT_WAVES_PER_WG as usize).copied();
+                let wgmin = |k: usize| wg0(k).fold(f32::INFINITY, f32::min) as f64;
+                let wgmax = |k: usize| wg0(k).fold(0f32, f32::max) as f64;
                 prow::row!("track-launches", "kernel_stats", { "lane" => lane.as_str(), "kernel" => name, "dur_us" => dur_us, "waves" => slots[0].len(),
                     "s0_w0" => w0(0), "s0_mean" => mean(0), "s0_max" => max(0), "s1_w0" => w0(1), "s1_mean" => mean(1), "s1_max" => max(1),
-                    "s2_w0" => w0(2), "s2_mean" => mean(2), "s2_max" => max(2), "s3_w0" => w0(3), "s3_mean" => mean(3), "s3_max" => max(3) });
+                    "s2_w0" => w0(2), "s2_mean" => mean(2), "s2_max" => max(2), "s3_w0" => w0(3), "s3_mean" => mean(3), "s3_max" => max(3),
+                    "s0_wgmin" => wgmin(0), "s0_wgmax" => wgmax(0), "s1_wgmin" => wgmin(1), "s1_wgmax" => wgmax(1), "s2_wgmin" => wgmin(2), "s2_wgmax" => wgmax(2) });
             }
         }
     }
@@ -2174,7 +2180,7 @@ impl Cards {
             let mut a = Args::new();
             a.ptr(px).ptr(f.ln.va).ptr(router).ptr(ps2).ptr(st.va).ptr(self.tok(&c.scores_v, ROUTE_ROWS)).ptr(d.at(self.t0 * E * 4)).ptr(d2.at(self.t0 * E * 4)).ptr(c.pred_aux.va);
             a.ptr(self.shared.plan2.va).ptr(self.shared.words.at(self.wd(W_PLAN2, f.card))).u32(self.half_seq[l][self.ch][1]).u32(n as u32).ptr(c.pred_keys.va).ptr(c.pred_count.va);
-            c.k.launch(&c.pred_rows, glm_5_3_flash::plan::PRED_ROWS_WGS, PLAN_WG, PLAN_LDS, &a);
+            c.k.launch(&c.pred_rows, glm_5_3_flash::plan::PRED_ROWS_BLOCKS, PLAN_WG, glm_5_3_flash::plan::PRED_ROWS_LDS, &a);
             return;
         }
         if rows {

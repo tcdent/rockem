@@ -69,25 +69,42 @@ pub const LEARN_WG: u32 = E as u32;
 pub const LEARN_TAB: usize = 5;
 /// `pred_step`'s: the reductions, the waves' best 8, the plan's keys `[E]`.
 pub const PLAN_LDS: u32 = (4 * (16 + E / 32 * TOP_K + E)) as u32;
+/// `pred_rows`' LDS: the plan's, then the tokens' normed inputs `[SPEC_TOKENS][H]` bf16 (at a 16-byte offset) and
+/// their sums of squares `[SPEC_TOKENS][8]`.
+pub const PRED_ROWS_LDS: u32 = PLAN_LDS + (2 * SPEC_TOKENS * crate::H + 4 * SPEC_TOKENS * 8) as u32;
+const _: () = assert!(PLAN_LDS % 16 == 0 && crate::H % 512 == 0 && crate::H / 16 <= 256 && PRED_ROWS_LDS <= 65536);
 /// `pred_step`'s workgroup: a thread an expert.
 pub const PLAN_WG: u32 = E as u32;
 /// Workgroups that predict a long step's tokens, a token a workgroup at a time.
 pub const PLAN_PRED_WGS: usize = 64;
-/// `pred_rows`' grid: a (token, router row) a wave — nine rows a workgroup, `E / 9` workgroups a token, every
-/// `SPEC_TOKENS` tokens' worth launched so the barrier count is fixed; then a token a workgroup (093).
+/// `pred_rows`' grid: a router row a wave over every token — nine rows a workgroup, `E / 9` workgroups (the barrier
+/// counts to it); then a token a workgroup (093).
 pub const PRED_ROWS_BLOCKS: u32 = (E / 9) as u32;
-pub const PRED_ROWS_WGS: u32 = PRED_ROWS_BLOCKS * SPEC_TOKENS as u32;
 const _: () = assert!(E % 9 == 0 && E / 32 == 9 && PRED_ROWS_BLOCKS as usize >= SPEC_TOKENS);
+// the wide reads: a lane's eight elements of a 256-chunk of a row, and the keys in LDS at a 16-byte offset
+const _: () = assert!(crate::H % 256 == 0 && E % 32 == 0 && E <= 512 && (16 + E / 32 * TOP_K) % 4 == 0);
 
 #[cfg(target_arch = "amdgpu")]
 pub mod gfx11 {
     use super::*;
     use crate::RMS_NORM_EPS;
+    use common::gemv::gfx11::to_bf16;
     use common::gemv::widen;
     use common::gfx11::{ballot, lds, wave_max, wave_sum, workgroup_sync};
     use common::math::{exp, sqrt};
     use core::arch::amdgpu::{workgroup_id_x, workitem_id_x};
     use core::sync::atomic::{fence, AtomicU32, Ordering};
+
+    /// 16-byte-aligned vectors: a read of one is a single wide load (`global_load_b128` / `ds_load_b128`).
+    #[repr(C, align(16))]
+    #[derive(Clone, Copy)]
+    struct F4([f32; 4]);
+    #[repr(C, align(16))]
+    #[derive(Clone, Copy)]
+    struct F8([f32; 8]);
+    #[repr(C, align(16))]
+    #[derive(Clone, Copy)]
+    struct H8([u16; 8]);
 
     #[inline(always)]
     fn sigmoid(x: f32) -> f32 {
@@ -253,16 +270,28 @@ pub mod gfx11 {
                 key *= *keys.add(w * E + e);
                 w += 1;
             }
-            // the plan: each expert's place among the keys (the greater first, between equals the lower expert)
-            *sk.add(e) = key;
+            // the plan: each expert's place among the keys (the greater first, between equals the lower expert). The
+            // keys are positive finite (1 + exp(z ≤ 20), at most four multiplied), so their bits order as u32; the low
+            // nine mantissa bits carry the expert's index for the tie (keys within 2⁻¹⁴ of each other rank by index),
+            // and a key is one 32-bit compare and a count. The 288 compares a thread were: a read and a wait a key,
+            // 19.9 µs (aff46); the short-circuit `||` branching on the exec mask, 13.8 (aff47); a 64-bit key with
+            // the index in the low word and a 64-bit count, 12.8 — 64-bit integer ops at reduced rate (aff49)
+            let kk = (key.to_bits() & !0x1FF) | (E - 1 - e) as u32;
+            *sk.add(e) = f32::from_bits(kk);
             workgroup_sync();
-            let mut r = 0usize;
+            let mut r = 0u32;
             let mut j = 0;
             while j < E {
-                let w = *sk.add(j);
-                r += (w > key || (w == key && j < e)) as usize;
-                j += 1;
+                // 32 keys a round through eight 16-byte LDS reads in flight
+                let ks: [F4; 8] = core::ptr::read(sk.add(j) as *const [F4; 8]);
+                let mut t = 0;
+                while t < 32 {
+                    r += (ks[t / 4].0[t % 4].to_bits() > kk) as u32;
+                    t += 1;
+                }
+                j += 32;
             }
+            let r = r as usize;
             if r < PLAN {
                 *plan.add(r) = e as u32;
             }
@@ -275,7 +304,7 @@ pub mod gfx11 {
     }
 
     /// The rows pass as one launch (093): the next layer's router over `x` (the FFN input plus the whole FFN output,
-    /// `hc_post`'s), the margins, the plan. Grid `PRED_ROWS_WGS` of `PLAN_WG`, all resident: phase 1, workgroup w
+    /// `hc_post`'s), the margins, the plan. Grid `PRED_ROWS_BLOCKS` of `PLAN_WG`, all resident: phase 1, workgroup w
     /// takes router rows `E + 8w..` over the `n` tokens into `scores2` (`[n][ROUTE_ROWS]`); a grid barrier on
     /// `count[0]`; phase 2, workgroup i < n takes token i — the two margins against `scores` (`hc_pre`'s route-ahead)
     /// and `scores2`, stored for the learning, its key into `keys` — and the last to arrive at `count[1]` multiplies the
@@ -293,52 +322,106 @@ pub mod gfx11 {
             let red = l; // [16]
             let cand = red.add(16); // [E / 32 · TOP_K]
             let sk = cand.add(E / 32 * TOP_K); // [E]
-            // stats: slot 0 the GEMV phase, 1 the grid barrier's wait, 2 the token's margins and key, 3 the last
-            // workgroup's product and rank (ticks of the 100 MHz clock; wave 0 of each workgroup stamps)
+            // stats (wave 0 of each workgroup stamps; ticks of the 100 MHz clock): slot 0 the normed inputs into LDS
+            // (loads, converts, stores, up to the sync), 1 the sync's wait, 2 the row's loads and dots to the scores'
+            // store, 3 the last workgroup's rank and plan. Known (aff47–53, 2026-10-22): the workgroups start within
+            // 0.6 µs of each other, the GEMV phase takes 8.3 (fastest) – 13.6 µs (slowest, the barrier's lift) of
+            // them, the margins ~6, the election and key product 1.7, the launch runs at 1.9 GHz
             let kt0 = common::stat_clock!();
-            // phase 1: a (token, router row) a wave — lane k takes elements k, k + 32, … of the token's input (its norm
-            // the wave's own sum of squares) and the row; one wave sum, no workgroup barrier. A wave a row over every
-            // token in turn was 512 dependent steps with ~3 waves a CU to hide them: 67 µs a launch (2026-10-22)
+            // phase 1: a router row a wave over every token — nine rows a workgroup, `PRED_ROWS_BLOCKS` workgroups. The
+            // tokens' normed inputs once a workgroup into LDS as bf16 (256 threads take 16 contiguous elements of each),
+            // their sums of squares through `ssum`; then the row's sixteen 16-byte loads all in flight, a dot a token
+            // from LDS, one wave sum each. A (token, row) a wave read every row once a token (aff45–49, 2026-10-22);
+            // a row a wave over the tokens with a load and a wait an element was 67 µs (aff43)
             {
-                let (i, block) = (wg / PRED_ROWS_BLOCKS as usize, wg % PRED_ROWS_BLOCKS as usize);
-                if i < n {
-                    let row = E + block * 9 + wave;
-                    let wr = router.add(row * H);
+                let block = wg;
+                let xn = sk.add(E) as *mut u16; // [SPEC_TOKENS][H] bf16
+                let ssum = xn.add(SPEC_TOKENS * H) as *mut f32; // [SPEC_TOKENS][8]
+                let mut i = 0;
+                while i < n {
                     let xt = x.add(i * H);
-                    let (mut ss, mut acc) = (0f32, 0f32);
-                    let mut k = lane as usize;
-                    while k < H {
-                        let v = *xt.add(k);
-                        ss += v * v;
-                        acc += v * widen(*ln.add(k)) * widen(*wr.add(k));
-                        k += 32;
+                    let mut ss = 0f32;
+                    if e < H / 16 {
+                        let k0 = e * 16;
+                        let xa = core::ptr::read(xt.add(k0) as *const F8);
+                        let xb = core::ptr::read(xt.add(k0 + 8) as *const F8);
+                        let la = core::ptr::read(ln.add(k0) as *const H8);
+                        let lb = core::ptr::read(ln.add(k0 + 8) as *const H8);
+                        let mut pa = H8([0u16; 8]);
+                        let mut pb = H8([0u16; 8]);
+                        let mut t = 0;
+                        while t < 8 {
+                            ss += xa.0[t] * xa.0[t] + xb.0[t] * xb.0[t];
+                            pa.0[t] = to_bf16(xa.0[t] * widen(la.0[t]));
+                            pb.0[t] = to_bf16(xb.0[t] * widen(lb.0[t]));
+                            t += 1;
+                        }
+                        core::ptr::write(xn.add(i * H + k0) as *mut H8, pa);
+                        core::ptr::write(xn.add(i * H + k0 + 8) as *mut H8, pb);
                     }
                     ss = wave_sum(lane, ss);
+                    if lane == 0 && wave < 8 {
+                        *ssum.add(i * 8 + wave) = ss;
+                    }
+                    i += 1;
+                }
+                let row = E + block * 9 + wave;
+                let wr = router.add(row * H);
+                const CH: usize = 256;
+                let mut wv = [H8([0u16; 8]); H / CH];
+                let mut c = 0;
+                while c < H / CH {
+                    wv[c] = core::ptr::read(wr.add(c * CH + lane as usize * 8) as *const H8);
+                    c += 1;
+                }
+                let kta = common::stat_clock!();
+                workgroup_sync();
+                let ktb = common::stat_clock!();
+                if wave == 0 {
+                    common::stat!(0, kta.wrapping_sub(kt0) & common::stats::CLOCK_MASK);
+                    common::stat!(1, ktb.wrapping_sub(kta) & common::stats::CLOCK_MASK);
+                }
+                let mut i = 0;
+                while i < n {
+                    let mut acc = 0f32;
+                    let mut c = 0;
+                    while c < H / CH {
+                        let xv = core::ptr::read(xn.add(i * H + c * CH + lane as usize * 8) as *const H8);
+                        let mut t = 0;
+                        while t < 8 {
+                            acc += widen(xv.0[t]) * widen(wv[c].0[t]);
+                            t += 1;
+                        }
+                        c += 1;
+                    }
                     acc = wave_sum(lane, acc);
                     if lane == 0 {
+                        let mut ss = 0f32;
+                        let mut w = 0;
+                        while w < H / 16 / 32 {
+                            ss += *ssum.add(i * 8 + w);
+                            w += 1;
+                        }
                         *scores2.add(i * RR + row) = acc / sqrt(ss / H as f32 + RMS_NORM_EPS);
                     }
+                    i += 1;
                 }
-            }
-            let kt1 = common::stat_clock!();
-            if wave == 0 {
-                common::stat!(0, kt1.wrapping_sub(kt0) & common::stats::CLOCK_MASK);
+                let ktc = common::stat_clock!();
+                if wave == 0 {
+                    common::stat!(2, ktc.wrapping_sub(ktb) & common::stats::CLOCK_MASK);
+                }
             }
             // the grid barrier: every workgroup's rows are in before any token's margins read them
             fence(Ordering::Release);
             workgroup_sync();
             if e == 0 {
                 AtomicU32::from_ptr(count).fetch_add(1, Ordering::AcqRel);
-                while AtomicU32::from_ptr(count).load(Ordering::Acquire) < PRED_ROWS_WGS {
+                while AtomicU32::from_ptr(count).load(Ordering::Acquire) < PRED_ROWS_BLOCKS {
                     core::hint::spin_loop();
                 }
             }
             workgroup_sync();
             fence(Ordering::Acquire);
-            let kt2 = common::stat_clock!();
-            if wave == 0 {
-                common::stat!(1, kt2.wrapping_sub(kt1) & common::stats::CLOCK_MASK);
-            }
             if wg >= n {
                 return;
             }
@@ -359,10 +442,6 @@ pub mod gfx11 {
             *keys.add(i * E + e) = 1.0 + exp(if z < 20.0 { z } else { 20.0 });
             fence(Ordering::Release);
             workgroup_sync();
-            let kt3 = common::stat_clock!();
-            if wave == 0 {
-                common::stat!(2, kt3.wrapping_sub(kt2) & common::stats::CLOCK_MASK);
-            }
             if e == 0 {
                 let last = AtomicU32::from_ptr(count.add(1)).fetch_add(1, Ordering::AcqRel) == n as u32 - 1;
                 *red.add(15) = if last { 1.0 } else { 0.0 };
@@ -382,16 +461,29 @@ pub mod gfx11 {
                 key *= *keys.add(w * E + e);
                 w += 1;
             }
-            // the plan: each expert's place among the keys (the greater first, between equals the lower expert)
-            *sk.add(e) = key;
+            let kt3b = common::stat_clock!();
+            // the plan: each expert's place among the keys (the greater first, between equals the lower expert). The
+            // keys are positive finite (1 + exp(z ≤ 20), at most four multiplied), so their bits order as u32; the low
+            // nine mantissa bits carry the expert's index for the tie (keys within 2⁻¹⁴ of each other rank by index),
+            // and a key is one 32-bit compare and a count. The 288 compares a thread were: a read and a wait a key,
+            // 19.9 µs (aff46); the short-circuit `||` branching on the exec mask, 13.8 (aff47); a 64-bit key with
+            // the index in the low word and a 64-bit count, 12.8 — 64-bit integer ops at reduced rate (aff49)
+            let kk = (key.to_bits() & !0x1FF) | (E - 1 - e) as u32;
+            *sk.add(e) = f32::from_bits(kk);
             workgroup_sync();
-            let mut r = 0usize;
+            let mut r = 0u32;
             let mut j = 0;
             while j < E {
-                let w = *sk.add(j);
-                r += (w > key || (w == key && j < e)) as usize;
-                j += 1;
+                // 32 keys a round through eight 16-byte LDS reads in flight
+                let ks: [F4; 8] = core::ptr::read(sk.add(j) as *const [F4; 8]);
+                let mut t = 0;
+                while t < 32 {
+                    r += (ks[t / 4].0[t % 4].to_bits() > kk) as u32;
+                    t += 1;
+                }
+                j += 32;
             }
+            let r = r as usize;
             if r < PLAN {
                 *plan.add(r) = e as u32;
             }
@@ -402,7 +494,7 @@ pub mod gfx11 {
             }
             let kt4 = common::stat_clock!();
             if wave == 0 {
-                common::stat!(3, kt4.wrapping_sub(kt3) & common::stats::CLOCK_MASK);
+                common::stat!(3, kt4.wrapping_sub(kt3b) & common::stats::CLOCK_MASK);
             }
         }
     }
