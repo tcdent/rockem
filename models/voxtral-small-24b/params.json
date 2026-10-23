@@ -1,0 +1,34 @@
+{
+  "dim": 5120,
+  "n_layers": 40,
+  "head_dim": 128,
+  "hidden_dim": 32768,
+  "n_heads": 32,
+  "n_kv_heads": 8,
+  "rope_theta": 100000000.0,
+  "norm_eps": 1e-05,
+  "vocab_size": 131072,
+  "max_position_embeddings": 32768,
+  "multimodal": {
+    "whisper_model_args": {
+      "encoder_args": {
+        "dim": 1280,
+        "n_layers": 32,
+        "head_dim": 64,
+        "hidden_dim": 5120,
+        "n_heads": 20,
+        "vocab_size": 51866,
+        "max_source_positions": 1500,
+        "audio_encoding_args": {
+          "sampling_rate": 16000,
+          "num_mel_bins": 128,
+          "hop_length": 160,
+          "window_size": 400
+        }
+      },
+      "downsample_args": {
+        "downsample_factor": 4
+      }
+    }
+  }
+}

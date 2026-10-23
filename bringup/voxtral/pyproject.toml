@@ -1,0 +1,22 @@
+[project]
+name = "rockem-voxtral"
+version = "0.0.0"
+description = "The Voxtral-Small-24B oracle and the bundle's edge files: transformers 5.x on the CPU, mistral-common for the tokenizer conversion check."
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "transformers>=5.13",
+  "mistral-common>=1.8",
+  "torch",
+  "safetensors",
+  "numpy",
+  "tokenizers",
+  "soundfile",
+  "accelerate",
+  "librosa",
+]
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

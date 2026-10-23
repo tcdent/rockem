@@ -33,3 +33,6 @@ bringup/expert-cache/data/
 # the box workloads' request bodies (prompts from real sessions)
 bringup/box/requests/
 bringup/box/logs/
+bringup/voxtral/.venv/
+bringup/voxtral/edge/
+bringup/voxtral/logs/

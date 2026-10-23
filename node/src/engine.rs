@@ -95,6 +95,24 @@ pub trait Engine {
     fn score_prefix(&mut self, id: u32) -> f32;
     /// The node is about to wait for input: whatever the engine keeps spinning may rest.
     fn idle(&mut self) {}
+    /// An audio encoder's window, in f32s (the manifest's `[model.audio] window`); 0 for a model without one.
+    fn audio_window(&self) -> usize {
+        0
+    }
+    /// The id each encoded row fills in place of its embedding (`[model.audio] placeholder`).
+    fn audio_placeholder(&self) -> u32 {
+        u32::MAX
+    }
+    /// Encode one window and queue its rows: each placeholder id `run` is given afterwards takes the next.
+    fn audio(&mut self, _window: &[f32]) {
+        unreachable!("no encoder")
+    }
+    /// Rows queued and not yet taken by a placeholder.
+    fn audio_queued(&self) -> usize {
+        0
+    }
+    /// Drop the queued rows (a new sequence).
+    fn audio_reset(&mut self) {}
     /// Dev: token `i`'s trace of the last step — every layer's residual output,
     /// every layer's routing, its logits — in the model's own shapes.
     fn trace(&mut self, i: usize) -> (&[f32], &[u32], &[f32]);

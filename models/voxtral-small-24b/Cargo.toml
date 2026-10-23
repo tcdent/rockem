@@ -1,0 +1,11 @@
+[package]
+name = "voxtral_small_24b"
+version = "0.0.0"
+edition = "2021"
+description = "Voxtral-Small-24B-2507: the pinned config, its constants, and the f32 transcription of the reference forward (the Whisper-shaped audio encoder, the projector, the Mistral decoder) that bring-up diffs against the oracle."
+
+[features]
+std = ["common/std"]
+
+[dependencies]
+common = { path = "../../common" }

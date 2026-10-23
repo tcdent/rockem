@@ -9,6 +9,7 @@ harness = { path = "../bringup/harness" }
 common = { path = "../common", features = ["std"] }
 deepseek_v2_lite = { path = "../models/deepseek-v2-lite", features = ["std"] }
 glm_5_3_flash = { path = "../models/glm-5.3-flash", features = ["std"] }
+voxtral_small_24b = { path = "../models/voxtral-small-24b", features = ["std"] }
 memmap2 = "0.9"
 serde_json = "1.0.151"
 

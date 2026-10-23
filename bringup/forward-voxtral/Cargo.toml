@@ -1,0 +1,17 @@
+[package]
+name = "forward-voxtral"
+version = "0.0.0"
+edition = "2021"
+description = "Bring-up driver for Voxtral-Small-24B: the shipped host decoder over the oracle's edges, every layer's output and the logits diffed against the goldens. Dev box only."
+
+[dependencies]
+harness = { path = "../harness" }
+common = { path = "../../common", features = ["std"] }
+voxtral_small_24b = { path = "../../models/voxtral-small-24b", features = ["std"] }
+glm_5_3_flash = { path = "../../models/glm-5.3-flash", features = ["std"] }
+memmap2 = "0.9"
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+debug = 1

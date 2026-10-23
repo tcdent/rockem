@@ -198,6 +198,38 @@ fn map_memory(path: &std::path::Path, len: usize, mem: Mem) -> *mut u8 {
 pub fn load(path: &std::path::Path, mem: Mem) -> &'static [u8] {
     load_with(path, mem)
 }
+/// A file whose byte ranges `(offset, len, node)` are bound to nodes before the first touch (a layout that lays
+/// each node's share in whole pages: Voxtral's decoder stream), then read in; `nodes` past the box's are taken
+/// modulo. Anonymous memory ignores the binding.
+pub fn load_bound(path: &std::path::Path, mem: Mem, ranges: &[(usize, usize, usize)], nodes: usize) -> &'static [u8] {
+    let mut src = fs::File::open(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let len = src.metadata().unwrap().len() as usize;
+    let dst = map_memory(path, len, mem);
+    if mem == Mem::Hugetlb && nodes > 1 {
+        for &(off, n, node) in ranges {
+            let mask: u64 = 1 << (node % nodes);
+            let r = unsafe { syscall(SYS_MBIND, dst as usize + off, n, MPOL_BIND, &mask as *const u64, 64u64, 0u64) };
+            assert_eq!(r, 0, "mbind node {}: {}", node % nodes, std::io::Error::last_os_error());
+        }
+    }
+    let buf = unsafe { std::slice::from_raw_parts_mut(dst, len) };
+    let (t0, name) = (std::time::Instant::now(), path.file_name().unwrap().to_string_lossy().into_owned());
+    let (mut done, mut next_mark) = (0, PROGRESS);
+    while done < len {
+        let n = src.read(&mut buf[done..(done + 64 << 20).min(len)]).unwrap();
+        assert!(n > 0, "short read on {}", path.display());
+        done += n;
+        if done >= next_mark || done == len {
+            println!("loading  : {name} {:.1}/{:.1} GB ({:.0} MB/s, bound by run)", done as f64 / 1e9, len as f64 / 1e9, done as f64 / 1e6 / t0.elapsed().as_secs_f64());
+            next_mark += PROGRESS;
+        }
+    }
+    prow::row!("track-boot", "boot", { "what" => name.as_str(), "s" => t0.elapsed().as_secs_f64(), "gb" => len as f64 / 1e9 });
+    if mem == Mem::Hugetlb {
+        assert_eq!(unsafe { mlock(dst, len) }, 0, "mlock: {}", std::io::Error::last_os_error());
+    }
+    unsafe { std::slice::from_raw_parts(dst, len) }
+}
 fn load_with(path: &std::path::Path, mem: Mem) -> &'static [u8] {
     let mut src = fs::File::open(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let len = src.metadata().unwrap().len() as usize;

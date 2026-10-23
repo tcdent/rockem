@@ -41,6 +41,7 @@ mod platform;
 mod probe;
 mod v2lite;
 mod v2lite_kfd;
+mod voxtral;
 mod wire;
 
 use engine::Engine;
@@ -166,7 +167,10 @@ struct Store {
 }
 impl Store {
     fn key(prev: u64, id: u32) -> u64 {
-        id.to_le_bytes().iter().fold(prev, |h, &b| (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3))
+        Self::key_bytes(prev, &id.to_le_bytes())
+    }
+    fn key_bytes(prev: u64, bytes: &[u8]) -> u64 {
+        bytes.iter().fold(prev, |h, &b| (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3))
     }
     /// The context being written becomes a segment with `snap` as its end state; its rows are no longer the active region.
     fn close(&mut self, ctx: usize, snap: Vec<f32>, logits: Vec<f32>) {
@@ -278,11 +282,22 @@ struct Session {
     /// Verify steps run and drafts accepted, over the connection.
     verified: usize,
     accepted: usize,
+    /// The encoder windows of this sequence, folded (FNV over their bytes) into every placeholder's store key: two
+    /// transcripts match only if their ids and their windows agree (094). Reset at BOS.
+    audio_salt: u64,
+    /// Placeholders fed this sequence, against the rows its windows queued: each must have a row.
+    audio_fed: usize,
+    audio_rows: usize,
 }
 /// The uniforms the speculative path draws with, apart from the positions' own.
 const DRAFT_SALT: u64 = 0x5eed_d4af_7000_0001;
 const RESIDUAL_SALT: u64 = 0x5eed_d4af_7000_0002;
 impl Session {
+    /// The store key of `id` after `prev`: a placeholder's carries the sequence's windows too.
+    fn key_of(&self, prev: u64, id: u32) -> u64 {
+        let k = Store::key(prev, id);
+        if id == self.e.audio_placeholder() { Store::key_bytes(k, &self.audio_salt.to_le_bytes()) } else { k }
+    }
     /// The prompt's positions past the prefix: fed, or matched in the store and not yet resumed.
     fn prompt(&self) -> usize {
         self.pending.map_or(self.pos, |(_, n)| n) - self.first_pos()
@@ -454,7 +469,7 @@ impl Session {
                 continue;
             }
             if let Some((ctx, n)) = self.pending {
-                let key = Store::key(self.store.contexts[ctx].as_ref().unwrap().keys[n - 1], id);
+                let key = self.key_of(self.store.contexts[ctx].as_ref().unwrap().keys[n - 1], id);
                 if let Some(&(c2, n2)) = self.store.index.get(&key) {
                     if c2 != self.active && self.store.contexts[c2].as_ref().map(|c| c.ids.get(n2 - 1) == Some(&id)).unwrap_or(false) && n2 == n + 1 && n2 < self.max_ctx {
                         self.pending = Some((c2, n2));
@@ -552,6 +567,7 @@ impl Session {
     /// Tokens `toks` computed at `pos..` (their rows at `row0..` of the last step) into the active
     /// context: rows, ids, keys; the position advances past them.
     fn commit(&mut self, toks: &[u32], row0: usize, pos: usize) {
+        let (ph, salt) = (self.e.audio_placeholder(), self.audio_salt);
         let s = self;
         let position = s.store.position;
         for (i, &tok) in toks.iter().enumerate() {
@@ -559,7 +575,10 @@ impl Session {
             s.e.rows(row0 + i, &mut s.store.active[p * position..(p + 1) * position]);
             let c = s.store.contexts[s.active].as_mut().unwrap();
             c.ids.push(tok);
-            let key = Store::key(c.keys[p - 1], tok);
+            let key = {
+                let k = Store::key(c.keys[p - 1], tok);
+                if tok == ph { Store::key_bytes(k, &salt.to_le_bytes()) } else { k }
+            };
             c.keys.push(key);
             s.store.grew(s.active, p);
         }
@@ -722,7 +741,10 @@ fn serve(listen: &str, sessions: &mut [Session], identity: u64) {
             }
             let ok = match u32::from_le_bytes(word) {
                 id if id == bos => {
-                    let ok = flush(session, &mut ids, &mut s);
+                    // rows still queued: the sequence ends with placeholders unfilled — a protocol error (094)
+                    let ok = flush(session, &mut ids, &mut s) && session.e.audio_queued() == 0;
+                    session.e.audio_reset();
+                    (session.audio_salt, session.audio_fed, session.audio_rows) = (0, 0, 0);
                     session.start();
                     ok
                 }
@@ -735,7 +757,7 @@ fn serve(listen: &str, sessions: &mut [Session], identity: u64) {
                         0 => session.max_ctx,
                         n => n,
                     };
-                    let mut ok = flush(session, &mut ids, &mut s) && session.started;
+                    let mut ok = flush(session, &mut ids, &mut s) && session.started && session.e.audio_queued() == 0;
                     if ok {
                         let (prompt, t0, mut n) = (session.prompt(), std::time::Instant::now(), 0usize);
                         ok = session.generate(limit, |id| {
@@ -749,14 +771,35 @@ fn serve(listen: &str, sessions: &mut [Session], identity: u64) {
                 wire::SCORE => {
                     let ok = flush(session, &mut ids, &mut s);
                     session.scoring = session.started;
-                    ok && session.started && session.settle()
+                    ok && session.started && session.e.audio_queued() == 0 && session.settle()
                 }
-                // an encoder's window (094): no model here carries an encoder yet, so it is refused
-                wire::AUDIO => false,
-                id if (id as usize) < vocab_size => {
-                    if !session.started {
+                // an encoder's window (094): the model's window of f32s follows; encoded now, its rows queued for the
+                // placeholders fed after it, its bytes folded into their store keys. Refused by a model without an
+                // encoder, before BOS, or short
+                wire::AUDIO => {
+                    let n = session.e.audio_window();
+                    if n == 0 || !session.started || !flush(session, &mut ids, &mut s) {
                         false
                     } else {
+                        let mut buf = vec![0u8; n * 4];
+                        if s.read_exact(&mut buf).is_err() {
+                            false
+                        } else {
+                            session.audio_salt = Store::key_bytes(session.audio_salt, &buf);
+                            let w: Vec<f32> = buf.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+                            session.e.audio(&w);
+                            session.audio_rows = session.audio_fed + session.e.audio_queued();
+                            true
+                        }
+                    }
+                }
+                id if (id as usize) < vocab_size => {
+                    if !session.started || (id == session.e.audio_placeholder() && session.audio_fed >= session.audio_rows) {
+                        false
+                    } else {
+                        if id == session.e.audio_placeholder() {
+                            session.audio_fed += 1;
+                        }
                         ids.push(id);
                         if ids.len() >= tokens || !more_now(&s) {
                             flush(session, &mut ids, &mut s)
@@ -881,6 +924,7 @@ fn main() {
         let e: Box<dyn Engine> = match name.as_str() {
             "deepseek-v2-lite" => v2lite::V2Lite::open(&dir, mem, max_ctx, gpu, experts_host),
             "glm-5.3-flash" => glm::Glm::open(&dir, mem, max_ctx, gpu, config("rockem.resident").and_then(|v| v.parse::<usize>().ok()).map_or(glm_kfd::RESIDENT_BYTES, |gb| gb << 30)),
+            "voxtral-small-24b" => voxtral::Voxtral::open(&dir, mem, max_ctx),
             other => halt(&format!("the manifest lists model {other:?}, which this node does not carry")),
         };
         assert!(max_ctx > e.first_pos(), "rockem.ctx must leave room after the prefix");
@@ -892,7 +936,7 @@ fn main() {
         let spec = e.drafts() && debug.is_none();
         let e_depth = if spec { e.draft_depth() } else { 0 };
         let vocab_n = e.vocab_size();
-        let session = Session { e, scoring: false, last_row: 0, next: 0, pos: first, max_ctx, started: false, prefix_left: 0, debug: debug.clone(), store, active: 0, pending: None, hits: 0, spec, drafts: vec![vec![0.0; vocab_n]; e_depth], depth: e_depth.min(1), draft_q: vec![0.0; e_depth], draft_made: e_depth.min(1), verified: 0, accepted: 0 };
+        let session = Session { e, scoring: false, last_row: 0, next: 0, pos: first, max_ctx, started: false, prefix_left: 0, debug: debug.clone(), store, active: 0, pending: None, hits: 0, spec, drafts: vec![vec![0.0; vocab_n]; e_depth], depth: e_depth.min(1), draft_q: vec![0.0; e_depth], draft_made: e_depth.min(1), verified: 0, accepted: 0, audio_salt: 0, audio_fed: 0, audio_rows: 0 };
         if spec {
             println!("spec     : the draft layer drafts up to {e_depth} tokens after every step, a further one while the last gives its token {} or more; verified in the next", session.e.draft_keep());
         }
