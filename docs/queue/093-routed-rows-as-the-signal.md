@@ -41,6 +41,13 @@ to arrive taking the margins and the rank) is ~35, which fits the ~40 µs the *p
 FFN card carries the act — the free form is fused + on the peer (its `x`, `fy` and the routed sum are there; the
 router rows and the pair state would move).
 
+**The fused launch (aff42–44, 2026-10-22):** `pred_rows` — the next layer's router rows, a grid barrier, the margins a
+token a workgroup, the last ranking — replaces `rows_h` + `pred_step` (60 µs) in the rows pass. 84 µs with eight rows a
+workgroup through barriered dots (aff42); 73 with a row a wave (aff43); 67 with the early pass handing it the first
+margin's threshold and the co-routing sums (aff44; the step 55.72, the prediction 7.99 / 4.89 held). Phase 1's GEMV
+is the bulk: a wave over 4096 elements is 128 dependent steps a token and 32 workgroups give ~3 waves a CU to hide them.
+aff45: a (token, row) a wave, 128 workgroups.
+
 ## The chain (2026-10-22)
 aff36 single-phase: the signal (missed 5.19 → 4.79) but the plan 98.6 µs late at the slot, step 57.84. aff37 two-phase,
 the amend replacing the list whole: complete 7.7 → 4.2, step 58.15. aff38 the head kept: unchanged — the fault was the

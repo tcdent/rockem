@@ -73,9 +73,11 @@ pub const PLAN_LDS: u32 = (4 * (16 + E / 32 * TOP_K + E)) as u32;
 pub const PLAN_WG: u32 = E as u32;
 /// Workgroups that predict a long step's tokens, a token a workgroup at a time.
 pub const PLAN_PRED_WGS: usize = 64;
-/// `pred_rows`' grid: a row of the next layer's router a wave (nine a workgroup), then a token a workgroup (093).
-pub const PRED_ROWS_WGS: u32 = (E / 9) as u32;
-const _: () = assert!(E % 9 == 0 && E / 32 == 9 && PRED_ROWS_WGS as usize >= SPEC_TOKENS);
+/// `pred_rows`' grid: a (token, router row) a wave — nine rows a workgroup, `E / 9` workgroups a token, every
+/// `SPEC_TOKENS` tokens' worth launched so the barrier count is fixed; then a token a workgroup (093).
+pub const PRED_ROWS_BLOCKS: u32 = (E / 9) as u32;
+pub const PRED_ROWS_WGS: u32 = PRED_ROWS_BLOCKS * SPEC_TOKENS as u32;
+const _: () = assert!(E % 9 == 0 && E / 32 == 9 && PRED_ROWS_BLOCKS as usize >= SPEC_TOKENS);
 
 #[cfg(target_arch = "amdgpu")]
 pub mod gfx11 {
@@ -291,14 +293,14 @@ pub mod gfx11 {
             let red = l; // [16]
             let cand = red.add(16); // [E / 32 · TOP_K]
             let sk = cand.add(E / 32 * TOP_K); // [E]
-            // phase 1: a row of the next layer's router a wave — lane k takes elements k, k + 32, … of the token's input
-            // (its norm the wave's own sum of squares) and the row; one wave sum, no workgroup barrier (eight rows a
-            // workgroup through 256-thread dots with two barriers each took 84 µs a launch, 2026-10-22)
+            // phase 1: a (token, router row) a wave — lane k takes elements k, k + 32, … of the token's input (its norm
+            // the wave's own sum of squares) and the row; one wave sum, no workgroup barrier. A wave a row over every
+            // token in turn was 512 dependent steps with ~3 waves a CU to hide them: 67 µs a launch (2026-10-22)
             {
-                let row = E + wg * 9 + wave;
-                let wr = router.add(row * H);
-                let mut i = 0;
-                while i < n {
+                let (i, block) = (wg / PRED_ROWS_BLOCKS as usize, wg % PRED_ROWS_BLOCKS as usize);
+                if i < n {
+                    let row = E + block * 9 + wave;
+                    let wr = router.add(row * H);
                     let xt = x.add(i * H);
                     let (mut ss, mut acc) = (0f32, 0f32);
                     let mut k = lane as usize;
@@ -313,7 +315,6 @@ pub mod gfx11 {
                     if lane == 0 {
                         *scores2.add(i * RR + row) = acc / sqrt(ss / H as f32 + RMS_NORM_EPS);
                     }
-                    i += 1;
                 }
             }
             // the grid barrier: every workgroup's rows are in before any token's margins read them
