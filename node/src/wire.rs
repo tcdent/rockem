@@ -22,21 +22,35 @@
 //!
 //! The header at connect, framed by position: the client writes `rock`,
 //! version u32, identity u64 — FNV-1a of the bundle's manifest.toml, which
-//! names the checkpoint, the recipe and every file's hash; 0 accepts any. The
-//! node answers with the same three fields and one more u32: the positions a
-//! sequence may hold after BOS, prompt and generation together, which is the
-//! node's context budget and not a property of the bundle. A mismatch, an
-//! unknown word, a full context or a closed peer ends the connection; abort is
-//! closing it. Nagle is off, so a token leaves as it is sampled. The console is
-//! the text twin: decimal ids in, a newline for GENERATE, token bytes out.
+//! names the checkpoint, the recipe and every file's hash; 0 accepts any — and
+//! the model, 32 bytes: the `name` of one of the manifest's models, UTF-8,
+//! zero-padded. A bundle carries one model or several, all resident; the
+//! connection speaks the one it named — its ids, its verbs, its context store —
+//! until it closes, and there is no default: a name the bundle lacks, an empty
+//! one included, is refused like a wrong identity (v5, 2026-10-23, docs/queue/094).
+//! The node answers with magic, version, identity and one more u32: the
+//! positions a sequence may hold after BOS, prompt and generation together,
+//! which is the node's context budget for that model and not a property of the
+//! bundle. A mismatch, an unknown word, a full context or a closed peer ends the
+//! connection; abort is closing it. Nagle is off, so a token leaves as it is
+//! sampled. The console is the text twin: decimal ids in, a newline for
+//! GENERATE, token bytes out.
+//!
+//! AUDIO (v5): one encoder window follows, of the size the model's manifest
+//! entry states, raw little-endian f32; the node encodes it and each
+//! placeholder id fed after takes the next row in place of its token embedding
+//! (docs/queue/094). A model without an encoder refuses it.
 
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 pub const GENERATE: u32 = u32::MAX;
 pub const SCORE: u32 = u32::MAX - 1;
-/// client → node: magic, version, identity
-pub const HELLO: usize = 16;
-/// node → client: the same, then positions
+pub const AUDIO: u32 = u32::MAX - 2;
+/// client → node: magic, version, identity, model name
+pub const HELLO: usize = 48;
+/// node → client: magic, version, identity, then positions
 pub const HEADER: usize = 20;
+/// The model's name in the hello: UTF-8, zero-padded.
+pub const MODEL_NAME: usize = 32;
 
 pub fn identity(manifest: &[u8]) -> u64 {
     manifest.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3))
@@ -51,7 +65,14 @@ pub fn header(identity: u64, positions: u32) -> [u8; HEADER] {
     h
 }
 
-/// The client's hello, if it is one of ours at this version: its expected identity.
-pub fn accept(h: &[u8; HELLO]) -> Option<u64> {
-    (&h[..4] == b"rock" && u32::from_le_bytes(h[4..8].try_into().unwrap()) == VERSION).then(|| u64::from_le_bytes(h[8..].try_into().unwrap()))
+/// The client's hello, if it is one of ours at this version: its expected identity and the model it names
+/// (a name that is empty or not UTF-8 is not a hello).
+pub fn accept(h: &[u8; HELLO]) -> Option<(u64, &str)> {
+    if &h[..4] != b"rock" || u32::from_le_bytes(h[4..8].try_into().unwrap()) != VERSION {
+        return None;
+    }
+    let name = &h[16..16 + MODEL_NAME];
+    let end = name.iter().position(|&b| b == 0).unwrap_or(MODEL_NAME);
+    let name = std::str::from_utf8(&name[..end]).ok().filter(|n| !n.is_empty())?;
+    Some((u64::from_le_bytes(h[8..16].try_into().unwrap()), name))
 }

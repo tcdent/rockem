@@ -21,6 +21,7 @@ identify the bundle. That identity is what the wire checks at connect (`docs/wir
 | `kernels.gfx1100.elf` | the GPU code object, carried as data and dispatched through the node's own queue | ~64 KB |
 | `tokenizer.json` | the checkpoint's tokenizer, verbatim: the edge encodes with it | 4,607,451 B |
 | `tokenizer_config.json` | the checkpoint's tokenizer config, verbatim: the chat template and the added tokens | 1,279 B |
+| `chat_template.jinja` | the chat template, when the model has its own file: the model directory's, else the checkpoint's. Wins over the config's template | 1,827 B |
 
 Sizes are stated so a reader can check a file by `ls`; each one is a closed-form function
 of the model constants and is asserted where the file is read.
@@ -33,27 +34,31 @@ lists.
 
 ## The manifest
 
+A bundle carries one model or several (wire v5, docs/queue/094): one `[[model]]` entry each,
+and each model's files in a directory named for it, so two models' files never collide. The
+node loads every model listed and the wire's hello names the one a connection speaks.
+
 ```toml
+[[model]]
+name = "deepseek-v2-lite"
 recipe = "experts:q4g128-a8-gptq"
 calibration = "calib.ids" # sha256:e23b5cd1…
 record_bytes = 4595712
 experts = 1664
 layers = [1, 27]
-
-[model]
-name = "deepseek-v2-lite"
 bos = 100000
 eos = 100001
 vocab_size = 102400
 
 [files]
-"experts.q4g128.bin" = "sha256:cb20c75f…"
-"dense.bf16.bin" = "sha256:7cc79780…"
-"vocab.bin" = "sha256:03a3e2c4…"
-"kernels.gfx1100.elf" = "sha256:27d72f91…"
-"sink.f32" = "sha256:758c6a55…"
-"tokenizer.json" = "sha256:41f3bf64…"
-"tokenizer_config.json" = "sha256:31181eaf…"
+"deepseek-v2-lite/experts.q4g128.bin" = "sha256:cb20c75f…"
+"deepseek-v2-lite/dense.bf16.bin" = "sha256:7cc79780…"
+"deepseek-v2-lite/vocab.bin" = "sha256:03a3e2c4…"
+"deepseek-v2-lite/kernels.gfx1100.elf" = "sha256:27d72f91…"
+"deepseek-v2-lite/sink.f32" = "sha256:758c6a55…"
+"deepseek-v2-lite/tokenizer.json" = "sha256:41f3bf64…"
+"deepseek-v2-lite/tokenizer_config.json" = "sha256:31181eaf…"
+"deepseek-v2-lite/chat_template.jinja" = "sha256:48949f47…"
 
 # checkpoint.toml
 # repo = "deepseek-ai/DeepSeek-V2-Lite"
@@ -68,8 +73,8 @@ vocab_size = 102400
 | `record_bytes` | bytes per expert record |
 | `experts` | number of records in the experts file |
 | `layers` | `[first MoE layer, layer count]`: records cover layers `first..count` |
-| `[model]` | `name`, the model crate this bundle was built by and is read with, and the constants the wire assumes, from that crate: the BOS and EOS ids and the vocabulary size. A client speaks the wire from these without reading the Rust. The context length is not here: it is the node's memory budget, chosen per card, and the node reports it in its wire header (`docs/wire.md`) |
-| `[files]` | sha256 of every file in the bundle. The kernels entry is present with an empty hash when the bundle was built without `--kernels` |
+| `[[model]]` | one entry a model: `name` (unique, at most 32 bytes: the model crate this entry was built by and is read with, the hello names it, and its files sit under a directory of that name), its recipe and geometry (the keys above), and the constants the wire assumes, from that crate: the BOS and EOS ids (`prefix` and `eos_tokens` the full sets, when more than one) and the vocabulary size. A client speaks the wire from these without reading the Rust. A model with an audio encoder adds `[model.audio]` (docs/queue/094). The context length is not here: it is the node's memory budget, chosen per card, and the node reports it in its wire header (`docs/wire.md`) |
+| `[files]` | sha256 of every file in the bundle, keyed `<model name>/<file>`. The kernels entry is present with an empty hash when the bundle was built without `--kernels` |
 | `# checkpoint.toml` | the model's `checkpoint.toml` verbatim, commented: repository, revision, pin date |
 
 **Identity.** FNV-1a, 64-bit, over the bytes of `manifest.toml` exactly as written
@@ -133,6 +138,22 @@ a Jinja engine, the way the transformers library does, so nothing is extracted o
 rewritten at build. What the edge does not need in it (`add_bos_token`,
 `model_max_length`) it ignores: BOS is the wire's verb, and the context is the node's.
 
+**`chat_template.jinja`.** The chat template as a file of its own, `layout::CHAT_TEMPLATE_FILE`.
+When a bundle has it, the edge renders with it instead of the config's template, the
+precedence transformers uses. It comes from the model's directory in this tree when that
+has one, and otherwise from the checkpoint; a bundle with neither has no such file.
+
+The template is where everything the model reads about tools lives: the list of tools,
+how a past call and its result are written, the instruction that calls exist. The edge
+passes tools and messages to it and adds nothing of its own. A model trained for tool use
+ships this in its checkpoint (GLM-5.3-Flash's `chat_template.jinja` does). DeepSeek-V2-Lite
+was never trained for tools and its template has none, so
+`models/deepseek-v2-lite/chat_template.jinja` is its template with a tool-call format added:
+tools listed as JSON, a call written `<tool_call>{"name": …, "arguments": {…}}</tool_call>`,
+a result as a `Tool:` turn. Without tools it renders exactly what the checkpoint's does.
+Reading calls back out of generated text is the edge's per-model parser
+(`api/rockem/calls.py`), checked by round trip against the same template.
+
 ## Who reads what
 
 The node reads the weight files, the sink, the vocabulary, the kernels, and the manifest
@@ -141,10 +162,10 @@ decodes with `vocab.bin`. The bring-up tools read the weight files against the r
 
 The API service at the edge is the bundle's second reader, in a second language
 (`api/rockem/bundle.py`). It needs
-the manifest (identity, computed the same way; `[model]` for the wire's constants),
-`tokenizer.json` to encode, `tokenizer_config.json` for the chat template, and `vocab.bin`
-or `tokenizer.json` to decode. Its package is the bundle minus its weights: those five
-files, about six megabytes, with the weight files still listed in the manifest but absent
+the manifest (identity, computed the same way; the `[[model]]` entries for the wire's constants),
+`tokenizer.json` to encode, `chat_template.jinja` or else `tokenizer_config.json` for the
+chat template, and `vocab.bin` or `tokenizer.json` to decode. Its package is the bundle
+minus its weights: those six files, about six megabytes, with the weight files still listed in the manifest but absent
 from the directory. A reader verifies the hash of whatever it opens. Because the wire's
 BOS is the token id 100000, encoding the rendered chat template with the tokenizer yields
 BOS as the first id and the client sends what the tokenizer produced.

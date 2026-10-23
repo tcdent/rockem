@@ -6,7 +6,8 @@ set -u
 cd "$(dirname "$0")/../.."
 B=${1:?bundle dir}; R=${2:-20}; NODE=${NODE:-target/release/node}; IDS=$(cat bringup/gates/prompt.ids); W=/tmp/rockem-gate/node-repeat
 ELF=${ELF:-models/deepseek-v2-lite/gpu/target/amdgcn-amd-amdhsa/release/deepseek_v2_lite_gpu.elf}
-bringup/gates/install_elf.sh $ELF $B
+M=${M:-deepseek-v2-lite}
+bringup/gates/install_elf.sh $ELF $B $M
 systemctl --user stop rockem-node 2>/dev/null; pkill -x node 2>/dev/null; sleep 1
 rm -rf $W; mkdir -p $W
 bad=0

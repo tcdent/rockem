@@ -9,7 +9,8 @@ set -u
 cd "$(dirname "$0")/../.."
 B=${1:?bundle dir}; L=${2:-50}; NODE=${NODE:-target/release/node}; IDS=$(cat bringup/gates/prompt.ids); W=/tmp/rockem-gate/node-lines
 ELF=${ELF:-models/deepseek-v2-lite/gpu/target/amdgcn-amd-amdhsa/release/deepseek_v2_lite_gpu.elf}
-bringup/gates/install_elf.sh $ELF $B
+M=${M:-deepseek-v2-lite}
+bringup/gates/install_elf.sh $ELF $B $M
 systemctl --user stop rockem-node 2>/dev/null; pkill -x node 2>/dev/null; sleep 1
 rm -rf $W; mkdir -p $W/dump
 (for i in $(seq 1 $L); do echo "$IDS"; done; sleep 3) | timeout 3000 $NODE rockem.bundle=$B rockem.mem=anon rockem.gpu=1 rockem.max=8 rockem.debug=$W/dump "${@:3}" > $W/out.log 2> $W/err.log

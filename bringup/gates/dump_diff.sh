@@ -10,7 +10,8 @@ B=${1:?bundle dir}; IDS=$(cat bringup/gates/prompt.ids); W=/tmp/rockem-gate
 # NODE and ELF: the node binary and code object under test (defaults: the tree's builds; set both to gate another build)
 NODE=${NODE:-target/release/node}
 ELF=${ELF:-models/deepseek-v2-lite/gpu/target/amdgcn-amd-amdhsa/release/deepseek_v2_lite_gpu.elf}
-bringup/gates/install_elf.sh $ELF $B
+M=${M:-deepseek-v2-lite}
+bringup/gates/install_elf.sh $ELF $B $M
 systemctl --user stop rockem-node 2>/dev/null; pkill -x node 2>/dev/null; sleep 1
 pgrep -x python3 -a | grep -E "wire.py|client.*\.py" && { echo "stray wire clients above: the host is not quiet"; exit 1; }
 for mode in batch seq; do

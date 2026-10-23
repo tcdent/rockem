@@ -204,7 +204,10 @@ fn write_sink(ck: &Checkpoint, path: &std::path::Path) {
 
 pub fn build() {
     let snapshot = arg("--snapshot");
-    let out = arg("--out");
+    // the bundle's root holds the manifest; this model's files sit under a directory named for it
+    let root = arg("--out");
+    let out = root.join("deepseek-v2-lite");
+    fs::create_dir_all(&out).unwrap();
     fs::create_dir_all(&out).unwrap();
     let ck = Checkpoint::open(&snapshot);
     let layers: Vec<usize> = (FIRST_K_DENSE_REPLACE..NUM_HIDDEN_LAYERS).collect();
@@ -276,15 +279,16 @@ pub fn build() {
     let sha_k = if out.join(layout::KERNELS_FILE).exists() { sha_of(layout::KERNELS_FILE) } else { String::new() };
     let sha = sha_of(layout::EXPERTS_FILE);
     let (sha_d, sha_v, sha_s) = (sha_of(layout::DENSE_FILE), sha_of(layout::VOCAB_FILE), sha_of(layout::SINK_FILE));
-    let mut sha_t = layout::TOKENIZER_FILES.map(|f| format!("\"{f}\" = \"sha256:{}\"", sha_of(f))).join("\n");
+    let mut sha_t = layout::TOKENIZER_FILES.map(|f| format!("\"deepseek-v2-lite/{f}\" = \"sha256:{}\"", sha_of(f))).join("\n");
     if out.join(layout::CHAT_TEMPLATE_FILE).exists() {
-        sha_t += &format!("\n\"{}\" = \"sha256:{}\"", layout::CHAT_TEMPLATE_FILE, sha_of(layout::CHAT_TEMPLATE_FILE));
+        sha_t += &format!("\n\"deepseek-v2-lite/{}\" = \"sha256:{}\"", layout::CHAT_TEMPLATE_FILE, sha_of(layout::CHAT_TEMPLATE_FILE));
     }
     let calib_line = calib_file.as_ref().map(|f| format!("calibration = \"{}\" # sha256:{}\n", f.file_name().unwrap().to_str().unwrap(), sha256(&fs::read(&f).unwrap()))).unwrap_or_default();
-    let mut m = fs::File::create(out.join("manifest.toml")).unwrap();
+    let mut m = fs::File::create(root.join("manifest.toml")).unwrap();
     let ck_toml = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../models/deepseek-v2-lite/checkpoint.toml")).unwrap_or_default();
-    // [model]: the model's name and the constants the wire assumes, so the edge speaks it without reading the crate
-    writeln!(m, "recipe = \"{recipe}\"\n{calib_line}record_bytes = {RECORD}\nexperts = {}\nlayers = [{}, {}]\n\n[model]\nname = \"deepseek-v2-lite\"\nbos = {BOS_TOKEN}\neos = {EOS_TOKEN}\nvocab_size = {VOCAB_SIZE}\n\n[files]\n\"experts.q4g128.bin\" = \"sha256:{sha}\"\n\"dense.bf16.bin\" = \"sha256:{sha_d}\"\n\"vocab.bin\" = \"sha256:{sha_v}\"\n\"kernels.gfx1100.elf\" = \"sha256:{sha_k}\"\n\"sink.f32\" = \"sha256:{sha_s}\"\n{sha_t}\n\n# checkpoint.toml\n{}", jobs.len(), FIRST_K_DENSE_REPLACE, NUM_HIDDEN_LAYERS, ck_toml.lines().map(|l| format!("# {l}")).collect::<Vec<_>>().join("\n")).unwrap();
-    println!("{}", out.join("manifest.toml").display());
+    // [[model]]: one entry a model the bundle carries (v5, docs/queue/094) — its name, recipe and geometry, and the
+    // constants the wire assumes, so the edge speaks it without reading the crate
+    writeln!(m, "[[model]]\nname = \"deepseek-v2-lite\"\nrecipe = \"{recipe}\"\n{calib_line}record_bytes = {RECORD}\nexperts = {}\nlayers = [{}, {}]\nbos = {BOS_TOKEN}\neos = {EOS_TOKEN}\nvocab_size = {VOCAB_SIZE}\n\n[files]\n\"deepseek-v2-lite/experts.q4g128.bin\" = \"sha256:{sha}\"\n\"deepseek-v2-lite/dense.bf16.bin\" = \"sha256:{sha_d}\"\n\"deepseek-v2-lite/vocab.bin\" = \"sha256:{sha_v}\"\n\"deepseek-v2-lite/kernels.gfx1100.elf\" = \"sha256:{sha_k}\"\n\"deepseek-v2-lite/sink.f32\" = \"sha256:{sha_s}\"\n{sha_t}\n\n# checkpoint.toml\n{}", jobs.len(), FIRST_K_DENSE_REPLACE, NUM_HIDDEN_LAYERS, ck_toml.lines().map(|l| format!("# {l}")).collect::<Vec<_>>().join("\n")).unwrap();
+    println!("{}", root.join("manifest.toml").display());
 }
 

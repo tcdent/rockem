@@ -23,7 +23,7 @@ import sys
 import time
 from pathlib import Path
 
-from rockem.bundle import Bundle
+from rockem.bundle import Bundle, Model
 from rockem.edge import Edge, Stops
 from rockem.wire import Client, ContextFull, Finish
 
@@ -31,9 +31,9 @@ HERE = Path(__file__).resolve().parent
 MODELS = HERE.parents[1] / "models"
 
 
-async def generate(addr: tuple[str, int], bundle: Bundle, edge: Edge, ids: list[int], stops: list[str], max_tokens: int) -> tuple[str, str, int]:
+async def generate(addr: tuple[str, int], bundle: Model, edge: Edge, ids: list[int], stops: list[str], max_tokens: int) -> tuple[str, str, int]:
     """One prompt on a fresh connection: the completion text, why it ended, ids received."""
-    client = await Client.connect(addr, bundle.prefix, bundle.eos_tokens, bundle.vocab_size, bundle.identity)
+    client = await Client.connect(addr, bundle.prefix, bundle.eos_tokens, bundle.vocab_size, bundle.identity, model=bundle.name)
     try:
         await client.prompt(ids)
         dec, st, text, n = edge.decoder(), Stops(stops), "", 0
@@ -54,11 +54,11 @@ async def generate(addr: tuple[str, int], bundle: Bundle, edge: Edge, ids: list[
         client.close()
 
 
-async def loglik(addr: tuple[str, int], bundle: Bundle, prompt_ids: list[int], cont_ids: list[int]) -> float:
+async def loglik(addr: tuple[str, int], bundle: Model, prompt_ids: list[int], cont_ids: list[int]) -> float:
     """ln p(continuation | prompt), summed over the continuation's ids, on a fresh
     connection. The prompt is fed unscored, so a repeated prompt is served from the
     node's store and only its last position is recomputed."""
-    client = await Client.connect(addr, bundle.prefix, bundle.eos_tokens, bundle.vocab_size, bundle.identity)
+    client = await Client.connect(addr, bundle.prefix, bundle.eos_tokens, bundle.vocab_size, bundle.identity, model=bundle.name)
     try:
         await client.prompt(prompt_ids)
         return sum(await client.score(cont_ids))
@@ -71,6 +71,7 @@ def main() -> int:
     ap.add_argument("task")
     ap.add_argument("--node", required=True)
     ap.add_argument("--bundle", required=True)
+    ap.add_argument("--model", required=True, help="the bundle's model to evaluate (the wire names it, v5)")
     ap.add_argument("--limit", type=int)
     ap.add_argument("--subset", help="score tasks: only problems whose id starts with this (a subject), still recorded")
     ap.add_argument("--no-record", action="store_true", help="do not append to the model's evals.toml")
@@ -79,7 +80,8 @@ def main() -> int:
     task = importlib.import_module(a.task)
     host, port = a.node.rsplit(":", 1)
     addr = (host, int(port))
-    bundle = Bundle(a.bundle)
+    whole = Bundle(a.bundle)
+    bundle = whole.model(a.model)
     edge = Edge(bundle)
     problems = task.problems()
     if a.subset:
@@ -141,9 +143,9 @@ def main() -> int:
     if not a.no_record and not a.limit:
         subset = f'subset = "{a.subset}"\n' if a.subset else ""
 
-        rec = MODELS / bundle.manifest.model / "evals.toml"
+        rec = MODELS / bundle.name / "evals.toml"
         with open(rec, "a") as f:
-            f.write(f'\n[[{a.task}.runs]]\ndate = "{stamp[:10]}"\nbundle = "{Path(a.bundle).name}"\nidentity = "{bundle.identity:016x}"\nrecipe = "{bundle.manifest.recipe}"\nnode = "{a.node}"\n{subset}{task.METRIC} = {score:.1f}\npassed = {passed}\nn = {len(problems)}\nids_per_s = {toks / secs:.0f}\nresults = "bringup/evals/{out.relative_to(HERE)}"\n')
+            f.write(f'\n[[{a.task}.runs]]\ndate = "{stamp[:10]}"\nbundle = "{Path(a.bundle).name}"\nidentity = "{bundle.identity:016x}"\nrecipe = "{bundle.recipe}"\nnode = "{a.node}"\n{subset}{task.METRIC} = {score:.1f}\npassed = {passed}\nn = {len(problems)}\nids_per_s = {toks / secs:.0f}\nresults = "bringup/evals/{out.relative_to(HERE)}"\n')
         print(f"recorded in {rec.relative_to(HERE.parents[1])}")
     return 0
 

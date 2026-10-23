@@ -30,7 +30,7 @@ produces. Nothing is transformed on either side, so a captured stream is a repla
 | anything else above the vocabulary | reserved; the node closes the connection |
 
 BOS, EOS and the vocabulary size are constants of the model, and the bundle's manifest
-states them in its `[model]` table (`docs/bundle.md`) so a client reads them from the
+states them in the model's `[[model]]` entry (`docs/bundle.md`) so a client reads them from the
 same directory the node loads. GENERATE and SCORE are constants of the protocol.
 
 ## Scoring
@@ -55,15 +55,21 @@ position recomputed, so four choices cost four candidates and one prompt.
 
 ## Header
 
-At connect, framed by position: the first sixteen bytes the client writes, and the first
+At connect, framed by position: the first forty-eight bytes the client writes, and the first
 twenty the node writes back.
 
 | offset | size | field | client → node | node → client |
 |---|---|---|---|---|
 | 0 | 4 | magic, the bytes `rock` | yes | yes |
-| 4 | 4 | version, u32 LE, currently 3 | yes | yes |
+| 4 | 4 | version, u32 LE, currently 5 | yes | yes |
 | 8 | 8 | identity, u64 LE | the identity expected, or 0 | the node's |
+| 16 | 32 | model, UTF-8, zero-padded | the `name` of one of the bundle's models | |
 | 16 | 4 | positions, u32 LE | | the positions a sequence may hold after BOS |
+
+A bundle carries one model or several, every one resident in the node; the hello names the one
+this connection speaks — its ids, its verbs, its context store, its positions budget — until it
+closes, and the node serves one connection at a time across all of them. There is no default:
+a name the bundle lacks, an empty one included, is refused like a wrong identity.
 
 Positions is the node's context budget: how many ids, prompt and generated together, a
 sequence can hold after its BOS. It is a property of the node, set at boot
@@ -147,6 +153,10 @@ The version in the header covers the word alphabet and the header layout. Anythi
 later, a token limit, a seed override, a reference to a compiled grammar for structured
 output, is a new verb, a new header field, or both, under a new version. A node speaks
 exactly one version and refuses the others; the client decides what to do with that.
+Version 5 added the model field to the hello and the AUDIO verb (`0xFFFFFFFD`: one encoder
+window follows, of the size the model's manifest entry states, raw little-endian f32; each
+placeholder id fed after takes the next encoded row in place of its token embedding; a model
+without an encoder refuses it — docs/queue/094). Version 4 made GENERATE take the ids wanted.
 Version 3 added SCORE and the f32 words it answers with. Version 2 added the positions
 field to the node's header; version 1 had sixteen bytes each way and no way for a client
 to learn the budget.

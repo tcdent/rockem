@@ -19,17 +19,17 @@ from rockem.bundle import Bundle  # noqa: E402
 from rockem.wire import Client  # noqa: E402
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--node", required=True); ap.add_argument("--bundle", required=True)
+ap.add_argument("--node", required=True); ap.add_argument("--bundle", required=True); ap.add_argument("--model", required=True)
 ap.add_argument("--sets", default="legal,code"); ap.add_argument("--debug", help="the node's rockem.debug dir, for the exact check")
 a = ap.parse_args()
 host, port = a.node.rsplit(":", 1); addr = (host, int(port))
-b = Bundle(a.bundle)
+b = Bundle(a.bundle).model(a.model)
 
 def logsoftmax(v):
     v = v.astype(np.float64); m = v.max(); return v - m - np.log(np.exp(v - m).sum())
 
 async def score(ids):
-    c = await Client.connect(addr, b.prefix, b.eos_tokens, b.vocab_size, b.identity)
+    c = await Client.connect(addr, b.prefix, b.eos_tokens, b.vocab_size, b.identity, model=b.name)
     try:
         await c.prompt([])
         return await c.score(ids)

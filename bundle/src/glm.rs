@@ -342,10 +342,13 @@ pub fn build() {
         return relayout(&p, &harness::arg("--from").map_or("legacy".to_string(), |v| v.to_string_lossy().into_owned()));
     }
     let snapshot = arg("--snapshot");
-    let out = arg("--out");
+    // the bundle's root holds the manifest and CACHEDIR.TAG; this model's files sit under a directory named for it
+    let root = arg("--out");
+    let out = root.join("glm-5.3-flash");
+    fs::create_dir_all(&out).unwrap();
     fs::create_dir_all(&out).unwrap();
     // a bundle is a function of the checkpoint and the recipe: reproducible, so backups skip it
-    fs::write(out.join("CACHEDIR.TAG"), "Signature: 8a477f597d28d172789f06886806bc55\n# rockem bundle: rebuilt from the checkpoint by `bundle --model glm-5.3-flash`\n").unwrap();
+    fs::write(root.join("CACHEDIR.TAG"), "Signature: 8a477f597d28d172789f06886806bc55\n# rockem bundle: rebuilt from the checkpoint by `bundle --model glm-5.3-flash`\n").unwrap();
     let ck = Checkpoint::open(&snapshot);
     let t0 = std::time::Instant::now();
     let experts = out.join(layout::EXPERTS_FILE);
@@ -376,15 +379,16 @@ pub fn build() {
     if out.join(layout::KERNELS_FILE).exists() {
         files.push(layout::KERNELS_FILE);
     }
-    let shas: Vec<String> = files.iter().map(|f| format!("\"{f}\" = \"sha256:{}\"", sha256_file(&out.join(f)))).collect();
+    let shas: Vec<String> = files.iter().map(|f| format!("\"glm-5.3-flash/{f}\" = \"sha256:{}\"", sha256_file(&out.join(f)))).collect();
     eprintln!("hashed {} files in {:.0}s", files.len(), t2.elapsed().as_secs_f32());
     let ck_toml = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../models/glm-5.3-flash/checkpoint.toml")).unwrap_or_default();
-    let mut m = fs::File::create(out.join("manifest.toml")).unwrap();
-    // [model]: the model's name and the constants the wire assumes, so the edge speaks it without reading
-    // the crate; `bos` is the prefix's first id and `eos` its first end id, with the full sets beside them
+    let mut m = fs::File::create(root.join("manifest.toml")).unwrap();
+    // [[model]]: one entry a model the bundle carries (v5, docs/queue/094) — its name, its recipe and geometry,
+    // and the constants the wire assumes so the edge speaks it without reading the crate: `bos` is the prefix's
+    // first id and `eos` its first end id, with the full sets beside them
     writeln!(
         m,
-        "recipe = \"{}\"\nrecord_bytes = {}\nexperts = {}\nlayers = [{}, {}]\n\n[model]\nname = \"glm-5.3-flash\"\nbos = {}\neos = {}\nprefix = [{}]\neos_tokens = [{}]\nvocab_size = {VOCAB_SIZE}\n\n[files]\n{}\n\n# checkpoint.toml\n{}",
+        "[[model]]\nname = \"glm-5.3-flash\"\nrecipe = \"{}\"\nrecord_bytes = {}\nexperts = {}\nlayers = [{}, {}]\nbos = {}\neos = {}\nprefix = [{}]\neos_tokens = [{}]\nvocab_size = {VOCAB_SIZE}\n\n[files]\n{}\n\n# checkpoint.toml\n{}",
         layout::RECIPE_RTN,
         layout::RECORD,
         layout::MOE_LAYERS * E,
@@ -400,5 +404,5 @@ pub fn build() {
     .unwrap();
     let _ = sha256; // the one-shot form is the V2-Lite builder's
     eprintln!("bundle written in {:.0}s", t0.elapsed().as_secs_f32());
-    println!("{}", out.join("manifest.toml").display());
+    println!("{}", root.join("manifest.toml").display());
 }

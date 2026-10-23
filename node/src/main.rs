@@ -1,15 +1,18 @@
 //! rockem node. Construction then execution: report the platform, open the
-//! bundle — its manifest names the model, and that model's engine loads it
-//! into memory the way the design says (hugetlbfs, first-touched by the thread
-//! that will read it) and builds itself — then serve: on the wire (`wire.rs`:
-//! u32 token ids in and out over TCP, nothing transformed) or, without
-//! `rockem.listen`, on the console — its text twin: a line of ids in, the
-//! continuation out as text, streamed. One binary carries every model
-//! (`engine.rs`).
+//! bundle — its manifest lists its models (`[[model]]`, each one's files in a
+//! directory named for it), and each model's engine loads it into memory the
+//! way the design says (hugetlbfs, first-touched by the thread that will read
+//! it) and builds itself, every model resident — then serve: on the wire
+//! (`wire.rs`: u32 token ids in and out over TCP, nothing transformed; the
+//! hello names the model a connection speaks, one connection at a time across
+//! all of them) or, without `rockem.listen`, on the console — its text twin for
+//! one model: a line of ids in, the continuation out as text, streamed. One
+//! binary carries every model (`engine.rs`).
 //!
 //! Configuration is the kernel command line (`rockem.*` tokens) or, on a dev
 //! host, the same tokens as program arguments:
-//!   rockem.bundle=/bundle      a bundle directory (docs/bundle.md); `manifest.toml` names the model
+//!   rockem.bundle=/bundle      a bundle directory (docs/bundle.md); `manifest.toml` lists its models
+//!   rockem.model=<name>        console: the model to serve, when the bundle has more than one
 //!   rockem.mem=anon            dev: anonymous memory instead of hugetlbfs
 //!   rockem.gpu=1               V2-Lite: the whole model on the card, the router and the draw included: one wait per token;
 //!                              GLM: the recurrent-attention layers on the cards, split by layer between them
@@ -59,20 +62,24 @@ fn config(key: &str) -> Option<String> {
     cmd.split_whitespace().map(String::from).chain(std::env::args().skip(1)).filter_map(|t| t.strip_prefix(&format!("{key}=")).map(String::from)).last()
 }
 
-/// `name = "…"` under `[model]` in a manifest.
-fn model_name(manifest: &str) -> Option<String> {
+/// The `name = "…"` of every `[[model]]` entry in a manifest, in order.
+fn model_names(manifest: &str) -> Vec<String> {
+    let mut names = Vec::new();
     let mut in_model = false;
     for line in manifest.lines() {
         let l = line.trim();
         if l.starts_with('[') {
-            in_model = l == "[model]";
+            in_model = l == "[[model]]";
         } else if in_model {
             if let Some(v) = l.strip_prefix("name") {
-                return v.trim().strip_prefix('=').map(|v| v.trim().trim_matches('"').to_string());
+                if let Some(n) = v.trim().strip_prefix('=').map(|v| v.trim().trim_matches('"').to_string()) {
+                    names.push(n);
+                }
+                in_model = false;
             }
         }
     }
-    None
+    names
 }
 
 /// The console vocabulary: byte offsets then bytes, by id.
@@ -655,19 +662,24 @@ impl Session {
 }
 
 /// The wire, one connection at a time (one cache).
-fn serve(listen: &str, session: &mut Session, identity: u64) {
+fn serve(listen: &str, sessions: &mut [Session], identity: u64) {
     let listener = std::net::TcpListener::bind(listen).unwrap();
-    println!("ready    : wire on {listen}, identity {identity:016x}");
-    let (bos, vocab_size, tokens, first) = (session.e.bos(), session.e.vocab_size(), session.e.tokens(), session.first_pos());
-    // between connections (the API opens one a request) the engine's threads rest: without this the last run's
+    println!("ready    : wire on {listen}, identity {identity:016x}, models {}", sessions.iter().map(|s| s.e.name()).collect::<Vec<_>>().join(" "));
+    // between connections (the API opens one a request) the engines' threads rest: without this the last run's
     // busy state held 95 workers in MWAITX, 100 % user time to the kernel, on an idle node (2026-10-15). The
     // accept blocks inside `incoming()`, so the call goes before the loop and after each connection's end.
-    session.e.idle();
+    sessions.iter_mut().for_each(|s| s.e.idle());
     for conn in listener.incoming() {
         let Ok(mut s) = conn else { continue };
         s.set_nodelay(true).unwrap();
+        // the hello names the model; a name the bundle lacks is refused like a wrong identity (no default)
         let mut h = [0u8; wire::HELLO];
-        if s.read_exact(&mut h).is_err() || !matches!(wire::accept(&h), Some(want) if want == 0 || want == identity) || s.write_all(&wire::header(identity, (session.max_ctx - first) as u32)).is_err() {
+        if s.read_exact(&mut h).is_err() {
+            continue;
+        }
+        let Some(session) = wire::accept(&h).filter(|&(want, _)| want == 0 || want == identity).and_then(|(_, name)| sessions.iter_mut().find(|s| s.e.name() == name)) else { continue };
+        let (bos, vocab_size, tokens, first) = (session.e.bos(), session.e.vocab_size(), session.e.tokens(), session.first_pos());
+        if s.write_all(&wire::header(identity, (session.max_ctx - first) as u32)).is_err() {
             continue;
         }
         session.started = false;
@@ -731,6 +743,8 @@ fn serve(listen: &str, session: &mut Session, identity: u64) {
                     session.scoring = session.started;
                     ok && session.started && session.settle()
                 }
+                // an encoder's window (094): no model here carries an encoder yet, so it is refused
+                wire::AUDIO => false,
                 id if (id as usize) < vocab_size => {
                     if !session.started {
                         false
@@ -808,12 +822,15 @@ fn main() {
     let mem = if config("rockem.mem").as_deref() == Some("anon") { loader::Mem::Anon } else { loader::Mem::Hugetlb };
     let bundle = std::path::Path::new(&bundle);
     let manifest = std::fs::read(bundle.join("manifest.toml")).unwrap_or_else(|e| halt(&format!("{}: {e}", bundle.join("manifest.toml").display())));
-    let name = model_name(&String::from_utf8_lossy(&manifest)).unwrap_or_else(|| halt("the manifest names no model ([model] name)"));
+    let names = model_names(&String::from_utf8_lossy(&manifest));
+    if names.is_empty() {
+        halt("the manifest lists no model ([[model]] name)");
+    }
     prow::Run::new("rockem")
         .attrs(prow::build_attrs!())
         .server(config("rockem.prow").unwrap_or_else(|| PROW_SERVER.into()))
         .core(PROW_CORE)
-        .attr("model", name.as_str())
+        .attr("model", names.join(" "))
         .attr("bundle", bundle.display().to_string())
         .attr("ctx", max_ctx)
         .attr("gpu", gpu)
@@ -821,40 +838,55 @@ fn main() {
         .attr("image", std::fs::read_to_string("/etc/rockem-profile").unwrap_or_default().trim())
         .start();
     let experts_host = config("rockem.experts").as_deref() == Some("host");
-    let e: Box<dyn Engine> = match name.as_str() {
-        "deepseek-v2-lite" => v2lite::V2Lite::open(bundle, mem, max_ctx, gpu, experts_host),
-        "glm-5.3-flash" => glm::Glm::open(bundle, mem, max_ctx, gpu, config("rockem.resident").and_then(|v| v.parse::<usize>().ok()).map_or(glm_kfd::RESIDENT_BYTES, |gb| gb << 30)),
-        other => halt(&format!("the manifest names model {other:?}, which this node does not carry")),
-    };
-    assert!(max_ctx > e.first_pos(), "rockem.ctx must leave room after the prefix");
-    let vocab = Vocab::load(loader::load(&bundle.join("vocab.bin"), loader::Mem::Anon), e.vocab_size());
     let debug = config("rockem.debug").map(std::path::PathBuf::from);
     if let Some(d) = &debug {
         std::fs::create_dir_all(d).unwrap();
     }
-    // the context store: a budget in positions, by default half of what the box reports free —
-    // an assumed mean between the store and everything else the node holds; `rockem.cache` sets it
+    // the context stores: a budget in positions shared equally by the models, by default half of what the box
+    // reports free — an assumed mean between the stores and everything else the node holds; `rockem.cache` sets it
     let avail_kb: usize = std::fs::read_to_string("/proc/meminfo").unwrap_or_default().lines().find_map(|l| l.strip_prefix("MemAvailable:")).and_then(|v| v.trim().split(' ').next()).and_then(|v| v.parse().ok()).unwrap_or(0);
-    let budget_bytes = config("rockem.cache").and_then(|v| v.parse::<usize>().ok()).map(|gb| gb << 30).unwrap_or(avail_kb << 9);
-    let position = e.position();
-    let state_cost = ((e.snapshot_len() + e.vocab_size()) * 4).div_ceil(position * 4);
-    let store = Store { contexts: Vec::new(), index: std::collections::HashMap::new(), budget: (budget_bytes / (position * 4)).max(max_ctx), state_cost, held: 0, clock: 0, max_ctx, position, active: Vec::new() };
-    println!("cache    : {} cached positions ({:.1} GB of host memory), {} KB each{}, for {}", store.budget, budget_bytes as f64 / 1e9, position * 4 / 1024, if e.snapshot_len() > 0 { format!(", {} MB a kept state ({} positions' worth; the newest {MARKS_KEPT} marks a transcript)", e.snapshot_len() * 4 >> 20, state_cost) } else { String::new() }, e.name());
-    let (bos, first) = (e.bos(), e.first_pos());
-    let spec = e.drafts() && debug.is_none();
-    let e_depth = if spec { e.draft_depth() } else { 0 };
-    let vocab_n = e.vocab_size();
-    let mut session = Session { e, scoring: false, last_row: 0, next: 0, pos: first, max_ctx, started: false, prefix_left: 0, debug, store, active: 0, pending: None, hits: 0, spec, drafts: vec![vec![0.0; vocab_n]; e_depth], depth: e_depth.min(1), draft_q: vec![0.0; e_depth], draft_made: e_depth.min(1), verified: 0, accepted: 0 };
-    if spec {
-        println!("spec     : the draft layer drafts up to {e_depth} tokens after every step, a further one while the last gives its token {} or more; verified in the next", session.e.draft_keep());
+    let budget_bytes = config("rockem.cache").and_then(|v| v.parse::<usize>().ok()).map(|gb| gb << 30).unwrap_or(avail_kb << 9) / names.len();
+    // every model resident, each from its own directory of the bundle; a connection names the one it speaks
+    let mut sessions: Vec<Session> = Vec::new();
+    for name in &names {
+        let dir = bundle.join(name);
+        let e: Box<dyn Engine> = match name.as_str() {
+            "deepseek-v2-lite" => v2lite::V2Lite::open(&dir, mem, max_ctx, gpu, experts_host),
+            "glm-5.3-flash" => glm::Glm::open(&dir, mem, max_ctx, gpu, config("rockem.resident").and_then(|v| v.parse::<usize>().ok()).map_or(glm_kfd::RESIDENT_BYTES, |gb| gb << 30)),
+            other => halt(&format!("the manifest lists model {other:?}, which this node does not carry")),
+        };
+        assert!(max_ctx > e.first_pos(), "rockem.ctx must leave room after the prefix");
+        let position = e.position();
+        let state_cost = ((e.snapshot_len() + e.vocab_size()) * 4).div_ceil(position * 4);
+        let store = Store { contexts: Vec::new(), index: std::collections::HashMap::new(), budget: (budget_bytes / (position * 4)).max(max_ctx), state_cost, held: 0, clock: 0, max_ctx, position, active: Vec::new() };
+        println!("cache    : {} cached positions ({:.1} GB of host memory), {} KB each{}, for {}", store.budget, budget_bytes as f64 / 1e9, position * 4 / 1024, if e.snapshot_len() > 0 { format!(", {} MB a kept state ({} positions' worth; the newest {MARKS_KEPT} marks a transcript)", e.snapshot_len() * 4 >> 20, state_cost) } else { String::new() }, e.name());
+        let first = e.first_pos();
+        let spec = e.drafts() && debug.is_none();
+        let e_depth = if spec { e.draft_depth() } else { 0 };
+        let vocab_n = e.vocab_size();
+        let session = Session { e, scoring: false, last_row: 0, next: 0, pos: first, max_ctx, started: false, prefix_left: 0, debug: debug.clone(), store, active: 0, pending: None, hits: 0, spec, drafts: vec![vec![0.0; vocab_n]; e_depth], depth: e_depth.min(1), draft_q: vec![0.0; e_depth], draft_made: e_depth.min(1), verified: 0, accepted: 0 };
+        if spec {
+            println!("spec     : the draft layer drafts up to {e_depth} tokens after every step, a further one while the last gives its token {} or more; verified in the next", session.e.draft_keep());
+        }
+        sessions.push(session);
     }
 
     // --- execution ---
     if let Some(listen) = config("rockem.listen") {
         let identity = wire::identity(&manifest);
-        serve(&listen, &mut session, identity);
+        serve(&listen, &mut sessions, identity);
         return;
     }
+    // the console speaks one model: the only one, or the one `rockem.model` names
+    let want = config("rockem.model");
+    let at = match (sessions.len(), &want) {
+        (1, None) => 0,
+        (_, Some(w)) => names.iter().position(|n| n == w).unwrap_or_else(|| halt(&format!("rockem.model={w:?} is not one of the bundle's models"))),
+        _ => halt("the bundle has more than one model: the console needs rockem.model=<name>"),
+    };
+    let mut session = sessions.swap_remove(at);
+    let vocab = Vocab::load(loader::load(&bundle.join(&names[at]).join("vocab.bin"), loader::Mem::Anon), session.e.vocab_size());
+    let bos = session.e.bos();
     // the console: one line is a prompt, its newline is GENERATE
     let max_new: usize = config("rockem.max").and_then(|v| v.parse().ok()).unwrap_or(64);
     let prefix: Vec<String> = session.e.prefix_ids().iter().map(|id| id.to_string()).collect();
