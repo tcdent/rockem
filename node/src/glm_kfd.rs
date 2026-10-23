@@ -269,7 +269,7 @@ struct Shared {
 }
 /// A handoff word's byte offset in `Shared::words`: the kind, and the card for a block output.
 /// The kernels a stats code object stamps (`common::stats`), reported by `timeline_report`.
-const STAT_KERNELS: &[&str] = &["hc_pre"];
+const STAT_KERNELS: &[&str] = &["hc_pre", "pred_rows"];
 /// `Shared::xact`'s regions, in bytes.
 const HG: usize = H / common::q4::GROUP;
 const XA_Q: usize = 0;

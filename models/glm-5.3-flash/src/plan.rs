@@ -293,6 +293,9 @@ pub mod gfx11 {
             let red = l; // [16]
             let cand = red.add(16); // [E / 32 · TOP_K]
             let sk = cand.add(E / 32 * TOP_K); // [E]
+            // stats: slot 0 the GEMV phase, 1 the grid barrier's wait, 2 the token's margins and key, 3 the last
+            // workgroup's product and rank (ticks of the 100 MHz clock; wave 0 of each workgroup stamps)
+            let kt0 = common::stat_clock!();
             // phase 1: a (token, router row) a wave — lane k takes elements k, k + 32, … of the token's input (its norm
             // the wave's own sum of squares) and the row; one wave sum, no workgroup barrier. A wave a row over every
             // token in turn was 512 dependent steps with ~3 waves a CU to hide them: 67 µs a launch (2026-10-22)
@@ -317,6 +320,10 @@ pub mod gfx11 {
                     }
                 }
             }
+            let kt1 = common::stat_clock!();
+            if wave == 0 {
+                common::stat!(0, kt1.wrapping_sub(kt0) & common::stats::CLOCK_MASK);
+            }
             // the grid barrier: every workgroup's rows are in before any token's margins read them
             fence(Ordering::Release);
             workgroup_sync();
@@ -328,6 +335,10 @@ pub mod gfx11 {
             }
             workgroup_sync();
             fence(Ordering::Acquire);
+            let kt2 = common::stat_clock!();
+            if wave == 0 {
+                common::stat!(1, kt2.wrapping_sub(kt1) & common::stats::CLOCK_MASK);
+            }
             if wg >= n {
                 return;
             }
@@ -348,6 +359,10 @@ pub mod gfx11 {
             *keys.add(i * E + e) = 1.0 + exp(if z < 20.0 { z } else { 20.0 });
             fence(Ordering::Release);
             workgroup_sync();
+            let kt3 = common::stat_clock!();
+            if wave == 0 {
+                common::stat!(2, kt3.wrapping_sub(kt2) & common::stats::CLOCK_MASK);
+            }
             if e == 0 {
                 let last = AtomicU32::from_ptr(count.add(1)).fetch_add(1, Ordering::AcqRel) == n as u32 - 1;
                 *red.add(15) = if last { 1.0 } else { 0.0 };
@@ -384,6 +399,10 @@ pub mod gfx11 {
             workgroup_sync();
             if e == 0 {
                 AtomicU32::from_ptr(word).store(value, Ordering::Release);
+            }
+            let kt4 = common::stat_clock!();
+            if wave == 0 {
+                common::stat!(3, kt4.wrapping_sub(kt3) & common::stats::CLOCK_MASK);
             }
         }
     }
