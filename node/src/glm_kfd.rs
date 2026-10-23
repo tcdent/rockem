@@ -540,8 +540,10 @@ impl Cards {
                     pred_s2: k.vram(STEP * ROUTE_ROWS * 4),
                     pred_word: k.vram(64),
                     pred_keys: k.vram(SPEC_TOKENS * glm_5_3_flash::E * 4),
+                    // host-visible: zeroed by an upload (a device-only `vram` buffer cannot be uploaded to — the node
+                    // segfaulted in its card setup on the first try, 2026-10-22)
                     pred_count: {
-                        let m = k.vram(64);
+                        let m = k.vram_visible(64);
                         k.upload(&m, 0, &[0u8; 64]);
                         m
                     },
