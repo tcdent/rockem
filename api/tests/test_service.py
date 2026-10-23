@@ -5,7 +5,7 @@ import pytest
 from rockem import core
 from rockem.edge import Stops
 
-from conftest import BOS, CALL_BODY, CALL_END, CALL_START, EOS, NEXT_TURN
+from conftest import BOS, CALL_BODY, CALL_END, CALL_START, EOS, NEXT_TURN, THINK_CLOSE, THINK_OPEN
 
 pytestmark = pytest.mark.anyio
 
@@ -37,6 +37,7 @@ async def test_engine_streams_to_eos(engine):
     run = await engine.start(core.Request(messages=[{"role": "user", "content": "hello"}]))
     assert run.prompt_tokens == 1
     events = [ev async for ev in run.events()]
+    assert isinstance(events.pop(0), core.Started)
     assert events[:-1] == [core.Delta(" paris", [2]), core.Delta(" stop", [3])]
     done = events[-1]
     assert (done.reason, done.stop_sequence, done.prompt_tokens, done.completion_tokens, done.positions) == (core.Reason.END_TURN, None, 1, 3, 11)
@@ -61,6 +62,7 @@ async def test_engine_abort_frees_the_node(engine, node):
     run = await engine.start(core.Request(prompt="hello"))
     assert engine.scheduler.free == 0
     events = run.events()
+    assert isinstance(await anext(events), core.Started)
     assert isinstance(await anext(events), core.Delta)
     await events.aclose()
     assert engine.scheduler.free == 1
@@ -92,15 +94,15 @@ async def test_internal_adapter(client):
     r = await client.post("/rockem/v1/generate", json={"messages": [{"role": "user", "content": "hello"}]})
     assert r.status_code == 200, r.text
     evs = data_events(r)
-    assert [e["type"] for e in evs] == ["text", "text", "done"]
+    assert [e["type"] for e in evs] == ["started", "text", "done"]  # the two tokens arrive within one flush
+    assert evs[0] == {"type": "started", "prompt_tokens": 1}
     assert "".join(e["text"] for e in evs if e["type"] == "text") == " paris stop"
     done = evs[-1]
     assert (done["reason"], done["model"], done["stop_sequence"]) == ("end_turn", "tiny", None)
     assert done["usage"] == {"prompt_tokens": 1, "completion_tokens": 3, "positions": 11}
     r = await client.post("/rockem/v1/generate", json={"prompt": "hello", "stop": ["stop"]})
-    evs = data_events(r)
-    assert evs[0] == {"type": "text", "text": " pari", "ids": [2]}  # the "s" could begin "stop", so it waits
-    assert evs[1] == {"type": "text", "text": "s ", "ids": [3]}
+    evs = data_events(r)[1:]
+    assert evs[0] == {"type": "text", "text": " paris ", "ids": [2, 3]}  # held "s" (could begin "stop") and the rest, one flush
     assert evs[-1]["reason"] == "stop_sequence" and evs[-1]["stop_sequence"] == "stop"
     assert (await client.post("/rockem/v1/generate", json={"prompt": "x", "messages": []})).status_code == 422
     assert (await client.post("/rockem/v1/generate", json={"prompt": " ".join(["hello"] * 12)})).status_code == 413
@@ -110,7 +112,7 @@ async def test_internal_adapter_reports_a_broken_generation(client, node):
     node.draws = [2] * 100
     node.close_after = 1  # the node goes away after one id
     evs = data_events(await client.post("/rockem/v1/generate", json={"prompt": "hello"}))
-    assert [e["type"] for e in evs] == ["text", "error"] and "node" in evs[-1]["message"]
+    assert [e["type"] for e in evs] == ["started", "text", "error"] and "node" in evs[-1]["message"]
 
 
 async def test_openai_adapter(client):
@@ -158,6 +160,7 @@ async def test_engine_tool_call_then_turn_marker(engine, node):
     node.draws = [2, CALL_START, CALL_BODY, CALL_END, NEXT_TURN, 4]
     run = await engine.start(core.Request(messages=[{"role": "user", "content": "hello"}], tools=tools))
     events = [ev async for ev in run.events()]
+    assert isinstance(events.pop(0), core.Started)
     assert events[0] == core.Delta(" paris", [2])
     call = events[1]
     assert isinstance(call, core.ToolCall) and (call.name, call.arguments, call.ids) == ("read", {"path": "a"}, [CALL_START, CALL_BODY, CALL_END])
@@ -195,8 +198,8 @@ async def test_internal_adapter_tools_round_trip(client, node):
     r = await client.post("/rockem/v1/generate", json=body)
     assert r.status_code == 200, r.text
     evs = data_events(r)
-    assert [e["type"] for e in evs] == ["tool_call", "done"] and evs[-1]["reason"] == "tool_use"
-    call = evs[0]
+    assert [e["type"] for e in evs] == ["started", "tool_call", "done"] and evs[-1]["reason"] == "tool_use"
+    call = evs[1]
     assert (call["name"], call["arguments"]) == ("read", {"path": "a"}) and call["id"].startswith("call_")
     bad = {"messages": [{"role": "user", "content": "x", "tool_call_id": "c"}]}
     assert (await client.post("/rockem/v1/generate", json=bad)).status_code == 422
@@ -208,7 +211,114 @@ async def test_engine_text_after_calls_ends_the_turn(engine, node):
     node.draws = [2, CALL_START, CALL_BODY, CALL_END, CALL_START, CALL_BODY, CALL_END, 3, 4]
     run = await engine.start(core.Request(messages=[{"role": "user", "content": "hello"}], tools=tools))
     events = [ev async for ev in run.events()]
+    assert isinstance(events.pop(0), core.Started)
     kinds = [type(e).__name__ for e in events]
     assert kinds == ["Delta", "ToolCall", "ToolCall", "Delta", "Done"], kinds
     assert events[0].text == " paris" and events[3].text == "" and events[3].ids == [3]
     assert events[-1].reason is core.Reason.TOOL_USE
+
+
+@pytest.fixture
+def thinking_engine(engine):
+    import dataclasses
+
+    engine.edge.format = dataclasses.replace(engine.edge.format, think=("<think>", "</think>"))
+    return engine
+
+
+def contiguous(seq, part):
+    return any(seq[i : i + len(part)] == part for i in range(len(seq)))
+
+
+async def test_reasoning_is_its_own_event_and_never_a_call(thinking_engine, node):
+    e = thinking_engine
+    node.draws = [THINK_OPEN, 0, THINK_CLOSE, 2, EOS]
+    run = await e.start(core.Request(messages=[{"role": "user", "content": "hello"}]))
+    events = [ev async for ev in run.events()]
+    assert events[:3] == [core.Started(1), core.Reasoning(" hello", [THINK_OPEN, 0]), core.Delta(" paris", [THINK_CLOSE, 2])]
+    assert events[-1].reason is core.Reason.END_TURN
+    # a call written while reasoning is reasoning, not a call
+    tools = [{"type": "function", "function": {"name": "read", "parameters": {}}}]
+    node.draws = [THINK_OPEN, CALL_START, CALL_BODY, CALL_END, THINK_CLOSE, 2, EOS]
+    run = await e.start(core.Request(messages=[{"role": "user", "content": "hello"}], tools=tools))
+    events = [ev async for ev in run.events()]
+    assert not any(isinstance(ev, core.ToolCall) for ev in events) and events[-1].reason is core.Reason.END_TURN
+    assert "".join(ev.text for ev in events if isinstance(ev, core.Reasoning)).startswith("<tool_call>")
+
+
+async def test_a_reply_sent_back_with_its_reasoning_is_rendered_from_its_ids(thinking_engine, node):
+    e = thinking_engine
+    node.draws = [THINK_OPEN, 0, THINK_CLOSE, 2, EOS]
+    await (await e.start(core.Request(messages=[{"role": "user", "content": "hello"}]))).fold()
+    generated = [THINK_OPEN, 0, THINK_CLOSE, 2]
+    turn = [{"role": "user", "content": "hello"}, None, {"role": "user", "content": "world"}]
+    turn[1] = {"role": "assistant", "content": " paris", "reasoning_content": " hello"}
+    assert contiguous(e.ids(core.Request(messages=turn)), generated)
+    turn[1] = {"role": "assistant", "content": " paris"}  # reasoning dropped: not the turn that was generated
+    assert not contiguous(e.ids(core.Request(messages=turn)), generated)
+
+
+async def test_internal_adapter_thinking(client, engine, node):
+    import dataclasses
+
+    engine.edge.format = dataclasses.replace(engine.edge.format, think=("<think>", "</think>"))
+    node.draws = [THINK_OPEN, 0, THINK_CLOSE, 2, EOS]
+    evs = data_events(await client.post("/rockem/v1/generate", json={"messages": [{"role": "user", "content": "hello"}]}))
+    assert [e["type"] for e in evs] == ["started", "thinking", "text", "done"]
+    assert (evs[1]["text"], evs[2]["text"]) == (" hello", " paris")
+    body = {"messages": [{"role": "user", "content": "hello"}, {"role": "assistant", "content": " paris", "thinking": " hello"}, {"role": "user", "content": "x"}]}
+    assert (await client.post("/rockem/v1/generate", json=body)).status_code == 200
+    bad = {"messages": [{"role": "user", "content": "x", "thinking": "no"}]}
+    assert (await client.post("/rockem/v1/generate", json=bad)).status_code == 422
+
+
+async def test_internal_adapter_flushes_by_time(client, node, monkeypatch):
+    from rockem.adapters import internal
+
+    monkeypatch.setattr(internal, "FLUSH_SECONDS", 0.05)
+    node.draws, node.delay = [2, 3, 4, 2], 0.03  # a token every 30 ms: a flush every second or third token
+    evs = data_events(await client.post("/rockem/v1/generate", json={"prompt": "hello"}))
+    texts = [e for e in evs if e["type"] == "text"]
+    assert 1 < len(texts) < 4 and [i for e in texts for i in e["ids"]] == [2, 3, 4, 2]
+    assert "".join(e["text"] for e in texts) == " paris stop x paris"
+
+
+async def test_reasoning_effort_defaults_low_and_is_checked(client, engine, monkeypatch):
+    seen = []
+    render = engine.edge.render
+    monkeypatch.setattr(engine.edge, "render", lambda *a, **k: (seen.append(k.get("reasoning_effort")), render(*a, **k))[1])
+    await client.post("/rockem/v1/generate", json={"messages": [{"role": "user", "content": "hello"}]})
+    await client.post("/rockem/v1/generate", json={"messages": [{"role": "user", "content": "hello"}], "reasoning_effort": "max"})
+    assert seen[0] == "low" and seen[-1] == "max"
+    bad = {"messages": [{"role": "user", "content": "hello"}], "reasoning_effort": "medium"}
+    assert (await client.post("/rockem/v1/generate", json=bad)).status_code == 422
+
+
+async def test_a_non_streaming_fold_aborts_when_the_client_leaves(engine, node):
+    import asyncio
+
+    from fastapi import HTTPException
+    from rockem.views import fold_or_abort
+
+    node.draws, node.delay = [2] * 50, 0.05  # a slow generation: 2.5 s if nobody stops it
+    left = asyncio.Event()
+
+    async def receive():
+        await left.wait()
+        return {"type": "http.disconnect"}
+
+    run = await engine.start(core.Request(prompt="hello"))
+    task = asyncio.ensure_future(fold_or_abort(run, receive))
+    await asyncio.sleep(0.12)
+    assert engine.scheduler.free == 0
+    left.set()  # the client goes away
+    with pytest.raises(HTTPException):
+        await task
+    assert engine.scheduler.free == 1  # the node connection closed: the abort, at once
+    node.delay = 0
+
+    async def stays():
+        await asyncio.Event().wait()
+
+    text, _, _, done = await fold_or_abort(await engine.start(core.Request(prompt="hello", max_tokens=1)), stays)
+    assert done.reason is core.Reason.MAX_TOKENS  # a fold that finishes first returns as before

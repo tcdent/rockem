@@ -1,0 +1,6 @@
+data: {"type":"started","prompt_tokens":1}
+
+data: {"type":"text","text":" paris ","ids":[2,3]}
+
+data: {"type":"done","reason":"stop_sequence","stop_sequence":"stop","usage":{"prompt_tokens":1,"completion_tokens":2,"positions":11},"model":"tiny","identity":"0000000000000000"}
+

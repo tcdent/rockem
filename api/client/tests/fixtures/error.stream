@@ -1,0 +1,6 @@
+data: {"type":"started","prompt_tokens":1}
+
+data: {"type":"text","text":" paris","ids":[2]}
+
+data: {"type":"error","message":"node: the node closed with 9 positions left"}
+

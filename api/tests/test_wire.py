@@ -11,17 +11,21 @@ IDENTITY = 0x0123456789ABCDEF
 
 
 def test_hello_is_the_documented_bytes():
-    assert wire.hello(0) == b"rock\x04\x00\x00\x00" + b"\x00" * 8
-    assert wire.hello(IDENTITY) == b"rock" + struct.pack("<IQ", 4, IDENTITY)
+    assert wire.hello("tiny") == b"rock\x05\x00\x00\x00" + b"\x00" * 8 + b"tiny" + b"\x00" * 28
+    assert wire.hello("glm-5.3-flash", IDENTITY) == b"rock" + struct.pack("<IQ", 5, IDENTITY) + b"glm-5.3-flash".ljust(32, b"\x00")
+    assert len(wire.hello("x" * 32)) == wire.HELLO == 48
+    for bad in ("", "x" * 33):
+        with pytest.raises(WireError):
+            wire.hello(bad)  # no default model, and the name fits its field
 
 
 def test_header_parses_and_refuses():
-    h = wire.parse_header(b"rock" + struct.pack("<IQI", 4, IDENTITY, 2047))
+    h = wire.parse_header(b"rock" + struct.pack("<IQI", 5, IDENTITY, 2047))
     assert h == Header(IDENTITY, 2047)
     with pytest.raises(WireError):
-        wire.parse_header(b"rocj" + struct.pack("<IQI", 4, 0, 1))
+        wire.parse_header(b"rocj" + struct.pack("<IQI", 5, 0, 1))
     with pytest.raises(WireError):
-        wire.parse_header(b"rock" + struct.pack("<IQI", 1, 0, 1))
+        wire.parse_header(b"rock" + struct.pack("<IQI", 4, 0, 1))
     with pytest.raises(Refused):
         wire.parse_header(b"")
 
@@ -97,8 +101,8 @@ def node():
     n.close()
 
 
-def connect(node, identity=0):
-    return wire.Client.connect(node.addr, BOS, EOS, VOCAB, identity=identity)
+def connect(node, identity=0, model="tiny"):
+    return wire.Client.connect(node.addr, BOS, EOS, VOCAB, identity=identity, model=model)
 
 
 async def collect(gen):
@@ -157,6 +161,9 @@ async def test_client_abort_is_close_and_the_node_returns_to_accepting(node):
 async def test_client_refused_on_identity(node):
     with pytest.raises(Refused):
         await connect(node, identity=IDENTITY ^ 1)
+    with pytest.raises(Refused):
+        await connect(node, model="other")  # a model the node does not serve
+    assert node.hellos[-1] == "other"
     async with await connect(node, identity=IDENTITY) as c:
         assert c.header.identity == IDENTITY
 
@@ -174,7 +181,7 @@ def test_session_takes_a_prefix_and_several_end_ids():
 async def test_client_sends_the_whole_prefix_once(node):
     # a two-id prefix: the second id travels like any id after BOS (this fake node feeds it;
     # the real node checks and swallows it, outside the budget, which is why the mirror skips it)
-    async with await wire.Client.connect(node.addr, (BOS, 5), {EOS}, VOCAB) as c:
+    async with await wire.Client.connect(node.addr, (BOS, 5), {EOS}, VOCAB, model="tiny") as c:
         await c.prompt([BOS, 5, 1, 2])  # what a template that writes the prefix yields
         assert c.session.remaining == 7 - 2
         await collect(c.generate())

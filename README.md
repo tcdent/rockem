@@ -48,8 +48,8 @@ the node never learns a character.
 | `node/` | the node: loads a bundle, runs the model on the CPU or on the card through KFD directly (its own AQL queue, no GPU runtime, the router and the draw on the card, one wait per token), keeps every computed context in host memory and reuses prefixes transparently, serves the wire or the console |
 | `os/` | the image: a pinned kernel, an initramfs that is the node, QEMU for the first rung and a VM with the card passed through for the second |
 | `bringup/` | the bring-up loop: reference goldens, the forward driver that diffs every edge and prices recipes, per-op benches against a measured ceiling, the reference quantizer, and `evals/`, published benchmarks run against a served node through the edge's own client |
-| `api/` | the edge, Python: reads a bundle's manifest, vocabulary and tokenizer (`rockem.bundle`), speaks the wire with the node's position budget mirrored (`rockem.wire`). The API service grows here; never on the node |
-| `docs/` | `wire.md`, the protocol; `bundle.md`, the bundle; `kernel-tuning-feedback.md`, how kernels get measured |
+| `api/` | the edge, Python, never on the node: reads a bundle (`rockem.bundle`), speaks the wire asynchronously (`rockem.wire`), schedules one request per node (`rockem.scheduler`), reads tool calls per model (`rockem.calls`), and serves HTTP (`rockem.app`): rockem's own `/rockem/v1/generate` (`docs/api.md`) beside OpenAI- and Anthropic-shaped surfaces. `api/client/` is the Rust client for our own surface |
+| `docs/` | `wire.md`, the protocol; `bundle.md`, the bundle; `api.md`, our HTTP surface; `kernel-tuning-feedback.md`, how kernels get measured |
 | `stories/` | the log of how it was built, in order, with the decisions and the dead ends |
 
 ## Where things run

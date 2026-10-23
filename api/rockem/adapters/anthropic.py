@@ -81,7 +81,7 @@ async def stream(events: AsyncIterator[core.Event], model: str, prompt_tokens: i
     yield _sse("message_start", {"type": "message_start", "message": {"id": id, "type": "message", "role": "assistant", "model": model, "content": [], "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": prompt_tokens, "output_tokens": 0}}})
     yield _sse("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})
     async for ev in events:
-        if isinstance(ev, core.ToolCall):
+        if isinstance(ev, (core.ToolCall, core.Started, core.Reasoning)):
             continue  # tools are not mapped on this surface yet
         if isinstance(ev, core.Delta):
             if ev.text:

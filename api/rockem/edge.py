@@ -1,15 +1,17 @@
 """Where text stops. The chat template, the tokenizer, the decoder and stop sequences,
-all from one bundle; past this module everything is ids."""
+all from one model in a bundle; past this module everything is ids."""
 
 from __future__ import annotations
 
 import json
 from typing import Any
 
+from functools import cached_property
+
 from jinja2.ext import loopcontrols
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
-from .bundle import Bundle, Decoder
+from .bundle import Decoder, Model
 from .calls import FORMATS, Format
 
 
@@ -35,24 +37,30 @@ def template_env() -> ImmutableSandboxedEnvironment:
 
 
 class Edge:
-    def __init__(self, bundle: Bundle):
-        self.bundle = bundle
-        self.bos_text = bundle.vocab[bundle.bos].decode()
-        self.eos_text = bundle.vocab[bundle.eos].decode()
-        self._template = template_env().from_string(bundle.chat_template)
+    def __init__(self, model: Model):
+        self.model = model
+        self.bos_text = model.vocab[model.bos].decode()
+        self.eos_text = model.vocab[model.eos].decode()
         # how this model's calls and turns read back out of its text; None: no format known
-        self.format: Format | None = FORMATS.get(bundle.manifest.model)
+        self.format: Format | None = FORMATS.get(model.name)
 
-    def render(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None, add_generation_prompt: bool = True) -> str:
+    @cached_property
+    def _template(self):
+        """The model's chat template, read when first rendered: a transcription-only model has none."""
+        return template_env().from_string(self.model.chat_template)
+
+    def render(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None, add_generation_prompt: bool = True, reasoning_effort: str | None = None) -> str:
         """The transcript the template makes of the messages and tools, BOS as text at the
         front. Messages and tools are in the shape chat templates take (transformers'): an
         assistant message's `tool_calls` are `{id, type, function: {name, arguments}}`, a
         result is `{role: "tool", tool_call_id, content}`, a tool is `{type, function}`.
-        Everything the model reads about tools is the template's; the edge adds nothing."""
+        Everything the model reads about tools is the template's; the edge adds nothing.
+        `reasoning_effort` is the template variable of that name (GLM-5.3-Flash: low, high,
+        max); a template that does not read it ignores it."""
         if tools and self.format is None:
-            raise TemplateError(f"{self.bundle.manifest.model}: no tool-call format for this model")
+            raise TemplateError(f"{self.model.name}: no tool-call format for this model")
         try:
-            return self._template.render(messages=messages, tools=tools or None, bos_token=self.bos_text, eos_token=self.eos_text, add_generation_prompt=add_generation_prompt)
+            return self._template.render(messages=messages, tools=tools or None, bos_token=self.bos_text, eos_token=self.eos_text, add_generation_prompt=add_generation_prompt, reasoning_effort=reasoning_effort)
         except TemplateError:
             raise
         except Exception as e:
@@ -60,13 +68,13 @@ class Edge:
 
     def encode(self, text: str) -> list[int]:
         """Ids for text. The tokenizer adds nothing: BOS is present only if the text has it."""
-        return self.bundle.tokenizer.encode(text).ids
+        return self.model.tokenizer.encode(text).ids
 
     def encode_chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> list[int]:
         return self.encode(self.render(messages, tools))
 
     def decoder(self) -> Decoder:
-        return self.bundle.vocab.decoder()
+        return self.model.vocab.decoder()
 
 
 class Stops:

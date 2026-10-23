@@ -1,7 +1,9 @@
 """The nodes' occupancy. A node serves one connection at a time and parks a second
 connector silently, so the edge never connects to a node it is using: each node is a
 token in a queue, taken for the length of one request and put back after. Waiters are
-served in arrival order. One process holds the one table."""
+served in arrival order. One process holds the one table, and every model shares it: a
+node serves one connection at a time across all its models, so a chat and a transcription
+wait in the same line (docs/queue/094)."""
 
 from __future__ import annotations
 
@@ -9,16 +11,16 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from .wire import Client
+from .bundle import Model
+from .wire import AudioSpec, Client
 
 Addr = tuple[str, int]
 
 
 class Scheduler:
-    def __init__(self, nodes: list[Addr], bos, eos, vocab_size: int, identity: int = 0):
-        """`bos` and `eos` as the wire client takes them: one id each, or the prefix and the end ids."""
+    def __init__(self, nodes: list[Addr], identity: int = 0):
         self.nodes = list(nodes)
-        self.bos, self.eos, self.vocab_size, self.identity = bos, eos, vocab_size, identity
+        self.identity = identity
         self._free: asyncio.Queue[Addr] = asyncio.Queue()
         for n in self.nodes:
             self._free.put_nowait(n)
@@ -32,12 +34,13 @@ class Scheduler:
         return len(self._free._getters)  # noqa: SLF001 — asyncio has no public count of waiters
 
     @asynccontextmanager
-    async def node(self) -> AsyncIterator[Client]:
-        """A connected client on the next free node; the node is free again on exit,
+    async def node(self, model: Model) -> AsyncIterator[Client]:
+        """A client on the next free node, speaking `model`; the node is free again on exit,
         and the connection is closed, which is the abort if a generation is running."""
+        audio = AudioSpec.of(model.audio) if model.audio else None
         addr = await self._free.get()
         try:
-            client = await Client.connect(addr, self.bos, self.eos, self.vocab_size, self.identity)
+            client = await Client.connect(addr, model.prefix, model.eos_tokens, model.vocab_size, self.identity, model=model.name, audio=audio)
         except BaseException:
             self._free.put_nowait(addr)
             raise

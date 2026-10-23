@@ -65,3 +65,10 @@ def test_parser_text_order_holds_and_bad_calls():
     bad = parse(fmt, "<tool_call>not json</tool_call>x")
     assert calls_of(bad) == [] and "".join(i.text for i in bad) == "<tool_call>not json</tool_call>x"
     assert calls_of(parse(fmt, '<tool_call>{"name": "a", "arguments": "{\\"k\\": 1}"}</tool_call>')) == [("a", {"k": 1})]
+
+
+def test_glm_reads_reasoning_effort():
+    tpl = template_env().from_string((Path(__file__).parent / "fixtures/glm-5.3-flash.chat_template.jinja").read_text())
+    msgs = [{"role": "user", "content": "hi"}]
+    for effort, line in [("low", "Reasoning Effort: Low"), ("high", "Reasoning Effort: High"), ("max", "Reasoning Effort: Max")]:
+        assert tpl.render(messages=msgs, add_generation_prompt=True, reasoning_effort=effort).startswith("[gMASK]<sop><|system|>" + line)

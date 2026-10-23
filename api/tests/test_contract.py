@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 from rockem.adapters import internal
 
-from conftest import CALL_BODY, CALL_END, CALL_START, EOS
+from conftest import CALL_BODY, CALL_END, CALL_START, EOS, THINK_CLOSE, THINK_OPEN
 
 FIXTURES = Path(__file__).resolve().parents[1] / "client/tests/fixtures"
 pytestmark = pytest.mark.anyio
@@ -28,9 +28,10 @@ def pinned(name: str, body: str):
 
 def test_request_fixture_is_a_valid_request():
     internal.Request.model_validate(json.loads((FIXTURES / "request.json").read_text()))
+    internal.TranscribeRequest.model_validate(json.loads((FIXTURES / "transcribe.json").read_text()))
 
 
-async def test_streams(client, node):
+async def test_streams(client, node, engine):
     req = json.loads((FIXTURES / "request.json").read_text())
     node.draws, node.max_ctx = [2, CALL_START, CALL_BODY, CALL_END, EOS], 64  # room for the whole conversation
     r = await client.post("/rockem/v1/generate", json=req)
@@ -44,3 +45,10 @@ async def test_streams(client, node):
     node.draws, node.close_after = [2] * 10, 1
     r = await client.post("/rockem/v1/generate", json={"prompt": "hello"})
     pinned("error.stream", r.text)
+
+    import dataclasses
+
+    engine.edge.format = dataclasses.replace(engine.edge.format, think=("<think>", "</think>"))
+    node.draws, node.close_after, node.max_ctx = [THINK_OPEN, 0, THINK_CLOSE, 2, EOS], None, 12
+    r = await client.post("/rockem/v1/generate", json={"messages": [{"role": "user", "content": "hello"}]})
+    pinned("thinking.stream", r.text)

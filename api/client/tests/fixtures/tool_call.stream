@@ -1,0 +1,8 @@
+data: {"type":"started","prompt_tokens":11}
+
+data: {"type":"text","text":" paris","ids":[2]}
+
+data: {"type":"tool_call","id":"call_0","name":"read","arguments":{"path":"a"},"ids":[8,9,10]}
+
+data: {"type":"done","reason":"tool_use","stop_sequence":null,"usage":{"prompt_tokens":11,"completion_tokens":5,"positions":63},"model":"tiny","identity":"0000000000000000"}
+

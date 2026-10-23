@@ -98,7 +98,7 @@ async def stream(events: AsyncIterator[core.Event], model: str, include_usage: b
     id, created = f"chatcmpl-{uuid.uuid4().hex[:24]}", int(time.time())
     yield _chunk(id, created, model, {"role": "assistant", "content": ""}, None)
     async for ev in events:
-        if isinstance(ev, core.ToolCall):
+        if isinstance(ev, (core.ToolCall, core.Started, core.Reasoning)):
             continue  # tools are not mapped on this surface yet
         if isinstance(ev, core.Delta):
             if ev.text:

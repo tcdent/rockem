@@ -48,21 +48,31 @@ class Checkpoint:
 
 
 @dataclass(frozen=True)
-class Manifest:
-    """`manifest.toml`, parsed. `files` maps a name to its sha256 hex; `raw` is the bytes the identity covers."""
+class ModelSpec:
+    """One `[[model]]` entry: the constants the wire assumes for that model."""
 
-    raw: bytes
-    model: str
-    recipe: str
-    calibration: str | None
-    record_bytes: int
-    experts: int
-    layers: tuple[int, int]
+    name: str
     bos: int
     eos: int
     vocab_size: int
-    prefix: tuple[int, ...]  # the ids every sequence begins with; [bos] unless the manifest says
-    eos_tokens: frozenset[int]  # every id that ends a turn; {eos} unless the manifest says
+    prefix: tuple[int, ...]  # the ids every sequence begins with; [bos] unless the entry says
+    eos_tokens: frozenset[int]  # every id that ends a turn; {eos} unless the entry says
+    audio: dict | None  # `[model.audio]`, for a model with an audio encoder (docs/queue/094)
+    # how the weights were made, which differs per model; read if the entry has them
+    recipe: str | None = None
+    calibration: str | None = None
+    record_bytes: int | None = None
+    experts: int | None = None
+    layers: tuple[int, int] | None = None
+
+
+@dataclass(frozen=True)
+class Manifest:
+    """`manifest.toml`, parsed. `models` in manifest order; `files` maps a path to its sha256
+    hex; `raw` is the bytes the identity covers. One bundle, one identity, every model in it."""
+
+    raw: bytes
+    models: dict[str, ModelSpec]
     files: dict[str, str]
     checkpoint: Checkpoint | None
 
@@ -71,20 +81,31 @@ class Manifest:
         try:
             t = tomllib.loads(raw.decode())
             files = {name: cls._sha(v) for name, v in t["files"].items()}
-            m = t["model"]
+            entries = t["model"]
+            if not isinstance(entries, list) or not entries:
+                raise KeyError("[[model]]: a list of one or more models")
+            models: dict[str, ModelSpec] = {}
+            for m in entries:
+                spec = ModelSpec(
+                    name=m["name"],
+                    bos=m["bos"],
+                    eos=m["eos"],
+                    vocab_size=m["vocab_size"],
+                    prefix=tuple(m.get("prefix", [m["bos"]])),
+                    eos_tokens=frozenset(m.get("eos_tokens", [m["eos"]])),
+                    audio=m.get("audio"),
+                    recipe=m.get("recipe"),
+                    calibration=m.get("calibration"),
+                    record_bytes=m.get("record_bytes"),
+                    experts=m.get("experts"),
+                    layers=tuple(m["layers"]) if "layers" in m else None,
+                )
+                if spec.name in models or len(spec.name.encode()) > 32 or not spec.name:
+                    raise KeyError(f"model name {spec.name!r}: unique, 1..32 bytes")
+                models[spec.name] = spec
             return cls(
                 raw=raw,
-                model=m["name"],
-                recipe=t["recipe"],
-                calibration=t.get("calibration"),
-                record_bytes=t["record_bytes"],
-                experts=t["experts"],
-                layers=(t["layers"][0], t["layers"][1]),
-                bos=m["bos"],
-                eos=m["eos"],
-                vocab_size=m["vocab_size"],
-                prefix=tuple(m.get("prefix", [m["bos"]])),
-                eos_tokens=frozenset(m.get("eos_tokens", [m["eos"]])),
+                models=models,
                 files=files,
                 checkpoint=cls._checkpoint(raw),
             )
@@ -157,7 +178,8 @@ class Decoder:
 
 class Bundle:
     """A bundle directory. Opening it reads and parses the manifest; each other file is
-    read on first use and checked against the manifest's hash."""
+    read on first use and checked against the manifest's hash. `model(name)` is one of its
+    models: its constants and its edge files, which live under a directory named for it."""
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -166,30 +188,18 @@ class Bundle:
         except OSError as e:
             raise BundleError(f"{self.path}: {e}") from e
         self.manifest = Manifest.parse(raw)
+        self._models: dict[str, Model] = {}
 
     @property
     def identity(self) -> int:
         return self.manifest.identity
 
-    @property
-    def bos(self) -> int:
-        return self.manifest.bos
-
-    @property
-    def eos(self) -> int:
-        return self.manifest.eos
-
-    @property
-    def vocab_size(self) -> int:
-        return self.manifest.vocab_size
-
-    @property
-    def prefix(self) -> tuple[int, ...]:
-        return self.manifest.prefix
-
-    @property
-    def eos_tokens(self) -> frozenset[int]:
-        return self.manifest.eos_tokens
+    def model(self, name: str) -> Model:
+        if name not in self.manifest.models:
+            raise BundleError(f"no model {name!r} in this bundle (it has {', '.join(self.manifest.models)})")
+        if name not in self._models:
+            self._models[name] = Model(self, self.manifest.models[name])
+        return self._models[name]
 
     def present(self) -> list[str]:
         """The listed files that are in the directory, in manifest order."""
@@ -209,6 +219,31 @@ class Bundle:
             raise BundleError(f"{name}: sha256 {got} != manifest's {want}")
         return data
 
+
+class Model:
+    """One model in a bundle: the wire's constants for it, and its edge files under
+    `<name>/` in the bundle."""
+
+    def __init__(self, bundle: Bundle, spec: ModelSpec):
+        self.bundle, self.spec = bundle, spec
+        self.name, self.bos, self.eos, self.vocab_size = spec.name, spec.bos, spec.eos, spec.vocab_size
+        self.prefix, self.eos_tokens, self.audio = spec.prefix, spec.eos_tokens, spec.audio
+        self.recipe, self.calibration = spec.recipe, spec.calibration
+        self.record_bytes, self.experts, self.layers = spec.record_bytes, spec.experts, spec.layers
+
+    @property
+    def identity(self) -> int:
+        return self.bundle.identity
+
+    def path(self, file: str) -> str:
+        return f"{self.name}/{file}"
+
+    def has(self, file: str) -> bool:
+        return self.path(file) in self.bundle.manifest.files
+
+    def read(self, file: str) -> bytes:
+        return self.bundle.read(self.path(file))
+
     @cached_property
     def vocab(self) -> Vocab:
         return Vocab(self.read(VOCAB_FILE), self.vocab_size)
@@ -216,18 +251,18 @@ class Bundle:
     @cached_property
     def tokenizer(self):
         """The checkpoint's tokenizer, `tokenizers.Tokenizer`, from `tokenizer.json`. Encoding
-        the rendered chat template with it yields BOS as the first id."""
+        the rendered chat template with it yields the prefix as the first ids."""
         from tokenizers import Tokenizer
 
         return Tokenizer.from_str(self.read(TOKENIZER_FILE).decode())
 
     @cached_property
     def chat_template(self) -> str:
-        """The Jinja source of the model's chat template: `chat_template.jinja` when the bundle
+        """The Jinja source of the model's chat template: `chat_template.jinja` when the model
         has one (it wins, as it does in transformers), else `tokenizer_config.json`'s."""
-        if CHAT_TEMPLATE_FILE in self.manifest.files:
+        if self.has(CHAT_TEMPLATE_FILE):
             return self.read(CHAT_TEMPLATE_FILE).decode()
         try:
             return json.loads(self.read(TOKENIZER_CONFIG_FILE))["chat_template"]
         except (json.JSONDecodeError, KeyError, TypeError) as e:
-            raise BundleError(f"{TOKENIZER_CONFIG_FILE}: {e!r}") from e
+            raise BundleError(f"{self.path(TOKENIZER_CONFIG_FILE)}: {e!r}") from e

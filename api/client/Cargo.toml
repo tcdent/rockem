@@ -1,0 +1,18 @@
+[package]
+name = "rockem-client"
+# The major version is the API version it speaks: 1.x.y speaks /rockem/v1 (docs/api.md).
+version = "1.0.0"
+edition = "2021"
+description = "Client for rockem's own API (docs/api.md): a request in, a stream of events out."
+publish = false
+
+[dependencies]
+# TLS is the consumer's choice: enable a reqwest TLS feature in your own build to reach https.
+reqwest = { version = "0.12", default-features = false, features = ["stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+futures-util = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

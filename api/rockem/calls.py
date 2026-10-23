@@ -26,6 +26,7 @@ class Format:
     end: str
     decode: Callable[[str], tuple[str, dict[str, Any]]]
     turn_stops: tuple[str, ...]
+    think: tuple[str, str] | None = None  # the markers around the model's reasoning, if it reasons
 
 
 def _json_call(span: str) -> tuple[str, dict[str, Any]]:
@@ -63,7 +64,7 @@ FORMATS: dict[str, Format] = {
     # rockem's own format for a checkpoint with none (models/deepseek-v2-lite/chat_template.jinja)
     "deepseek-v2-lite": Format("<tool_call>", "</tool_call>", _json_call, ("\nUser:", "\nTool:", "\nAssistant:")),
     # the checkpoint's native format (its chat_template.jinja); <|user|> and <|observation|> open the next turn
-    "glm-5.3-flash": Format("<tool_call>", "</tool_call>", _glm_call, ("<|user|>", "<|observation|>")),
+    "glm-5.3-flash": Format("<tool_call>", "</tool_call>", _glm_call, ("<|user|>", "<|observation|>"), ("<think>", "</think>")),
 }
 
 
@@ -133,3 +134,50 @@ class Parser:
         out = (self.fmt.start if self._in_call else "") + self._buf
         self._buf, self._in_call, self._scan = "", False, 0
         return out
+
+
+class Thinking:
+    """Streamed text in; (reasoning, text) pieces out, in order, the markers dropped. A reply
+    is reasoning while inside the model's think markers: from the start when the prompt
+    already opened them (the generation prompt ends with the open marker), or when the reply
+    itself begins with the open marker. Text that could be part of a marker is held."""
+
+    def __init__(self, markers: tuple[str, str], inside: bool):
+        self.open, self.close = markers
+        self.inside = inside
+        self._at_start = not inside  # only a reply's beginning can open reasoning
+        self._buf = ""
+
+    def feed(self, text: str) -> list[tuple[bool, str]]:
+        self._buf += text
+        out: list[tuple[bool, str]] = []
+        while self._buf:
+            if self.inside:
+                i = self._buf.find(self.close)
+                if i >= 0:
+                    if i:
+                        out.append((True, self._buf[:i]))
+                    self._buf, self.inside = self._buf[i + len(self.close) :], False
+                    continue
+                return out + self._emit(True, self.close)
+            if self._at_start:
+                lead = self._buf.lstrip()
+                if lead.startswith(self.open):
+                    self._buf, self.inside, self._at_start = lead[len(self.open) :], True, False
+                    continue
+                if not lead or self.open.startswith(lead):
+                    return out  # still could open
+                self._at_start = False
+            out.append((False, self._buf))
+            self._buf = ""
+        return out
+
+    def _emit(self, reasoning: bool, marker: str) -> list[tuple[bool, str]]:
+        hold = max((k for k in range(1, len(marker)) if self._buf.endswith(marker[:k])), default=0)
+        cut = len(self._buf) - hold
+        piece, self._buf = self._buf[:cut], self._buf[cut:]
+        return [(reasoning, piece)] if piece else []
+
+    def flush(self) -> list[tuple[bool, str]]:
+        piece, self._buf = self._buf, ""
+        return [(self.inside, piece)] if piece else []
