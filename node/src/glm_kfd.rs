@@ -181,6 +181,7 @@ struct Card {
     /// shared expert's output, `[STEP][H]` f32), the router's logits over it (`[STEP][ROUTE_ROWS]` f32, layer l + 1's
     /// from `E`, as `scores_v`) and the few-token router's word (unread).
     pred_step: crate::kfd::Kernel,
+    pred_rows: crate::kfd::Kernel,
     pred_learn: crate::kfd::Kernel,
     pred_input: crate::kfd::Kernel,
     pred_x: Mem,
@@ -534,6 +535,7 @@ impl Cards {
                     hc_pre: k.kernel("hc_pre"),
                     hc_route_ahead: k.kernel("hc_route_ahead"),
                     pred_step: k.kernel("pred_step"),
+                    pred_rows: k.kernel("pred_rows"),
                     pred_learn: k.kernel("pred_learn"),
                     pred_input: k.kernel("pred_input"),
                     pred_x: k.vram(STEP * H * 4),
@@ -2163,9 +2165,17 @@ impl Cards {
         // the routed rows: the host's experts' rows as the leader holds them once its word is in (this pass runs behind
         // `hc_post`, which waited for it), weighted in pick order (093); null for the early pass
         let router = f.router.as_ref().unwrap().va;
+        if rows && decode {
+            // `hc_post` wrote the input (x + the whole FFN output); the next layer's router, the margins and the plan in
+            // one launch (`pred_rows`: three launches were ~60 µs on the card's chain behind `hc_post`, 2026-10-22)
+            let mut a = Args::new();
+            a.ptr(px).ptr(f.ln.va).ptr(router).ptr(ps2).ptr(st.va).ptr(self.tok(&c.scores_v, ROUTE_ROWS)).ptr(d.at(self.t0 * E * 4)).ptr(d2.at(self.t0 * E * 4)).ptr(slot(l));
+            a.ptr(self.shared.plan2.va).ptr(self.shared.words.at(self.wd(W_PLAN2, f.card))).u32(self.half_seq[l][self.ch][1]).u32(n as u32).ptr(c.pred_keys.va).ptr(c.pred_count.va);
+            c.k.launch(&c.pred_rows, glm_5_3_flash::plan::PRED_ROWS_WGS, PLAN_WG, PLAN_LDS, &a);
+            return;
+        }
         if rows {
-            // `hc_post` wrote the input (x + the whole FFN output); the stacked router (this layer's rows, then the
-            // next's) over it through the rows kernel — `hc_route_ahead` on hc_pre's grid was 27 µs for 1.2 M MACs
+            // a long step's rows pass: the stacked router through the matrix path, the margins for the learning
             if decode {
                 self.rows(c, &c.rows_h, px, Some(f.ln.va), router, ps2, ROUTE_ROWS, H, n, ROWS);
             } else {

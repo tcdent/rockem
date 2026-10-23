@@ -73,11 +73,16 @@ pub const PLAN_LDS: u32 = (4 * (16 + E / 32 * TOP_K + E)) as u32;
 pub const PLAN_WG: u32 = E as u32;
 /// Workgroups that predict a long step's tokens, a token a workgroup at a time.
 pub const PLAN_PRED_WGS: usize = 64;
+/// `pred_rows`' grid: 8 of the next layer's router rows a workgroup, then a token a workgroup (093).
+pub const PRED_ROWS_WGS: u32 = (E / 8) as u32;
+const _: () = assert!(E % 8 == 0 && PRED_ROWS_WGS as usize >= SPEC_TOKENS);
 
 #[cfg(target_arch = "amdgpu")]
 pub mod gfx11 {
     use super::*;
-    use common::gfx11::{ballot, lds, wave_max, workgroup_sync};
+    use crate::RMS_NORM_EPS;
+    use common::gemv::widen;
+    use common::gfx11::{ballot, lds, wave_max, wave_sum, workgroup_sync};
     use common::math::{exp, sqrt};
     use core::arch::amdgpu::{workgroup_id_x, workitem_id_x};
     use core::sync::atomic::{fence, AtomicU32, Ordering};
@@ -253,6 +258,157 @@ pub mod gfx11 {
             fence(Ordering::Release);
             workgroup_sync();
             if e == 0 && !word.is_null() {
+                AtomicU32::from_ptr(word).store(value, Ordering::Release);
+            }
+        }
+    }
+
+    /// The rows pass as one launch (093): the next layer's router over `x` (the FFN input plus the whole FFN output,
+    /// `hc_post`'s), the margins, the plan. Grid `PRED_ROWS_WGS` of `PLAN_WG`, all resident: phase 1, workgroup w
+    /// takes router rows `E + 8w..` over the `n` tokens into `scores2` (`[n][ROUTE_ROWS]`); a grid barrier on
+    /// `count[0]`; phase 2, workgroup i < n takes token i — the two margins against `scores` (`hc_pre`'s route-ahead)
+    /// and `scores2`, stored for the learning, its key into `keys` — and the last to arrive at `count[1]` multiplies the
+    /// keys and ranks into `plan`, then `word`. Three launches (27 + 33 µs and a 10 µs add) were ~60 µs on the card's
+    /// critical chain behind `hc_post`; the chain is the point, so the margins run a token a workgroup.
+    #[no_mangle]
+    pub extern "gpu-kernel" fn pred_rows(x: *const f32, ln: *const u16, router: *const u16, scores2: *mut f32, pred: *const f32, scores: *const f32, p_d: *mut f32, p_d2: *mut f32, p_picks: *const u32, plan: *mut u32, word: *mut u32, value: u32, n: u32, keys: *mut f32, count: *mut u32) {
+        unsafe {
+            const RR: usize = crate::hc::gfx11_consts::ROUTE_ROWS;
+            let e = workitem_id_x() as usize;
+            let (lane, wave) = ((e % 32) as u32, e / 32);
+            let wg = workgroup_id_x() as usize;
+            let n = n as usize;
+            let l = lds::<f32>();
+            let red = l; // [16]
+            let cand = red.add(16); // [E / 32 · TOP_K]
+            let sk = cand.add(E / 32 * TOP_K); // [E]
+            // phase 1: this workgroup's 8 rows of the next layer's router, over every token's normed input (the first 8
+            // waves; the ninth idles)
+            let mut i = 0;
+            while i < n {
+                let xt = x.add(i * H);
+                let mut ss = 0f32;
+                if e < 256 {
+                    let mut k = e;
+                    while k < H {
+                        let v = *xt.add(k);
+                        ss += v * v;
+                        k += 256;
+                    }
+                }
+                ss = wave_sum(lane, ss);
+                if lane == 0 && wave < 8 {
+                    *red.add(wave) = ss;
+                }
+                workgroup_sync();
+                let mut tot = 0f32;
+                let mut k = 0;
+                while k < 8 {
+                    tot += *red.add(k);
+                    k += 1;
+                }
+                let rr = 1.0 / sqrt(tot / H as f32 + RMS_NORM_EPS);
+                workgroup_sync();
+                let mut r = 0;
+                while r < 8 {
+                    let row = E + wg * 8 + r;
+                    let wr = router.add(row * H);
+                    let mut acc = 0f32;
+                    if e < 256 {
+                        let mut k = e;
+                        while k < H {
+                            acc += *xt.add(k) * widen(*ln.add(k)) * widen(*wr.add(k));
+                            k += 256;
+                        }
+                    }
+                    acc = wave_sum(lane, acc);
+                    if lane == 0 && wave < 8 {
+                        *red.add(wave) = acc;
+                    }
+                    workgroup_sync();
+                    if e == 0 {
+                        let mut sum = 0f32;
+                        let mut k = 0;
+                        while k < 8 {
+                            sum += *red.add(k);
+                            k += 1;
+                        }
+                        *scores2.add(i * RR + row) = sum * rr;
+                    }
+                    workgroup_sync();
+                    r += 1;
+                }
+                i += 1;
+            }
+            // the grid barrier: every workgroup's rows are in before any token's margins read them
+            fence(Ordering::Release);
+            workgroup_sync();
+            if e == 0 {
+                AtomicU32::from_ptr(count).fetch_add(1, Ordering::AcqRel);
+                while AtomicU32::from_ptr(count).load(Ordering::Acquire) < PRED_ROWS_WGS {
+                    core::hint::spin_loop();
+                }
+            }
+            workgroup_sync();
+            fence(Ordering::Acquire);
+            if wg >= n {
+                return;
+            }
+            // phase 2: this workgroup's token
+            let i = wg;
+            let (ca, cc, ca2) = (*pred.add(HDR), *pred.add(HDR + 1), *pred.add(HDR + 2));
+            let (bn, bias) = (*pred.add(BN + e), *pred.add(BIAS + e));
+            let g1 = sigmoid(*scores.add(i * RR + E + e)) + bn;
+            let t1 = eighth(g1, lane, wave, cand, red);
+            let g2 = sigmoid(*scores2.add(i * RR + E + e)) + bn;
+            let t2 = eighth(g2, lane, wave, cand, red);
+            let (d, d2) = ((g1 - t1) * 10.0, (g2 - t2) * 10.0);
+            *p_d.add(i * E + e) = d;
+            *p_d2.add(i * E + e) = d2;
+            let mut z = ca * d + ca2 * d2 + cc + bias;
+            let mut q = 0;
+            while q < TOP_K {
+                z += *pred.add(CO + *p_picks.add(i * TOP_K + q) as usize * E + e);
+                q += 1;
+            }
+            *keys.add(i * E + e) = 1.0 + exp(if z < 20.0 { z } else { 20.0 });
+            fence(Ordering::Release);
+            workgroup_sync();
+            if e == 0 {
+                let last = AtomicU32::from_ptr(count.add(1)).fetch_add(1, Ordering::AcqRel) == n as u32 - 1;
+                *red.add(15) = if last { 1.0 } else { 0.0 };
+                if last {
+                    AtomicU32::from_ptr(count.add(1)).store(0, Ordering::Relaxed);
+                    AtomicU32::from_ptr(count).store(0, Ordering::Relaxed);
+                }
+            }
+            workgroup_sync();
+            if *red.add(15) == 0.0 {
+                return;
+            }
+            fence(Ordering::Acquire);
+            let mut key = 1f32;
+            let mut w = 0;
+            while w < n {
+                key *= *keys.add(w * E + e);
+                w += 1;
+            }
+            // the plan: each expert's place among the keys (the greater first, between equals the lower expert)
+            *sk.add(e) = key;
+            workgroup_sync();
+            let mut r = 0usize;
+            let mut j = 0;
+            while j < E {
+                let w = *sk.add(j);
+                r += (w > key || (w == key && j < e)) as usize;
+                j += 1;
+            }
+            if r < PLAN {
+                *plan.add(r) = e as u32;
+            }
+            fence(Ordering::Release);
+            workgroup_sync();
+            if e == 0 {
                 AtomicU32::from_ptr(word).store(value, Ordering::Release);
             }
         }
