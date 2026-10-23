@@ -1,6 +1,6 @@
 # 093 — The routed rows as the predictor's signal
 
-**Status:** Built (aff36, 2026-10-22) — measuring
+**Status:** Measured single-phase (aff36, 2026-10-22): the signal pays (missed host experts a layer 5.19 → 4.79, planned 416 → 429 items), the lateness costs more (the plan arrives after hc_post + the predictor: slot.ahead 0.4 → 98.6 µs a layer, the prefetch completes 94.1 % not 96.2, complete experts 7.73 → 7.41, verify step 52.73 → 57.84 ms) — the two-phase plan is the design, in progress
 **Area:** decode
 **Gain:** offline, the route-ahead over the FFN input plus the whole FFN output as the second margin settled recall@13
 .6205 → .647 (phase3b, +.027, nearly the full attention-ahead's +.038 of queue 092) for 2.4 MB of router weights and
