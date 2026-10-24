@@ -28,7 +28,7 @@ from .core import Engine
 from .edge import Edge
 from .scheduler import Addr, Scheduler
 from .transcribe import Transcriber
-from .views import AnthropicMessagesView, HealthView, InternalView, OpenAIChatView, TranscribeView
+from .views import RUNS, AnthropicMessagesView, HealthView, InternalView, OpenAIChatView, TranscribeView
 
 
 def parse_nodes(spec: str) -> list[Addr]:
@@ -75,5 +75,26 @@ async def chat() -> HTMLResponse:
     """A page to talk to the service by hand: `chat.html`, next to this file."""
     return HTMLResponse((Path(__file__).parent / "chat.html").read_text())
 
+class ReleaseRuns:
+    """Gives back the node of every run a request took, when the request ends, however it ends:
+    finished, failed, or its client gone before the stream began (then neither the body nor a
+    response's background task ever runs). The views register their runs (views.RUNS)."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        runs: list = []
+        scope[RUNS] = runs  # the list itself: routes see copies of the scope, all holding this list
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            for run in runs:
+                await run.release()
+
+
 app = FastAPI(title="rockem", lifespan=lifespan)
+app.add_middleware(ReleaseRuns)
 app.include_router(router)

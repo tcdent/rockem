@@ -23,6 +23,9 @@ from .transcribe import NoSpeech, Transcriber
 from .wire import ContextFull, Refused, WireError
 
 
+RUNS = "rockem.runs"  # the request scope's list of the node connections this request took
+
+
 def get_engine(request: HttpRequest) -> core.Engine:
     return request.app.state.engine
 
@@ -34,11 +37,14 @@ def get_transcriber(request: HttpRequest) -> Transcriber:
     return t
 
 
-async def start(engine: core.Engine, req: core.Request) -> core.Run:
+async def start(engine: core.Engine, req: core.Request, request: HttpRequest) -> core.Run:
     """Refusals happen here, before any response starts: a prompt the template rejects or
-    the node cannot hold is a 4xx, a node that cannot be reached is a 503."""
+    the node cannot hold is a 4xx, a node that cannot be reached is a 503. The run is registered
+    on the request, so `app.ReleaseRuns` gives its node back however the request ends."""
     try:
-        return await engine.start(req)
+        run = await engine.start(req)
+        request.scope.setdefault(RUNS, []).append(run)
+        return run
     except (TemplateError, ValueError) as e:
         raise HTTPException(400, str(e)) from e
     except ContextFull as e:
@@ -88,7 +94,7 @@ class GenerationView(BaseView):
         return f"{self.engine.edge.model.identity:016x}"
 
     async def _start(self, req: core.Request) -> core.Run:
-        return await start(self.engine, req)
+        return await start(self.engine, req, self.request)
 
     @staticmethod
     def _sse(body: AsyncIterator[bytes]) -> StreamingResponse:
@@ -155,7 +161,7 @@ class TranscribeView(BaseView):
             return sse(internal.stream(no_speech(), t.model.name, f"{t.model.identity:016x}"))
         except (AudioError, ValueError) as e:
             raise HTTPException(400, str(e)) from e
-        run = await start(t.engine, req)
+        run = await start(t.engine, req, self.request)
         return sse(internal.stream(run.events(), t.model.name, f"{t.model.identity:016x}"))
 
 

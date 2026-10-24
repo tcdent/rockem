@@ -322,3 +322,36 @@ async def test_a_non_streaming_fold_aborts_when_the_client_leaves(engine, node):
 
     text, _, _, done = await fold_or_abort(await engine.start(core.Request(prompt="hello", max_tokens=1)), stays)
     assert done.reason is core.Reason.MAX_TOKENS  # a fold that finishes first returns as before
+
+
+async def test_a_client_gone_before_the_stream_gives_the_node_back(engine, node):
+    """The tablet's cancel, 2026-10-24: the prompt was sent, then the client left before the
+    response began. Nothing iterated the stream, so nothing released the node, and every later
+    request waited forever. The middleware releases it however the request ends."""
+    import json as _json
+
+    from rockem.app import app
+
+    app.state.engine = engine
+    node.draws, node.delay = [2] * 50, 0.05
+    body = _json.dumps({"messages": [{"role": "user", "content": "hello"}]}).encode()
+    sent = []
+
+    async def receive():
+        if not sent:
+            sent.append(1)
+            return {"type": "http.request", "body": body, "more_body": False}
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            raise OSError("the client is gone")  # as the server reports a closed socket
+
+    scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"}, "http_version": "1.1", "method": "POST",
+             "scheme": "http", "path": "/rockem/v1/generate", "raw_path": b"/rockem/v1/generate", "query_string": b"",
+             "root_path": "", "headers": [(b"content-type", b"application/json")], "client": ("t", 1), "server": ("s", 80)}
+    try:
+        await app(scope, receive, send)
+    except Exception:
+        pass  # the server's to handle; what matters is the node
+    assert engine.scheduler.free == 1

@@ -165,8 +165,18 @@ class Run:
     def __init__(self, engine: Engine, req: Request, ids: list[int], cm, client, inside: bool = False):
         self.engine, self.req, self.client, self._cm = engine, req, client, cm
         self.inside = inside
+        self._released = False
         prefix = client.session.prefix
         self.prompt_tokens = len(ids) - (len(prefix) if tuple(ids[: len(prefix)]) == prefix else 0)
+
+    async def release(self) -> None:
+        """Close the node connection and give the node back to the line: once, whenever the run
+        ends. `events` does it when it finishes; whoever started the run must call it too, because
+        a stream that never starts never runs `events`' `finally`: a client gone between the prompt
+        and the stream left the node taken and its line stuck (2026-10-24)."""
+        if not self._released:
+            self._released = True
+            await self._cm.__aexit__(None, None, None)
 
     async def events(self) -> AsyncIterator[Event]:
         req, client, fmt = self.req, self.client, self.engine.edge.format
@@ -268,7 +278,7 @@ class Run:
                 self.engine.remember("".join(memo_think), "".join(memo_text), memo_ids)
             yield Done(reason, stops.matched if reason is Reason.STOP_SEQUENCE else None, self.prompt_tokens, n, client.positions)
         finally:
-            await self._cm.__aexit__(None, None, None)
+            await self.release()
 
     async def fold(self) -> tuple[str, list[int], list[ToolCall], Done]:
         """The reply's text (reasoning left out), every id, the calls, and the end."""
