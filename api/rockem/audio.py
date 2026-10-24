@@ -1,10 +1,11 @@
 """Audio at the edge: everything before the model's encoder, so the node sees only finished
 windows (docs/queue/094; tcdent 2026-10-23: "offload any preprocessing to the api").
 
-The pipeline is the reference's (mistral-common and transformers' Voxtral processor): decode
-to f32, average the channels, resample to the model's rate with soxr at HQ, pad with zeros to
-a whole number of windows, take Whisper's log-mel spectrogram over the whole clip, then cut it
-into windows. The spectrogram is normalized by the clip's maximum, so a window depends on the
+The pipeline is the reference's (mistral-common and transformers' Voxtral processor; Granite
+Speech's torchaudio extractor): decode to f32, average the channels, resample to the model's rate
+with soxr at HQ, pad with zeros to a whole number of windows, take the log-mel spectrogram over
+the whole clip (Whisper's log and normalization; the FFT size and filterbank per model), then cut
+it into windows. The spectrogram is normalized by the clip's maximum, so a window depends on the
 whole clip and is never computed alone. The mel filterbank is the bundle's own file."""
 
 from __future__ import annotations
@@ -25,10 +26,11 @@ class Spectrogram:
 
     sample_rate: int
     hop: int
-    fft_window: int
+    fft_window: int  # the Hann window's length
+    fft: int  # the transform's size: the window zero-padded to it, centered (Granite: 400 in 512)
     bins: int
     frames: int  # a window's frames
-    filters: np.ndarray  # [bins][fft_window // 2 + 1] f32
+    filters: np.ndarray  # [bins][fft // 2 + 1] f32
 
     @property
     def window_samples(self) -> int:
@@ -37,11 +39,12 @@ class Spectrogram:
     @classmethod
     def of(cls, audio: dict, filters: bytes) -> Spectrogram:
         bins, frames = audio["window"]
-        n_freq = audio["fft_window"] // 2 + 1
+        fft = audio.get("fft", audio["fft_window"])  # Whisper-shaped models: the window's own length
+        n_freq = fft // 2 + 1
         f = np.frombuffer(filters, dtype="<f4")
         if f.size != bins * n_freq:
             raise AudioError(f"mel filters: {f.size} values, the model's are {bins} x {n_freq}")
-        return cls(audio["sample_rate"], audio["hop"], audio["fft_window"], bins, frames, f.reshape(bins, n_freq))
+        return cls(audio["sample_rate"], audio["hop"], audio["fft_window"], fft, bins, frames, f.reshape(bins, n_freq))
 
     def signal(self, data: bytes) -> np.ndarray:
         """Mono f32 at the model's rate, from any file soundfile reads (WAV, FLAC, OGG, MP3…)."""
@@ -68,13 +71,17 @@ class Spectrogram:
         rather than the whole clip's frames (about 1.7 GB at 30 minutes, measured 2026-10-23).
         The normalization needs the clip's maximum, so it runs once over the whole mel."""
         n = -(-x.size // self.window_samples) * self.window_samples
-        half = self.fft_window // 2
+        half = self.fft // 2
         x = np.pad(np.pad(x.astype(np.float32), (0, n - x.size)), (half, half), mode="reflect")  # centered frames
         frames = n // self.hop  # one per hop; Whisper drops the last of the n/hop + 1
-        window = np.hanning(self.fft_window + 1)[:-1]  # periodic Hann
+        # periodic Hann over fft_window samples, zero-padded to the transform's size, centered: a frame
+        # sees the same samples whatever the size (torchaudio's win_length < n_fft)
+        window = np.zeros(self.fft)
+        lead = (self.fft - self.fft_window) // 2
+        window[lead : lead + self.fft_window] = np.hanning(self.fft_window + 1)[:-1]
         filters = self.filters.astype(np.float64)
         mel = np.empty((self.bins, frames), dtype=np.float64)
-        offsets = np.arange(self.fft_window)[None, :]
+        offsets = np.arange(self.fft)[None, :]
         for start in range(0, frames, self.frames):
             stop = min(start + self.frames, frames)
             idx = offsets + self.hop * np.arange(start, stop)[:, None]

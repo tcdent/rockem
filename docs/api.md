@@ -239,7 +239,7 @@ of a conversation. The audio itself never enters a conversation.
 | field | meaning |
 |---|---|
 | `audio` | the recording, base64: any format libsndfile reads (WAV, FLAC, OGG, MP3), any rate, any channels |
-| `language` | optional, a code like `en`; omitted, the model detects the language |
+| `language` | optional, a code like `en`. Granite detects the language itself and ignores this |
 | `max_tokens` | optional: ids to generate at most |
 
 The text arrives as `started`, then `text` events, then `done` with `end_turn`.
@@ -255,14 +255,18 @@ only drops near-digital silence (−70 dBFS), so quiet speech still goes through
 
 Every step before the model's encoder happens in the service: decode, average the
 channels, resample to the model's rate, pad to whole windows, compute the spectrogram over
-the whole clip and cut it into windows. That pipeline is the reference's (mistral-common's
-loader and transformers' Whisper features, matched to within one f32 rounding step), with
-the model's mel filterbank read from the bundle. The service renders the model's
+the whole clip and cut it into windows. That pipeline is the reference's (for Granite, torchaudio's
+mel spectrogram with a 512-point FFT over a 400-sample window, matched to its float32 rounding),
+with the model's mel filterbank read from the bundle. The service renders the model's
 transcription prompt and sends the windows to the node with the wire's AUDIO verb
 (`docs/queue/094-audio-verb.md`).
 
-The transcription model is Voxtral Small 24B (`voxtral-small-24b`), up to 30 minutes of
-audio a request. It shares the nodes, and their one line, with the generation model.
+The transcription model is Granite Speech 4.1 2B (`granite-speech-4.1-2b`, since 2026-10-24;
+tcdent: "our transcription API will only serve the new model"). It hears 3-second windows, 30
+placeholders each (10 a second of audio), so a recording's length is bounded by the node's
+context. The prompt is the model card's raw transcription request: the text comes back
+lowercase and unpunctuated, for word accuracy. The model detects the language, so `language` is
+accepted and ignored. It shares the nodes, and their one line, with the generation model.
 
 ## Versioning
 

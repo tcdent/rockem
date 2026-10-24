@@ -45,7 +45,7 @@ use rockem_client::{Client, Event, StreamExt, TranscribeRequest};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::new("https://rockem.a10k.co");
     let audio = std::fs::read("note.wav")?;
-    // The language is optional; without it the model detects the language.
+    // The language is optional; the model detects the language itself.
     let mut events = client.transcribe(&TranscribeRequest::new(audio).language("en")).await?;
     let mut text = String::new();
     while let Some(event) = events.next().await {
@@ -63,8 +63,10 @@ A recording with no voice in it, such as silence, hiss or noise, ends at once wi
 `Reason::NoSpeech` and no text: the service checks before sending it to the model, which would
 otherwise invent a transcript. A single short word is enough to pass.
 
-The model is Voxtral Small 24B, which handles up to 30 minutes of audio a request. The
-transcript is text for a person to review: the audio never enters a conversation.
+The model is Granite Speech 4.1 2B. The transcript comes back lowercase and unpunctuated, for
+word accuracy, and the model detects the language itself, so `language` is ignored. A
+recording's length is bounded by the service's context. The transcript is text for a person to
+review: the audio never enters a conversation.
 
 **Status:** while the service has no transcription model deployed, `transcribe` returns
 `Error::Status { status: 503, .. }`. Build and test against the API now; the endpoint goes
