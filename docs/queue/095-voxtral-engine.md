@@ -2,7 +2,9 @@
 
 **Status:** LIVE beside GLM on metatron (aff68, 2026-10-23 15:24: `models glm-5.3-flash voxtral-small-24b`; GLM's
 18k workload and long SCORE bit-identical beside it; `/rockem/v1/transcribe` answered three LibriSpeech clips word for
-word in ~18 s each — one 30 s window: encoder + prefill ~15 s, then ~90 ms a token). aff69 fixes a refusal: a
+word in ~18 s each — one 30 s window: encoder + prefill ~15 s, then ~90 ms a token). **aff75 (2026-10-23 evening): a
+30 s clip in 6.0 s** — encoder 1.0 s, prefill 2.5 s, 54 ms a token; the speed pass below, read through prow
+(`bringup/reads/voxtral.sh`). aff69 fixes a refusal: a
 connection closed with audio rows still queued left them in the engine and the next BOS refused every later
 transcription; a new connection drops them now. In the gate: the decoder's top-1 against the reference's own
 transcript 37/38; the three clips transcribed exactly (casing and punctuation aside), ending at EOS on their own.
@@ -81,7 +83,13 @@ we can get this faster … try a little bit on tuning and then explore other opt
 | aff71 (before) | 18.8 s | ~8–10 s | ~800 ms | ~90–100 ms |
 | aff72: `common::sgemm` | 15.7 s | 1.34 s | 800 ms | 100 ms |
 | aff73: per-token work over the pool, down split four ways | 8.6 s | 1.30 s | ~255 ms | 72.8 ms |
-| aff74: K/V cache a kv head's positions contiguous, attention a (kv head, 8 tokens) an item, vectorized SiLU, rope a token an item | see below | | | |
+| aff74: K/V cache a kv head's positions contiguous, attention a (kv head, 8 tokens) an item, vectorized SiLU, rope a token an item | 6.1 s | 0.93 s (1.31 the first after boot) | 236 ms | 52.9 ms |
+| aff75: the small runs spread over the complexes, attention blocks of 2 tokens | 6.0 s | 0.99 s | 210 ms | 53.8 ms |
+
+aff75's step (prow, `voxtral.sh`): prefill a step: norm 8.5, qkv 12.8, rope 2.2, attn 13, o 17.7, gu 64, silu 18, down 75, head 1.3
+(the weights 170 of 210); decode a token: attn 4.9, o 2.6, gu 25.3, silu 1.7, down 13.8, head 1.3 (the weights 45 against a
+41 ms DRAM floor). The encoder a window: norm+pack 86, qkv 155, attention 103, o 124, ffn 490, projector 13. libri2 end
+to end 18.8 → 6.0 s; libri0 (shorter) 5.0, libri1 4.4.
 
 - **The encoder's GEMM** (`common::sgemm`): the dot form (`linalg::dot` a row and position, a horizontal reduction an
   output, the activation row re-read for every weight row) ran at a few FLOP a cycle. Now the weights are packed once
