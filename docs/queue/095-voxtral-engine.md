@@ -1,5 +1,10 @@
 # 095 — Voxtral-Small-24B in the node
 
+**Retired from the manifest 2026-10-24** (tcdent: "We do not need to continue deploying Voxtral"): Granite Speech 4.1 2B
+(docs/queue/096) serves transcription — better WER at a twelfth of the decoder bytes, suited to the CPU. The engine,
+builder and gates stay in the tree; the bundle's files are in `bundles/voxtral-staging` (`bringup/gates/bundle_merge.py`
+puts them back).
+
 **Status:** LIVE beside GLM on metatron (aff68, 2026-10-23 15:24: `models glm-5.3-flash voxtral-small-24b`; GLM's
 18k workload and long SCORE bit-identical beside it; `/rockem/v1/transcribe` answered three LibriSpeech clips word for
 word in ~18 s each — one 30 s window: encoder + prefill ~15 s, then ~90 ms a token). **aff75 (2026-10-23 evening): a

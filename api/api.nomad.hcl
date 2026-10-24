@@ -34,7 +34,7 @@ job "rockem-api" {
       kill_timeout = "10s"
 
       config {
-        image        = "registry.a10k.co/rockem/api:dbef7404772f"
+        image        = "registry.a10k.co/rockem/api:030263fa5c4b"
         network_mode = "host"
         ports        = ["http"]
         args         = ["--host", "${NOMAD_IP_http}", "--port", "${NOMAD_PORT_http}"]
@@ -49,7 +49,7 @@ job "rockem-api" {
         # metatron's inference node
         ROCKEM_NODES            = "192.168.88.6:7332"
         ROCKEM_MODEL            = "glm-5.3-flash"
-        ROCKEM_TRANSCRIBE_MODEL = "voxtral-small-24b"
+        ROCKEM_TRANSCRIBE_MODEL = "granite-speech-4.1-2b"
       }
 
       resources {

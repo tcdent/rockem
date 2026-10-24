@@ -1,8 +1,11 @@
 # 096 — Granite Speech 4.1 2B: transcription suited to the CPU
 
-**Status:** BUILT and gated on the dev host (2026-10-24), not booted — awaiting tcdent's go-ahead (lab boot:
-`bringup/box/lab_boot.sh <label> bringup/box/dev.cmdline.lab-granite`, the bundle `bundles/lab-granite` beside
-production). The edge's two changes for rockem.api are listed below.
+**Status:** BUILT and gated on the dev host (2026-10-24), **in the production manifest** in Voxtral's place (tcdent
+2026-10-24: "We do not need to continue deploying Voxtral. So let's pull that out of the manifest. So our transcription
+API will only serve the new model" — `bundles/glm-5.3-flash-q4rtn` lists glm-5.3-flash and granite-speech-4.1-2b;
+Voxtral's files sit in `bundles/voxtral-staging`). Not booted yet: the next deploy boots it. The API job's
+`ROCKEM_TRANSCRIBE_MODEL` is granite-speech-4.1-2b; the edge's two changes for rockem.api are listed below and gate the
+first transcription.
 **Area:** models/granite-speech-4.1-2b, bundle, node, bring-up
 **Gain:** the leaderboard's best open transcription WER (5.33 on the Open ASR English set, against Voxtral Small's 6.62,
 Mini 3B's 7.05, Whisper large-v3's 7.44) with 2B parameters instead of 24B: the decoder streams 0.9 GB a token
