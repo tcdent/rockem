@@ -1,11 +1,12 @@
 # 096 — Granite Speech 4.1 2B: transcription suited to the CPU
 
-**Status:** BUILT and gated on the dev host (2026-10-24), **in the production manifest** in Voxtral's place (tcdent
-2026-10-24: "We do not need to continue deploying Voxtral. So let's pull that out of the manifest. So our transcription
-API will only serve the new model" — `bundles/glm-5.3-flash-q4rtn` lists glm-5.3-flash and granite-speech-4.1-2b;
-Voxtral's files sit in `bundles/voxtral-staging`). Not booted yet: the next deploy boots it. The API job's
-`ROCKEM_TRANSCRIBE_MODEL` is granite-speech-4.1-2b; the edge's two changes for rockem.api are listed below and gate the
-first transcription.
+**Status:** LIVE on metatron (aff76, 2026-10-24 21:00: `models glm-5.3-flash granite-speech-4.1-2b`; GLM's 18k workload
+and long SCORE bit-identical beside it; the API container from rockem.api's d5931f2). Through the service, read back with
+`bringup/reads/granite.sh`: **libri2 (12.5 s) in 1.34 s wall** (2.09 cold) — the node's part 0.4 s of generation after an
+encoder of 0.61 s for the 5 padded windows (ff 306, attention 134, conv 143 ms) and a prefill of 168 ids in 0.21 s (35 ms
+a 32-token step); **decode 10.7 ms a token**; libri0 and libri1 (5–6 s clips) 0.69 and 0.61 s wall. Voxtral on the same
+clip was 6.0 s and 54 ms a token (aff75). Transcripts word for word (lowercase; the model adds light punctuation on the
+longer clip even under the raw prompt). Voxtral's files sit in `bundles/voxtral-staging`.
 **Area:** models/granite-speech-4.1-2b, bundle, node, bring-up
 **Gain:** the leaderboard's best open transcription WER (5.33 on the Open ASR English set, against Voxtral Small's 6.62,
 Mini 3B's 7.05, Whisper large-v3's 7.44) with 2B parameters instead of 24B: the decoder streams 0.9 GB a token
@@ -79,7 +80,10 @@ measurement (Voxtral's dev-host prefill was 40 s against the box's 2.5).
    English prompt).
 
 ## Open
-- The box's numbers (encoder, prefill, decode a token) and the WER on more than three clips; the INT4 decoder's
+- Speed levers, all small: the first request's encoder pays a first touch (955 vs 610 ms: attention 429 vs 134); decode
+  at 10.7 ms a token is ~3× the 1 GB stream's DRAM floor — 200 pool runs a token at ~30 µs each, attention 2.7 ms for 37
+  heads' worth of 200 positions (the item is a kv head × a token block: 4 items a token), the lm_head's 1572 items.
+- The WER on more than three clips; the INT4 decoder's
   position-0 explosion (a sink-token effect, harmless to the transcript so far) — the V2-Lite lesson (FIRST_POS) if it
   ever shows.
 - Padding at the edge: a clip's last window is zero audio the model hears as silence (≤ 3 s); Voxtral had the same.
