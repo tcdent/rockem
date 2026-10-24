@@ -305,7 +305,8 @@ fn encoder_gate(dense: Dense, pool: &dyn common::pool::Pool, gdir: &std::path::P
                 report.record("rows", &rows[r * H..(r + 1) * H], g, &format!("window {w} row {r}"));
             }
         }
-        println!("window {w}: {:.2}s", t1.elapsed().as_secs_f32());
+        let ph: Vec<String> = voxtral_small_24b::encoder::PHASES.iter().zip(enc.phases).map(|(n, s)| format!("{n} {s:.2}")).collect();
+        println!("window {w}: {:.2}s ({})", t1.elapsed().as_secs_f32(), ph.join(", "));
     }
     report.print();
 }

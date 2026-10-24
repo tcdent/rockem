@@ -60,6 +60,8 @@ pub mod q4;
 pub mod rmsnorm;
 pub mod rope;
 pub mod sample;
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+pub mod sgemm;
 pub mod softmax;
 pub mod stats;
 pub mod swiglu;

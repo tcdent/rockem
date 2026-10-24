@@ -56,6 +56,46 @@ impl Acts {
         let (k, g) = (self.k, self.k / GROUP);
         Act { q: &self.q[t * k..(t + 1) * k], scale: &self.scale[t * g..(t + 1) * g], gsum: &self.gsum[t * g..(t + 1) * g] }
     }
+    /// The slices `quantize(t)` writes, as pointers an item of the pool takes (the tokens' slices are disjoint).
+    fn writer(&mut self) -> ActsOut {
+        ActsOut { q: self.q.as_mut_ptr() as usize, scale: self.scale.as_mut_ptr() as usize, gsum: self.gsum.as_mut_ptr() as usize, k: self.k }
+    }
+}
+#[derive(Clone, Copy)]
+struct ActsOut {
+    q: usize,
+    scale: usize,
+    gsum: usize,
+    k: usize,
+}
+impl ActsOut {
+    /// Token `t`'s INT8 activation from `x` (`quantize`'s bits).
+    unsafe fn quantize(self, t: usize, x: &[f32]) {
+        let (k, g) = (self.k, self.k / GROUP);
+        let mut qa = QAct {
+            q: core::slice::from_raw_parts_mut((self.q as *mut i8).add(t * k), k),
+            scale: core::slice::from_raw_parts_mut((self.scale as *mut f32).add(t * g), g),
+            gsum: core::slice::from_raw_parts_mut((self.gsum as *mut i32).add(t * g), g),
+        };
+        qa.quantize(&x[..k]);
+    }
+}
+
+/// The step's per-token work over the pool, a token an item; one token runs inline.
+fn tokens(pool: &dyn Pool, n: usize, f: &(dyn Fn(usize) + Sync)) {
+    if n == 1 {
+        f(0)
+    } else {
+        pool.run(n, f)
+    }
+}
+
+/// Where a step's time goes (`phases`, seconds), in order.
+pub const PHASES: [&str; 10] = ["embed", "norm", "qkv", "rope", "attn", "o", "gu", "silu", "down", "head"];
+fn phase(phases: &mut [f64; 10], i: usize, t: &mut std::time::Instant) {
+    let now = std::time::Instant::now();
+    phases[i] += (now - *t).as_secs_f64();
+    *t = now;
 }
 
 pub struct Decoder<'a> {
@@ -82,6 +122,8 @@ pub struct Decoder<'a> {
     act_q: Acts,
     act_ff: Acts,
     pub logits: Vec<f32>, // [STEP][VOCAB_SIZE]
+    /// Seconds in each of `PHASES` over the last `step`.
+    pub phases: [f64; 10],
     /// Dev: every layer's residual output of the last step, `[layers][n][H]`, when tracing.
     pub trace: Option<Vec<f32>>,
 }
@@ -126,6 +168,7 @@ impl<'a> Decoder<'a> {
             act_q: Acts::new(Q_DIM),
             act_ff: Acts::new(D_FF),
             logits: vec![0.0; STEP * VOCAB_SIZE],
+            phases: [0.0; 10],
             trace: None,
         }
     }
@@ -152,10 +195,17 @@ impl<'a> Decoder<'a> {
                     q4::gemm::<H>(half, uw, us, n, |t| act.act(t), |t| up.at(t * stride + c * half));
                 });
             }
-            Which::Down => self.pool.run_on(m.items(), &node, &ccd, &move |c| {
-                let it = stream.item(l, which, c);
-                q4::gemm::<D_FF>(m.chunk, it.w, it.s, n, |t| act.act(t), |t| out.at(t * stride + c * m.chunk));
-            }),
+            // down's 20 items are 256 rows each: split four ways at runtime so 80 cores stream it, a sub-item's rows
+            // (whole tiles) and their scales contiguous within the item
+            Which::Down => {
+                const SPLIT: usize = 4;
+                let rows = m.chunk / SPLIT;
+                self.pool.run_on(m.items() * SPLIT, &|i| node(i / SPLIT), &|i| i, &move |i| {
+                    let (c, s) = (i / SPLIT, i % SPLIT);
+                    let it = stream.item(l, which, c);
+                    q4::gemm::<D_FF>(rows, &it.w[s * rows * D_FF / 2..], &it.s[s * rows * (D_FF / GROUP)..], n, |t| act.act(t), |t| out.at(t * stride + c * m.chunk + s * rows));
+                })
+            }
             Which::O => self.pool.run_on(m.items(), &node, &ccd, &move |c| {
                 let it = stream.item(l, which, c);
                 q4::gemm::<Q_DIM>(m.chunk, it.w, it.s, n, |t| act.act(t), |t| out.at(t * stride + c * m.chunk));
@@ -172,6 +222,8 @@ impl<'a> Decoder<'a> {
     pub fn step(&mut self, toks: &[u32], pos: usize, row: impl Fn(usize) -> Option<&'a [f32]>, all: bool) {
         let n = toks.len();
         assert!(n > 0 && n <= STEP && pos + n <= self.max_ctx);
+        self.phases = [0.0; 10];
+        let mut tm = std::time::Instant::now();
         let emb = self.dense.embed_tokens();
         for t in 0..n {
             let x = &mut self.x[t * H..(t + 1) * H];
@@ -188,17 +240,23 @@ impl<'a> Decoder<'a> {
         if let Some(tr) = &mut self.trace {
             tr.clear();
         }
+        phase(&mut self.phases, 0, &mut tm);
         for l in 0..NUM_HIDDEN_LAYERS {
-            self.layer(l, n, pos);
+            self.layer(l, n, pos, &mut tm);
             if let Some(tr) = &mut self.trace {
                 tr.extend_from_slice(&self.x[..n * H]);
             }
         }
         // the head: the normed residual of the tokens wanted, the lm_head's items over the pool
         let first = if all { 0 } else { n - 1 };
-        for t in first..n {
-            rmsnorm::<H>(&self.x[t * H..(t + 1) * H], &self.final_norm, RMS_NORM_EPS, &mut self.xn[t * H..(t + 1) * H]);
-            self.act_h.quantize(t, &self.xn[t * H..(t + 1) * H]);
+        {
+            let (x, fnorm, xn, act) = (&self.x, &self.final_norm, Out(self.xn.as_mut_ptr()), self.act_h.writer());
+            tokens(self.pool, n - first, &move |i| unsafe {
+                let t = first + i;
+                let row = core::slice::from_raw_parts_mut(xn.at(t * H), H);
+                rmsnorm::<H>(&x[t * H..(t + 1) * H], fnorm, RMS_NORM_EPS, row);
+                act.quantize(t, row);
+            });
         }
         let m = layout::LM_HEAD;
         let (stream, nodes, per_run) = (self.stream, self.nodes, m.per_run());
@@ -208,18 +266,29 @@ impl<'a> Decoder<'a> {
             let it = stream.head_item(c);
             q4::gemm::<H>(m.chunk, it.w, it.s, n - first, |t| act.act(first + t), |t| out.at((first + t) * VOCAB_SIZE + c * m.chunk));
         });
+        phase(&mut self.phases, 9, &mut tm);
     }
 
-    fn layer(&mut self, l: usize, n: usize, pos: usize) {
-        let (ln0, ln1) = self.norms[l].split_at(H);
+    /// The step's tokens normed by `norm` and quantized into `act_h`, a token an item.
+    fn norm_tokens(&mut self, n: usize, norm: &[f32]) {
+        let (x, xn, act) = (&self.x, Out(self.xn.as_mut_ptr()), self.act_h.writer());
+        tokens(self.pool, n, &move |t| unsafe {
+            let row = core::slice::from_raw_parts_mut(xn.at(t * H), H);
+            rmsnorm::<H>(&x[t * H..(t + 1) * H], norm, RMS_NORM_EPS, row);
+            act.quantize(t, row);
+        });
+    }
+
+    fn layer(&mut self, l: usize, n: usize, pos: usize, tm: &mut std::time::Instant) {
+        let norms = std::mem::take(&mut self.norms[l]);
+        let (ln0, ln1) = norms.split_at(H);
         // attention: the normed input quantized a token, q|k|v an item over the pool
-        for t in 0..n {
-            rmsnorm::<H>(&self.x[t * H..(t + 1) * H], ln0, RMS_NORM_EPS, &mut self.xn[t * H..(t + 1) * H]);
-            self.act_h.quantize(t, &self.xn[t * H..(t + 1) * H]);
-        }
+        self.norm_tokens(n, ln0);
+        phase(&mut self.phases, 1, tm);
         let stride = layout::QKV.rows;
         let out = Out(self.qkv.as_mut_ptr());
         self.gemv(l, Which::Qkv, n, &self.act_h, out, stride);
+        phase(&mut self.phases, 2, tm);
         // rotary on q and k, then k and v into the cache
         for t in 0..n {
             let p = pos + t;
@@ -235,6 +304,7 @@ impl<'a> Decoder<'a> {
             self.k_cache[at..at + KV_DIM].copy_from_slice(&row[Q_DIM..Q_DIM + KV_DIM]);
             self.v_cache[at..at + KV_DIM].copy_from_slice(&row[Q_DIM + KV_DIM..Q_DIM + 2 * KV_DIM]);
         }
+        phase(&mut self.phases, 3, tm);
         // causal attention, a (token, head) an item: scores over the positions up to the token's, softmax, the values
         {
             let (qkv, k_cache, v_cache) = (&self.qkv, &self.k_cache, &self.v_cache);
@@ -269,35 +339,44 @@ impl<'a> Decoder<'a> {
                 }
             });
         }
+        phase(&mut self.phases, 4, tm);
         // o projection over the attention output, into the residual
-        for t in 0..n {
-            self.act_q.quantize(t, &self.attn[t * Q_DIM..(t + 1) * Q_DIM]);
+        {
+            let (attn, act) = (&self.attn, self.act_q.writer());
+            tokens(self.pool, n, &move |t| unsafe { act.quantize(t, &attn[t * Q_DIM..(t + 1) * Q_DIM]) });
         }
         let out = Out(self.xn.as_mut_ptr());
         self.gemv(l, Which::O, n, &self.act_q, out, H);
         for t in 0..n * H {
             self.x[t] += self.xn[t];
         }
-        // the FFN: gate|up an item over the pool, SiLU(gate)·up a token, down an item, into the residual
-        for t in 0..n {
-            rmsnorm::<H>(&self.x[t * H..(t + 1) * H], ln1, RMS_NORM_EPS, &mut self.xn[t * H..(t + 1) * H]);
-            self.act_h.quantize(t, &self.xn[t * H..(t + 1) * H]);
-        }
+        phase(&mut self.phases, 5, tm);
+        // the FFN: gate|up an item over the pool, SiLU(gate)·up a token (an item), down an item, into the residual
+        self.norm_tokens(n, ln1);
+        phase(&mut self.phases, 1, tm);
         // the gate rows into `gu`'s first half, the up rows into its second (`STEP · D_FF` floats on)
         let out = Out(self.gu.as_mut_ptr());
         self.gemv(l, Which::Gu, n, &self.act_h, out, D_FF);
-        let (gate, up) = self.gu.split_at(STEP * D_FF);
-        for t in 0..n {
-            for i in 0..D_FF {
-                self.hid[t * D_FF + i] = silu(gate[t * D_FF + i]) * up[t * D_FF + i];
-            }
-            self.act_ff.quantize(t, &self.hid[t * D_FF..(t + 1) * D_FF]);
+        phase(&mut self.phases, 6, tm);
+        {
+            let (gate, up) = self.gu.split_at(STEP * D_FF);
+            let (hid, act) = (Out(self.hid.as_mut_ptr()), self.act_ff.writer());
+            tokens(self.pool, n, &move |t| unsafe {
+                let row = core::slice::from_raw_parts_mut(hid.at(t * D_FF), D_FF);
+                for i in 0..D_FF {
+                    row[i] = silu(gate[t * D_FF + i]) * up[t * D_FF + i];
+                }
+                act.quantize(t, row);
+            });
         }
+        phase(&mut self.phases, 7, tm);
         let out = Out(self.xn.as_mut_ptr());
         self.gemv(l, Which::Down, n, &self.act_ff, out, H);
         for t in 0..n * H {
             self.x[t] += self.xn[t];
         }
+        phase(&mut self.phases, 8, tm);
+        self.norms[l] = norms;
     }
 
     /// Position `pos`'s rows for the store: K then V of every layer.

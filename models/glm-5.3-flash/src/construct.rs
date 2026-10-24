@@ -738,6 +738,9 @@ impl Pool for Threads {
     fn ccds_of(&self, node: usize) -> usize {
         self.node_ccds.get(node).map_or(1, |c| c.len().max(1))
     }
+    fn complexes(&self) -> Vec<(usize, usize)> {
+        self.node_ccds.iter().enumerate().flat_map(|(nd, cc)| (0..cc.len()).map(move |c| (nd, c))).collect()
+    }
     fn prefetchers(&self, slot: usize) -> usize {
         self.touchers.get(slot).copied().unwrap_or(1).max(1)
     }

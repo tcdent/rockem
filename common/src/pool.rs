@@ -96,6 +96,12 @@ pub trait Pool: Sync {
         let _ = node;
         1
     }
+    /// Every (node, core complex) the pool has cores on, in a stable order — the `node` and `ccd` arguments
+    /// `run_on` slots by: a caller gives items that share an operand the same complex, so its L3 holds it once.
+    #[cfg(feature = "std")]
+    fn complexes(&self) -> std::vec::Vec<(usize, usize)> {
+        std::vec![(0, 0)]
+    }
     /// Of the last run's items, how many ran on a core of their preferred CCD, and how many
     /// there were (0, 0 for a pool that has no CCDs to prefer).
     fn locality(&self) -> (usize, usize) {
