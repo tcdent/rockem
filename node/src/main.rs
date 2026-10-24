@@ -478,6 +478,16 @@ impl Session {
                         continue;
                     }
                 }
+                // a divergence inside the cached transcript (not a prompt that runs past its end): the ids on both sides,
+                // the cached transcript's from 8 before the divergence and the request's from it, so the row says what changed
+                if let Some(c) = self.store.contexts[ctx].as_ref() {
+                    if n < c.ids.len() {
+                        let join = |v: &[u32]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ");
+                        let cached = join(&c.ids[n.saturating_sub(8)..(n + 32).min(c.ids.len())]);
+                        let new = join(&ids[at..(at + 32).min(ids.len())]);
+                        prow::row!("track-store", "store_diverge", { "pos" => n, "transcript" => c.ids.len(), "cached" => cached.as_str(), "new" => new.as_str() });
+                    }
+                }
                 if !self.materialize(n) {
                     return false;
                 }
