@@ -276,6 +276,20 @@ pub mod gfx11 {
         }
     }
 
+    /// `rows_h` one row a wave (060): the same launch where the wide grid would be under-occupied —
+    /// a small `m` at a verify width leaves the card a couple of workgroups at `ROWS` 4, and the
+    /// waves, not the rows, stream the weights. The host picks it when `rows_grid(m, n, ROWS)` is
+    /// under ~2 workgroups a CU; the rows' arithmetic is unchanged, only their grouping.
+    #[no_mangle]
+    pub extern "gpu-kernel" fn rows_h1(x: *const f32, ln: *const u16, w: *const u16, out: *mut f32, m: u32, n: u32) {
+        unsafe {
+            let tid = workitem_id_x();
+            let (m, n) = (m as usize, n as usize);
+            let t = tid as usize;
+            rows_over::<H, true, 1>(tid, w, ln, m, n, RMS_NORM_EPS, |i, s| *x.add(i * H + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
+        }
+    }
+
 
     /// `rows_h` on the matrix path for a step of many tokens (`rows_wmma`). Grid: wmma_grid(m, n), LDS WMMA_LDS.
     #[no_mangle]
@@ -327,6 +341,18 @@ pub mod gfx11 {
             let (m, n) = (m as usize, n as usize);
             let t = tid as usize;
             rows_over::<PART_QKV, false, ROWS>(tid, w, core::ptr::null(), m, n, 0.0, |i, s| *x.add(i * PART_QKV + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
+        }
+    }
+
+    /// `rows_part` one row a wave (060): the output projection's narrow twin, picked where the wide
+    /// grid would be under-occupied (m H at a verify width is 128 workgroups on 84 CUs).
+    #[no_mangle]
+    pub extern "gpu-kernel" fn rows_part1(x: *const f32, w: *const u16, out: *mut f32, m: u32, n: u32) {
+        unsafe {
+            let tid = workitem_id_x();
+            let (m, n) = (m as usize, n as usize);
+            let t = tid as usize;
+            rows_over::<PART_QKV, false, 1>(tid, w, core::ptr::null(), m, n, 0.0, |i, s| *x.add(i * PART_QKV + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
         }
     }
 

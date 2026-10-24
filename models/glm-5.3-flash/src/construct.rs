@@ -1969,8 +1969,8 @@ pub trait Placed {
     /// Whether expert `e` of layer `l` is resident on a card (the prefetch leaves those to the cards).
     fn resident(&self, l: usize, e: usize) -> bool;
     /// The residency's slots claimed, slots in all, and loads made since the start.
-    fn resident_stats(&self) -> (usize, usize, usize) {
-        (0, 0, 0)
+    fn resident_stats(&self) -> ResidentStats {
+        ResidentStats::default()
     }
     /// Whether the bring-up checks run (the node built with `bringup-checks`).
     fn checks(&self) -> bool;
@@ -2031,6 +2031,27 @@ pub trait Placed {
 pub enum LayerState {
     Kda { window: Vec<f32>, mem: Vec<f32> },
     Mla { cache: Vec<u16>, pools: Vec<u16> },
+}
+
+/// The residency's shape, for the node's `experts` row (063's instrument): slots claimed and in all,
+/// loads since the start, the slots a MoE layer holds (both cards), the layer's held experts at the
+/// min / median / max, and the distinct experts a layer picked over the last `RESIDENT_HALF_LIFE`
+/// steps — what the residency's size has to beat for its share of the picks. A `held` at the
+/// capacity (`per_layer`) everywhere says the slots are the limit; a held below capacity, or a
+/// `seen` far above `held`, says the policy is (the budget, the margin, the counts' aging).
+#[derive(Default, Clone, Copy)]
+pub struct ResidentStats {
+    pub filled: usize,
+    pub slots: usize,
+    pub loads: usize,
+    /// The slots a MoE layer holds in all (the cards' `per_layer` summed).
+    pub per_layer: usize,
+    pub held_min: u32,
+    pub held_med: u32,
+    pub held_max: u32,
+    pub seen_min: u32,
+    pub seen_med: u32,
+    pub seen_max: u32,
 }
 
 /// A token's time by phase, summed over steps until reset (bring-up, and the node's `step` rows

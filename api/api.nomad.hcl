@@ -34,7 +34,7 @@ job "rockem-api" {
       kill_timeout = "10s"
 
       config {
-        image        = "registry.a10k.co/rockem/api:d5931f29eec3"
+        image        = "registry.a10k.co/rockem/api:a62dcb818fb7"
         network_mode = "host"
         ports        = ["http"]
         args         = ["--host", "${NOMAD_IP_http}", "--port", "${NOMAD_PORT_http}"]

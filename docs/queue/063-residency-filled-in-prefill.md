@@ -50,3 +50,22 @@ warm-up measurements; tcdent's long-context rule.
 2. Measure: resident share and the expert lap of the first 100 decode steps after an 18k cold prompt,
    against the baseline's 2 % and 9.5 ms a step token.
 3. Then 038 (the residents used in prefill too) and 045 (the copy engine pulls instead of a core).
+- 2026-10-24: instrumented — the `experts` row gained `per_layer` and the held min / median / max, and
+  the distinct experts a layer picked over the last half-life window (`seen_min` / `seen_med` /
+  `seen_max`, a bit a pick folded at each half-life). Served (run `262e0e1f`, positions 1k–85k): the
+  residency came up at 8 slots a layer (the 1M-context boot's VRAM past the reserve), `held` at the
+  capacity everywhere, and the routing touched median 224 of 288 experts a layer per window (p90 288)
+  — the 32 % share of 10-18 belonged to the single-text regime; across requests the lifetime counts
+  hold a global hotlist that matches none of them (share 6.1 %).
+- 2026-10-24: the counts age at each new prompt — `RESIDENT_PROMPT_AGE` 4 (÷16) at the first prefill
+  step after decode steps, the `seen` windows folded there too, so a window's `seen` reads the current
+  text's breadth. Target: the routing replay's per-text numbers (0.438 / 0.364 at 21 / 18 slots a
+  layer); at 8 slots a layer the ceiling is the share of the text's top-8-every-window experts.
+- 2026-10-24: **aging profiled on served traffic** (`bringup/reads/aging.sh`): the resident share of decode and verify
+  picks by the step's index within its request, the boots before aging (aff76/77) against those with it (aff78–80):
+  1–4 11.2 / 10.7 %, 5–16 11.5 / 10.7, 17–64 10.4 / 9.8, 65–256 10.9 / 10.1, 257+ 11.9 / 10.9 — about a point lower
+  everywhere, not a faster rise. Two mechanisms in the code: it ages at every turn of the same conversation (the first
+  prefill step after decode steps is every request, not only a new text), and the loader's ~one upload a step needs
+  ~360 steps to refill 8 slots × 45 layers, longer than most requests. Kept at tcdent's call ("the theory of aging is
+  sound … incorporate profiling to check or verify that rather than just removing it"); a rule that ages only on a new
+  text (a cache miss) and a faster refill are the variants to read against the same profile.

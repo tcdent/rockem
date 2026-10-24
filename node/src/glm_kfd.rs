@@ -93,6 +93,12 @@ struct Resident {
     jobs: Vec<Vec<(u32, u32, u8)>>,
     /// Uploads made (bring-up: the warm-up's cost).
     uploads: usize,
+    /// `[MOE_LAYERS]`: a bit a expert picked this window (since the last half-life); folded into
+    /// `window_seen` at the half-life, so the `experts` row can read a layer's distinct experts
+    /// against its `held` (063's instrument).
+    window: Vec<[u64; (glm_5_3_flash::E + 63) / 64]>,
+    /// `[MOE_LAYERS]`: distinct experts picked over the last window, published at the fold.
+    window_seen: Vec<u32>,
 }
 const NONE: u32 = u32::MAX;
 const PENDING: u32 = u32::MAX - 1;
@@ -118,6 +124,15 @@ const LOADER_CORE: usize = 24;
 /// ARC 0.366 there, but 0.294 / 0.345 on code). Belady's ceiling: 0.552 / 0.577.
 const RESIDENT_MARGIN: u32 = 2;
 const RESIDENT_HALF_LIFE: u64 = 16;
+/// The counts' shift when a new prompt arrives (the first prefill step after decode steps): the
+/// residency is the current text's hotlist, not the box's lifetime average — served, the routing
+/// touches nearly every expert of a layer within a half-life's window (the `experts` row's `seen`,
+/// 2026-10-24: median 224 of 288, p90 288, at 8 slots a layer), so counts summed across requests
+/// hold a global hotlist that matches none of them (the node's own note: a static hotlist does not
+/// travel between texts, 0.19 of picks). A shift of 4 puts the last prompt's picks 16× over the
+/// one before it, and the routing replay's per-text numbers (0.438 / 0.364, 2026-10-18) are the
+/// target this aging buys back.
+const RESIDENT_PROMPT_AGE: u32 = 4;
 /// VRAM a card may spend on resident experts at most (the node); what is free past a reserve decides.
 pub const RESIDENT_BYTES: usize = 12 << 30;
 /// VRAM left unallocated on a card: the driver's and the queue's own, and room for a bring-up gate's buffers.
@@ -146,9 +161,11 @@ struct Card {
     xhs: Mem,
     xhg: Mem,
     rows_h: crate::kfd::Kernel,
+    rows_h1: crate::kfd::Kernel,
     rows_h_w: crate::kfd::Kernel,
     rows_d2: crate::kfd::Kernel,
     rows_part: crate::kfd::Kernel,
+    rows_part1: crate::kfd::Kernel,
     rows_part_w: crate::kfd::Kernel,
     mtp_eh_w: crate::kfd::Kernel,
     ffn_gu_w: crate::kfd::Kernel,
@@ -494,6 +511,7 @@ impl Cards {
                 let alloc = |floats: usize| k.vram_visible(floats * 4);
                 Card {
                     rows_h: k.kernel("rows_h"),
+                    rows_h1: k.kernel("rows_h1"),
                     rows_h_w: k.kernel("rows_h_w"),
                     rows_part_w: k.kernel("rows_part_w"),
                     mtp_eh_w: k.kernel("mtp_eh_w"),
@@ -505,6 +523,7 @@ impl Cards {
                     mla_o_w: k.kernel("mla_o_w"),
                     rows_d2: k.kernel("rows_d2"),
                     rows_part: k.kernel("rows_part"),
+                    rows_part1: k.kernel("rows_part1"),
                     step: k.kernel("kda_step"),
                     copy: k.kernel("copy_f32"),
                     xpt_gu: k.kernel("xpt_gu"),
@@ -931,7 +950,7 @@ impl Cards {
                 per_layer.push(count / moe);
                 counts.push(count);
             }
-            Resident { table: std::sync::Arc::new((0..moe * glm_5_3_flash::E).map(|_| AtomicU32::new(NONE)).collect()), loader: None, inflight: Default::default(), allowed: Default::default(), issued: Default::default(), steps: 0, prefill: false, count: vec![0; moe * glm_5_3_flash::E], turn: 0, owner: counts.iter().map(|&k| vec![(NONE, NONE); k]).collect(), free: counts.iter().map(|&k| (0..k as u32).rev().collect()).collect(), held: (0..n).map(|_| vec![0; moe]).collect(), per_layer, slots, jobs: (0..n).map(|_| Vec::new()).collect(), uploads: 0 }
+            Resident { table: std::sync::Arc::new((0..moe * glm_5_3_flash::E).map(|_| AtomicU32::new(NONE)).collect()), loader: None, inflight: Default::default(), allowed: Default::default(), issued: Default::default(), steps: 0, prefill: false, count: vec![0; moe * glm_5_3_flash::E], turn: 0, owner: counts.iter().map(|&k| vec![(NONE, NONE); k]).collect(), free: counts.iter().map(|&k| (0..k as u32).rev().collect()).collect(), held: (0..n).map(|_| vec![0; moe]).collect(), per_layer, slots: slots, jobs: (0..n).map(|_| Vec::new()).collect(), uploads: 0, window: (0..moe).map(|_| [0; (glm_5_3_flash::E + 63) / 64]).collect(), window_seen: vec![0; moe] }
         };
         // the prefetch predictor's pairs, a table a card
         let pred_tab: Vec<(Mem, usize)> = cards
@@ -1174,7 +1193,7 @@ impl Cards {
             a.ptr(x).ptr(m.input_ln.va).ptr(m.ix.va).ptr(ix).u32(IX_ROWS as u32).u32(n as u32);
             c.k.launch_free(&c.rows_h_w, g::wmma_grid(IX_ROWS, n), g::WG, g::WMMA_LDS, &a);
         } else {
-            self.rows_free(c, &c.rows_h, x, ln, m.ix.va, ix, IX_ROWS, H, n, ROWS);
+            self.rows_free(c, &c.rows_h, None, x, ln, m.ix.va, ix, IX_ROWS, H, n, ROWS);
         }
         // over q_a's output normed with q_a's norm: the query and, alongside it, the indexer's query (VRAM: the card scores the pools)
         let qln = Some(m.qa_ln.va);
@@ -1183,7 +1202,7 @@ impl Cards {
             self.rows_w(c, &c.mla_iq_w, mqa, qln, m.ix_wq_b.va, None, miq, INDEX_N_HEADS * INDEX_HEAD_DIM, n, true);
         } else {
             self.rows8(c, &c.mla_qb, mqa, qln, m.q_b.0.va, m.q_b.1.va, mq, MLA_HEADS * Q_HEAD, Q_LORA_RANK, n, ROWS_QB);
-            self.rows_free(c, &c.mla_iq, mqa, qln, m.ix_wq_b.va, miq, INDEX_N_HEADS * INDEX_HEAD_DIM, Q_LORA_RANK, n, ROWS);
+            self.rows_free(c, &c.mla_iq, None, mqa, qln, m.ix_wq_b.va, miq, INDEX_N_HEADS * INDEX_HEAD_DIM, Q_LORA_RANK, n, ROWS);
         }
         c.k.fence();
         // behind the fence the host waits on, while it finishes the rows: q_abs here, and the other card's q_a in, its
@@ -1278,8 +1297,8 @@ impl Cards {
     }
     /// bf16 rows on card `c` over the step's `n` tokens (as `rows8`). Addresses are device VAs.
     #[allow(clippy::too_many_arguments)]
-    fn rows(&self, c: &Card, kernel: &crate::kfd::Kernel, x: usize, ln: Option<usize>, w: usize, out: usize, m: usize, k_width: usize, n: usize, r: usize) {
-        self.rows_at(c, kernel, x, ln, w, out, m, k_width, n, r, true)
+    fn rows(&self, c: &Card, kernel: &crate::kfd::Kernel, narrow: Option<&crate::kfd::Kernel>, x: usize, ln: Option<usize>, w: usize, out: usize, m: usize, k_width: usize, n: usize, r: usize) {
+        self.rows_at(c, kernel, narrow, x, ln, w, out, m, k_width, n, r, true)
     }
     /// A matrix-path rows launch over a step of many tokens (`rows_wmma`): the kernel's args in the scalar
     /// twin's order (x, [ln], w, [s], out, m, n); the grid covers the rows and the tokens at once.
@@ -1304,14 +1323,26 @@ impl Cards {
     /// `rows` launched free: as soon as the launch before it has launched, so the two run together —
     /// for a launch whose inputs were complete when the one before it launched.
     #[allow(clippy::too_many_arguments)]
-    fn rows_free(&self, c: &Card, kernel: &crate::kfd::Kernel, x: usize, ln: Option<usize>, w: usize, out: usize, m: usize, k_width: usize, n: usize, r: usize) {
-        self.rows_at(c, kernel, x, ln, w, out, m, k_width, n, r, false)
+    fn rows_free(&self, c: &Card, kernel: &crate::kfd::Kernel, narrow: Option<&crate::kfd::Kernel>, x: usize, ln: Option<usize>, w: usize, out: usize, m: usize, k_width: usize, n: usize, r: usize) {
+        self.rows_at(c, kernel, narrow, x, ln, w, out, m, k_width, n, r, false)
     }
     #[allow(clippy::too_many_arguments)]
-    fn rows_at(&self, c: &Card, kernel: &crate::kfd::Kernel, x: usize, ln: Option<usize>, w: usize, out: usize, m: usize, k_width: usize, n: usize, r: usize, barrier: bool) {
+    fn rows_at(&self, c: &Card, kernel: &crate::kfd::Kernel, narrow: Option<&crate::kfd::Kernel>, x: usize, ln: Option<usize>, w: usize, out: usize, m: usize, k_width: usize, n: usize, r: usize, barrier: bool) {
         let mut p0 = 0;
         while p0 < n {
             let np = (n - p0).min(TOKENS);
+            // 060: past one token, a launch whose wide grid is under ~2 workgroups a CU keeps one row a
+            // wave: `ROWS` 4 makes m H a 128-workgroup launch on 84 CUs, and the waves, not the rows,
+            // stream the weights (bench-rows 2026-10-24: m 256/1024 at n 2–4 run 24–27 µs against 9–11
+            // at one token, even cache-resident). The rows' arithmetic is unchanged, only their
+            // grouping — the outputs are the same bits.
+            let (kernel, r) = match narrow {
+                // narrow below one workgroup a CU: bench-rows 2026-10-24 (µs at n 4, wide / narrow) m 1024 27.0 / 19.7,
+                // 1536 34.9 / 22.4, 2048 35.2 / 33.1 (64 workgroups), 3072 34.1 / 37.6 (96), 4096 36.8 / 50.1 (128):
+                // past ~a workgroup a CU the one-row waves' LDS reads cost more than the occupancy buys
+                Some(k1) if np > 1 && m.div_ceil(common::gemv::rows_per_wg(np, r)) < c.k.cu => (k1, 1),
+                _ => (kernel, r),
+            };
             let mut a = Args::new();
             a.ptr(x + p0 * k_width * 4);
             if let Some(ln) = ln {
@@ -1345,9 +1376,24 @@ impl Cards {
         use std::sync::atomic::Ordering;
         let r = &mut self.resident;
         r.steps += 1;
+        // a new prompt after decode steps (a request's prefill, or a scoring text): the counts age hard,
+        // so the residency retargets to the current text within the prompt's own steps (063's aging)
+        if prefill && !r.prefill && r.steps > 1 {
+            for c in r.count.iter_mut() {
+                *c >>= RESIDENT_PROMPT_AGE;
+            }
+            for (ml, w) in r.window.iter_mut().enumerate() {
+                r.window_seen[ml] = w.iter().map(|x| x.count_ones()).sum();
+                *w = [0; (glm_5_3_flash::E + 63) / 64];
+            }
+        }
         r.prefill = prefill;
         r.turn = (r.steps % r.held[0].len() as u64) as usize;
         if r.steps % RESIDENT_HALF_LIFE == 0 {
+            for (ml, w) in r.window.iter_mut().enumerate() {
+                r.window_seen[ml] = w.iter().map(|x| x.count_ones()).sum();
+                *w = [0; (glm_5_3_flash::E + 63) / 64];
+            }
             for c in r.count.iter_mut() {
                 *c >>= 1;
             }
@@ -1464,7 +1510,7 @@ impl Placed for Cards {
                 a.ptr(self.tok(&c.x, H)).ptr(p.input_ln.va).ptr(p.sq.va).ptr(self.tok(smix, M_SMALL)).u32(M_SMALL as u32).u32(n as u32);
                 c.k.launch(&c.rows_h_w, g::wmma_grid(M_SMALL, n), g::WG, g::WMMA_LDS, &a);
             } else {
-                self.rows(c, &c.rows_h, self.tok(&c.x, H), Some(p.input_ln.va), p.sq.va, self.tok(smix, M_SMALL), M_SMALL, H, n, ROWS);
+                self.rows(c, &c.rows_h, Some(&c.rows_h1), self.tok(&c.x, H), Some(p.input_ln.va), p.sq.va, self.tok(smix, M_SMALL), M_SMALL, H, n, ROWS);
             }
             // the gates' second halves as one launch: f_b over f_a's output, g_b over g_a's — token i's input at smix[i · M_SMALL]
             let mut p0 = 0;
@@ -1486,7 +1532,7 @@ impl Placed for Cards {
                 a.ptr(self.tok(normed, g::PART_QKV)).ptr(p.o.va).ptr(c.yv.at((i * STEP + self.t0) * H * 4)).u32(H as u32).u32(n as u32);
                 c.k.launch(&c.rows_part_w, g::wmma_grid(H, n), g::WG, g::WMMA_LDS, &a);
             } else {
-                self.rows(c, &c.rows_part, self.tok(normed, g::PART_QKV), None, p.o.va, c.yv.at((i * STEP + self.t0) * H * 4), H, g::PART_QKV, n, ROWS);
+                self.rows(c, &c.rows_part, Some(&c.rows_part1), self.tok(normed, g::PART_QKV), None, p.o.va, c.yv.at((i * STEP + self.t0) * H * 4), H, g::PART_QKV, n, ROWS);
             }
         }
         // each card's shares out and its word; every card folds the sum into its streams
@@ -1527,11 +1573,29 @@ impl Placed for Cards {
     fn checks(&self) -> bool {
         cfg!(feature = "bringup-checks")
     }
-    fn resident_stats(&self) -> (usize, usize, usize) {
+    fn resident_stats(&self) -> glm_5_3_flash::construct::ResidentStats {
+        use glm_5_3_flash::construct::ResidentStats;
         let r = &self.resident;
         let total: usize = r.owner.iter().map(|o| o.len()).sum();
         let free: usize = r.free.iter().map(|f| f.len()).sum();
-        (total - free, total, r.uploads)
+        let moe = glm_5_3_flash::layout::MOE_LAYERS;
+        let mut held: Vec<u32> = (0..moe).map(|ml| r.held.iter().map(|h| h[ml]).sum()).collect();
+        held.sort_unstable();
+        let mut seen = r.window_seen.clone();
+        seen.sort_unstable();
+        let mid = held.len() / 2;
+        ResidentStats {
+            filled: total - free,
+            slots: total,
+            loads: r.uploads,
+            per_layer: r.per_layer.iter().sum(),
+            held_min: held.first().copied().unwrap_or(0),
+            held_med: held.get(mid).copied().unwrap_or(0),
+            held_max: held.last().copied().unwrap_or(0),
+            seen_min: seen.first().copied().unwrap_or(0),
+            seen_med: seen.get(mid).copied().unwrap_or(0),
+            seen_max: seen.last().copied().unwrap_or(0),
+        }
     }
     fn resident(&self, l: usize, e: usize) -> bool {
         let at = self.resident.table[(l - glm_5_3_flash::FIRST_K_DENSE_REPLACE) * glm_5_3_flash::E + e].load(std::sync::atomic::Ordering::Relaxed);
@@ -1593,6 +1657,7 @@ impl Placed for Cards {
                     continue; // a slot no expert runs in
                 }
                 r.count[ml * e_n + e] += 1;
+                r.window[ml][e / 64] |= 1 << (e % 64);
                 let at = r.table[ml * e_n + e].load(Ordering::Acquire);
                 if at != NONE && at != PENDING {
                     let card = (at >> 24) as usize;
@@ -1739,7 +1804,7 @@ impl Placed for Cards {
             a.ptr(t.dx.va).ptr(t.eh.va).ptr(c.x.va).u32(H as u32).u32(n as u32);
             c.k.launch(&c.mtp_eh_w, g::wmma_grid(H, n), g::WG, g::WMMA_LDS, &a);
         } else {
-            self.rows(c, &c.mtp_eh, t.dx.va, None, t.eh.va, c.x.va, H, 2 * H, n, ROWS);
+            self.rows(c, &c.mtp_eh, None, t.dx.va, None, t.eh.va, c.x.va, H, 2 * H, n, ROWS);
         }
         let value = self.next_seq();
         self.mla_value = value;
@@ -1798,7 +1863,7 @@ impl Placed for Cards {
                 self.copy_out(c, self.shared.xh.at(i * H * 4), c.fx.va, 1);
                 c.fx.va
             };
-            self.rows(c, &c.rows_h, x, Some(t.head_norm[ci].va), lm.va, c.lg.va, rows, H, 1, ROWS);
+            self.rows(c, &c.rows_h, None, x, Some(t.head_norm[ci].va), lm.va, c.lg.va, rows, H, 1, ROWS);
         }
         for (ci, c) in self.cards.iter().enumerate() {
             let (r0, rows) = head_rows(ci, self.cards.len());
@@ -1835,7 +1900,8 @@ impl Placed for Cards {
             a.ptr(self.tok(&c.miq, INDEX_N_HEADS * INDEX_HEAD_DIM)).ptr(c.mproj.at((MIX + self.t0 * IX_ROWS) * 4)).ptr(m.pools.va).ptr(self.tok(&c.mscore, stride)).u32(n as u32).u32(visible as u32).u32(stride as u32).f32(scale).f32(wscale);
             c.k.launch(&c.ix_score_w, ixw_grid(n, visible), 256, IXW_LDS as u32, &a);
         }
-        // the selection across slices of the pools at a verify step past 32k positions (docs/queue/019)
+        // the selection across slices of the pools at a verify step past 32k positions (docs/queue/019); a
+        // few-token step's own fixed-order merge measured slower than these slices (060, 2026-10-24)
         let slices = select_slices(n, (pos + n) / INDEX_KPOOL);
         let mut a = Args::new();
         a.ptr(self.tok(&c.mscore, stride)).u32(stride as u32).u32(pos as u32).u32(slices as u32).ptr(self.tok(&c.mselst, SELECT_STATE)).ptr(self.tok(&c.msel, DENSE_BELOW)).ptr(self.tok(&c.mseln, 1));
@@ -2094,7 +2160,7 @@ impl Placed for Cards {
                     a.ptr(c.fx.va).ptr(norm.va).ptr(lm.va).ptr(c.lg.va).u32(rows as u32).u32(np as u32);
                     c.k.launch(&c.rows_h_w, g::wmma_grid(rows, np), g::WG, g::WMMA_LDS, &a);
                 } else {
-                    self.rows(c, &c.rows_h, c.fx.va, Some(norm.va), lm.va, c.lg.va, rows, H, np, ROWS);
+                    self.rows(c, &c.rows_h, None, c.fx.va, Some(norm.va), lm.va, c.lg.va, rows, H, np, ROWS);
                 }
             }
             for (ci, c) in self.cards.iter().enumerate() {
@@ -2195,7 +2261,7 @@ impl Cards {
         if rows {
             // a long step's rows pass: the stacked router through the matrix path, the margins for the learning
             if decode {
-                self.rows(c, &c.rows_h, px, Some(f.ln.va), router, ps2, ROUTE_ROWS, H, n, ROWS);
+                self.rows(c, &c.rows_h, Some(&c.rows_h1), px, Some(f.ln.va), router, ps2, ROUTE_ROWS, H, n, ROWS);
             } else {
                 let mut a = Args::new();
                 a.ptr(px).ptr(f.ln.va).ptr(router).ptr(ps2).u32(ROUTE_ROWS as u32).u32(n as u32);

@@ -188,8 +188,8 @@ impl Glm {
         }
         if (pos + width) / 16 != pos / 16 {
             let c = self.model.coverage(&[8, 16, 32, 64]);
-            let (filled, slots, loads) = self.model.placed.as_ref().map_or((0, 0, 0), |p| p.resident_stats());
-            prow::row!("track-step", "experts", { "pos" => pos + width, "top8" => c[0], "top16" => c[1], "top32" => c[2], "top64" => c[3], "filled" => filled, "slots" => slots, "loads" => loads });
+            let st = self.model.placed.as_ref().map_or(Default::default(), |p| p.resident_stats());
+            prow::row!("track-step", "experts", { "pos" => pos + width, "top8" => c[0], "top16" => c[1], "top32" => c[2], "top64" => c[3], "filled" => st.filled, "slots" => st.slots, "loads" => st.loads, "per_layer" => st.per_layer, "held_min" => st.held_min, "held_med" => st.held_med, "held_max" => st.held_max, "seen_min" => st.seen_min, "seen_med" => st.seen_med, "seen_max" => st.seen_max });
         }
         self.take_training();
         self.model.profile = Default::default();

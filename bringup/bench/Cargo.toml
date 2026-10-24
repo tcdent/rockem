@@ -125,6 +125,10 @@ name = "bench-rows-w"
 path = "src/rows_w.rs"
 
 [[bin]]
+name = "bench-rows"
+path = "src/rows.rs"
+
+[[bin]]
 name = "bench-fp8-rows"
 path = "src/fp8_rows.rs"
 

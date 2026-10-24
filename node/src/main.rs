@@ -235,14 +235,33 @@ impl Store {
     fn trim(&mut self, keep: usize) {
         while self.held > self.budget {
             let Some(victim) = self.contexts.iter().enumerate().filter(|(i, c)| *i != keep && c.is_some()).min_by_key(|(_, c)| c.as_ref().unwrap().used).map(|(i, _)| i) else { break };
-            let c = self.contexts[victim].take().unwrap();
-            for (n, k) in c.keys.iter().enumerate() {
-                if self.index.get(k) == Some(&(victim, n + 1)) {
-                    self.index.remove(k);
-                }
-            }
+            let c = self.take(victim);
             self.held -= self.cost(&c);
         }
+    }
+    /// Remove context `ctx` from the store, its index entries handed to the live contexts that share their prefixes.
+    /// An entry names the first context that reached its position (`or_insert`); a conversation's turns each copy the
+    /// matched prefix into a new context, so a long conversation's positions are owned turn by turn by older and older
+    /// contexts. Dropping an owner's entries without re-pointing them broke every later request at the first position it
+    /// owned — the match ended there although newer contexts held the same ids, and a model with sequence state replayed
+    /// from the prefix (a ~70k conversation re-prefilled every turn once eviction started, 2026-10-24). The keys are a
+    /// running hash, so a live context shares a prefix with `ctx` exactly up to the first position their keys differ.
+    fn take(&mut self, ctx: usize) -> Context {
+        let c = self.contexts[ctx].take().unwrap();
+        let orphans: Vec<usize> = (0..c.keys.len()).filter(|&n| self.index.get(&c.keys[n]) == Some(&(ctx, n + 1))).collect();
+        for &n in &orphans {
+            self.index.remove(&c.keys[n]);
+        }
+        if !orphans.is_empty() {
+            for (j, other) in self.contexts.iter().enumerate() {
+                let Some(o) = other else { continue };
+                let shared = o.keys.iter().zip(&c.keys).take_while(|(a, b)| a == b).count();
+                for &n in orphans.iter().take_while(|&&n| n < shared) {
+                    self.index.entry(c.keys[n]).or_insert((j, n + 1));
+                }
+            }
+        }
+        c
     }
     fn touch(&mut self, ctx: usize) {
         self.clock += 1;
@@ -394,7 +413,7 @@ impl Session {
         let old = self.active;
         let (rows, _) = self.e.prefix();
         self.active = self.store.open(Some((src, at)), self.e.prefix_ids(), rows);
-        let gone = self.store.contexts[old].take().unwrap();
+        let gone = self.store.take(old);
         self.store.held -= self.store.cost(&gone);
         let mut drawn = false;
         if at == first {
@@ -1058,3 +1077,53 @@ fn main() {
 /// the main thread 77 µs a CPU layer of page faults, 3.5 ms a verify step (bench-alloc, 2026-10-22).
 #[global_allocator]
 static ALLOC: common::alloc::Classes = common::alloc::Classes;
+
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+
+    fn store() -> Store {
+        Store { contexts: Vec::new(), index: std::collections::HashMap::new(), budget: usize::MAX, state_cost: 0, held: 0, clock: 0, max_ctx: 64, position: 1, active: Vec::new() }
+    }
+    /// One more id at the end of `ctx`, as a step records it.
+    fn append(s: &mut Store, ctx: usize, id: u32) {
+        let c = s.contexts[ctx].as_mut().unwrap();
+        let k = Store::key(*c.keys.last().unwrap(), id);
+        c.ids.push(id);
+        c.keys.push(k);
+        let n = c.ids.len() - 1;
+        s.grew(ctx, n);
+    }
+
+    /// A conversation's turns as the node builds them — each a new context seeded from the last one's transcript, then
+    /// extended — and the oldest evicted: every position of the newest transcript must still resolve to a live context
+    /// holding that prefix (2026-10-24: they did not, and a ~70k conversation re-prefilled every turn).
+    #[test]
+    fn eviction_keeps_every_prefix_resolvable() {
+        let mut s = store();
+        let a = s.open(None, &[1], &[0.0]);
+        for id in 2..10 {
+            append(&mut s, a, id);
+        }
+        s.close(a, Vec::new(), Vec::new());
+        let b = s.open(Some((a, 9)), &[1], &[0.0]);
+        for id in 10..20 {
+            append(&mut s, b, id);
+        }
+        s.close(b, Vec::new(), Vec::new());
+        let c = s.open(Some((b, 19)), &[1], &[0.0]);
+        for id in 20..30 {
+            append(&mut s, c, id);
+        }
+        s.close(c, Vec::new(), Vec::new());
+        let gone = s.take(a);
+        s.held -= s.cost(&gone);
+        let keys = s.contexts[c].as_ref().unwrap().keys.clone();
+        for (n, k) in keys.iter().enumerate() {
+            let (owner, len) = *s.index.get(k).unwrap_or_else(|| panic!("position {n}: no index entry"));
+            assert_eq!(len, n + 1, "position {n}");
+            let o = s.contexts[owner].as_ref().unwrap_or_else(|| panic!("position {n}: the entry names an evicted context"));
+            assert_eq!(o.keys[n], *k, "position {n}");
+        }
+    }
+}

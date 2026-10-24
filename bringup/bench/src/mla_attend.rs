@@ -80,6 +80,8 @@ fn main() {
     let k_qabs_w = k.kernel("mla_qabs_w");
     let qabs = k.vram(maxn * MLA_HEADS * KV_LORA_RANK * 2);
     let olat = k.vram(maxn * MLA_HEADS * KV_LORA_RANK * 4);
+    // the attend's (max, sum) a head (058, 2026-10-19: the attend split by positions across the cards returns its mix raw)
+    let ml = k.vram(maxn * MLA_HEADS * 2 * 4);
     println!("bench-mla-attend: {MLA_HEADS} heads, latents {KV_LORA_RANK} bf16, {INDEX_N_HEADS}×{INDEX_HEAD_DIM} indexer, {npools} pools allocated; µs a launch (a token)");
     println!("{:>9} {:>6} {:>22} {:>22} {:>22} {:>26}", "positions", "tokens", "ix_score", "ix_select", "mla_attend", "qabs+attend_w(+merge)+uv_w");
     for &pos in &positions {
@@ -177,13 +179,13 @@ fn main() {
             });
             let t_aw = time(&|| {
                 let mut a = kfd::Args::new();
-                a.ptr(qabs.va).ptr(lat.va).ptr(sel.va).ptr(counts.va).ptr(olat.va).ptr(part.va).u32(chunks as u32).u32(chunk as u32);
+                a.ptr(qabs.va).ptr(lat.va).ptr(sel.va).ptr(counts.va).ptr(olat.va).ptr(part.va).ptr(ml.va).u32(chunks as u32).u32(chunk as u32);
                 k.launch(&k_attend_w, (n * AW_HEAD_TILES * chunks) as u32, AW_WG, AW_LDS as u32, &a);
             });
             let t_merge = if chunks > 1 {
                 time(&|| {
                     let mut a = kfd::Args::new();
-                    a.ptr(part.va).ptr(olat.va);
+                    a.ptr(part.va).ptr(olat.va).ptr(ml.va);
                     k.launch(&k_merge, (n * AW_HEAD_TILES) as u32, AW_WG, AW_MERGE_LDS as u32, &a);
                 })
             } else {
