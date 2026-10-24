@@ -355,3 +355,41 @@ async def test_a_client_gone_before_the_stream_gives_the_node_back(engine, node)
     except Exception:
         pass  # the server's to handle; what matters is the node
     assert engine.scheduler.free == 1
+
+
+async def test_a_client_gone_while_its_long_prompt_is_written_stops_the_node(engine, node):
+    """2026-10-24: a 1.1 MB prompt kept being written to the node after its client left, because
+    the handler was still writing it (at the node's prefill speed) and nothing watched the client."""
+    import asyncio
+    import json as _json
+
+    from rockem.app import app
+
+    app.state.engine = engine
+    node.max_ctx, node.read_delay, node.rcvbuf = 1_000_000, 0.001, 32_768  # a slow node with a full buffer
+    body = _json.dumps({"prompt": " ".join(["hello"] * 300_000), "max_tokens": 1}).encode()
+    left = asyncio.Event()
+    sent = []
+
+    async def receive():
+        if not sent:
+            sent.append(1)
+            return {"type": "http.request", "body": body, "more_body": False}
+        await left.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        pass
+
+    scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"}, "http_version": "1.1", "method": "POST",
+             "scheme": "http", "path": "/rockem/v1/generate", "raw_path": b"/rockem/v1/generate", "query_string": b"",
+             "root_path": "", "headers": [(b"content-type", b"application/json")], "client": ("t", 1), "server": ("s", 80)}
+    request = asyncio.ensure_future(app(scope, receive, send))
+    await asyncio.sleep(0.5)
+    assert engine.scheduler.free == 0  # the prompt is being written
+    left.set()  # the client goes away
+    await asyncio.wait({request}, timeout=3)
+    assert request.done(), "the request is still writing the prompt"
+    read_then = node.words
+    await asyncio.sleep(0.5)
+    assert node.words == read_then and engine.scheduler.free == 1

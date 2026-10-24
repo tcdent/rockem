@@ -37,12 +37,38 @@ def get_transcriber(request: HttpRequest) -> Transcriber:
     return t
 
 
+async def until_disconnect(work, receive):
+    """`work`'s result, unless the client goes away first: then `work` is cancelled (a 499).
+    Starting a run waits in line and then writes the prompt to the node, and a long prompt is
+    written at the node's prefill speed, so a cancel can come long before the stream begins.
+    Nothing else watches the client in that time (2026-10-24: a cancelled 1.1 MB prompt kept
+    being written). Cancelling the write closes the node connection with a reset."""
+
+    async def gone() -> None:
+        while (await receive())["type"] != "http.disconnect":
+            pass
+
+    task, left = asyncio.ensure_future(work), asyncio.ensure_future(gone())
+    try:
+        await asyncio.wait({task, left}, return_when=asyncio.FIRST_COMPLETED)
+        if task.done():
+            return task.result()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        raise HTTPException(499, "the client closed the connection")
+    finally:
+        left.cancel()
+        if not task.done():
+            task.cancel()
+
+
 async def start(engine: core.Engine, req: core.Request, request: HttpRequest) -> core.Run:
     """Refusals happen here, before any response starts: a prompt the template rejects or
     the node cannot hold is a 4xx, a node that cannot be reached is a 503. The run is registered
     on the request, so `app.ReleaseRuns` gives its node back however the request ends."""
     try:
-        run = await engine.start(req)
+        run = await until_disconnect(engine.start(req), request.receive)
         request.scope.setdefault(RUNS, []).append(run)
         return run
     except (TemplateError, ValueError) as e:
@@ -58,24 +84,7 @@ async def fold_or_abort(run: core.Run, receive) -> tuple:
     its node connection, the wire's abort. A streaming response gets this from the response
     machinery; a non-streaming one folds inside the handler, which nothing cancels on a
     disconnect, so the node would compute to the end for nobody (rockem.lead, 2026-10-23)."""
-
-    async def gone() -> None:
-        while (await receive())["type"] != "http.disconnect":
-            pass
-
-    fold, left = asyncio.ensure_future(run.fold()), asyncio.ensure_future(gone())
-    try:
-        await asyncio.wait({fold, left}, return_when=asyncio.FIRST_COMPLETED)
-        if fold.done():
-            return fold.result()
-        fold.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await fold
-        raise HTTPException(499, "the client closed the connection")
-    finally:
-        left.cancel()
-        if not fold.done():
-            fold.cancel()
+    return await until_disconnect(run.fold(), receive)
 
 
 def sse(body: AsyncIterator[bytes]) -> StreamingResponse:
