@@ -861,7 +861,7 @@ fn peer_hung_up(fd: i32) -> bool {
 /// A generated continuation: the prompt's positions past the prefix (`hits` of them from the store),
 /// the ids generated and the time it took; the verify steps and drafts accepted since the last.
 fn request_row(session: &mut Session, mode: &str, prompt: usize, generated: usize, ms: f64) {
-    prow::row!("track-store", "request", { "mode" => mode, "prompt" => prompt, "hits" => session.hits, "generated" => generated, "ms" => ms, "verified" => session.verified, "accepted" => session.accepted });
+    prow::row!("track-store", "request", { "model" => session.e.name(), "mode" => mode, "prompt" => prompt, "hits" => session.hits, "generated" => generated, "ms" => ms, "verified" => session.verified, "accepted" => session.accepted });
     session.verified = 0;
     session.accepted = 0;
 }

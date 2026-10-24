@@ -71,8 +71,48 @@ process (or the box) is frozen, not spinning in the pool. The box's telnet shell
 open after both models have loaded (the serve loop out of the picture), the watchdog on the housekeeping core.
 (The host's RAID array is reshaping, 2026-10-23 14:00: NFS reads at 120–170 MB/s, a lab boot ~25 min.)
 
+## The speed pass (2026-10-23, aff72–74) — libri2 (30 s, one window, 382-id prompt, 40 ids out) through the service
+Read back with `bringup/reads/voxtral.sh` (rows `audio_window` and `vox_step` on `track-step`, a row a window and a
+step, the phases as columns; the `request` row carries the model name since aff74). tcdent: "take a pass at seeing if
+we can get this faster … try a little bit on tuning and then explore other options".
+
+| build | wall | encoder a window | prefill a 32-token step | decode a token |
+|---|---|---|---|---|
+| aff71 (before) | 18.8 s | ~8–10 s | ~800 ms | ~90–100 ms |
+| aff72: `common::sgemm` | 15.7 s | 1.34 s | 800 ms | 100 ms |
+| aff73: per-token work over the pool, down split four ways | 8.6 s | 1.30 s | ~255 ms | 72.8 ms |
+| aff74: K/V cache a kv head's positions contiguous, attention a (kv head, 8 tokens) an item, vectorized SiLU, rope a token an item | see below | | | |
+
+- **The encoder's GEMM** (`common::sgemm`): the dot form (`linalg::dot` a row and position, a horizontal reduction an
+  output, the activation row re-read for every weight row) ran at a few FLOP a cycle. Now the weights are packed once
+  into 16-row k-major panels and a 6×16 tile holds twelve accumulators: two loads and six broadcasts feed twelve FMAs a
+  k; k walks in blocks of 256 (a panel's 16 KB in L1) through a C scratch; the epilogue folds the bias, the GELU and
+  the residual add. The dev host (32 Zen 1 cores, loaded) 43 → 7.3 s a window from the kernel alone, 7.3 → 3.8 s from
+  placement: the items (48 positions × 128 columns) are ordered by column block and `Pool::complexes` hands a
+  contiguous run of them to one core complex, whose L3 holds the weight block while its cores stream the positions
+  (before that, every item pulled its 640 KB block from DRAM: the traffic, not the FMAs, was the bound). The gate's
+  error shrank (speech rows rel 2.2e-2 → 7.5e-3, tone 3.2e-4 → 2.6e-4): the dot form's summation order was the worse
+  one, which closes most of the "2e-2 on speech rows" item. q|k|v fused with the 1/8 folded into q (a power of two,
+  the reference's bits), the convolutions as GEMMs over the unrolled input, attention a (head, 48 positions) item
+  against the head's keys and transposed values packed as panels, `softmax_row` vectorized (`exp8`).
+- **On the box the encoder is 1.3 s**, 2.5 TFLOP/s over 96 cores for the GEMMs (27 % of peak; the dev host's Zen 1
+  reaches 45 % of its) and attention at a third of that rate: every activation lives in one node's DRAM and three
+  nodes read it across the fabric (~45 GB a window). Quantified, on the shelf — ~0.7 s a window: node-local
+  activations (position blocks bound per node) with the packed weights replicated a node (4 × 2.7 GB).
+- **The decoder's prefill** (aff73): the norm + quantize, the o-input quantize and SiLU·up + quantize ran on the main
+  thread — a million SiLUs a layer a step, 28 ms a step for the SiLU alone — now a token an item; down's 20 items of
+  256 rows (20 of 96 cores streaming a third of the layer's bytes) split four ways at runtime (whole tiles). A step
+  800 → 255 ms; decode 100 → 73 ms a token.
+- **Attention** read K and V at `[position][KV_DIM]`: a head's rows a page apart, past the prefetcher — 18 ms of the
+  73 a decode token at 400 positions, and 11 → 47 ms a prefill step as the position grew. aff74 lays the cache out
+  `[layer][kv head][position][HEAD_DIM]` and makes an item a kv head × a block of 8 tokens (the four query heads that
+  share it): the head's keys and values are one sequential stream read once a position for 32 (token, head) rows.
+  `rows()`/`seed()` keep the store's POSITION layout.
+
 ## Open
-- Speed: the encoder's GEMM is a naive tile (43 s a window on the dev host, idle); the prefill and decode on the box to
-  be measured (aff65). Expected: decode ~40 ms a token at the DRAM ceiling, prefill a 30 s window in ~1 s.
-- The encoder's 2e-2 on speech rows.
+- Speed, what the pass left (see the table above): the encoder's node placement (on the shelf, ~0.7 s), down at K =
+  32768 (72–114 ms a prefill step against ~40 expected: the 1 MB of INT8 activations a 32-token step is re-read a tile
+  pair from beyond L2), the pool's wake cost on the per-token runs (~140 µs a run, 80 norm runs a step = 11 ms), the
+  decode's DRAM floor at 12.4 GB a token (~41 ms of the 73).
+- The encoder's 7.5e-3 on speech rows (was 2.2e-2; f32 both sides).
 - A larger speech set with ground truth for WER, the recipe's real test.

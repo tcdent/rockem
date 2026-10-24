@@ -26,9 +26,6 @@ pub struct Voxtral {
     prefix_logits: Vec<f32>,
     last_pos: usize,
     empty: Vec<f32>,
-    /// Decode steps since the last `idle`: seconds in each decoder phase, then the steps' wall seconds.
-    decode_ms: [f64; 11],
-    decode_n: usize,
 }
 
 impl Voxtral {
@@ -61,14 +58,8 @@ impl Voxtral {
         }
         let prefix_logits = dec.logits[..VOCAB_SIZE].to_vec();
         println!("voxtral  : {} positions of context ({:.1} GB of K/V), the prefix computed in {:.1}s", dec.max_ctx(), 2.0 * (dec.max_ctx() * POSITION) as f64 * 4.0 / 2.0 / 1e9, t0.elapsed().as_secs_f32());
-        Box::new(Voxtral { dec, enc, pool, rows: VecDeque::new(), taken: 0, prefix_rows, prefix_logits, last_pos: 0, empty: Vec::new(), decode_ms: [0.0; 11], decode_n: 0 })
+        Box::new(Voxtral { dec, enc, pool, rows: VecDeque::new(), taken: 0, prefix_rows, prefix_logits, last_pos: 0, empty: Vec::new() })
     }
-}
-
-/// `PHASES` with their milliseconds (`scale` × the seconds given).
-fn phases_ms(ph: &[f64], scale: f64) -> String {
-    let v: Vec<String> = voxtral_small_24b::decoder::PHASES.iter().zip(ph).map(|(n, s)| format!("{n} {:.1}", s * scale * 1e3)).collect();
-    v.join(", ")
 }
 
 impl Engine for Voxtral {
@@ -132,16 +123,12 @@ impl Engine for Voxtral {
         let rows_static: &'static Vec<Option<Vec<f32>>> = unsafe { std::mem::transmute(rows_ref) };
         let t0 = std::time::Instant::now();
         self.dec.step(toks, pos, |t| rows_static[t].as_deref(), all_logits);
-        let ms = t0.elapsed().as_secs_f64() * 1e3;
-        if toks.len() > 1 {
-            println!("step     : {} tokens at {pos}: {ms:.0} ms ({})", toks.len(), phases_ms(&self.dec.phases, 1.0));
-        } else {
-            for (a, p) in self.decode_ms.iter_mut().zip(self.dec.phases) {
-                *a += p;
-            }
-            self.decode_ms[10] += ms * 1e-3;
-            self.decode_n += 1;
-        }
+        // the step's time by phase (decoder::PHASES), a row a step
+        let (ms, p) = (t0.elapsed().as_secs_f64() * 1e3, self.dec.phases.map(|s| s * 1e3));
+        prow::row!("track-step", "vox_step", {
+            "pos" => pos, "width" => toks.len(), "ms" => ms, "embed_ms" => p[0], "norm_ms" => p[1], "qkv_ms" => p[2], "rope_ms" => p[3],
+            "attn_ms" => p[4], "o_ms" => p[5], "gu_ms" => p[6], "silu_ms" => p[7], "down_ms" => p[8], "head_ms" => p[9],
+        });
     }
     fn rows(&self, i: usize, out: &mut [f32]) {
         self.dec.rows(self.last_pos + i, out)
@@ -168,11 +155,6 @@ impl Engine for Voxtral {
         common::softmax::log_prob(&self.prefix_logits, id as usize)
     }
     fn idle(&mut self) {
-        if self.decode_n > 0 {
-            println!("decode   : {} tokens, {:.1} ms a token ({})", self.decode_n, self.decode_ms[10] * 1e3 / self.decode_n as f64, phases_ms(&self.decode_ms[..10], 1.0 / self.decode_n as f64));
-            self.decode_ms = [0.0; 11];
-            self.decode_n = 0;
-        }
         self.pool.idle()
     }
     fn trace(&mut self, i: usize) -> (&[f32], &[u32], &[f32]) {
@@ -188,8 +170,12 @@ impl Engine for Voxtral {
         let mut rows = vec![0f32; ROWS_PER_WINDOW * H];
         let t0 = std::time::Instant::now();
         self.enc.encode(window, &mut rows);
-        let ph: Vec<String> = voxtral_small_24b::encoder::PHASES.iter().zip(self.enc.phases).map(|(n, s)| format!("{n} {:.0}", s * 1e3)).collect();
-        println!("audio    : window {} encoded in {:.2}s (ms: {})", self.rows.len(), t0.elapsed().as_secs_f32(), ph.join(", "));
+        // the window's encoding by phase (encoder::PHASES), a row a window
+        let p = self.enc.phases.map(|s| s * 1e3);
+        prow::row!("track-step", "audio_window", {
+            "window" => self.rows.len(), "ms" => t0.elapsed().as_secs_f64() * 1e3, "conv_ms" => p[0], "norm_ms" => p[1], "qkv_ms" => p[2],
+            "attn_ms" => p[3], "o_ms" => p[4], "ffn_ms" => p[5], "proj_ms" => p[6],
+        });
         self.rows.push_back(rows);
     }
     fn audio_queued(&self) -> usize {

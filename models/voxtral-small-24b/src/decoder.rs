@@ -1,19 +1,20 @@
 //! The decoder on the host: Mistral Small 3.1's 40 layers over the q4 stream, a step of up to `STEP`
 //! tokens at a time. Every matrix is streamed as items over the pool (`q4::gemm` over the step's tokens
 //! an item, so an item's rows are read once a step), the activations INT8 per token (`q4::QAct`), the
-//! residual, norms, rotary, attention and SiLU in f32. The K/V cache is f32, `[layer][position][KV_DIM]`
-//! each; a position's rows for the node's context store are its K then V of every layer
-//! (`POSITION` f32). An audio placeholder's input is the row given for it instead of its embedding.
+//! residual, norms, rotary, attention and SiLU in f32. The K/V cache is f32, `[layer][kv head][position][HEAD_DIM]`
+//! each, so a head's keys over the positions are one sequential stream (at `[position][KV_DIM]` a head's rows sat a
+//! page apart, past the prefetcher: 18 ms a decode token at 400 positions, 2026-10-23); a position's rows for the
+//! node's context store are its K then V of every layer (`POSITION` f32). An audio placeholder's input is the row
+//! given for it instead of its embedding.
 
 use crate::layout::{self, Which};
 use crate::weights::{widen, Dense, Stream};
 use crate::*;
-use common::math::{exp, sqrt};
+use common::math::sqrt;
 use common::pool::Pool;
 use common::q4::{self, Act, QAct, GROUP};
 use common::rmsnorm::rmsnorm;
 use common::rope::rotate_half;
-use common::swiglu::silu;
 
 /// Tokens a step takes at most.
 pub const STEP: usize = 32;
@@ -47,11 +48,6 @@ impl Acts {
     fn new(k: usize) -> Self {
         Acts { q: vec![0; STEP * k], scale: vec![0.0; STEP * k / GROUP], gsum: vec![0; STEP * k / GROUP], k }
     }
-    fn quantize(&mut self, t: usize, x: &[f32]) {
-        let (k, g) = (self.k, self.k / GROUP);
-        let mut qa = QAct { q: &mut self.q[t * k..(t + 1) * k], scale: &mut self.scale[t * g..(t + 1) * g], gsum: &mut self.gsum[t * g..(t + 1) * g] };
-        qa.quantize(&x[..k]);
-    }
     fn act(&self, t: usize) -> Act<'_> {
         let (k, g) = (self.k, self.k / GROUP);
         Act { q: &self.q[t * k..(t + 1) * k], scale: &self.scale[t * g..(t + 1) * g], gsum: &self.gsum[t * g..(t + 1) * g] }
@@ -81,12 +77,14 @@ impl ActsOut {
     }
 }
 
-/// The step's per-token work over the pool, a token an item; one token runs inline.
-fn tokens(pool: &dyn Pool, n: usize, f: &(dyn Fn(usize) + Sync)) {
+/// The step's small items (a token's norm, its SiLU, an attention block) over the pool, spread round-robin over the
+/// core complexes (`cx`, from `Pool::complexes`) so a run of 32 lands on 32 cores of every complex, not one queue's;
+/// one item runs inline.
+fn spread(pool: &dyn Pool, cx: &[(usize, usize)], n: usize, f: &(dyn Fn(usize) + Sync)) {
     if n == 1 {
         f(0)
     } else {
-        pool.run(n, f)
+        pool.run_on(n, &|i| cx[i % cx.len()].0, &|i| cx[i % cx.len()].1, f)
     }
 }
 
@@ -122,6 +120,8 @@ pub struct Decoder<'a> {
     act_q: Acts,
     act_ff: Acts,
     pub logits: Vec<f32>, // [STEP][VOCAB_SIZE]
+    /// The pool's core complexes (`spread`).
+    cx: Vec<(usize, usize)>,
     /// Seconds in each of `PHASES` over the last `step`.
     pub phases: [f64; 10],
     /// Dev: every layer's residual output of the last step, `[layers][n][H]`, when tracing.
@@ -168,12 +168,18 @@ impl<'a> Decoder<'a> {
             act_q: Acts::new(Q_DIM),
             act_ff: Acts::new(D_FF),
             logits: vec![0.0; STEP * VOCAB_SIZE],
+            cx: pool.complexes(),
             phases: [0.0; 10],
             trace: None,
         }
     }
     pub fn max_ctx(&self) -> usize {
         self.max_ctx
+    }
+    /// Where layer `l`'s kv head `kvh` keeps position `p` in either cache.
+    #[inline(always)]
+    fn kv_at(&self, l: usize, kvh: usize, p: usize) -> usize {
+        ((l * KV_HEADS + kvh) * self.max_ctx + p) * HEAD_DIM
     }
 
     /// Matrix `which` of layer `l` over the step's `n` tokens: every item on the pool, on the node that holds
@@ -251,7 +257,7 @@ impl<'a> Decoder<'a> {
         let first = if all { 0 } else { n - 1 };
         {
             let (x, fnorm, xn, act) = (&self.x, &self.final_norm, Out(self.xn.as_mut_ptr()), self.act_h.writer());
-            tokens(self.pool, n - first, &move |i| unsafe {
+            spread(self.pool, &self.cx, n - first, &move |i| unsafe {
                 let t = first + i;
                 let row = core::slice::from_raw_parts_mut(xn.at(t * H), H);
                 rmsnorm::<H>(&x[t * H..(t + 1) * H], fnorm, RMS_NORM_EPS, row);
@@ -272,7 +278,7 @@ impl<'a> Decoder<'a> {
     /// The step's tokens normed by `norm` and quantized into `act_h`, a token an item.
     fn norm_tokens(&mut self, n: usize, norm: &[f32]) {
         let (x, xn, act) = (&self.x, Out(self.xn.as_mut_ptr()), self.act_h.writer());
-        tokens(self.pool, n, &move |t| unsafe {
+        spread(self.pool, &self.cx, n, &move |t| unsafe {
             let row = core::slice::from_raw_parts_mut(xn.at(t * H), H);
             rmsnorm::<H>(&x[t * H..(t + 1) * H], norm, RMS_NORM_EPS, row);
             act.quantize(t, row);
@@ -289,53 +295,67 @@ impl<'a> Decoder<'a> {
         let out = Out(self.qkv.as_mut_ptr());
         self.gemv(l, Which::Qkv, n, &self.act_h, out, stride);
         phase(&mut self.phases, 2, tm);
-        // rotary on q and k, then k and v into the cache
-        for t in 0..n {
-            let p = pos + t;
-            let (cos, sin) = (&self.cos[p * HEAD_DIM..(p + 1) * HEAD_DIM], &self.sin[p * HEAD_DIM..(p + 1) * HEAD_DIM]);
-            let row = &mut self.qkv[t * stride..(t + 1) * stride];
-            for h in 0..HEADS {
-                rotate_half::<HEAD_DIM>(&mut row[h * HEAD_DIM..(h + 1) * HEAD_DIM], cos, sin);
-            }
-            for h in 0..KV_HEADS {
-                rotate_half::<HEAD_DIM>(&mut row[Q_DIM + h * HEAD_DIM..Q_DIM + (h + 1) * HEAD_DIM], cos, sin);
-            }
-            let at = (l * self.max_ctx + p) * KV_DIM;
-            self.k_cache[at..at + KV_DIM].copy_from_slice(&row[Q_DIM..Q_DIM + KV_DIM]);
-            self.v_cache[at..at + KV_DIM].copy_from_slice(&row[Q_DIM + KV_DIM..Q_DIM + 2 * KV_DIM]);
+        // rotary on q and k, then k and v into the cache: a token an item (its row, its position)
+        {
+            let (cos, sin, max_ctx) = (&self.cos, &self.sin, self.max_ctx);
+            let (qkv, kc, vc) = (Out(self.qkv.as_mut_ptr()), Out(self.k_cache.as_mut_ptr()), Out(self.v_cache.as_mut_ptr()));
+            spread(self.pool, &self.cx, n, &move |t| unsafe {
+                let p = pos + t;
+                let (cos, sin) = (&cos[p * HEAD_DIM..(p + 1) * HEAD_DIM], &sin[p * HEAD_DIM..(p + 1) * HEAD_DIM]);
+                let row = core::slice::from_raw_parts_mut(qkv.at(t * stride), stride);
+                for h in 0..HEADS {
+                    rotate_half::<HEAD_DIM>(&mut row[h * HEAD_DIM..(h + 1) * HEAD_DIM], cos, sin);
+                }
+                for h in 0..KV_HEADS {
+                    rotate_half::<HEAD_DIM>(&mut row[Q_DIM + h * HEAD_DIM..Q_DIM + (h + 1) * HEAD_DIM], cos, sin);
+                    let at = ((l * KV_HEADS + h) * max_ctx + p) * HEAD_DIM;
+                    core::slice::from_raw_parts_mut(kc.at(at), HEAD_DIM).copy_from_slice(&row[Q_DIM + h * HEAD_DIM..Q_DIM + (h + 1) * HEAD_DIM]);
+                    core::slice::from_raw_parts_mut(vc.at(at), HEAD_DIM).copy_from_slice(&row[Q_DIM + KV_DIM + h * HEAD_DIM..Q_DIM + KV_DIM + (h + 1) * HEAD_DIM]);
+                }
+            });
         }
         phase(&mut self.phases, 3, tm);
-        // causal attention, a (token, head) an item: scores over the positions up to the token's, softmax, the values
+        // causal attention: an item a kv head and a block of `TB` tokens — the head's keys and values are read once a
+        // position for the block's tokens × the query heads that share them (TB 8 → 2 on 2026-10-23: 32 items of a
+        // 32-token step left cores idle, 24 ms a step; 128 items); scores a (token, head) row of `len8`, the softmax
+        // zeroing the positions a token does not see
         {
-            let (qkv, k_cache, v_cache) = (&self.qkv, &self.k_cache, &self.v_cache);
+            const TB: usize = 2;
+            let (qkv, kc, vc) = (&self.qkv, &self.k_cache, &self.v_cache);
             let (max_ctx, out) = (self.max_ctx, Out(self.attn.as_mut_ptr()));
             let scale = 1.0 / sqrt(HEAD_DIM as f32);
-            self.pool.run(n * HEADS, &move |i| {
-                let (t, h) = (i / HEADS, i % HEADS);
-                let kvh = h / KV_GROUP;
-                let q = &qkv[t * stride + h * HEAD_DIM..t * stride + (h + 1) * HEAD_DIM];
-                let len = pos + t + 1;
-                let mut s = vec![0f32; len];
-                let mut mx = f32::NEG_INFINITY;
+            let blocks = n.div_ceil(TB);
+            spread(self.pool, &self.cx, KV_HEADS * blocks, &move |i| {
+                let (kvh, b) = (i % KV_HEADS, i / KV_HEADS);
+                let (t0, t1) = (b * TB, ((b + 1) * TB).min(n));
+                let (nt, len) = (t1 - t0, pos + t1);
+                let len8 = len.div_ceil(8) * 8;
+                let kb = ((l * KV_HEADS + kvh) * max_ctx) * HEAD_DIM;
+                let (k, v) = (&kc[kb..kb + len * HEAD_DIM], &vc[kb..kb + len * HEAD_DIM]);
+                let q = |t: usize, h: usize| &qkv[(t0 + t) * stride + (kvh * KV_GROUP + h) * HEAD_DIM..][..HEAD_DIM];
+                let mut s = vec![0f32; nt * KV_GROUP * len8];
                 for p in 0..len {
-                    let k = &k_cache[(l * max_ctx + p) * KV_DIM + kvh * HEAD_DIM..][..HEAD_DIM];
-                    let d = common::linalg::dot(q, k) * scale;
-                    s[p] = d;
-                    if d > mx {
-                        mx = d;
+                    let kr = &k[p * HEAD_DIM..(p + 1) * HEAD_DIM];
+                    for t in 0..nt {
+                        for h in 0..KV_GROUP {
+                            s[(t * KV_GROUP + h) * len8 + p] = common::linalg::dot(q(t, h), kr) * scale;
+                        }
                     }
                 }
-                let mut sum = 0f32;
-                for v in s.iter_mut() {
-                    *v = exp(*v - mx);
-                    sum += *v;
+                for t in 0..nt {
+                    for h in 0..KV_GROUP {
+                        common::sgemm::softmax_row(&mut s[(t * KV_GROUP + h) * len8..(t * KV_GROUP + h + 1) * len8], pos + t0 + t + 1);
+                        unsafe { core::slice::from_raw_parts_mut(out.at((t0 + t) * Q_DIM + (kvh * KV_GROUP + h) * HEAD_DIM), HEAD_DIM) }.fill(0.0);
+                    }
                 }
-                let inv = 1.0 / sum;
-                let o = unsafe { core::slice::from_raw_parts_mut(out.at(t * Q_DIM + h * HEAD_DIM), HEAD_DIM) };
-                o.fill(0.0);
                 for p in 0..len {
-                    let v = &v_cache[(l * max_ctx + p) * KV_DIM + kvh * HEAD_DIM..][..HEAD_DIM];
-                    common::linalg::axpy(o, s[p] * inv, v);
+                    let vr = &v[p * HEAD_DIM..(p + 1) * HEAD_DIM];
+                    for t in 0..nt {
+                        for h in 0..KV_GROUP {
+                            let o = unsafe { core::slice::from_raw_parts_mut(out.at((t0 + t) * Q_DIM + (kvh * KV_GROUP + h) * HEAD_DIM), HEAD_DIM) };
+                            common::linalg::axpy(o, s[(t * KV_GROUP + h) * len8 + p], vr);
+                        }
+                    }
                 }
             });
         }
@@ -343,7 +363,7 @@ impl<'a> Decoder<'a> {
         // o projection over the attention output, into the residual
         {
             let (attn, act) = (&self.attn, self.act_q.writer());
-            tokens(self.pool, n, &move |t| unsafe { act.quantize(t, &attn[t * Q_DIM..(t + 1) * Q_DIM]) });
+            spread(self.pool, &self.cx, n, &move |t| unsafe { act.quantize(t, &attn[t * Q_DIM..(t + 1) * Q_DIM]) });
         }
         let out = Out(self.xn.as_mut_ptr());
         self.gemv(l, Which::O, n, &self.act_q, out, H);
@@ -361,11 +381,9 @@ impl<'a> Decoder<'a> {
         {
             let (gate, up) = self.gu.split_at(STEP * D_FF);
             let (hid, act) = (Out(self.hid.as_mut_ptr()), self.act_ff.writer());
-            tokens(self.pool, n, &move |t| unsafe {
+            spread(self.pool, &self.cx, n, &move |t| unsafe {
                 let row = core::slice::from_raw_parts_mut(hid.at(t * D_FF), D_FF);
-                for i in 0..D_FF {
-                    row[i] = silu(gate[t * D_FF + i]) * up[t * D_FF + i];
-                }
+                common::sgemm::silu_mul(&gate[t * D_FF..(t + 1) * D_FF], &up[t * D_FF..(t + 1) * D_FF], row);
                 act.quantize(t, row);
             });
         }
@@ -382,9 +400,11 @@ impl<'a> Decoder<'a> {
     /// Position `pos`'s rows for the store: K then V of every layer.
     pub fn rows(&self, pos: usize, out: &mut [f32]) {
         for l in 0..NUM_HIDDEN_LAYERS {
-            let at = (l * self.max_ctx + pos) * KV_DIM;
-            out[l * 2 * KV_DIM..l * 2 * KV_DIM + KV_DIM].copy_from_slice(&self.k_cache[at..at + KV_DIM]);
-            out[l * 2 * KV_DIM + KV_DIM..(l + 1) * 2 * KV_DIM].copy_from_slice(&self.v_cache[at..at + KV_DIM]);
+            for h in 0..KV_HEADS {
+                let at = self.kv_at(l, h, pos);
+                out[l * 2 * KV_DIM + h * HEAD_DIM..][..HEAD_DIM].copy_from_slice(&self.k_cache[at..at + HEAD_DIM]);
+                out[l * 2 * KV_DIM + KV_DIM + h * HEAD_DIM..][..HEAD_DIM].copy_from_slice(&self.v_cache[at..at + HEAD_DIM]);
+            }
         }
     }
     /// Install `rows` (`[n][POSITION]`) as positions `0..n`.
@@ -392,10 +412,12 @@ impl<'a> Decoder<'a> {
         let n = rows.len() / POSITION;
         for p in 0..n {
             for l in 0..NUM_HIDDEN_LAYERS {
-                let at = (l * self.max_ctx + p) * KV_DIM;
                 let r = &rows[p * POSITION + l * 2 * KV_DIM..p * POSITION + (l + 1) * 2 * KV_DIM];
-                self.k_cache[at..at + KV_DIM].copy_from_slice(&r[..KV_DIM]);
-                self.v_cache[at..at + KV_DIM].copy_from_slice(&r[KV_DIM..]);
+                for h in 0..KV_HEADS {
+                    let at = self.kv_at(l, h, p);
+                    self.k_cache[at..at + HEAD_DIM].copy_from_slice(&r[h * HEAD_DIM..(h + 1) * HEAD_DIM]);
+                    self.v_cache[at..at + HEAD_DIM].copy_from_slice(&r[KV_DIM + h * HEAD_DIM..KV_DIM + (h + 1) * HEAD_DIM]);
+                }
             }
         }
     }

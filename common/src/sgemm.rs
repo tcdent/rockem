@@ -239,6 +239,28 @@ unsafe fn gelu_slice(x: &mut [f32]) {
     }
 }
 
+/// `out[i] = silu(gate[i]) · up[i]` (`swiglu::silu`'s expression, `exp8` for the exponential).
+pub fn silu_mul(gate: &[f32], up: &[f32], out: &mut [f32]) {
+    debug_assert!(gate.len() == up.len() && out.len() >= gate.len());
+    unsafe { silu_mul_avx2(gate, up, out) }
+}
+#[target_feature(enable = "avx2,fma")]
+unsafe fn silu_mul_avx2(gate: &[f32], up: &[f32], out: &mut [f32]) {
+    let (g, u, o) = (gate.as_ptr(), up.as_ptr(), out.as_mut_ptr());
+    let one = _mm256_set1_ps(1.0);
+    let mut i = 0;
+    while i + 8 <= gate.len() {
+        let gv = _mm256_loadu_ps(g.add(i));
+        let e = exp8(_mm256_sub_ps(_mm256_setzero_ps(), gv));
+        _mm256_storeu_ps(o.add(i), _mm256_mul_ps(_mm256_div_ps(gv, _mm256_add_ps(one, e)), _mm256_loadu_ps(u.add(i))));
+        i += 8;
+    }
+    while i < gate.len() {
+        *o.add(i) = crate::swiglu::silu(*g.add(i)) * *u.add(i);
+        i += 1;
+    }
+}
+
 /// Softmax of `s[..valid]` in place, `s[valid..]` set to zero (the row's length a multiple of 8).
 pub fn softmax_row(s: &mut [f32], valid: usize) {
     debug_assert!(s.len() % 8 == 0 && valid <= s.len());
@@ -370,6 +392,13 @@ mod tests {
             assert!((e - want).abs() <= 2e-6 * want, "exp {x}: {e} vs {want}");
             assert!((g[i] - crate_gelu(x)).abs() < 1e-5 * (1.0 + x.abs()), "gelu {x}");
         }
+        let (g, u): (Vec<f32>, Vec<f32>) = ((0..19).map(|i| i as f32 * 0.9 - 8.0).collect(), (0..19).map(|i| 1.0 + i as f32).collect());
+        let mut o = std::vec![0f32; 19];
+        silu_mul(&g, &u, &mut o);
+        for i in 0..19 {
+            let want = crate::swiglu::silu(g[i]) * u[i];
+            assert!((o[i] - want).abs() < 1e-5 * (1.0 + want.abs()), "silu {i}: {} vs {want}", o[i]);
+        }
         let mut s: Vec<f32> = (0..24).map(|i| (i as f32) * 0.3 - 2.0).collect();
         softmax_row(&mut s, 20);
         let mx = (0..20).map(|i| i as f32 * 0.3 - 2.0).fold(f32::MIN, f32::max);
@@ -378,5 +407,34 @@ mod tests {
             let want = if i < 20 { crate::math::exp(i as f32 * 0.3 - 2.0 - mx) / z } else { 0.0 };
             assert!((s[i] - want).abs() < 1e-6, "softmax {i}: {} vs {want}", s[i]);
         }
+    }
+}
+
+#[cfg(test)]
+mod rate {
+    /// `cargo test -p common --features std --release sgemm::rate -- --ignored --nocapture`: the per-token FFN epilogue's
+    /// cost (SiLU·up over D_FF = 32768 and its INT8 quantization), one core.
+    #[test]
+    #[ignore]
+    fn silu_and_quantize_a_token() {
+        use crate::testing::Rng;
+        let mut rng = Rng::new(1);
+        let n = 32768;
+        let g: std::vec::Vec<f32> = (0..n).map(|_| rng.unit() * 4.0).collect();
+        let u: std::vec::Vec<f32> = (0..n).map(|_| rng.unit()).collect();
+        let mut o = std::vec![0f32; n];
+        let (mut q, mut sc, mut gs) = (std::vec![0i8; n], std::vec![0f32; n / 128], std::vec![0i32; n / 128]);
+        let reps = 2000;
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            super::silu_mul(&g, &u, &mut o);
+        }
+        let t1 = std::time::Instant::now();
+        for _ in 0..reps {
+            let mut qa = crate::q4::QAct { q: &mut q, scale: &mut sc, gsum: &mut gs };
+            qa.quantize(&o);
+        }
+        let t2 = std::time::Instant::now();
+        std::println!("silu_mul {:.1} µs a token ({:.2} ns an element), quantize {:.1} µs ({:.2} ns)", (t1 - t0).as_secs_f64() * 1e6 / reps as f64, (t1 - t0).as_secs_f64() * 1e9 / (reps * n) as f64, (t2 - t1).as_secs_f64() * 1e6 / reps as f64, (t2 - t1).as_secs_f64() * 1e9 / (reps * n) as f64);
     }
 }
