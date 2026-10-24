@@ -42,6 +42,7 @@ mod probe;
 mod v2lite;
 mod v2lite_kfd;
 mod voxtral;
+mod granite;
 mod wire;
 
 use engine::Engine;
@@ -960,6 +961,7 @@ fn main() {
                 glm::Glm::open(&dir, mem, max_ctx, gpu, config("rockem.resident").and_then(|v| v.parse::<usize>().ok()).map_or(glm_kfd::RESIDENT_BYTES, |gb| gb << 30), p, b)
             }
             "voxtral-small-24b" => voxtral::Voxtral::open(&dir, mem, max_ctx, host(&mut pool).0),
+            "granite-speech-4.1-2b" => granite::Granite::open(&dir, mem, max_ctx, host(&mut pool).0),
             other => halt(&format!("the manifest lists model {other:?}, which this node does not carry")),
         };
         // the node's budget, capped by what the model itself can hold

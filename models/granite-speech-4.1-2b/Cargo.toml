@@ -1,0 +1,11 @@
+[package]
+name = "granite_speech_4_1_2b"
+version = "0.0.0"
+edition = "2021"
+description = "Granite Speech 4.1 2B: the pinned config, its constants, and the host transcription of the reference forward (the Conformer CTC encoder, the Q-Former projector, the Granite decoder) that bring-up diffs against the oracle."
+
+[features]
+std = ["common/std"]
+
+[dependencies]
+common = { path = "../../common" }

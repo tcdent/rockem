@@ -1,0 +1,5 @@
+data/
+logs/
+edge/
+.venv/
+__pycache__/

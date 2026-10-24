@@ -1,0 +1,17 @@
+[package]
+name = "forward-granite"
+version = "0.0.0"
+edition = "2021"
+description = "Bring-up driver for Granite Speech 4.1 2B: the shipped host encoder and decoder over the oracle's edges, every block's and layer's output and the logits diffed against the goldens; end to end from a set's log-mel. Dev box only."
+
+[dependencies]
+harness = { path = "../harness" }
+common = { path = "../../common", features = ["std"] }
+granite_speech_4_1_2b = { path = "../../models/granite-speech-4.1-2b", features = ["std"] }
+glm_5_3_flash = { path = "../../models/glm-5.3-flash", features = ["std"] }
+memmap2 = "0.9"
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+debug = 1

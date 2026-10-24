@@ -1,0 +1,28 @@
+[project]
+name = "granite-bringup"
+version = "0.0.0"
+description = "The Granite Speech 4.1 2B oracle and the bundle's edge files: transformers on the CPU (granite_speech), torchaudio for the reference's log-mel."
+requires-python = ">=3.12"
+dependencies = [
+  "transformers>=5.13",
+  "torch",
+  "torchaudio",
+  "accelerate",
+  "safetensors",
+  "soundfile",
+  "numpy",
+  "huggingface_hub",
+  "jinja2",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+torchaudio = [{ index = "pytorch-cpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

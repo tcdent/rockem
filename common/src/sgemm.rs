@@ -38,16 +38,24 @@ pub struct Packed<'a> {
     pub bias: Option<&'a [f32]>,
 }
 
-/// How an item's tile reaches `out`: `v = c + bias`, then `gelu(v)` if `gelu`, then `out += v` if `add`, else `out = v`.
+/// The activation an epilogue applies after the bias.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Act {
+    None,
+    Gelu,
+    Silu,
+}
+/// How an item's tile reaches `out`: `v = c + bias`, then `act(v)`, then `out += v` if `add`, else `out = v`.
 #[derive(Clone, Copy)]
 pub struct Epilogue {
-    pub gelu: bool,
+    pub act: Act,
     pub add: bool,
 }
-pub const STORE: Epilogue = Epilogue { gelu: false, add: false };
-pub const GELU: Epilogue = Epilogue { gelu: true, add: false };
-pub const ADD: Epilogue = Epilogue { gelu: false, add: true };
-pub const GELU_ADD: Epilogue = Epilogue { gelu: true, add: true };
+pub const STORE: Epilogue = Epilogue { act: Act::None, add: false };
+pub const GELU: Epilogue = Epilogue { act: Act::Gelu, add: false };
+pub const SILU: Epilogue = Epilogue { act: Act::Silu, add: false };
+pub const ADD: Epilogue = Epilogue { act: Act::None, add: true };
+pub const GELU_ADD: Epilogue = Epilogue { act: Act::Gelu, add: true };
 
 /// `w[j][kk] = at(j, kk)` for `j < rows`, zero rows up to `m` (`m % NR == 0`) → panels `[m / NR][k][NR]`.
 pub fn pack_with(m: usize, rows: usize, k: usize, at: impl Fn(usize, usize) -> f32) -> Vec<f32> {
@@ -170,8 +178,10 @@ unsafe fn epilogue(c: *const f32, rows: usize, cols: usize, bias: Option<*const 
             if let Some(b) = bias {
                 v = _mm256_add_ps(v, _mm256_loadu_ps(b.add(j)));
             }
-            if ep.gelu {
-                v = gelu8(v);
+            match ep.act {
+                Act::None => {}
+                Act::Gelu => v = gelu8(v),
+                Act::Silu => v = silu8(v),
             }
             let o = out.add(t * ldo + j);
             if ep.add {
@@ -235,6 +245,78 @@ unsafe fn gelu_slice(x: &mut [f32]) {
     while i < x.len() {
         let v = _mm256_set1_ps(*p.add(i));
         *p.add(i) = _mm256_cvtss_f32(gelu8(v));
+        i += 1;
+    }
+}
+
+/// `x / (1 + e^−x)` a lane (`swiglu::silu`'s expression, `exp8` for the exponential).
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn silu8(x: __m256) -> __m256 {
+    let e = exp8(_mm256_sub_ps(_mm256_setzero_ps(), x));
+    _mm256_div_ps(x, _mm256_add_ps(_mm256_set1_ps(1.0), e))
+}
+/// `1 / (1 + e^−x)` a lane.
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn sigmoid8(x: __m256) -> __m256 {
+    let e = exp8(_mm256_sub_ps(_mm256_setzero_ps(), x));
+    _mm256_div_ps(_mm256_set1_ps(1.0), _mm256_add_ps(_mm256_set1_ps(1.0), e))
+}
+
+/// `silu` over a slice in place.
+pub fn silu(x: &mut [f32]) {
+    unsafe { silu_slice(x) }
+}
+#[target_feature(enable = "avx2,fma")]
+unsafe fn silu_slice(x: &mut [f32]) {
+    let p = x.as_mut_ptr();
+    let mut i = 0;
+    while i + 8 <= x.len() {
+        _mm256_storeu_ps(p.add(i), silu8(_mm256_loadu_ps(p.add(i))));
+        i += 8;
+    }
+    while i < x.len() {
+        *p.add(i) = crate::swiglu::silu(*p.add(i));
+        i += 1;
+    }
+}
+
+/// GLU over the channel halves: `out[i] = x[i] · sigmoid(x[n + i])` for `n = out.len()` (`x.len() == 2n`).
+pub fn glu(x: &[f32], out: &mut [f32]) {
+    debug_assert_eq!(x.len(), 2 * out.len());
+    unsafe { glu_avx2(x, out) }
+}
+#[target_feature(enable = "avx2,fma")]
+unsafe fn glu_avx2(x: &[f32], out: &mut [f32]) {
+    let n = out.len();
+    let (a, b, o) = (x.as_ptr(), x.as_ptr().add(n), out.as_mut_ptr());
+    let mut i = 0;
+    while i + 8 <= n {
+        _mm256_storeu_ps(o.add(i), _mm256_mul_ps(_mm256_loadu_ps(a.add(i)), sigmoid8(_mm256_loadu_ps(b.add(i)))));
+        i += 8;
+    }
+    while i < n {
+        *o.add(i) = *a.add(i) / (1.0 + crate::math::exp(-*b.add(i)));
+        i += 1;
+    }
+}
+
+/// `out[i] += a[i] · b[i]`.
+pub fn mul_add(out: &mut [f32], a: &[f32], b: &[f32]) {
+    debug_assert!(a.len() == out.len() && b.len() == out.len());
+    unsafe { mul_add_avx2(out, a, b) }
+}
+#[target_feature(enable = "avx2,fma")]
+unsafe fn mul_add_avx2(out: &mut [f32], a: &[f32], b: &[f32]) {
+    let (o, a, b) = (out.as_mut_ptr(), a.as_ptr(), b.as_ptr());
+    let mut i = 0;
+    while i + 8 <= out.len() {
+        _mm256_storeu_ps(o.add(i), _mm256_fmadd_ps(_mm256_loadu_ps(a.add(i)), _mm256_loadu_ps(b.add(i)), _mm256_loadu_ps(o.add(i))));
+        i += 8;
+    }
+    while i < out.len() {
+        *o.add(i) += *a.add(i) * *b.add(i);
         i += 1;
     }
 }
@@ -341,7 +423,7 @@ mod tests {
         let want = naive(&w, Some(&b), m, k, &x, n);
         let pw = pack(&w, m, k);
         let p = Packed { w: &pw, m, k, bias: Some(&b) };
-        for (ep, f) in [(STORE, (|v: f32, _o: f32| v) as fn(f32, f32) -> f32), (GELU, |v, _| crate_gelu(v)), (ADD, |v, o| v + o), (GELU_ADD, |v, o| crate_gelu(v) + o)] {
+        for (ep, f) in [(STORE, (|v: f32, _o: f32| v) as fn(f32, f32) -> f32), (GELU, |v, _| crate_gelu(v)), (SILU, |v, _| crate::swiglu::silu(v)), (ADD, |v, o| v + o), (GELU_ADD, |v, o| crate_gelu(v) + o)] {
             let mut out: Vec<f32> = (0..n * m).map(|i| i as f32 * 1e-3).collect();
             let before = out.clone();
             for i in 0..items(m, n) {
@@ -398,6 +480,19 @@ mod tests {
         for i in 0..19 {
             let want = crate::swiglu::silu(g[i]) * u[i];
             assert!((o[i] - want).abs() < 1e-5 * (1.0 + want.abs()), "silu {i}: {} vs {want}", o[i]);
+        }
+        let x2: Vec<f32> = (0..38).map(|i| i as f32 * 0.5 - 9.0).collect();
+        let mut g2 = std::vec![0f32; 19];
+        glu(&x2, &mut g2);
+        let mut s2 = x2.clone();
+        silu(&mut s2);
+        let mut m2 = std::vec![1f32; 19];
+        mul_add(&mut m2, &x2[..19], &x2[19..]);
+        for i in 0..19 {
+            let want = x2[i] / (1.0 + crate::math::exp(-x2[19 + i]));
+            assert!((g2[i] - want).abs() < 1e-5 * (1.0 + want.abs()), "glu {i}");
+            assert!((s2[i] - crate::swiglu::silu(x2[i])).abs() < 1e-5 * (1.0 + x2[i].abs()), "silu {i}");
+            assert!((m2[i] - (1.0 + x2[i] * x2[19 + i])).abs() < 1e-5, "mul_add {i}");
         }
         let mut s: Vec<f32> = (0..24).map(|i| (i as f32) * 0.3 - 2.0).collect();
         softmax_row(&mut s, 20);
