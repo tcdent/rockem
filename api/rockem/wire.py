@@ -329,7 +329,17 @@ class Client:
                     return
 
     def close(self) -> None:
-        self.writer.close()
+        """Close at once with a reset, discarding whatever is still unsent. An ordinary close
+        sends its FIN after the send buffer, so a cancelled long prompt would reach the node in
+        full before the close did, and the node would compute it for nobody (a codey conversation's
+        273 KB, 2026-10-24). A reset reaches the node now, and its per-step check stops it."""
+        sock = self.writer.get_extra_info("socket")
+        if sock is not None:
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            except OSError:
+                pass  # already gone
+        self.writer.transport.abort()
 
     async def __aenter__(self) -> Client:
         return self

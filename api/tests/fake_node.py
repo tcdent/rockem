@@ -4,6 +4,7 @@ client can be tested against the wire's exact behavior, the budget's edge includ
 from __future__ import annotations
 
 import socket
+import select
 import struct
 import time
 import threading
@@ -42,6 +43,9 @@ class FakeNode:
         self.audio: dict[str, dict] = {}
         self.windows: list[bytes] = []  # every AUDIO window received
         self.delay = 0.0  # seconds before each generated id
+        self.read_delay = 0.0  # seconds before reading each word: a node busy computing its prompt
+        self.words = 0  # words read after the header, every connection
+        self.rcvbuf = 0  # a small receive buffer (bytes), so a long prompt waits on the sender's side
         self.close_after: int | None = None  # drop the connection after this many generated ids
         self.srv = socket.socket()
         self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -61,6 +65,8 @@ class FakeNode:
                 return
             with s:
                 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                if self.rcvbuf:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, self.rcvbuf)
                 self.sessions += 1
                 h = read_exact(s, wire.HELLO)
                 if len(h) != wire.HELLO or h[:4] != wire.MAGIC:
@@ -76,7 +82,16 @@ class FakeNode:
                 s.sendall(wire.MAGIC + struct.pack("<IQI", wire.VERSION, self.identity, self.max_ctx - FIRST_POS))
                 pos, started, drawn, ids = 0, False, 0, []
                 while True:
+                    if self.read_delay:
+                        time.sleep(self.read_delay)
+                        # the node asks the socket before every step (poll POLLRDHUP): a hang-up or an
+                        # error ends the sequence even with the prompt's words still queued
+                        p = select.poll()
+                        p.register(s, select.POLLRDHUP | select.POLLERR | select.POLLHUP)
+                        if any(ev & (select.POLLERR | select.POLLHUP) for _, ev in p.poll(0)):
+                            break
                     w = read_exact(s, 4)
+                    self.words += len(w) == 4
                     if len(w) != 4:
                         break
                     (word,) = struct.unpack("<I", w)

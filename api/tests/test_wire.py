@@ -1,3 +1,4 @@
+import contextlib
 import asyncio
 import struct
 
@@ -191,3 +192,23 @@ async def test_client_sends_the_whole_prefix_once(node):
             await c.prompt([BOS, 1])  # half a prefix
     await asyncio.sleep(0.05)
     assert [t[:3] for t in node.transcripts[:2]] == [[5, 1, 2], [5, 1, 10]]
+
+
+@pytest.mark.anyio
+async def test_close_is_a_reset_that_drops_the_unsent_prompt(node):
+    """2026-10-24: a cancelled long prompt kept the node busy, because an ordinary close's FIN
+    waits behind the unsent prompt. The client's close resets instead: the node stops reading."""
+    node.max_ctx, node.read_delay, node.rcvbuf = 1_000_000, 0.001, 32_768  # slow, with a full buffer, as in production
+    c = await connect(node)
+    big = [1] * 400_000  # 1.6 MB of prompt: far more than the kernel buffers hold
+    task = asyncio.ensure_future(c.prompt(big))
+    await asyncio.sleep(0.3)
+    c.close()  # the cancel
+    task.cancel()
+    with contextlib.suppress(BaseException):
+        await task
+    await asyncio.sleep(1.0)
+    read_then = node.words
+    await asyncio.sleep(1.0)
+    assert node.words == read_then, "the node is still reading the cancelled prompt"
+    assert node.words < 50_000
