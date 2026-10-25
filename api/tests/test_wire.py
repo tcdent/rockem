@@ -212,3 +212,43 @@ async def test_close_is_a_reset_that_drops_the_unsent_prompt(node):
     await asyncio.sleep(1.0)
     assert node.words == read_then, "the node is still reading the cancelled prompt"
     assert node.words < 50_000
+
+
+@pytest.mark.anyio
+async def test_a_node_connection_notices_a_dead_machine(node):
+    """2026-10-25: a node panic reset its machine and closed nothing; the API waited 250 s and on."""
+    import socket as _socket
+
+    async with await connect(node) as c:
+        s = c.writer.get_extra_info("socket")
+        assert s.getsockopt(_socket.SOL_SOCKET, _socket.SO_KEEPALIVE) == 1
+        idle = s.getsockopt(_socket.IPPROTO_TCP, _socket.TCP_KEEPIDLE)
+        intvl, cnt = s.getsockopt(_socket.IPPROTO_TCP, _socket.TCP_KEEPINTVL), s.getsockopt(_socket.IPPROTO_TCP, _socket.TCP_KEEPCNT)
+        assert idle + intvl * cnt <= 15  # a dead machine is noticed within seconds
+        assert s.getsockopt(_socket.IPPROTO_TCP, _socket.TCP_USER_TIMEOUT) == wire.USER_TIMEOUT_MS
+
+
+@pytest.mark.anyio
+async def test_a_machine_that_is_down_fails_the_connect(monkeypatch):
+    monkeypatch.setattr(wire, "CONNECT_TIMEOUT", 0.5)
+    import time as _time
+
+    t0 = _time.time()
+    with pytest.raises(OSError):
+        await wire.Client.connect(("10.255.255.1", 7332), BOS, EOS, VOCAB, model="tiny")  # nothing answers there
+    assert _time.time() - t0 < 2
+
+
+@pytest.mark.anyio
+async def test_a_node_that_vanishes_mid_reply_ends_the_stream(engine, node):
+    """The node's machine resets mid-reply: the next read fails, the client gets an error, the node's
+    place in line is free again."""
+    from rockem import core
+
+    node.draws, node.delay, node.close_after = [2] * 50, 0.01, 3
+    run = await engine.start(core.Request(prompt="hello"))
+    events = []
+    with pytest.raises((WireError, OSError)):  # a reset reads as OSError, a clean close as WireError
+        async for ev in run.events():
+            events.append(ev)
+    assert engine.scheduler.free == 1

@@ -393,3 +393,11 @@ async def test_a_client_gone_while_its_long_prompt_is_written_stops_the_node(eng
     read_then = node.words
     await asyncio.sleep(0.5)
     assert node.words == read_then and engine.scheduler.free == 1
+
+
+
+async def test_a_node_that_vanishes_ends_the_http_stream_with_an_error(client, node):
+    node.draws, node.delay, node.close_after = [2] * 50, 0.01, 3
+    evs = data_events(await client.post("/rockem/v1/generate", json={"prompt": "hello"}))
+    assert evs[-1]["type"] == "error" and "node" in evs[-1]["message"]
+    assert (await client.get("/health")).json()["free"] == 1

@@ -225,6 +225,25 @@ class Session:
         raise Disconnected(f"the node closed with {self.remaining} positions left")
 
 
+# A node that dies with its machine (it is the machine's init: a panic resets the box) closes
+# nothing: the connection looks open, and a client waiting for ids would wait forever, holding the
+# node's place in line (2026-10-25: 250 s idle and counting after a node panic). The kernel's
+# keepalive probes an idle connection; a rebooted machine answers them with a reset and a dead one
+# not at all, so the read fails within about KEEPIDLE + KEEPINTVL · KEEPCNT seconds. The probes are
+# the kernel's, so a node busy computing a long prompt answers them and is never mistaken for dead.
+KEEPIDLE, KEEPINTVL, KEEPCNT = 5, 2, 3
+USER_TIMEOUT_MS = 15_000  # unacknowledged writes (a prompt to a dead machine) fail after this
+CONNECT_TIMEOUT = 10.0  # seconds: a machine that is down does not refuse, it does not answer
+
+
+def notice_a_dead_node(sock: socket.socket) -> None:
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, KEEPIDLE)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, KEEPINTVL)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, KEEPCNT)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT, USER_TIMEOUT_MS)
+
+
 class Client:
     """One connection, one session, asyncio. `connect` exchanges the headers; `prompt`,
     `generate` and `close` are the three moves. Closing mid-generation is the abort."""
@@ -239,10 +258,14 @@ class Client:
     async def connect(cls, addr: tuple[str, int], bos, eos, vocab_size: int, identity: int = 0, *, model: str, audio: AudioSpec | None = None) -> Client:
         """`model` is the manifest name of the model this connection speaks; `bos` and `eos`
         are that model's prefix and end ids (one id each, or a sequence and a set)."""
-        reader, writer = await asyncio.open_connection(*addr)
+        try:
+            reader, writer = await asyncio.wait_for(asyncio.open_connection(*addr), CONNECT_TIMEOUT)
+        except TimeoutError as e:
+            raise OSError(f"{addr[0]}:{addr[1]}: no answer to connect in {CONNECT_TIMEOUT:g} s") from e
         sock = writer.get_extra_info("socket")
         if sock is not None:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            notice_a_dead_node(sock)
         try:
             writer.write(hello(model, identity))
             await writer.drain()
