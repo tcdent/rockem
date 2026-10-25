@@ -229,11 +229,15 @@ class Session:
 # nothing: the connection looks open, and a client waiting for ids would wait forever, holding the
 # node's place in line (2026-10-25: 250 s idle and counting after a node panic). The kernel's
 # keepalive probes an idle connection; a rebooted machine answers them with a reset and a dead one
-# not at all, so the read fails within about KEEPIDLE + KEEPINTVL · KEEPCNT seconds. The probes are
-# the kernel's, so a node busy computing a long prompt answers them and is never mistaken for dead.
+# not at all, so the read fails within about KEEPIDLE + KEEPINTVL · KEEPCNT seconds.
+#
+# Only the wire's presence is timed, never data. A node computing a long prompt sends nothing and
+# reads nothing for as long as the prompt takes; its kernel still answers probes. tcdent: "we don't
+# expect that we always get data over the wire but we do know that the wire is there." So there is
+# no TCP_USER_TIMEOUT: it also times a zero window, and killed healthy connections whose node was
+# busy computing (Errno 110 on codey's long prompts, 2026-10-25, the day it was added).
 KEEPIDLE, KEEPINTVL, KEEPCNT = 5, 2, 3
-USER_TIMEOUT_MS = 15_000  # unacknowledged writes (a prompt to a dead machine) fail after this
-CONNECT_TIMEOUT = 10.0  # seconds: a machine that is down does not refuse, it does not answer
+CONNECT_TIMEOUT = 10.0  # seconds with no answer at all, not even a refusal: the machine is not there
 
 
 def notice_a_dead_node(sock: socket.socket) -> None:
@@ -241,7 +245,6 @@ def notice_a_dead_node(sock: socket.socket) -> None:
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, KEEPIDLE)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, KEEPINTVL)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, KEEPCNT)
-    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT, USER_TIMEOUT_MS)
 
 
 class Client:

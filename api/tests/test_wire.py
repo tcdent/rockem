@@ -225,7 +225,8 @@ async def test_a_node_connection_notices_a_dead_machine(node):
         idle = s.getsockopt(_socket.IPPROTO_TCP, _socket.TCP_KEEPIDLE)
         intvl, cnt = s.getsockopt(_socket.IPPROTO_TCP, _socket.TCP_KEEPINTVL), s.getsockopt(_socket.IPPROTO_TCP, _socket.TCP_KEEPCNT)
         assert idle + intvl * cnt <= 15  # a dead machine is noticed within seconds
-        assert s.getsockopt(_socket.IPPROTO_TCP, _socket.TCP_USER_TIMEOUT) == wire.USER_TIMEOUT_MS
+        # nothing times the data: a node computing a long prompt reads nothing for as long as it takes
+        assert s.getsockopt(_socket.IPPROTO_TCP, _socket.TCP_USER_TIMEOUT) == 0
 
 
 @pytest.mark.anyio
@@ -252,3 +253,5 @@ async def test_a_node_that_vanishes_mid_reply_ends_the_stream(engine, node):
         async for ev in run.events():
             events.append(ev)
     assert engine.scheduler.free == 1
+
+
