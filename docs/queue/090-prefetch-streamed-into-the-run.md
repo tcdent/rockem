@@ -77,6 +77,15 @@ all of it in the long windows, little in the short ones — so ~20 % is the boun
 evict the lines of experts that do run (082's note). The static job never cuts them: `prefetch_amend` keeps any expert with a taken item, and
 no correction runs after the rows pass.
 
+## The plans measured (aff85, `plan_eval`, 2026-10-25: 50,225 decode layer runs of tcdent's 360k session)
+`bringup/reads/plan_eval.py`. P(picked) by rank, early plan / rows plan: rank 1 .999 / .999, 4 .976 / .988, 8 .852 /
+.907, 10 .755 / .826, 12 .653 / .722, 13 .603 / .672, 14 .554 / .619, 16 .466 / .512, 20 .329 / .352, 24 .237 /
+.237. The 13 posted (non-resident, best first): .798 / .842 picked (10.37 / 10.95 of 13 a layer), covering .603 /
+.639 of the 17.2 non-resident picks a layer. Calibration of 1 − 1/key: the rows plan is close (predicted .35 → .37
+observed, .65 → .62, .85 → .80, .99 → .97); the early plan is overconfident from ~.3 up (.65 → .49, .85 → .66). So a
+probability cut is meaningful on the rows plan today and not on the early one; and the marginal posts (ranks 12–13,
+~.65–.72 on the rows plan) are still mostly hits — a cut there pays only if a miss's L3 damage exceeds ~2 hits.
+
 ## Design: a re-targetable stream with a strength-ordered budget
 
 The job stops being a batch with a deadline and becomes a stream with three correction points, each with better

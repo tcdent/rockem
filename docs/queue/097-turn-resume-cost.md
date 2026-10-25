@@ -39,6 +39,22 @@ Time to the first id, the same turn workload (18–41k context, one send a turn)
 | 1,500 | 6.24 s | 3.98–4.70 s |
 | 3,000 | 11.0 s | 7.37–7.63 s |
 
+## tcdent's session at 360k (aff85, 2026-10-25)
+The cold 360,680-token prefill: 2.2 ms a prompt token over 13.2 minutes, 1.97 at the start to 2.34 at 350k (the
+cards' share growing with context, `kda` 0.11 → 0.29; the CPU experts 1.38 → 1.57). The five turns after it, every
+resume held and in place:
+
+| new tokens | gap before the resume (with the tool's time) | sequence start to resume | prefill |
+|---|---|---|---|
+| 239 | 2.5 s | 1.66 s | 1.13 s |
+| 2,768 | 2.5 s | 1.74 s | 7.45 s |
+| 1,345 | 3.2 s | 1.75 s | 4.15 s |
+| 1,548 | 2.6 s | 1.77 s | 3.96 s |
+| 1,513 | 6.9 s | 1.78 s | 4.54 s |
+
+Before: 15.6–25.5 s a gap at 312–332k. What is left of the 1.7 s at 360k is `start` (~240 ms) and matching the ids
+(~1.4 s: ~4 µs an id) — the next lever on long turns.
+
 ## The split threshold
 A prefill step was split into the wavefront's two chunks from 64 tokens. Each chunk reads the weights of nearly every
 expert its tokens pick (a few hundred tokens touch almost all 256 of a layer), so a short turn read them twice. A lab
