@@ -81,10 +81,14 @@ pub const STEP: usize = 1024;
 /// chunk's arithmetic unchanged, the cards' and the host's halves of a layer overlapped instead of summed.
 /// A chunk is a contiguous run of the step's tokens (its rows in every step buffer at its first token's).
 pub const CHUNKS: usize = 2;
-/// The chunks of an `n`-token step: `CHUNKS` when each can be a launch pass (`TOKENS`) or more wide (so every
-/// chunk takes the prefill kernels and the prefill residency), else one.
+/// Steps narrower than this run as one chunk: each chunk reads the weights of nearly every expert its tokens picked (a
+/// few hundred tokens touch almost all of a layer's 256), so splitting a short step read them twice for the overlap's
+/// sake (076, 2026-10-25, the turn workload at 18–63k context: a 300-token turn 2.90 → 2.48–2.72 s unsplit, experts
+/// 0.87 → 0.48 s; from 700 tokens the split was as fast or faster).
+pub const CHUNK_FROM: usize = 512;
+/// The chunks of an `n`-token step: `CHUNKS` from `CHUNK_FROM` tokens, else one.
 pub const fn chunk_count(n: usize) -> usize {
-    if n >= CHUNKS * TOKENS { CHUNKS } else { 1 }
+    if n >= CHUNK_FROM { CHUNKS } else { 1 }
 }
 /// Chunk `c` of an `n`-token step as (first token, tokens): equal runs of whole passes, the last taking the
 /// remainder — a chunk starts on a pass boundary, as a step's passes do.

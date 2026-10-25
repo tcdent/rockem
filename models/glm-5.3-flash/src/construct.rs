@@ -2332,6 +2332,23 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             }
         }
     }
+    /// `seed` without the rows: `snap` as the KDA layers' state, the MLA layers' rows and pool keys left as they are
+    /// (the transcript they hold has the same ids up to the position resumed).
+    pub fn seed_state(&mut self, snap: &[f32]) {
+        assert_eq!(snap.len(), layout::SNAPSHOT);
+        let mut ki = 0;
+        for (l, st) in self.layers.iter_mut().enumerate() {
+            if let LayerState::Kda { window, mem } = st {
+                let base = ki * layout::KDA_STATE;
+                window.copy_from_slice(&snap[base..base + KDA_WINDOW]);
+                mem.copy_from_slice(&snap[base + KDA_WINDOW..base + layout::KDA_STATE]);
+                if let Some(p) = self.placed.as_mut() {
+                    p.seed(l, window, mem);
+                }
+                ki += 1;
+            }
+        }
+    }
     /// The bundle's prefix file: its rows, then its snapshot.
     pub fn seed_prefix(&mut self, w: &Weights, prefix: &[f32]) {
         assert_eq!(prefix.len(), layout::PREFIX_LEN);

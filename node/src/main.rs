@@ -121,11 +121,25 @@ impl Vocab {
 trait Segment {
     /// The first `len` f32s, streamed into `out`.
     fn read(&self, len: usize, out: &mut [f32]);
+    /// Whether the rows are the DRAM region the context was written in (`Store::reopen` can take it back).
+    fn is_dram(&self) -> bool {
+        false
+    }
+    /// That region, the segment left empty.
+    fn take_dram(&mut self) -> Vec<f32> {
+        unreachable!("not a DRAM segment")
+    }
 }
 struct Dram(Vec<f32>);
 impl Segment for Dram {
     fn read(&self, len: usize, out: &mut [f32]) {
         common::copy::stream(bytes_mut(&mut out[..len]), bytes(&self.0[..len]));
+    }
+    fn is_dram(&self) -> bool {
+        !self.0.is_empty()
+    }
+    fn take_dram(&mut self) -> Vec<f32> {
+        std::mem::take(&mut self.0)
     }
 }
 fn bytes(v: &[f32]) -> &[u8] {
@@ -220,6 +234,18 @@ impl Store {
         self.contexts[slot] = Some(c);
         slot
     }
+    /// A closed context the active one again, at its end: its rows the active region once more (moved back, not
+    /// copied), its end state no longer kept apart — the model holds it. The active region `start` opened is dropped.
+    fn reopen(&mut self, ctx: usize) -> usize {
+        let c = self.contexts[ctx].as_mut().unwrap();
+        self.active = c.rows.take_dram();
+        if !c.snap.is_empty() {
+            c.snap = Vec::new();
+            c.snap_logits = Vec::new();
+            self.held -= self.state_cost;
+        }
+        ctx
+    }
     /// Record position `n` of `ctx` (its id, key and rows are in place) and stay under budget.
     fn grew(&mut self, ctx: usize, n: usize) {
         let key = self.contexts[ctx].as_ref().unwrap().keys[n];
@@ -289,6 +315,12 @@ struct Session {
     active: usize,
     /// While the prompt is a prefix the store holds: (context, positions matched); nothing computed yet.
     pending: Option<(usize, usize)>,
+    /// What the model holds when a sequence starts: the closed context it last ran and the positions of it its
+    /// state covers. A resume within that transcript's own prefix restores only the sequence state (the rows
+    /// are in place); rebuilding every position's rows was ~70 µs a position a turn (~20 s at 320k, 2026-10-25).
+    installed: Option<(usize, usize)>,
+    /// When the current sequence started (its first prefix id): the resume's cost row counts from here.
+    started_at: Option<std::time::Instant>,
     hits: usize,
     /// Speculative decoding: the model carries a draft layer (the cards run it after every step).
     spec: bool,
@@ -328,13 +360,17 @@ impl Session {
     /// The first prefix id: a new context. Whether the model is seeded from the
     /// prefix or from a longer cached transcript is decided by the ids that follow.
     fn start(&mut self) {
+        let t_start = std::time::Instant::now();
+        self.started_at = Some(t_start);
         // the active region belongs to the active context whenever it is allocated; a new
         // connection resets `started` without closing, so the region, not the flag, decides
+        self.installed = None;
         if !self.store.active.is_empty() {
             let mut snap = vec![0f32; self.e.snapshot_len()];
             self.e.snapshot(&mut snap);
             let logits = if self.pos > self.first_pos() { self.e.logits_row(self.last_row).to_vec() } else { Vec::new() };
             self.store.close(self.active, snap, logits);
+            self.installed = Some((self.active, self.pos));
         }
         let (rows, _) = self.e.prefix();
         self.active = self.store.open(None, self.e.prefix_ids(), rows);
@@ -346,6 +382,7 @@ impl Session {
         self.pending = self.store.index.get(&self.store.contexts[self.active].as_ref().unwrap().keys[first - 1]).copied().filter(|&(c, _)| c != self.active);
         self.pos = first;
         self.prefix_left = first - 1;
+        prow::row!("track-store", "store_start", { "ms" => t_start.elapsed().as_secs_f64() * 1e3 });
         self.started = true;
         self.scoring = false;
         self.hits = 0;
@@ -392,7 +429,7 @@ impl Session {
         let n = n.min(matched);
         self.store.touch(src);
         let first = self.first_pos();
-        let (at, replay): (usize, Vec<u32>) = {
+        let (at, replay, held, in_place): (usize, Vec<u32>, bool, bool) = {
             let c = self.store.contexts[src].as_ref().unwrap();
             let at = if self.e.snapshot_len() == 0 || n == first {
                 n
@@ -408,14 +445,30 @@ impl Session {
                 }
                 best
             };
-            (at, c.ids[at..n].to_vec())
+            // the model already holds positions `..at` when the transcript it last ran has the same key there (the
+            // store's running hash of the ids): then only the sequence state is restored. Rebuilding every
+            // position's MLA rows and pool keys and uploading them a position at a time was ~27 µs a position a
+            // turn (2026-10-25: 0.5 s at 18k, ~9 s at 330k)
+            let held = at > first
+                && self.e.snapshot_len() > 0
+                && self.installed.is_some_and(|(ic, upto)| {
+                    at <= upto && self.store.contexts.get(ic).and_then(|x| x.as_ref()).is_some_and(|x| x.keys.len() >= at && x.keys[at - 1] == c.keys[at - 1])
+                });
+            // resumed at the end of the very transcript the sequence before it closed (an agent's next turn): that
+            // context goes on as the active one, its rows the active region again — not a copy of every position
+            // into a new one (~29 µs a position: 0.55 s at 18.7k, ~9.6 s at 330k, 2026-10-25)
+            let in_place = held && self.installed.map(|(ic, _)| ic) == Some(src) && at == c.ids.len() && !c.snap.is_empty() && c.rows.is_dram();
+            (at, c.ids[at..n].to_vec(), held, in_place)
         };
         let old = self.active;
-        let (rows, _) = self.e.prefix();
-        self.active = self.store.open(Some((src, at)), self.e.prefix_ids(), rows);
-        let gone = self.store.take(old);
-        self.store.held -= self.store.cost(&gone);
+        let t_open = std::time::Instant::now();
+        if !in_place {
+            let (rows, _) = self.e.prefix();
+            self.active = self.store.open(Some((src, at)), self.e.prefix_ids(), rows);
+        }
+        let open_ms = t_open.elapsed().as_secs_f64() * 1e3;
         let mut drawn = false;
+        let t_seed = std::time::Instant::now();
         if at == first {
             self.e.seed_prefix();
         } else {
@@ -428,7 +481,11 @@ impl Session {
                 let m = c.marks.iter().find(|(p, _, _)| *p == at).unwrap();
                 (&m.1, &m.2)
             };
-            self.e.seed(&self.store.active[..at * self.store.position], snap);
+            if held {
+                self.e.seed_state(snap);
+            } else {
+                self.e.seed(&self.store.active[..at * self.store.position], snap);
+            }
             // the logits kept with the state: the draw at this position needs no step
             if !logits.is_empty() {
                 self.e.set_logits(0, logits);
@@ -437,9 +494,17 @@ impl Session {
                 drawn = true;
             }
         }
+        let seed_ms = t_seed.elapsed().as_secs_f64() * 1e3;
+        if in_place {
+            self.active = self.store.reopen(src);
+        }
+        let gone = self.store.take(old);
+        self.store.held -= self.store.cost(&gone);
         self.pos = at;
         self.hits = at - first;
         prow::row!("track-store", "store_resume", { "matched" => n, "transcript" => self.store.contexts[src].as_ref().unwrap().ids.len(), "at" => at, "drawn" => drawn, "replayed" => replay.len() });
+        let since_start_ms = self.started_at.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e3);
+        prow::row!("track-store", "resume_cost", { "at" => at, "held" => held, "in_place" => in_place, "open_ms" => open_ms, "seed_ms" => seed_ms, "since_start_ms" => since_start_ms });
         replay.is_empty() || self.feed_many(&replay, &mut |_| {}, &|| false)
     }
     /// The sequence state now, kept with the active context at this position (the end of a
@@ -1004,7 +1069,7 @@ fn main() {
         let spec = e.drafts() && debug.is_none();
         let e_depth = if spec { e.draft_depth() } else { 0 };
         let vocab_n = e.vocab_size();
-        let session = Session { e, scoring: false, last_row: 0, next: 0, pos: first, max_ctx, started: false, prefix_left: 0, debug: debug.clone(), store, active: 0, pending: None, hits: 0, spec, drafts: vec![vec![0.0; vocab_n]; e_depth], depth: e_depth.min(1), draft_q: vec![0.0; e_depth], draft_made: e_depth.min(1), verified: 0, accepted: 0, audio_salt: 0, audio_fed: 0, audio_rows: 0 };
+        let session = Session { e, scoring: false, last_row: 0, next: 0, pos: first, max_ctx, started: false, prefix_left: 0, debug: debug.clone(), store, active: 0, pending: None, installed: None, started_at: None, hits: 0, spec, drafts: vec![vec![0.0; vocab_n]; e_depth], depth: e_depth.min(1), draft_q: vec![0.0; e_depth], draft_made: e_depth.min(1), verified: 0, accepted: 0, audio_salt: 0, audio_fed: 0, audio_rows: 0 };
         if spec {
             println!("spec     : the draft layer drafts up to {e_depth} tokens after every step, a further one while the last gives its token {} or more; verified in the next", session.e.draft_keep());
         }
@@ -1093,6 +1158,34 @@ mod store_tests {
         c.keys.push(k);
         let n = c.ids.len() - 1;
         s.grew(ctx, n);
+    }
+
+    /// The next turn of the transcript just closed resumes it in place: its rows are the active region again (the
+    /// same values, not a copy), its end state leaves the budget, and the prefix-only context `start` opened goes.
+    #[test]
+    fn reopen_takes_the_rows_back() {
+        let mut s = store();
+        s.state_cost = 5;
+        let a = s.open(None, &[1], &[0.5]);
+        for id in 2..10 {
+            append(&mut s, a, id);
+            s.active[id as usize - 1] = id as f32;
+        }
+        s.close(a, vec![1.0], vec![2.0]);
+        let held_closed = s.held;
+        let fresh = s.open(None, &[1], &[0.5]);
+        assert!(s.contexts[a].as_ref().unwrap().rows.is_dram());
+        let r = s.reopen(a);
+        assert_eq!(r, a);
+        assert_eq!(&s.active[..9], &[0.5, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
+        let c = s.contexts[a].as_ref().unwrap();
+        assert!(c.snap.is_empty() && !c.rows.is_dram());
+        assert_eq!(c.ids.len(), 9);
+        let gone = s.take(fresh);
+        s.held -= s.cost(&gone);
+        assert_eq!(s.held, held_closed - 5, "the end state left the budget; the prefix-only context is gone");
+        append(&mut s, a, 10);
+        assert_eq!(s.index.get(s.contexts[a].as_ref().unwrap().keys.last().unwrap()), Some(&(a, 10)));
     }
 
     /// A conversation's turns as the node builds them — each a new context seeded from the last one's transcript, then

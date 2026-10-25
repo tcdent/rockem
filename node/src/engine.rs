@@ -48,6 +48,11 @@ pub trait Engine {
     /// Install `rows` (`[n][position]`) as positions `0..n`, and `snap` as the
     /// state at `n` (empty for a model without snapshots); computing resumes at `n`.
     fn seed(&mut self, rows: &[f32], snap: &[f32]);
+    /// Install `snap` as the sequence state, the positions' rows already in place (the model last ran a
+    /// transcript with the same ids up to here). Only a model with a snapshot (`snapshot_len() > 0`).
+    fn seed_state(&mut self, _snap: &[f32]) {
+        unreachable!("a model whose state is all rows has no state to seed apart from them")
+    }
     /// The sequence state now, `snapshot_len()` f32s.
     fn snapshot(&self, out: &mut [f32]);
     /// `toks` at positions `pos..pos + n` through the model (`n <= tokens()`);

@@ -249,6 +249,9 @@ impl Engine for Glm {
     fn seed(&mut self, rows: &[f32], snap: &[f32]) {
         self.model.seed(&self.w, rows, snap)
     }
+    fn seed_state(&mut self, snap: &[f32]) {
+        self.model.seed_state(snap)
+    }
     fn snapshot(&self, out: &mut [f32]) {
         self.model.snapshot(out)
     }
