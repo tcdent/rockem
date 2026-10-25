@@ -106,31 +106,51 @@ class Engine:
             self.replies.popitem(last=False)
 
     def ids(self, req: Request) -> list[int]:
+        """The request's ids. A chat renders once: the template notes where each message starts
+        (`Edge.render_noted`), each remembered assistant turn becomes the generation prompt's ids
+        then the ids it was generated as, and the text between those turns is encoded in one
+        batch. The splits are the ones the per-turn path made, so the ids are the same; that path
+        rendered the whole history three times a turn, 12 s at 165k tokens (rockem.lead and
+        tcdent, 2026-10-25: speed, with no conversation cache beside the node's). The text is cut
+        further only before special tokens, where cutting cannot change the ids."""
         if req.ids is not None:
             return req.ids
         if req.messages is None:
             return self.edge.encode(req.prompt or "")
-        msgs, tools = req.messages, req.tools
-        e = req.reasoning_effort
-        full = self.edge.render(msgs, tools, reasoning_effort=e)
-        out: list[int] = []
-        done = ""  # the rendered text encoded so far
+        msgs = req.messages
+        full, starts = self.edge.render_noted(msgs, req.tools, req.reasoning_effort)
+        opening = self.edge.generation_prompt
+        ends = starts[1:] + [len(full) - len(opening)]  # where each message's text ends
+        marks = self.edge.split_marks
+        texts: list[str] = []  # text to encode, in order, each piece on its own
+        plan: list[int | list[int]] = []  # the ids in order: a piece's index, or a remembered turn's ids
+        done = 0
+
+        def text(a: int, b: int, tail: str = "") -> None:
+            # a's text up to b, cut further before every message that starts with a split mark
+            # (exact: the tokenizer encodes either side of a special token on its own), so the
+            # batch encodes in parallel: 1.36 s for 0.73 MB at once, 0.06 s in message pieces
+            cuts = [a] + [p for p in starts if a < p < b and full.startswith(marks, p)] + [b]
+            for x, y in zip(cuts, cuts[1:]):
+                plan.append(len(texts))
+                texts.append(full[x:y] + (tail if y == b else ""))
+
         for i, m in enumerate(msgs):
             content = m.get("content") if m.get("role") == "assistant" else None
             ids = self.replies.get((m.get("reasoning_content") or "", content)) if isinstance(content, str) else None
-            if ids is None:
+            if ids is None or not full.startswith(opening, starts[i]):
                 continue
-            before = self.edge.render(msgs[:i], tools, add_generation_prompt=False, reasoning_effort=e)
-            opened = self.edge.render(msgs[:i], tools, add_generation_prompt=True, reasoning_effort=e)
-            after = self.edge.render(msgs[: i + 1], tools, add_generation_prompt=False, reasoning_effort=e)
-            if not (full.startswith(after) and after.startswith(before) and opened.startswith(before) and len(before) >= len(done)):
-                continue
-            # the text up to this turn's opening (the generation prompt it was generated after), then the ids as generated
-            out.extend(self.edge.encode(before[len(done):] + opened[len(before):]))
-            out.extend(ids)
-            done = after
-            log.info("turn %d rendered from its %d generated ids", i, len(ids))
-        out.extend(self.edge.encode(full[len(done):]))
+            text(done, starts[i], opening)  # the text before the turn, and the opening it was generated after
+            plan.append(ids)
+            done = ends[i]
+        text(done, len(full))
+        encoded = self.edge.encode_batch(texts)
+        out: list[int] = []
+        for step in plan:
+            out += encoded[step] if isinstance(step, int) else step
+        turns = sum(isinstance(step, list) for step in plan)
+        if turns:
+            log.info("%d turns rendered from their generated ids", turns)
         return out
 
     async def start(self, req: Request) -> Run:

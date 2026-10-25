@@ -285,8 +285,8 @@ async def test_internal_adapter_flushes_by_time(client, node, monkeypatch):
 
 async def test_reasoning_effort_defaults_low_and_is_checked(client, engine, monkeypatch):
     seen = []
-    render = engine.edge.render
-    monkeypatch.setattr(engine.edge, "render", lambda *a, **k: (seen.append(k.get("reasoning_effort")), render(*a, **k))[1])
+    render = engine.edge.render_noted
+    monkeypatch.setattr(engine.edge, "render_noted", lambda *a, **k: (seen.append(a[2] if len(a) > 2 else k.get("reasoning_effort")), render(*a, **k))[1])
     await client.post("/rockem/v1/generate", json={"messages": [{"role": "user", "content": "hello"}]})
     await client.post("/rockem/v1/generate", json={"messages": [{"role": "user", "content": "hello"}], "reasoning_effort": "max"})
     assert seen[0] == "low" and seen[-1] == "max"
