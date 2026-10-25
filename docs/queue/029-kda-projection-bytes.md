@@ -72,6 +72,45 @@ cards: on SCORE `experts` 1.24 → 1.10 and `kda` 0.25 → 0.44, the total the s
 token (the unpack, at 1,024-wide steps). The boot's encode is single-threaded on the host: +26.6 s a boot.
 `Quantified, on the shelf — 26 s a boot`: the encode split over the loader's threads.
 
+## Why exp4 is not faster in the node (2026-10-25)
+
+The rows kernels' 1.08–1.17× in the isolated bench did not reach the node (aff83 verify steps: `sq` 159.9 → 150.9 µs,
+`o` 59.9 → 60.8, from the card lanes). `bench-exp4 --node` runs each layer's `sq`, `fg`, `o` back to back as the node
+does, every launch timed from its own stamps; it reproduces the node (`o` 1.02×). The isolated `o` gain was the
+Infinity Cache: three layers of `o` alone (100 MB) partly fit its 80 MB, and in the node `o` follows an 80–103 MB `sq`.
+
+Three limiters, in the order found:
+
+1. **The compiler sank the chunk loads into the decode branch.** The chunk is used only when the group is not stored
+   whole, so LLVM moved its load under the head's test and waited for it at once (`s_waitcnt vmcnt(0)` a row a step):
+   a round trip a row. Decoding on every lane and selecting the whole group's bf16 (loaded on its rare branch only)
+   keeps the loads together. With two steps' loads issued ahead (`EXP4_AHEAD`), node order, bits equal:
+
+   | node order, × against bf16 | 1 token | 2–4 tokens |
+   |---|---|---|
+   | aff83 (shipped) | sq 1.11, o 1.01 | sq 1.08–1.09, o 1.02 |
+   | select + two ahead | sq 1.21, fg 1.21, o 1.20 | sq 1.08–1.10, fg 1.06–1.08, o 1.04–1.05 |
+   | select, one ahead | sq 1.22, o 1.10 | sq 1.13, o 1.03 (the run hung the card at 4 tokens, below) |
+
+2. **`sq` at verify widths: workgroup rounds.** Wave stamps (a throwaway stats build; each wave's start and end):
+   an exp4 wave takes 46 µs against bf16's 66, but at 152 registers the card holds two workgroups a CU, so the 394
+   workgroups run in three rounds, the last a third full; bf16 (140 registers) holds two and a half and runs in two.
+   The launch is 133 µs against 148. Fewer registers (≤ 128: three a CU) or a grid sized to the card's slots is the lever.
+
+3. **`o` at verify widths: rounds in lockstep.** `o` is 128 workgroups: every wave starts at once and they move
+   through each round together — stage the activations, barrier, load the weights, compute, barrier — so DRAM idles
+   while everyone stages and computes, and fewer bytes shorten only the loading. Waves take ~40 µs either way. The
+   lever: fetch the next round's weights before the barrier (`workgroup_sync` waits on LDS only, so loads can stay in
+   flight across it).
+
+Neither lever is built. The select form is in the tree, not deployed (verify steps ~0.2 ms a step at 18k by the
+node-order layer times, 216 → 211 µs a layer a card).
+
+**A card hang (2026-10-25):** the one-ahead build hung card 0 in `bench-exp4 --node` at 4 tokens (exp4 sequence; the
+same ELF had passed 1–3 tokens and the bit checks at every width). The node on that card panicked and the box reset.
+Not reproduced or explained; the two-ahead build ran every width twice without it. Benches beside the serving node
+share its card: a hang there takes production down.
+
 ## History
 - 2026-10-25 (aff83): exp4 deployed — the node holds only exp4, generation bit-identical, ~1.07 GB a card freed.
 - 2026-10-17 (`bdc57ec`): DFloat11 scoped; not built.

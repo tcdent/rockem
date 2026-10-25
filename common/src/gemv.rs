@@ -534,6 +534,16 @@ pub mod gfx11 {
         unsafe fn row(self, row: usize) -> Self::Row;
         /// The wave's `R` rows' step `s` against the pass's `NP` staged tokens.
         unsafe fn step<const NP: usize, const R: usize>(lane: u32, r: &[Self::Row; R], s: usize, slab: *const f32, lds: *const f32, acc: &mut [[f32; PASS]; R]);
+        /// A full round: `count` steps from `s0`, step `k`'s tokens staged at `slab + k · NP · STEP`. The steps in turn,
+        /// unless a format loads the round's weights ahead of its arithmetic (`Exp4`).
+        #[inline(always)]
+        unsafe fn round<const NP: usize, const R: usize>(lane: u32, r: &[Self::Row; R], s0: usize, count: usize, slab: *const f32, lds: *const f32, acc: &mut [[f32; PASS]; R]) {
+            let mut k = 0;
+            while k < count {
+                Self::step::<NP, R>(lane, r, s0 + k, slab.add(k * NP * STEP), lds, acc);
+                k += 1;
+            }
+        }
     }
     /// bf16 rows: `bf16_row_step`.
     #[derive(Clone, Copy)]
@@ -588,7 +598,34 @@ pub mod gfx11 {
         unsafe fn step<const NP: usize, const R: usize>(lane: u32, r: &[Self::Row; R], s: usize, slab: *const f32, _: *const f32, acc: &mut [[f32; PASS]; R]) {
             exp4_row_step::<K, NP, R>(lane, r, s, slab, acc)
         }
+        /// The round's chunks and heads loaded `EXP4_AHEAD` steps at a time before any is decoded: a step's loads alone
+        /// (twelve bytes a lane a row) left the few-token kernels waiting a round trip a step, at 0.77 of the bf16
+        /// bytes and the same time (bench-exp4 --node 2026-10-25: `o` 1.02×).
+        #[inline(always)]
+        unsafe fn round<const NP: usize, const R: usize>(lane: u32, r: &[Self::Row; R], s0: usize, count: usize, slab: *const f32, _: *const f32, acc: &mut [[f32; PASS]; R]) {
+            let mut k = 0;
+            while k + EXP4_AHEAD <= count {
+                let mut f = [Exp4Fetch::<R>::EMPTY; EXP4_AHEAD];
+                let mut d = 0;
+                while d < EXP4_AHEAD {
+                    f[d] = exp4_fetch::<K, R>(lane, r, s0 + k + d);
+                    d += 1;
+                }
+                let mut d = 0;
+                while d < EXP4_AHEAD {
+                    exp4_compute::<K, NP, R>(lane, r, s0 + k + d, &f[d], slab.add((k + d) * NP * STEP), acc);
+                    d += 1;
+                }
+                k += EXP4_AHEAD;
+            }
+            while k < count {
+                exp4_row_step::<K, NP, R>(lane, r, s0 + k, slab.add(k * NP * STEP), acc);
+                k += 1;
+            }
+        }
     }
+    /// Steps of a round whose exp4 loads are issued together (`Exp4::round`).
+    pub const EXP4_AHEAD: usize = 2;
     /// A chunk's eight weights as bf16 pairs — weight q in the low half of pair q, weight 4 + q in the high — from its
     /// sign-and-mantissa bytes (`lo` weights 0–3, `hi` 4–7), its nibbles `cb` and its group's base exponent: weights q
     /// and 4 + q at once, their bytes by one byte permute, their codes by a shift and a mask (code q at bit 4q, code
@@ -648,10 +685,51 @@ pub mod gfx11 {
         let (lo, hi) = (readfirstlane(a as u32 as i32) as u32 as u64, readfirstlane((a >> 32) as u32 as i32) as u32 as u64);
         (lo | (hi << 32)) as *const T
     }
-    /// `bf16_row_step` for exp4 rows: the lane's eight weights rebuilt as bf16 (`crate::exp4::weight`'s rule), then the
-    /// same widening and the same products in the same order.
+    /// One step's loads of an exp4 rows step, for `R` rows: each row's head for the lane's group, its eight
+    /// sign-and-mantissa bytes and its nibbles.
+    #[derive(Clone, Copy)]
+    pub struct Exp4Fetch<const R: usize> {
+        h: [u32; R],
+        mb: [u64; R],
+        cb: [u32; R],
+    }
+    impl<const R: usize> Exp4Fetch<R> {
+        const EMPTY: Self = Exp4Fetch { h: [0; R], mb: [0; R], cb: [0; R] };
+    }
+    /// Every row's head, bytes and nibbles of step `s`, loaded together: they do not depend on each other, so the
+    /// three loads of all R rows are in flight at once, as the bf16 step's are. Loading the bytes only after the head
+    /// said the group was not raw made each step two trips to VRAM (bench-exp4, 2026-10-25: rows_h_e4 at 0.70× the
+    /// bf16 kernel).
     #[inline(always)]
-    pub unsafe fn exp4_row_step<const K: usize, const NP: usize, const R: usize>(lane: u32, w: &[(*const u8, *const u32, *const u16); R], s: usize, slab: *const f32, acc: &mut [[f32; PASS]; R]) {
+    pub unsafe fn exp4_fetch<const K: usize, const R: usize>(lane: u32, w: &[(*const u8, *const u32, *const u16); R], s: usize) -> Exp4Fetch<R> {
+        use crate::exp4::GROUP;
+        let l = lane as usize;
+        let base = s * 256 + l * 8;
+        let mut f = Exp4Fetch::<R>::EMPTY;
+        if base < K {
+            // the step's two groups' heads: the same for every lane of the wave, each lane taking its half's
+            let groups = K / GROUP;
+            let g0 = 2 * s;
+            let mut r = 0;
+            while r < R {
+                let (chunk, head, _) = w[r];
+                let head = uniform(head);
+                let h0 = *head.add(g0);
+                let h1 = if g0 + 1 < groups { *head.add(g0 + 1) } else { 0 };
+                f.h[r] = if l < 16 { h0 } else { h1 };
+                let p = chunk.add((base / 8) * crate::exp4::CHUNK) as *const u32;
+                let (a, b, c) = (core::ptr::read_unaligned(p), core::ptr::read_unaligned(p.add(1)), core::ptr::read_unaligned(p.add(2)));
+                f.mb[r] = a as u64 | ((b as u64) << 32);
+                f.cb[r] = c;
+                r += 1;
+            }
+        }
+        f
+    }
+    /// Step `s` from its loads: the lane's eight weights rebuilt as bf16 (`crate::exp4::weight`'s rule), then the
+    /// bf16 step's widening and products in its order.
+    #[inline(always)]
+    pub unsafe fn exp4_compute<const K: usize, const NP: usize, const R: usize>(lane: u32, w: &[(*const u8, *const u32, *const u16); R], s: usize, f: &Exp4Fetch<R>, slab: *const f32, acc: &mut [[f32; PASS]; R]) {
         const { assert!(K % 8 == 0 && NP <= PASS && crate::exp4::GROUP == 128 && STEP_WEIGHTS == 2 * crate::exp4::GROUP) };
         use crate::exp4::GROUP;
         let l = lane as usize;
@@ -661,49 +739,30 @@ pub mod gfx11 {
             // each use (the same f32 as the bf16 step's, so the same products): half the registers of eight f32 a row,
             // which kept `rows_h_e4`'s four rows out of scratch (2026-10-25)
             let mut pw = [[0u32; 4]; R];
-            // every row's head, bytes and nibbles loaded first and together: they do not depend on each other, so the
-            // three loads of all R rows are in flight at once, as the bf16 step's are. Loading the bytes only after
-            // the head said the group was not raw made each step two trips to VRAM (bench-exp4, 2026-10-25: rows_h_e4
-            // at 0.70× the bf16 kernel)
-            let mut hs = [0u32; R];
-            let mut mbs = [0u64; R];
-            let mut cbs = [0u32; R];
-            // the step's two groups' heads: the same for every lane of the wave (scalar loads), each lane taking its half's
-            let groups = K / GROUP;
-            let g0 = 2 * s;
             let mut r = 0;
             while r < R {
-                let (chunk, head, _) = w[r];
-                // the row is the wave's, so its heads are: scalar loads, off the vector memory path the chunks use
-                let head = uniform(head);
-                let h0 = *head.add(g0);
-                let h1 = if g0 + 1 < groups { *head.add(g0 + 1) } else { 0 };
-                hs[r] = if l < 16 { h0 } else { h1 };
-                let p = chunk.add((base / 8) * crate::exp4::CHUNK) as *const u32;
-                let (a, b, c) = (core::ptr::read_unaligned(p), core::ptr::read_unaligned(p.add(1)), core::ptr::read_unaligned(p.add(2)));
-                mbs[r] = a as u64 | ((b as u64) << 32);
-                cbs[r] = c;
-                r += 1;
-            }
-            let mut r = 0;
-            while r < R {
-                let (h, mb, cb) = (hs[r], mbs[r], cbs[r]);
+                let (h, mb, cb) = (f.h[r], f.mb[r], f.cb[r]);
                 let slot = (h >> 8) as usize;
+                // weights q and 4 + q at once, one in each half of a register (`exp4_pairs`) — decoded on every lane and
+                // selected, never decoded only off a branch: the chunk's loads, used only on that branch, were sunk
+                // into it by the compiler, each issued after the head's test and waited at once (`s_waitcnt vmcnt(0)`
+                // a row a step, 2026-10-25), which held the kernels to a round trip a row
+                let dec = exp4_pairs(mb as u32, (mb >> 32) as u32, cb, h & 0xFF);
+                let mut whole = [0u32; 4];
                 if slot != 0 {
                     // a group stored whole (0.68 % of groups): its bf16 as the bf16 step reads them
                     let p = w[r].2.add(slot * GROUP + base % GROUP) as *const u64;
                     let (a, b) = (core::ptr::read_unaligned(p), core::ptr::read_unaligned(p.add(1)));
                     let mut q = 0;
                     while q < 4 {
-                        pw[r][q] = ((a >> (16 * q)) & 0xFFFF) as u32 | ((((b >> (16 * q)) & 0xFFFF) as u32) << 16);
+                        whole[q] = ((a >> (16 * q)) & 0xFFFF) as u32 | ((((b >> (16 * q)) & 0xFFFF) as u32) << 16);
                         q += 1;
                     }
-                } else {
-                    // weights q and 4 + q at once, one in each half of a register: their sign-and-mantissa bytes by one
-                    // byte permute, their codes by a shift and a mask (the chunk's codes in nibble order put code q at
-                    // bit 4q and code 4 + q at bit 16 + 4q), the base added to both halves (no half passes 255, so
-                    // nothing carries), then sign, exponent and mantissa into place: about five operations a weight
-                    pw[r] = exp4_pairs(mb as u32, (mb >> 32) as u32, cb, h & 0xFF);
+                }
+                let mut q = 0;
+                while q < 4 {
+                    pw[r][q] = if slot != 0 { whole[q] } else { dec[q] };
+                    q += 1;
                 }
                 r += 1;
             }
@@ -724,6 +783,12 @@ pub mod gfx11 {
                 i += 1;
             }
         }
+    }
+    /// `bf16_row_step` for exp4 rows: one step's loads, then its arithmetic.
+    #[inline(always)]
+    pub unsafe fn exp4_row_step<const K: usize, const NP: usize, const R: usize>(lane: u32, w: &[(*const u8, *const u32, *const u16); R], s: usize, slab: *const f32, acc: &mut [[f32; PASS]; R]) {
+        let f = exp4_fetch::<K, R>(lane, w, s);
+        exp4_compute::<K, NP, R>(lane, w, s, &f, slab, acc)
     }
     /// FP8 e4m3 rows with an f32 scale per `FP8_BLOCK`-square block (`super::fp8`'s
     /// layout): a row is its bytes and its block row of scales. The decode is a
@@ -957,11 +1022,7 @@ pub mod gfx11 {
                 t0 = t;
             }
             if live {
-                let mut k = 0;
-                while k < r {
-                    F::step::<NP, R>(lane, &wr, s0 + k, slab.add(k * NP * STEP), fmt, &mut acc);
-                    k += 1;
-                }
+                F::round::<NP, R>(lane, &wr, s0, r, slab, fmt, &mut acc);
             }
             crate::gfx11::workgroup_sync();
             #[cfg(all(target_arch = "amdgpu", feature = "stats"))]

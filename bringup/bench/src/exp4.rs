@@ -10,7 +10,11 @@
 //! widths `--wn`, against the same kernels on the bf16 matrix: the outputs' bits, and the unpack's time beside the
 //! launch's (chains of 8: a launch is milliseconds).
 //!
-//!   bench-exp4 --elf <kernels.gfx1100.elf> --bundle <bundle dir> [--layers 3] [--n 1,2,3,4] [--wn 32,128,512] [--iters 20]
+//! Then the node's order (`--node`): each layer's `sq`, `fg` and `o` back to back as the node launches them in a decode
+//! or verify step, rotating over the layers, so each matrix is read after the others streamed through the cache, as in
+//! serving; each launch timed from its own stamps (median a kernel, µs), bf16 and exp4 as separate sequences.
+//!
+//!   bench-exp4 --elf <kernels.gfx1100.elf> --bundle <bundle dir> [--layers 3] [--n 1,2,3,4] [--wn 32,128,512] [--iters 20] [--node]
 #![allow(clippy::missing_safety_doc)]
 #[path = "../../../node/src/kfd.rs"]
 #[allow(dead_code)]
@@ -53,7 +57,8 @@ fn main() {
     let f = std::fs::File::open(dir.join(glm_5_3_flash::layout::DENSE_FILE)).unwrap();
     let dense = unsafe { memmap2::Mmap::map(&f).unwrap() };
     let w = Weights::from_dense(&dense);
-    let k = kfd::Kfd::open(&elf, false, 0);
+    // stamped launches, as the node runs (deploys keep track-launches): the node-shaped section reads each launch's time
+    let k = kfd::Kfd::open(&elf, true, 0);
     let kern = |n: &str| k.kernel(n);
     let (rows_h, rows_h1, rows_h_e4, rows_h1_e4) = (kern("rows_h"), kern("rows_h1"), kern("rows_h_e4"), kern("rows_h1_e4"));
     let (rows_part, rows_part1, rows_part_e4, rows_part1_e4) = (kern("rows_part"), kern("rows_part1"), kern("rows_part_e4"), kern("rows_part1_e4"));
@@ -164,6 +169,90 @@ fn main() {
             };
             let (tb, te) = (time(kb, &mat.bf), time(ke, &mat.e4));
             println!("{:>4} {n:>3} {tb:>9.1} {te:>9.1} {:>9.0} {:>9.0} {:>8.2}  {}", mat.name, mat.bytes_bf as f64 / tb / 1e3, mat.bytes_e4 as f64 / te / 1e3, tb / te, if differ == 0 { "equal".to_string() } else { format!("{differ} of {} words differ", n * mat.m * mat.bf.len()) });
+        }
+    }
+    if harness::flag("--node") {
+        println!("node order (sq, fg, o a layer, rotating over {} layers), µs a launch from its stamps, median:", kda.len());
+        println!("{:>3} {:>6} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}", "n", "", "sq", "fg", "o", "layer", "sq GB/s", "o GB/s", "", "");
+        let (sq, o, fg) = (&mats[0], &mats[1], &mats[2]);
+        for &n in &ns {
+            let mut res = Vec::new();
+            for e4 in [false, true] {
+                let narrow = |m: usize| n > 1 && m.div_ceil(common::gemv::rows_per_wg(n, common::gemv::ROWS)) < k.cu;
+                let pick = |m: &Mat| -> (&kfd::Kernel, u32) {
+                    let nr = narrow(m.m) && m.name != "fg";
+                    let kern = match (m.name, nr, e4) {
+                        ("sq", false, false) => &rows_h, ("sq", true, false) => &rows_h1, ("sq", false, true) => &rows_h_e4, ("sq", true, true) => &rows_h1_e4,
+                        ("o", false, false) => &rows_part, ("o", true, false) => &rows_part1, ("o", false, true) => &rows_part_e4, ("o", true, true) => &rows_part1_e4,
+                        (_, _, false) => &rows_d2, (_, _, true) => &rows_d2_e4,
+                    };
+                    (kern, g::rows_grid(m.m, n, if nr { 1 } else { common::gemv::ROWS }))
+                };
+                let one = |m: &Mat, li: usize| {
+                    let (kern, grid) = pick(m);
+                    let lds = match m.name { "sq" => g::normed_rows_lds(H, n), "o" => g::rows_lds(g::PART_QKV, n), _ => g::rows_lds(KDA_DIM, n) } as u32;
+                    let mut a = kfd::Args::new();
+                    a.ptr(bx.va);
+                    if m.name == "sq" {
+                        a.ptr(bln.va);
+                    }
+                    a.ptr(if e4 { m.e4[li].va } else { m.bf[li].va }).ptr(oa.va).u32(m.m as u32).u32(n as u32);
+                    if m.name == "fg" {
+                        a.u32(g::PART_QKV as u32).u32(KDA_DIM as u32 * 2);
+                    }
+                    k.launch(kern, grid, g::WG, lds, &a);
+                };
+                let (mut t_sq, mut t_fg, mut t_o, mut t_layer) = (vec![], vec![], vec![], vec![]);
+                // with a stats code object: each launch's waves' phases (`rows_pass`: staging, weight steps, tail; shader
+                // cycles), the median wave a launch, then the median launch a kernel
+                let mut ph: [[Vec<f64>; 3]; 3] = Default::default();
+                for it in 0..iters + 1 {
+                    // a chain of 40 layers (120 launches, inside the ring), one sync
+                    for c in 0..40 {
+                        let li = c % kda.len();
+                        one(sq, li);
+                        one(fg, li);
+                        one(o, li);
+                    }
+                    k.sync();
+                    if it == 0 {
+                        continue; // the first chain warms the clocks and the code
+                    }
+                    for (j, (_, slots)) in k.stats().iter().enumerate() {
+                        for (q, v) in slots.iter().take(3).enumerate() {
+                            if v.is_empty() {
+                                continue;
+                            }
+                            let mut v: Vec<f64> = v.iter().map(|&x| x as f64).collect();
+                            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                            ph[j % 3][q].push(v[v.len() / 2]);
+                        }
+                    }
+                    let tl = k.timeline();
+                    for l in tl.chunks_exact(3) {
+                        let us = |x: &(&str, u64, u64)| (x.2 - x.1) as f64 / 100.0;
+                        t_sq.push(us(&l[0]));
+                        t_fg.push(us(&l[1]));
+                        t_o.push(us(&l[2]));
+                        t_layer.push((l[2].2 - l[0].1) as f64 / 100.0);
+                    }
+                }
+                let med = |v: &mut Vec<f64>| { v.sort_by(|a, b| a.partial_cmp(b).unwrap()); v[v.len() / 2] };
+                let (a, b, c, d) = (med(&mut t_sq), med(&mut t_fg), med(&mut t_o), med(&mut t_layer));
+                let (bs, bo) = if e4 { (sq.bytes_e4, o.bytes_e4) } else { (sq.bytes_bf, o.bytes_bf) };
+                println!("{n:>3} {:>6} {a:>9.1} {b:>9.1} {c:>9.1} {d:>9.1} {:>9.0} {:>9.0}", if e4 { "exp4" } else { "bf16" }, bs as f64 / a / 1e3, bo as f64 / c / 1e3);
+                if !ph[0][0].is_empty() {
+                    let mut line = format!("{n:>3} {:>6}", "phases");
+                    for (j, name) in ["sq", "fg", "o"].iter().enumerate() {
+                        let [st, sp, tl] = &mut ph[j];
+                        line += &format!("  {name} stage/steps/tail {:.0}/{:.0}/{:.0} cycles", med(st), med(sp), med(tl));
+                    }
+                    println!("{line}");
+                }
+                res.push((a, b, c, d));
+            }
+            let (x, y) = (res[0], res[1]);
+            println!("{n:>3} {:>6} {:>9.2} {:>9.2} {:>9.2} {:>9.2}", "×", x.0 / y.0, x.1 / y.1, x.2 / y.2, x.3 / y.3);
         }
     }
     // the prefill path: unpack, then the bf16 matrix kernel on the scratch
