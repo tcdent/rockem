@@ -86,6 +86,24 @@ observed, .65 → .62, .85 → .80, .99 → .97); the early plan is overconfiden
 probability cut is meaningful on the rows plan today and not on the early one; and the marginal posts (ranks 12–13,
 ~.65–.72 on the rows plan) are still mostly hits — a cut there pays only if a miss's L3 damage exceeds ~2 hits.
 
+## The cap sweep (lab090, 2026-10-25): the window, not the cap, is the limit
+A lab node cycled `PREFETCH_CAP` per decode step (11 / 13 / 15 / 17), the step and use rows carrying it; eight 107-token
+decodes at 18k, 120 verify steps a cap (`bringup/reads/cap_sweep.sh`):
+
+| cap | experts, ms a token | total, ms a token | complete | partial | missed | complete L3 | partial L3 | all L3 |
+|---|---|---|---|---|---|---|---|---|
+| 11 | 7.67 | 22.31 | 7.53 | 2.52 | 4.75 | 86.5 % | 73.0 % | 56.1 % |
+| 13 | 7.56 | 21.74 | 7.52 | 3.78 | 3.93 | 84.3 % | 58.4 % | 56.5 % |
+| 15 | 7.70 | 21.98 | 7.73 | 4.54 | 3.16 | 82.7 % | 47.7 % | 56.1 % |
+| 17 | 7.59 | 21.97 | 7.89 | 5.07 | 2.28 | 81.1 % | 42.7 % | 56.9 % |
+
+The prefetch completes ~7.5–7.9 experts a layer whatever it posts — even at 11 it leaves 2.5 partial: it is bound by
+its window (the time from the amend to the run, at the delivery rate), not by its cap. A larger cap turns misses into
+partials and dilutes every expert's L3 share; the share of all the run's lines served from L3 stays at 56–57 %, and the
+`experts` lap does not move (within ±0.1 ms a token). So trimming low-confidence posts saves nothing (the window never
+reached them in full), and posting more gains nothing. What moves the L3-served share is more window — the plan
+earlier, as good as the rows plan (098) — or more delivery inside it. `PREFETCH_CAP` stays 13.
+
 ## Design: a re-targetable stream with a strength-ordered budget
 
 The job stops being a batch with a deadline and becomes a stream with three correction points, each with better
@@ -128,9 +146,8 @@ experts "before the run arrives"; there is no time between the two.)
 tcdent (2026-10-21); bringup/reads/prefetch.sh (done share, window) and prefetch_use.sh (status, L3 shares).
 
 ## Next
-0. The post's size, first — a cap sweep (`PREFETCH_CAP` 9 / 11 / 13 / 15) against the `experts` lap and the complete
-   experts' L3 share: fewer, surer posts against the ~2.6 mispredicted experts' L3 pollution; then the per-rank
-   P(picked) curve (2 below) to make the cut a score threshold rather than a count.
+0. Done 2026-10-25: the cap sweep (above) — the window binds, not the cap; the per-rank curve is measured (`plan_eval`).
+   Next: a longer window (098's earlier plan) or more delivery inside it.
 1. The truth-cut with the keep-open (stages one and two together, after phase 0): re-target the open job at
    `ffn_input` to the real picks − residents, cut experts' takers stopped; measured by `prefetch_use`'s
    complete/partial/missed and the `experts` lap against aff83's 7.26 / 3.15 / 4.73 baseline.
@@ -156,3 +173,6 @@ tcdent (2026-10-21); bringup/reads/prefetch.sh (done share, window) and prefetch
   lines streamed inside a DRAM-bound run free no bandwidth, so the ~0.5–1 ms estimate is withdrawn; the misprediction
   tax is a bound; the score's calibration is unmeasured (it is a probability by design, corrected the same day); the truth-cut has no window without the keep-open. Added: the
   job table and the cap sweep as the first measurement.
+
+- 2026-10-25 (lab090): the cap sweep — 11 to 17 posts complete the same ~7.5–7.9 experts, the L3-served share flat at
+  56–57 %, the `experts` lap unchanged: the window is the limit.
