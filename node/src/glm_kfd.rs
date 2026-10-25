@@ -164,8 +164,13 @@ struct Card {
     rows_h1: crate::kfd::Kernel,
     rows_h_w: crate::kfd::Kernel,
     rows_d2: crate::kfd::Kernel,
-    rows_part: crate::kfd::Kernel,
-    rows_part1: crate::kfd::Kernel,
+    // the KDA matrices are held in exp4 (029): the decode path's kernels read it, a prefill step unpacks it to bf16
+    rows_h_e4: crate::kfd::Kernel,
+    rows_h1_e4: crate::kfd::Kernel,
+    rows_d2_e4: crate::kfd::Kernel,
+    rows_part_e4: crate::kfd::Kernel,
+    rows_part1_e4: crate::kfd::Kernel,
+    exp4_unpack: crate::kfd::Kernel,
     rows_part_w: crate::kfd::Kernel,
     mtp_eh_w: crate::kfd::Kernel,
     ffn_gu_w: crate::kfd::Kernel,
@@ -241,6 +246,10 @@ struct Card {
     smixs: Vec<Mem>,   // [PARTS][STEP][SMALL_ROWS + 3·PART_QKV] f32: fa | ga | beta | q | k | v, one launch's rows
     fgs: Vec<Mem>,     // [PARTS][STEP][2][PART_QKV]: a part's f | gate
     normeds: Vec<Mem>, // [PARTS][STEP][PART_QKV]
+    // a prefill step's KDA matrix as bf16 (`exp4_unpack`): `sq` the largest, `o` after it in the same buffer (the queue's
+    // order and barriers keep them apart), the gates' `fg` beside them
+    kda_bf: Mem,    // [SMALL_ROWS + 3·PART_QKV][H] bf16
+    kda_bf_fg: Mem, // [2·PART_QKV][KDA_DIM] bf16
     snap: Mem,   // [KDA_WINDOW + KDA_MEMORY] f32, host memory: a layer's state on its way out
     // the FFN's and the head's
     fx: Mem,     // [TOKENS][H] f32: the streams' mean, the head's input, a pass of tokens
@@ -290,7 +299,11 @@ struct Shared {
 }
 /// A handoff word's byte offset in `Shared::words`: the kind, and the card for a block output.
 /// The kernels a stats code object stamps (`common::stats`), reported by `timeline_report`.
-const STAT_KERNELS: &[&str] = &["hc_pre", "pred_rows"];
+/// `hc_pre`'s slots are its phases in order; `pred_rows` and `mla_o` (008's FP8 rows question,
+/// 2026-10-24) run through `rows_pass`, whose slots are its phases: 0 the activation staging
+/// rounds, 1 the weight rounds (the FP8 decode and dot), 2 the tail (the norm's reduction, the
+/// ready, the emits) — shader cycles a wave, wave 0 of each workgroup the clean read.
+const STAT_KERNELS: &[&str] = &["hc_pre", "pred_rows", "mla_o"];
 /// `Shared::xact`'s regions, in bytes.
 const HG: usize = H / common::q4::GROUP;
 const XA_Q: usize = 0;
@@ -343,10 +356,10 @@ struct Part {
     card: usize,
     head0: usize,
     input_ln: Mem,
-    sq: Mem,       // [SMALL_ROWS + 3·PART_QKV][H] bf16: f_a's rows, g_a's, b's, then the part's q rows, k rows, v rows — one launch
-    o: Mem,        // [H][PART_QKV] bf16
+    sq: Mem,       // [SMALL_ROWS + 3·PART_QKV][H] exp4: f_a's rows, g_a's, b's, then the part's q rows, k rows, v rows — one launch
+    o: Mem,        // [H][PART_QKV] exp4
     taps: Mem,     // [3][KDA_QKV][CONV_TAPS] bf16
-    fg: Mem,       // [2·PART_QKV][KDA_DIM] bf16: the part's f_b rows, g_b rows
+    fg: Mem,       // [2·PART_QKV][KDA_DIM] exp4: the part's f_b rows, g_b rows
     dt_bias: Mem,
     a_log: Mem,
     o_norm: Mem,
@@ -522,8 +535,12 @@ impl Cards {
                     mla_iq_w: k.kernel("mla_iq_w"),
                     mla_o_w: k.kernel("mla_o_w"),
                     rows_d2: k.kernel("rows_d2"),
-                    rows_part: k.kernel("rows_part"),
-                    rows_part1: k.kernel("rows_part1"),
+                    rows_h_e4: k.kernel("rows_h_e4"),
+                    rows_h1_e4: k.kernel("rows_h1_e4"),
+                    rows_d2_e4: k.kernel("rows_d2_e4"),
+                    rows_part_e4: k.kernel("rows_part_e4"),
+                    rows_part1_e4: k.kernel("rows_part1_e4"),
+                    exp4_unpack: k.kernel("exp4_unpack"),
                     step: k.kernel("kda_step"),
                     copy: k.kernel("copy_f32"),
                     xpt_gu: k.kernel("xpt_gu"),
@@ -613,6 +630,8 @@ impl Cards {
                     smixs: (0..g::PARTS).map(|_| alloc(STEP * (SMALL_ROWS + 3 * g::PART_QKV))).collect(),
                     fgs: (0..g::PARTS).map(|_| alloc(STEP * 2 * g::PART_QKV)).collect(),
                     normeds: (0..g::PARTS).map(|_| alloc(STEP * g::PART_QKV)).collect(),
+                    kda_bf: k.vram((SMALL_ROWS + 3 * g::PART_QKV) * H * 2),
+                    kda_bf_fg: k.vram(2 * g::PART_QKV * KDA_DIM * 2),
                     snap: k.host((KDA_WINDOW + KDA_MEMORY) * 4),
                     fx: k.vram(TOKENS * H * 4),
                     gu: alloc(STEP * DENSE_GU_ROWS),
@@ -715,31 +734,36 @@ impl Cards {
                 for r in 0..H {
                     o_half.extend_from_slice(&kw.o[r * KDA_QKV + i * g::PART_QKV..r * KDA_QKV + (i + 1) * g::PART_QKV]);
                 }
-                let sq = {
-                    let (q, kk, v) = (rows(kw.q, H, head0), rows(kw.k, H, head0), rows(kw.v, H, head0));
-                    let m = k.vram_visible((SMALL_ROWS + 3 * g::PART_QKV) * H * 2);
-                    let mut off = 0;
-                    for part in [kw.f_a, kw.g_a, kw.b, q, kk, v] {
-                        k.upload(&m, off, raw(part));
-                        off += part.len() * 2;
-                    }
-                    assert_eq!(off, m.size);
-                    m
+                // the part's three matrices in exp4 (029: lossless, 77 % of the bytes), encoded here from the bundle's bf16
+                let exp4 = |w: &[u16], m: usize, kk: usize| -> (Mem, usize) {
+                    let e = common::exp4::encode(w, m, kk);
+                    let b = e.planes();
+                    let mm = k.vram_visible(b.len());
+                    k.upload(&mm, 0, &b);
+                    (mm, b.len())
                 };
-                let pair = |a: &[u16], b: &[u16]| -> Mem {
-                    let m = k.vram_visible((a.len() + b.len()) * 2);
-                    k.upload(&m, 0, raw(a));
-                    k.upload(&m, a.len() * 2, raw(b));
-                    m
+                let (sq, sq_bytes) = {
+                    let (q, kk, v) = (rows(kw.q, H, head0), rows(kw.k, H, head0), rows(kw.v, H, head0));
+                    let mut w: Vec<u16> = Vec::with_capacity((SMALL_ROWS + 3 * g::PART_QKV) * H);
+                    for part in [kw.f_a, kw.g_a, kw.b, q, kk, v] {
+                        w.extend_from_slice(part);
+                    }
+                    exp4(&w, SMALL_ROWS + 3 * g::PART_QKV, H)
+                };
+                let (o, o_bytes) = exp4(&o_half, H, g::PART_QKV);
+                let (fg, fg_bytes) = {
+                    let mut w = rows(kw.f_b, KDA_DIM, head0).to_vec();
+                    w.extend_from_slice(rows(kw.g_b, KDA_DIM, head0));
+                    exp4(&w, 2 * g::PART_QKV, KDA_DIM)
                 };
                 let p = Part {
                     card,
                     head0,
                     input_ln: up(raw(&input_ln)),
                     sq,
-                    o: up(raw(&o_half)),
+                    o,
                     taps: up(raw(&taps)),
-                    fg: pair(rows(kw.f_b, KDA_DIM, head0), rows(kw.g_b, KDA_DIM, head0)),
+                    fg,
                     dt_bias: up(raw(kw.dt_bias)),
                     a_log: up(raw(kw.a_log)),
                     o_norm: up(raw(kw.o_norm)),
@@ -748,7 +772,7 @@ impl Cards {
                     ring: k.vram(SPEC_TOKENS * KDA_MEMORY * 4),
                     ring_w: k.vram(SPEC_TOKENS * KDA_WINDOW * 4),
                 };
-                bytes += 2 * ((SMALL_ROWS + 3 * g::PART_QKV) * H + H * g::PART_QKV + 2 * g::PART_QKV * KDA_DIM + taps.len()) + 4 * (KDA_WINDOW + KDA_MEMORY);
+                bytes += sq_bytes + o_bytes + fg_bytes + 2 * taps.len() + 4 * (KDA_WINDOW + KDA_MEMORY);
                 parts.push(p);
             }
             layers[l] = Some(Layer { parts });
@@ -1320,6 +1344,12 @@ impl Cards {
             c.k.launch(kernel, g::wmma_grid(m, n), g::WG, g::WMMA_LDS, &a);
         }
     }
+    /// The exp4 `[m][k]` matrix at `w` unpacked to bf16 at `out` (029), after the launches before it.
+    fn exp4_unpack(&self, c: &Card, w: usize, out: usize, m: usize, k: usize) {
+        let mut a = Args::new();
+        a.ptr(w).ptr(out).u32(m as u32).u32(k as u32);
+        c.k.launch(&c.exp4_unpack, (m * k / 8).div_ceil(256) as u32, 256, 0, &a);
+    }
     /// `rows` launched free: as soon as the launch before it has launched, so the two run together —
     /// for a launch whose inputs were complete when the one before it launched.
     #[allow(clippy::too_many_arguments)]
@@ -1505,20 +1535,25 @@ impl Placed for Cards {
             let (smix, fg, normed) = (&c.smixs[i], &c.fgs[i], &c.normeds[i]);
             // the gates' first halves and beta, then q | k | v: one launch over the normed block input, [n][M_SMALL];
             // a step of many tokens takes the matrix path (bf16 activations, numerically its own)
+            // the matrices are exp4 (029): a decode or verify step's kernels read it; a prefill step unpacks each matrix
+            // to the card's bf16 scratch once and runs the bf16 kernels on it — the same bits either way
             if n > SPEC_TOKENS {
+                self.exp4_unpack(c, p.sq.va, c.kda_bf.va, M_SMALL, H);
                 let mut a = Args::new();
-                a.ptr(self.tok(&c.x, H)).ptr(p.input_ln.va).ptr(p.sq.va).ptr(self.tok(smix, M_SMALL)).u32(M_SMALL as u32).u32(n as u32);
+                a.ptr(self.tok(&c.x, H)).ptr(p.input_ln.va).ptr(c.kda_bf.va).ptr(self.tok(smix, M_SMALL)).u32(M_SMALL as u32).u32(n as u32);
                 c.k.launch(&c.rows_h_w, g::wmma_grid(M_SMALL, n), g::WG, g::WMMA_LDS, &a);
+                self.exp4_unpack(c, p.fg.va, c.kda_bf_fg.va, 2 * g::PART_QKV, KDA_DIM);
             } else {
-                self.rows(c, &c.rows_h, Some(&c.rows_h1), self.tok(&c.x, H), Some(p.input_ln.va), p.sq.va, self.tok(smix, M_SMALL), M_SMALL, H, n, ROWS);
+                self.rows(c, &c.rows_h_e4, Some(&c.rows_h1_e4), self.tok(&c.x, H), Some(p.input_ln.va), p.sq.va, self.tok(smix, M_SMALL), M_SMALL, H, n, ROWS);
             }
             // the gates' second halves as one launch: f_b over f_a's output, g_b over g_a's — token i's input at smix[i · M_SMALL]
+            let (fg_kernel, fg_w) = if n > SPEC_TOKENS { (&c.rows_d2, c.kda_bf_fg.va) } else { (&c.rows_d2_e4, p.fg.va) };
             let mut p0 = 0;
             while p0 < n {
                 let np = (n - p0).min(TOKENS);
                 let mut a = Args::new();
-                a.ptr(smix.at((self.t0 + p0) * M_SMALL * 4)).ptr(p.fg.va).ptr(fg.at((self.t0 + p0) * 2 * g::PART_QKV * 4)).u32(2 * g::PART_QKV as u32).u32(np as u32).u32(g::PART_QKV as u32).u32(M_SMALL as u32);
-                c.k.launch(&c.rows_d2, g::rows_grid(2 * g::PART_QKV, np, ROWS), g::WG, g::rows_lds(KDA_DIM, np) as u32, &a);
+                a.ptr(smix.at((self.t0 + p0) * M_SMALL * 4)).ptr(fg_w).ptr(fg.at((self.t0 + p0) * 2 * g::PART_QKV * 4)).u32(2 * g::PART_QKV as u32).u32(np as u32).u32(g::PART_QKV as u32).u32(M_SMALL as u32);
+                c.k.launch(fg_kernel, g::rows_grid(2 * g::PART_QKV, np, ROWS), g::WG, g::rows_lds(KDA_DIM, np) as u32, &a);
                 p0 += np;
             }
             // the delta rule over the step's tokens in order, the heads' memory in registers across them
@@ -1528,11 +1563,13 @@ impl Placed for Cards {
             a.ptr(mixed).ptr(p.taps.va).ptr(p.window.va).ptr(fg0).ptr(p.dt_bias.va).ptr(p.a_log.va).ptr(smix0 + 2 * KDA_DIM * 4).ptr(fg0 + g::PART_QKV * 4).ptr(p.mem.va).ptr(p.o_norm.va).ptr(self.tok(normed, g::PART_QKV)).u32(p.head0 as u32).u32(n as u32).u32(M_SMALL as u32).u32(2 * g::PART_QKV as u32).u32(M_SMALL as u32).ptr(if ring { p.ring.va } else { 0 }).ptr(if ring { p.ring_w.va } else { 0 });
             c.k.launch(&c.step, g::STEP_GRID, g::WG, g::STEP_LDS as u32, &a);
             if n > SPEC_TOKENS {
+                // `sq`'s unpack is consumed by now (the queue is in order and this launch waits on the ones before it)
+                self.exp4_unpack(c, p.o.va, c.kda_bf.va, H, g::PART_QKV);
                 let mut a = Args::new();
-                a.ptr(self.tok(normed, g::PART_QKV)).ptr(p.o.va).ptr(c.yv.at((i * STEP + self.t0) * H * 4)).u32(H as u32).u32(n as u32);
+                a.ptr(self.tok(normed, g::PART_QKV)).ptr(c.kda_bf.va).ptr(c.yv.at((i * STEP + self.t0) * H * 4)).u32(H as u32).u32(n as u32);
                 c.k.launch(&c.rows_part_w, g::wmma_grid(H, n), g::WG, g::WMMA_LDS, &a);
             } else {
-                self.rows(c, &c.rows_part, Some(&c.rows_part1), self.tok(normed, g::PART_QKV), None, p.o.va, c.yv.at((i * STEP + self.t0) * H * 4), H, g::PART_QKV, n, ROWS);
+                self.rows(c, &c.rows_part_e4, Some(&c.rows_part1_e4), self.tok(normed, g::PART_QKV), None, p.o.va, c.yv.at((i * STEP + self.t0) * H * 4), H, g::PART_QKV, n, ROWS);
             }
         }
         // each card's shares out and its word; every card folds the sum into its streams

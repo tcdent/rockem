@@ -356,6 +356,20 @@ pub mod gfx11 {
         }
     }
 
+    /// An exp4 `[m][k]` matrix at `w` unpacked to bf16 at `out` (029): a prefill step's KDA matrices, once a step, for the
+    /// matrix path's bf16 kernels (`rows_h_w`, `rows_part_w`) and the gates' `rows_d2` — their bits, since the bf16 is
+    /// the original exactly. A thread a chunk of eight weights. Grid: (m · k / 8).div_ceil(256).
+    #[no_mangle]
+    pub extern "gpu-kernel" fn exp4_unpack(w: *const u8, out: *mut u16, m: u32, k: u32) {
+        unsafe {
+            let (m, k) = (m as usize, k as usize);
+            let c = workgroup_id_x() as usize * 256 + workitem_id_x() as usize;
+            if c < m * k / 8 {
+                common::gemv::gfx11::exp4_unpack_chunk(w as *const u8, m, k, c, out.add(c * 8));
+            }
+        }
+    }
+
     /// The exp4 twins of the decode path's KDA rows kernels (029): the same launches over the lossless 12-bit form of
     /// the same matrices (`common::exp4`, its planes at `w`), the bf16 kernels' arguments, grids and LDS, their bits.
     /// Decode and verify steps only (at most `FEW` tokens, `rows_fmt_few`); a prefill step takes the bf16 matrix path.

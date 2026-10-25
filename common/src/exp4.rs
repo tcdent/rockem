@@ -10,8 +10,10 @@
 //!   Twelve bytes in one place are one 96-bit load a lane (three narrow loads a step ran the kernel load-bound,
 //!   bench-exp4 2026-10-25);
 //! - `head` `[m][K / GROUP]` u32: the group's base exponent in bits 0–7 — its largest exponent less 15, or 0 — and in
-//!   bits 8–31 one plus its slot in `raw` when the group is stored whole (0 otherwise);
-//! - `raw` `[slots][GROUP]` u16: the bf16 of every group holding an exponent below its base — 0.68 % of the KDA
+//!   bits 8–31 its slot in `raw` when the group is stored whole (0 otherwise);
+//! - `raw` `[1 + slots][GROUP]` u16: slot 0 a group of zeros — every group's head names a readable slot, so the matrix
+//!   path loads a raw fragment for every lane and selects, with no branch (a divergent branch around its fragments spilled
+//!   ~490 bytes, 2026-10-25) — then the bf16 of every group holding an exponent below its base — 0.68 % of the KDA
 //!   projections' groups (a weight more than 15 binades below its group's largest, or an exponent-0 weight in a group
 //!   whose base is past 0: 14,716 of 4.7 billion weights), read as bf16 by the lanes of that group.
 //!
@@ -28,9 +30,9 @@ pub const SPAN: u8 = 15;
 
 /// Bytes a run of eight weights takes in `chunk`.
 pub const CHUNK: usize = 12;
-/// Bytes of the three planes of a `[m][k]` matrix with `slots` raw groups.
+/// Bytes of the three planes of a `[m][k]` matrix with `slots` raw groups (and the zero slot).
 pub const fn bytes(m: usize, k: usize, slots: usize) -> usize {
-    m * (k / 8) * CHUNK + 4 * m * (k / GROUP) + 2 * GROUP * slots
+    m * (k / 8) * CHUNK + 4 * m * (k / GROUP) + 2 * GROUP * (1 + slots)
 }
 
 /// A matrix in the three planes, and its raw groups.
@@ -42,8 +44,17 @@ pub struct Exp4 {
 }
 #[cfg(any(test, feature = "std"))]
 impl Exp4 {
+    /// Groups stored whole (the zero slot not counted).
     pub fn slots(&self) -> usize {
-        self.raw.len() / GROUP
+        self.raw.len() / GROUP - 1
+    }
+    /// The three planes in one buffer, in the order the kernels read them (`super::gemv::gfx11::Exp4::at`).
+    pub fn planes(&self) -> Vec<u8> {
+        let mut b = Vec::with_capacity(self.chunk.len() + 4 * self.head.len() + 2 * self.raw.len());
+        b.extend_from_slice(&self.chunk);
+        b.extend(self.head.iter().flat_map(|h| h.to_le_bytes()));
+        b.extend(self.raw.iter().flat_map(|h| h.to_le_bytes()));
+        b
     }
 }
 
@@ -57,7 +68,7 @@ fn exp(v: u16) -> u8 {
 pub fn encode(w: &[u16], m: usize, k: usize) -> Exp4 {
     assert!(k % GROUP == 0 && w.len() == m * k);
     let groups = k / GROUP;
-    let mut e = Exp4 { chunk: vec![0; m * (k / 8) * CHUNK], head: vec![0; m * groups], raw: Vec::new() };
+    let mut e = Exp4 { chunk: vec![0; m * (k / 8) * CHUNK], head: vec![0; m * groups], raw: vec![0; GROUP] };
     for r in 0..m {
         for g in 0..groups {
             let ws = &w[r * k + g * GROUP..r * k + (g + 1) * GROUP];
@@ -90,7 +101,7 @@ pub fn weight(e: &Exp4, k: usize, r: usize, j: usize) -> u16 {
     let head = e.head[r * (k / GROUP) + j / GROUP];
     let slot = (head >> 8) as usize;
     if slot != 0 {
-        return e.raw[(slot - 1) * GROUP + j % GROUP];
+        return e.raw[slot * GROUP + j % GROUP];
     }
     let at = r * k + j;
     let ch = (at / 8) * CHUNK;
@@ -138,5 +149,6 @@ mod tests {
         assert_eq!(e.slots(), 2, "the zeros' group and the deep weight's group went raw, the tiny group did not");
         assert_eq!(decode(&e, m, k), w);
         assert_eq!(e.chunk.len() + 4 * e.head.len() + 2 * e.raw.len(), bytes(m, k, e.slots()));
+        assert!(e.raw[..GROUP].iter().all(|&v| v == 0), "slot 0 is the zero group");
     }
 }

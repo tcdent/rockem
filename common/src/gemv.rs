@@ -589,6 +589,48 @@ pub mod gfx11 {
             exp4_row_step::<K, NP, R>(lane, r, s, slab, acc)
         }
     }
+    /// A chunk's eight weights as bf16 pairs — weight q in the low half of pair q, weight 4 + q in the high — from its
+    /// sign-and-mantissa bytes (`lo` weights 0–3, `hi` 4–7), its nibbles `cb` and its group's base exponent: weights q
+    /// and 4 + q at once, their bytes by one byte permute, their codes by a shift and a mask (code q at bit 4q, code
+    /// 4 + q at bit 16 + 4q), the base added to both halves (no half passes 255, so nothing carries), then sign,
+    /// exponent and mantissa into place: about five operations a weight. The rows and the matrix paths both decode here.
+    #[inline(always)]
+    pub unsafe fn exp4_pairs(lo: u32, hi: u32, cb: u32, base: u32) -> [u32; 4] {
+        let b2 = base * 0x0001_0001;
+        let mut pw = [0u32; 4];
+        let mut q = 0;
+        while q < 4 {
+            let mq = perm(hi, lo, (q as u32) | 0x0C00 | ((4 + q as u32) << 16) | 0x0C00_0000);
+            let eq = ((cb >> (4 * q)) & 0x000F_000F) + b2;
+            pw[q] = ((mq & 0x0080_0080) << 8) | (eq << 7) | (mq & 0x007F_007F);
+            q += 1;
+        }
+        pw
+    }
+    /// Chunk `c` (eight weights) of an exp4 `[m][k]` matrix at `w` as bf16, into `out` (eight u16): the prefill path's
+    /// unpack (`exp4_unpack` in kda.rs), where a step's many token blocks would each decode the same weights again on the
+    /// matrix path (bench-exp4 2026-10-25: 0.58× the bf16 kernel at 512 tokens) — unpacked once a step instead, the
+    /// matrix path runs on bf16 as before.
+    #[inline(always)]
+    pub unsafe fn exp4_unpack_chunk(w: *const u8, m: usize, k: usize, c: usize, out: *mut u16) {
+        use crate::exp4::{CHUNK, GROUP};
+        let head = w.add(m * (k / 8) * CHUNK) as *const u32;
+        let raw = (head as *const u8).add(4 * m * (k / GROUP)) as *const u16;
+        let (row, j) = (c / (k / 8), (c % (k / 8)) * 8);
+        let h = *head.add(row * (k / GROUP) + j / GROUP);
+        let p = w.add(c * CHUNK) as *const u32;
+        let (lo, hi, cb) = (core::ptr::read_unaligned(p), core::ptr::read_unaligned(p.add(1)), core::ptr::read_unaligned(p.add(2)));
+        let slot = (h >> 8) as usize;
+        let o = out as *mut u32;
+        if slot != 0 {
+            let v = core::ptr::read_unaligned(raw.add(slot * GROUP + j % GROUP) as *const [u32; 4]);
+            core::ptr::write_unaligned(o as *mut [u32; 4], v);
+        } else {
+            let pw = exp4_pairs(lo, hi, cb, h & 0xFF);
+            // pairs (q, 4 + q) to the row's order: word i is weights 2i, 2i + 1
+            core::ptr::write_unaligned(o as *mut [u32; 4], [(pw[0] & 0xFFFF) | (pw[1] << 16), (pw[2] & 0xFFFF) | (pw[3] << 16), (pw[0] >> 16) | (pw[1] & 0xFFFF_0000), (pw[2] >> 16) | (pw[3] & 0xFFFF_0000)]);
+        }
+    }
     /// Weights a rows step covers (32 lanes × 8): two exp4 groups, so a step's heads are two.
     const STEP_WEIGHTS: usize = 256;
     unsafe extern "C" {
@@ -649,7 +691,7 @@ pub mod gfx11 {
                 let slot = (h >> 8) as usize;
                 if slot != 0 {
                     // a group stored whole (0.68 % of groups): its bf16 as the bf16 step reads them
-                    let p = w[r].2.add((slot - 1) * GROUP + base % GROUP) as *const u64;
+                    let p = w[r].2.add(slot * GROUP + base % GROUP) as *const u64;
                     let (a, b) = (core::ptr::read_unaligned(p), core::ptr::read_unaligned(p.add(1)));
                     let mut q = 0;
                     while q < 4 {
@@ -661,15 +703,7 @@ pub mod gfx11 {
                     // byte permute, their codes by a shift and a mask (the chunk's codes in nibble order put code q at
                     // bit 4q and code 4 + q at bit 16 + 4q), the base added to both halves (no half passes 255, so
                     // nothing carries), then sign, exponent and mantissa into place: about five operations a weight
-                    let (lo, hi) = (mb as u32, (mb >> 32) as u32);
-                    let b2 = (h & 0xFF) * 0x0001_0001;
-                    let mut q = 0;
-                    while q < 4 {
-                        let mq = perm(hi, lo, (q as u32) | 0x0C00 | ((4 + q as u32) << 16) | 0x0C00_0000);
-                        let eq = ((cb >> (4 * q)) & 0x000F_000F) + b2;
-                        pw[r][q] = ((mq & 0x0080_0080) << 8) | (eq << 7) | (mq & 0x007F_007F);
-                        q += 1;
-                    }
+                    pw[r] = exp4_pairs(mb as u32, (mb >> 32) as u32, cb, h & 0xFF);
                 }
                 r += 1;
             }

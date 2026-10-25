@@ -45,12 +45,36 @@ issued together 0.94×; a branch-free decode two weights a register 0.97×; the 
 96-bit load a lane 1.08–1.13×. The heads are still vector loads (the row pointer is not provably wave-uniform; a
 `readfirstlane` did not make them scalar); the ceiling from the bytes alone is 1.29×.
 
-**What is not done:** the node. Prefill steps use the WMMA kernels on bf16, so the node would hold both forms (+3.65 GB
-of VRAM a card, out of the residency's budget) unless the WMMA rows kernels read exp4 too; and the generation check on
-a boot (`bringup/box/gen_ref.sh`: the bf16 reference `bf16-aff81` is recorded and reproduces on the same boot).
+**The node (aff83, 2026-10-25): exp4 only.** The cards hold the KDA projections as exp4 and nothing else. Decode and
+verify steps run the exp4 rows kernels. A prefill or SCORE step unpacks each matrix (`exp4_unpack`) into one bf16 scratch
+a card (the largest part matrix, 103 MB) and runs the bf16 WMMA kernels on it: an exp4 WMMA kernel measured 0.55× at
+512 tokens (the decode repeated for every token block), the unpack-then-WMMA path 0.92–0.94× at 1,024 tokens
+(`sq` unpack 293 µs, `o` 66 µs).
+
+> yeah let's go ahead and integrate it with the wmmma kernels because freeing up some of that vram is going to be
+> essential and i don't think that adding any additional vram is something we can do at this point anyway — tcdent
+
+Measured on aff83 against aff81 (bf16):
+
+| check | aff81 bf16 | aff83 exp4 |
+|---|---|---|
+| long SCORE (3,632 ids) | reference | bit-identical, three runs |
+| `gen_ref.sh` 18k cold (24 tokens) / decode (126 tokens) | `bf16-aff81` | identical, both |
+| the cards' state (both cards) | 20.57 GB | 18.42 GB |
+| routed experts resident | 4 a layer (201 on card 1) | 6 a layer (275 / 266) |
+| verify step at 18k, ms a token: kda / total | 7.99 / 22.7 | 7.89 / 22.4 |
+| prefill at 18k, ms a prompt token | 1.97 / 2.00 | 1.99 / 2.03 |
+| SCORE, warm, ms a token | 2.23 | 2.22 |
+| the cards' boot (`cards` row) | 10 s | 36.6 s |
+
+The freed VRAM goes to the expert slots (the slots fill the budget), so a step's cost moves from the CPU experts to the
+cards: on SCORE `experts` 1.24 → 1.10 and `kda` 0.25 → 0.44, the total the same. Prefill is +0.02–0.03 ms a prompt
+token (the unpack, at 1,024-wide steps). The boot's encode is single-threaded on the host: +26.6 s a boot.
+`Quantified, on the shelf — 26 s a boot`: the encode split over the loader's threads.
 
 ## History
+- 2026-10-25 (aff83): exp4 deployed — the node holds only exp4, generation bit-identical, ~1.07 GB a card freed.
 - 2026-10-17 (`bdc57ec`): DFloat11 scoped; not built.
 
 ## Next
-DFloat11 kernel prototype measured against the bf16 stream; FP8 only if tcdent opens it.
+The boot encode across threads (above). DFloat11 is not needed: exp4 is lossless at 77 % of the bytes with faster decode kernels. FP8 only if tcdent opens it.
