@@ -1340,6 +1340,19 @@ impl Cards {
             c.k.launch(kernel, g::wmma_grid(m, n), g::WG, g::WMMA_LDS, &a);
         }
     }
+    /// An exp4 rows launch of a decode or verify step (`n` ≤ `SPEC_TOKENS`, one launch): `E4_ROWS` rows a wave, the
+    /// LDS `e4_rows_lds` gives (none past one token), after the launches before it.
+    #[allow(clippy::too_many_arguments)]
+    fn rows_e4(&self, c: &Card, kernel: &crate::kfd::Kernel, x: usize, ln: Option<usize>, w: usize, out: usize, m: usize, k_width: usize, n: usize) {
+        let mut a = Args::new();
+        a.ptr(x);
+        if let Some(ln) = ln {
+            a.ptr(ln);
+        }
+        a.ptr(w).ptr(out).u32(m as u32).u32(n as u32);
+        let (grid, wg) = g::e4_launch(m, n);
+        c.k.launch(kernel, grid, wg, g::e4_rows_lds(k_width, n, ln.is_some()) as u32, &a);
+    }
     /// The exp4 `[m][k]` matrix at `w` unpacked to bf16 at `out` (029), after the launches before it.
     fn exp4_unpack(&self, c: &Card, w: usize, out: usize, m: usize, k: usize) {
         let mut a = Args::new();
@@ -1540,16 +1553,17 @@ impl Placed for Cards {
                 c.k.launch(&c.rows_h_w, g::wmma_grid(M_SMALL, n), g::WG, g::WMMA_LDS, &a);
                 self.exp4_unpack(c, p.fg.va, c.kda_bf_fg.va, 2 * g::PART_QKV, KDA_DIM);
             } else {
-                self.rows(c, &c.rows_h_e4, None, self.tok(&c.x, H), Some(p.input_ln.va), p.sq.va, self.tok(smix, M_SMALL), M_SMALL, H, n, g::E4_ROWS);
+                self.rows_e4(c, &c.rows_h_e4, self.tok(&c.x, H), Some(p.input_ln.va), p.sq.va, self.tok(smix, M_SMALL), M_SMALL, H, n);
             }
             // the gates' second halves as one launch: f_b over f_a's output, g_b over g_a's — token i's input at smix[i · M_SMALL]
-            let (fg_kernel, fg_w, fg_r) = if n > SPEC_TOKENS { (&c.rows_d2, c.kda_bf_fg.va, ROWS) } else { (&c.rows_d2_e4, p.fg.va, g::E4_ROWS) };
+            let (fg_kernel, fg_w) = if n > SPEC_TOKENS { (&c.rows_d2, c.kda_bf_fg.va) } else { (&c.rows_d2_e4, p.fg.va) };
             let mut p0 = 0;
             while p0 < n {
                 let np = (n - p0).min(TOKENS);
                 let mut a = Args::new();
                 a.ptr(smix.at((self.t0 + p0) * M_SMALL * 4)).ptr(fg_w).ptr(fg.at((self.t0 + p0) * 2 * g::PART_QKV * 4)).u32(2 * g::PART_QKV as u32).u32(np as u32).u32(g::PART_QKV as u32).u32(M_SMALL as u32);
-                c.k.launch(fg_kernel, g::rows_grid(2 * g::PART_QKV, np, fg_r), g::WG, g::rows_lds(KDA_DIM, np) as u32, &a);
+                let (grid, wg, lds) = if n > SPEC_TOKENS { (g::rows_grid(2 * g::PART_QKV, np, ROWS), g::WG, g::rows_lds(KDA_DIM, np)) } else { let (gr, wg) = g::e4_launch(2 * g::PART_QKV, np); (gr, wg, g::e4_rows_lds(KDA_DIM, np, false)) };
+                c.k.launch(fg_kernel, grid, wg, lds as u32, &a);
                 p0 += np;
             }
             // the delta rule over the step's tokens in order, the heads' memory in registers across them
@@ -1565,7 +1579,7 @@ impl Placed for Cards {
                 a.ptr(self.tok(normed, g::PART_QKV)).ptr(c.kda_bf.va).ptr(c.yv.at((i * STEP + self.t0) * H * 4)).u32(H as u32).u32(n as u32);
                 c.k.launch(&c.rows_part_w, g::wmma_grid(H, n), g::WG, g::WMMA_LDS, &a);
             } else {
-                self.rows(c, &c.rows_part_e4, None, self.tok(normed, g::PART_QKV), None, p.o.va, c.yv.at((i * STEP + self.t0) * H * 4), H, g::PART_QKV, n, g::E4_ROWS);
+                self.rows_e4(c, &c.rows_part_e4, self.tok(normed, g::PART_QKV), None, p.o.va, c.yv.at((i * STEP + self.t0) * H * 4), H, g::PART_QKV, n);
             }
         }
         // each card's shares out and its word; every card folds the sum into its streams

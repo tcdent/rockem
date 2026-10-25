@@ -125,10 +125,11 @@ fn main() {
                 _ => (&rows_d2, &rows_d2_e4),
             };
             let lds = match mat.name { "sq" => g::normed_rows_lds(H, n), "o" => g::rows_lds(g::PART_QKV, n), _ => g::rows_lds(KDA_DIM, n) } as u32;
+            let lds_e4 = g::e4_rows_lds(mat.k, n, mat.name == "sq") as u32;
             // the exp4 kernels' own rows a wave (`E4_ROWS`), the bf16 kernels' as the node launched them
             let launch = |kernel: &kfd::Kernel, wv: usize, out: usize| {
                 let e4 = std::ptr::eq(kernel, ke);
-                let grid = g::rows_grid(mat.m, n, if e4 { g::E4_ROWS } else { r });
+                let (grid, wg) = if e4 { g::e4_launch(mat.m, n) } else { (g::rows_grid(mat.m, n, r), g::WG) };
                 let mut a = kfd::Args::new();
                 a.ptr(bx.va);
                 if mat.name == "sq" {
@@ -139,7 +140,7 @@ fn main() {
                     // rows_d2: the split (f_b's rows read the first KDA_DIM of a token's input, g_b's the next) and the token stride
                     a.u32(g::PART_QKV as u32).u32(KDA_DIM as u32 * 2);
                 }
-                k.launch(kernel, grid, g::WG, lds, &a);
+                k.launch(kernel, grid, wg, if e4 { lds_e4 } else { lds }, &a);
             };
             // the bits: every layer's copy, both kernels
             let mut differ = 0usize;
@@ -181,18 +182,18 @@ fn main() {
             let mut res = Vec::new();
             for e4 in [false, true] {
                 let narrow = |m: usize| n > 1 && m.div_ceil(common::gemv::rows_per_wg(n, common::gemv::ROWS)) < k.cu;
-                let pick = |m: &Mat| -> (&kfd::Kernel, u32) {
+                let pick = |m: &Mat| -> (&kfd::Kernel, (u32, u32)) {
                     let nr = narrow(m.m) && m.name != "fg";
                     let kern = match (m.name, nr, e4) {
                         ("sq", false, false) => &rows_h, ("sq", true, false) => &rows_h1, ("sq", _, true) => &rows_h_e4,
                         ("o", false, false) => &rows_part, ("o", true, false) => &rows_part1, ("o", _, true) => &rows_part_e4,
                         (_, _, false) => &rows_d2, (_, _, true) => &rows_d2_e4,
                     };
-                    (kern, g::rows_grid(m.m, n, if e4 { g::E4_ROWS } else if nr { 1 } else { common::gemv::ROWS }))
+                    (kern, if e4 { g::e4_launch(m.m, n) } else { (g::rows_grid(m.m, n, if nr { 1 } else { common::gemv::ROWS }), g::WG) })
                 };
                 let one = |m: &Mat, li: usize| {
-                    let (kern, grid) = pick(m);
-                    let lds = match m.name { "sq" => g::normed_rows_lds(H, n), "o" => g::rows_lds(g::PART_QKV, n), _ => g::rows_lds(KDA_DIM, n) } as u32;
+                    let (kern, (grid, wg)) = pick(m);
+                    let lds = if e4 { g::e4_rows_lds(m.k, n, m.name == "sq") } else { match m.name { "sq" => g::normed_rows_lds(H, n), "o" => g::rows_lds(g::PART_QKV, n), _ => g::rows_lds(KDA_DIM, n) } } as u32;
                     let mut a = kfd::Args::new();
                     a.ptr(bx.va);
                     if m.name == "sq" {
@@ -202,7 +203,7 @@ fn main() {
                     if m.name == "fg" {
                         a.u32(g::PART_QKV as u32).u32(KDA_DIM as u32 * 2);
                     }
-                    k.launch(kern, grid, g::WG, lds, &a);
+                    k.launch(kern, grid, wg, lds, &a);
                 };
                 let (mut t_sq, mut t_fg, mut t_o, mut t_layer) = (vec![], vec![], vec![], vec![]);
                 // with a stats code object: each launch's waves' phases (`rows_pass`: staging, weight steps, tail; shader

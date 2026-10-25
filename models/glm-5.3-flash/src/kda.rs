@@ -198,6 +198,13 @@ pub mod gfx11_consts {
     /// `o` 1.07× (with 4 steps loaded ahead), `fg` 1.16×; 1 lost to both (0.72–0.93×). At 2 the grids are 788 / 256 / 512
     /// workgroups, past the 84 CUs, so no narrow twin is needed.
     pub const E4_ROWS: usize = 2;
+    /// Waves a workgroup of the exp4 rows kernels past one token (`exp4_rows_direct`: no LDS, no barrier, so a workgroup
+    /// is only the unit the card places).
+    pub const E4_WAVES: usize = 8;
+    /// The exp4 rows kernels' launch: (grid, workgroup size) for `m` rows at `n` tokens.
+    pub const fn e4_launch(m: usize, n: usize) -> (u32, u32) {
+        if n > 1 { (m.div_ceil(E4_WAVES * E4_ROWS) as u32, 32 * E4_WAVES as u32) } else { (rows_grid(m, n, 1), WG) }
+    }
     /// The rows kernels: 8 rows per workgroup.
     /// Workgroups of a rows launch over `m` rows for `n` tokens, the kernel's `r` rows a wave
     /// (`common::gemv::rows_per_wg`).
@@ -221,6 +228,12 @@ pub mod gfx11_consts {
     /// A rows kernel that norms its input: the slab, then 8 wave partials per token of the pass.
     pub const fn normed_rows_lds(k: usize, n: usize) -> usize {
         rows_lds(k, n) + 4 * 8 * common::gemv::PASS
+    }
+    /// The exp4 rows kernels (`rows_h_e4`, `rows_d2_e4`, `rows_part_e4`): one token is the staged pass (its slab, and
+    /// the norm's partials with `norm`); a few tokens stage nothing (`exp4_rows_direct`), so no LDS, which would only
+    /// hold workgroups off the CUs.
+    pub const fn e4_rows_lds(k: usize, n: usize, norm: bool) -> usize {
+        if n > 1 { 0 } else if norm { normed_rows_lds(k, n) } else { rows_lds(k, n) }
     }
     /// The FP8 rows kernels: the same, plus their decode table.
     pub const fn fp8_rows_lds(k: usize, n: usize) -> usize {
@@ -261,7 +274,7 @@ pub mod gfx11 {
     //! rows: the output projection). One token is n = 1 through the same kernels.
     pub use super::gfx11_consts::*;
     use crate::*;
-    use common::gemv::gfx11::{rows_fmt_few, rows_over, Exp4};
+    use common::gemv::gfx11::{exp4_rows_direct, rows_fmt_one, rows_over, Exp4};
     use common::gemv::{widen, ROWS};
     use common::gfx11::{lds, wave_sum, workgroup_sync};
     use common::math::{exp, rsqrt};
@@ -376,18 +389,30 @@ pub mod gfx11 {
     }
 
     /// The exp4 twins of the decode path's KDA rows kernels (029): the same rows over the lossless 12-bit form of the
-    /// same matrices (`common::exp4`, its planes at `w`), the bf16 kernels' arguments and LDS, their bits; `E4_ROWS` rows
-    /// a wave (grid `rows_grid(m, n, E4_ROWS)`). Decode and verify steps only (at most `FEW` tokens, `rows_fmt_few`); a
-    /// prefill step unpacks to bf16 and takes the matrix path. The steps loaded ahead (`Exp4<A, A1>`: at a few tokens,
-    /// at one) are each matrix's best of the sweep (2026-10-25): eight at one token (`sq` 1.03×, `o` 1.03×, `fg` even),
-    /// two at a few for `sq` and `fg`, four for `o`.
+    /// same matrices (`common::exp4`, its planes at `w`), the bf16 kernels' arguments and their bits. Decode and verify
+    /// steps only (at most `FEW` tokens); a prefill step unpacks to bf16 and takes the matrix path. One token is the
+    /// staged pass (`rows_fmt_one`, eight steps loaded ahead); two to four stage nothing (`exp4_rows_direct`: each wave
+    /// reads its activations from L2 and runs its steps with no barrier, at the step's own width — half of the verify
+    /// steps are two tokens), `E4_ROWS` rows a wave, two steps loaded ahead. Launch: `e4_launch`, LDS `e4_rows_lds`.
+    /// Node order against bf16 (bench-exp4 --node 2026-10-25, µs a layer of sq + fg + o): 1 token 166.4 / 204.1,
+    /// 2 tokens 176.4 / 220.6, 3 182.5 / 221.7, 4 189.8 / 223.3.
     #[no_mangle]
     pub extern "gpu-kernel" fn rows_h_e4(x: *const f32, ln: *const u16, w: *const u8, out: *mut f32, m: u32, n: u32) {
         unsafe {
             let tid = workitem_id_x();
             let (m, n) = (m as usize, n as usize);
             let t = tid as usize;
-            rows_fmt_few::<H, true, Exp4<2, 8>, E4_ROWS>(tid, Exp4::<2, 8>::at::<H>(w, m), ln, m, n, RMS_NORM_EPS, |i, s| *x.add(i * H + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
+            let emit = |row: usize, i: usize, y: f32| *out.add(i * m + row) = y;
+            if n <= 1 {
+                rows_fmt_one::<H, true, Exp4<2, 8>>(tid, Exp4::<2, 8>::at::<H>(w, m), ln, m, n, RMS_NORM_EPS, |i, s| *x.add(i * H + s * 256 + t), emit);
+            } else {
+                // the step's own width: half of the verify steps are two tokens, a quarter three
+                match n {
+                    2 => exp4_rows_direct::<H, true, 2, 8, E4_ROWS, E4_WAVES, 2>(tid, Exp4::<2, 8>::at::<H>(w, m), ln, m, n, RMS_NORM_EPS, |_, i| x.add(i * H), emit),
+                    3 => exp4_rows_direct::<H, true, 2, 8, E4_ROWS, E4_WAVES, 3>(tid, Exp4::<2, 8>::at::<H>(w, m), ln, m, n, RMS_NORM_EPS, |_, i| x.add(i * H), emit),
+                    _ => exp4_rows_direct::<H, true, 2, 8, E4_ROWS, E4_WAVES, { common::gemv::FEW }>(tid, Exp4::<2, 8>::at::<H>(w, m), ln, m, n, RMS_NORM_EPS, |_, i| x.add(i * H), emit),
+                }
+            }
         }
     }
     #[no_mangle]
@@ -396,8 +421,21 @@ pub mod gfx11 {
             let tid = workitem_id_x();
             let (m, n, xs) = (m as usize, n as usize, xs as usize);
             let t = tid as usize;
-            let x = if core::arch::amdgpu::workgroup_id_x() as usize * common::gemv::rows_per_wg(n, E4_ROWS) >= split as usize { x.add(KDA_DIM) } else { x };
-            rows_fmt_few::<KDA_DIM, false, Exp4<2, 8>, E4_ROWS>(tid, Exp4::<2, 8>::at::<KDA_DIM>(w, m), core::ptr::null(), m, n, 0.0, |i, s| if s * 256 + t < KDA_DIM { *x.add(i * xs + s * 256 + t) } else { 0.0 }, || {}, |row, i, y| *out.add(i * m + row) = y);
+            let emit = |row: usize, i: usize, y: f32| *out.add(i * m + row) = y;
+            if n <= 1 {
+                // a workgroup's rows are on one side of `split` (a multiple of a workgroup's rows)
+                let x = if core::arch::amdgpu::workgroup_id_x() as usize * common::gemv::rows_per_wg(n, 1) >= split as usize { x.add(KDA_DIM) } else { x };
+                rows_fmt_one::<KDA_DIM, false, Exp4<2, 8>>(tid, Exp4::<2, 8>::at::<KDA_DIM>(w, m), core::ptr::null(), m, n, 0.0, |i, s| if s * 256 + t < KDA_DIM { *x.add(i * xs + s * 256 + t) } else { 0.0 }, emit);
+            } else {
+                // a wave's rows are on one side of `split` (a multiple of E4_ROWS)
+                let split = split as usize;
+                // the step's own width: half of the verify steps are two tokens, a quarter three
+                match n {
+                    2 => exp4_rows_direct::<KDA_DIM, false, 2, 8, E4_ROWS, E4_WAVES, 2>(tid, Exp4::<2, 8>::at::<KDA_DIM>(w, m), core::ptr::null(), m, n, 0.0, |row, i| if row >= split { x.add(KDA_DIM + i * xs) } else { x.add(i * xs) }, emit),
+                    3 => exp4_rows_direct::<KDA_DIM, false, 2, 8, E4_ROWS, E4_WAVES, 3>(tid, Exp4::<2, 8>::at::<KDA_DIM>(w, m), core::ptr::null(), m, n, 0.0, |row, i| if row >= split { x.add(KDA_DIM + i * xs) } else { x.add(i * xs) }, emit),
+                    _ => exp4_rows_direct::<KDA_DIM, false, 2, 8, E4_ROWS, E4_WAVES, { common::gemv::FEW }>(tid, Exp4::<2, 8>::at::<KDA_DIM>(w, m), core::ptr::null(), m, n, 0.0, |row, i| if row >= split { x.add(KDA_DIM + i * xs) } else { x.add(i * xs) }, emit),
+                }
+            }
         }
     }
     #[no_mangle]
@@ -406,7 +444,17 @@ pub mod gfx11 {
             let tid = workitem_id_x();
             let (m, n) = (m as usize, n as usize);
             let t = tid as usize;
-            rows_fmt_few::<PART_QKV, false, Exp4<4, 8>, E4_ROWS>(tid, Exp4::<4, 8>::at::<PART_QKV>(w, m), core::ptr::null(), m, n, 0.0, |i, s| *x.add(i * PART_QKV + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
+            let emit = |row: usize, i: usize, y: f32| *out.add(i * m + row) = y;
+            if n <= 1 {
+                rows_fmt_one::<PART_QKV, false, Exp4<2, 8>>(tid, Exp4::<2, 8>::at::<PART_QKV>(w, m), core::ptr::null(), m, n, 0.0, |i, s| *x.add(i * PART_QKV + s * 256 + t), emit);
+            } else {
+                // the step's own width: half of the verify steps are two tokens, a quarter three
+                match n {
+                    2 => exp4_rows_direct::<PART_QKV, false, 2, 8, E4_ROWS, E4_WAVES, 2>(tid, Exp4::<2, 8>::at::<PART_QKV>(w, m), core::ptr::null(), m, n, 0.0, |_, i| x.add(i * PART_QKV), emit),
+                    3 => exp4_rows_direct::<PART_QKV, false, 2, 8, E4_ROWS, E4_WAVES, 3>(tid, Exp4::<2, 8>::at::<PART_QKV>(w, m), core::ptr::null(), m, n, 0.0, |_, i| x.add(i * PART_QKV), emit),
+                    _ => exp4_rows_direct::<PART_QKV, false, 2, 8, E4_ROWS, E4_WAVES, { common::gemv::FEW }>(tid, Exp4::<2, 8>::at::<PART_QKV>(w, m), core::ptr::null(), m, n, 0.0, |_, i| x.add(i * PART_QKV), emit),
+                }
+            }
         }
     }
 

@@ -132,6 +132,30 @@ Node order, idle node, µs a layer (sq + fg + o):
 At 4 tokens `sq` streams 633 GB/s and `o` 575 against ~730 at one token: what is left is the lockstep rounds (stage,
 barrier, load, compute, barrier) — the structure, not the sizing.
 
+**No staging (2026-10-25).** tcdent: "i'm curious if some of those lockstep rounds could be fused, which kind of
+supports your idea of dropping the staging entirely in that we just move to the next step when we can." Past one token
+the exp4 kernels stage nothing (`exp4_rows_direct`): each wave reads its lanes' activations from L2 (the launch before
+wrote them) and runs its rows' steps with no barrier. Bits: the products are the staged pass's `wl · x`, and the norm's
+sum of squares is replayed exactly (lane `l` holds the staged threads `8l..8l+8`'s sums; the 32-thread butterfly as
+masks 1, 2, 4 inside a lane and 8, 16 across lanes, then the eight waves in order). Each step runs at its own width:
+half of the verify steps are two tokens and a quarter three, and the staged pass computed all of them at four.
+Node order, idle node, µs a layer, bits equal at every width:
+
+| | 1 token | 2 tokens | 3 tokens | 4 tokens |
+|---|---|---|---|---|
+| bf16 | 204.1 | 220.6 | 221.7 | 223.3 |
+| aff83 (shipped exp4) | 208.0 | 208.2 | 210.1 | 211.1 |
+| sized, staged | 165.7 | — | — | 193.6 |
+| no staging, own width | 166.4 | 176.4 | 182.5 | 189.8 |
+
+Over the verify-width mix (2: 50 %, 3: 25 %, 4: 25 %) a layer is ~181 µs a card against ~210 on aff83: ~1 ms a verify
+step. `sq` at two tokens streams 710 GB/s, bf16's rate per byte. What was tried and kept out, all measured in node
+order: a pipeline loading the next steps' weights before each step's arithmetic (`o` unchanged, `sq` 125–130 µs: its
+registers); waves a workgroup 8 / 4 / 2 / 1 (no difference: the grid's quantization was not the limit); four rows a wave
+(4 tokens 205.8). `o` stays at ~550–580 GB/s at every width and shape: one round of waves, 26 MB — the launch's own ramp,
+not its loop. Gotcha found on the way: a pointer rebuilt from `readfirstlane` loses the global address space, so its
+loads compile as flat loads, which also count on the scalar counter; the chunks' loads waited on every head's wait.
+
 **A card hang (2026-10-25):** the one-ahead build hung card 0 in `bench-exp4 --node` at 4 tokens (exp4 sequence; the
 same ELF had passed 1–3 tokens and the bit checks at every width). The node on that card panicked and the box reset.
 Not reproduced or explained; the two-ahead build ran every width twice without it. Benches beside the serving node

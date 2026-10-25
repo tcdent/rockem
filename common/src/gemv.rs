@@ -594,9 +594,11 @@ pub mod gfx11 {
         unsafe fn setup(_: u32, _: *mut f32) {}
         #[inline(always)]
         unsafe fn row(self, row: usize) -> Self::Row {
-            // a row is its wave's: the pointers in scalar registers, not a vector pair each a row (`rows_h_e4` at 129
-            // registers, one past the three workgroups a CU its LDS allows, 2026-10-25)
-            (uniform(self.chunk.add(row * (K / 8) * crate::exp4::CHUNK)), uniform(self.head.add(row * (K / crate::exp4::GROUP))), self.raw)
+            // a row is its wave's: the head pointer in scalar registers (the head loads are scalar). Not the chunk's: a
+            // pointer rebuilt from `readfirstlane` loses its global address space, and the chunks' loads became flat
+            // loads, which count on the scalar counter too — each head's wait then waited for the chunks loaded ahead
+            // (2026-10-25)
+            (self.chunk.add(row * (K / 8) * crate::exp4::CHUNK), uniform(self.head.add(row * (K / crate::exp4::GROUP))), self.raw)
         }
         #[inline(always)]
         unsafe fn step<const NP: usize, const R: usize>(lane: u32, r: &[Self::Row; R], s: usize, slab: *const f32, _: *const f32, acc: &mut [[f32; PASS]; R]) {
@@ -734,6 +736,13 @@ pub mod gfx11 {
     /// bf16 step's widening and products in its order.
     #[inline(always)]
     pub unsafe fn exp4_compute<const K: usize, const NP: usize, const R: usize>(lane: u32, w: &[(*const u8, *const u32, *const u16); R], s: usize, f: &Exp4Fetch<R>, slab: *const f32, acc: &mut [[f32; PASS]; R]) {
+        let l = lane as usize;
+        exp4_compute_x::<K, NP, R>(lane, w, s, f, |i, j| *slab.add(i * STEP + l * STRIDE + j), acc)
+    }
+    /// `exp4_compute` with token `i`'s element `j` of the lane's eight from `x(i, j)`: staged in LDS, or in registers
+    /// (`exp4_rows_direct`).
+    #[inline(always)]
+    pub unsafe fn exp4_compute_x<const K: usize, const NP: usize, const R: usize>(lane: u32, w: &[(*const u8, *const u32, *const u16); R], s: usize, f: &Exp4Fetch<R>, x: impl Fn(usize, usize) -> f32, acc: &mut [[f32; PASS]; R]) {
         const { assert!(K % 8 == 0 && NP <= PASS && crate::exp4::GROUP == 128 && STEP_WEIGHTS == 2 * crate::exp4::GROUP) };
         use crate::exp4::GROUP;
         let l = lane as usize;
@@ -772,10 +781,9 @@ pub mod gfx11 {
             }
             let mut i = 0;
             while i < NP {
-                let x = slab.add(i * STEP + l * STRIDE);
                 let mut j = 0;
                 while j < 4 {
-                    let (xa, xb) = (*x.add(j), *x.add(4 + j));
+                    let (xa, xb) = (x(i, j), x(i, 4 + j));
                     let mut r = 0;
                     while r < R {
                         acc[r][i] += f32::from_bits(pw[r][j] << 16) * xa;
@@ -936,14 +944,138 @@ pub mod gfx11 {
         }
     }
 
-    /// `rows_fmt` for a launch of at most `FEW` tokens (a decode or verify step): only the one-token and `FEW` widths
-    /// are compiled, so a format whose decode needs registers is not held to the `PASS`-wide pass's 128 accumulators
-    /// (`rows_h_e4` spilled 100 bytes through it, 2026-10-25). A wider launch is a host error.
+    /// `rows_fmt` for a launch of one token: the staged pass at width 1 only.
     #[inline(always)]
-    pub unsafe fn rows_fmt_few<const K: usize, const NORM: bool, F: Rows<K>, const R: usize>(tid: u32, w: F, ln: *const u16, m: usize, n: usize, eps: f32, stage: impl Fn(usize, usize) -> f32, ready: impl Fn(), emit: impl Fn(usize, usize, f32)) {
-        match width(n) {
-            1 => rows_pass::<K, 1, NORM, F, 1>(tid, w, ln, m, 0, n, eps, &stage, &ready, &emit),
-            _ => rows_pass::<K, FEW, NORM, F, R>(tid, w, ln, m, 0, n, eps, &stage, &ready, &emit),
+    pub unsafe fn rows_fmt_one<const K: usize, const NORM: bool, F: Rows<K>>(tid: u32, w: F, ln: *const u16, m: usize, n: usize, eps: f32, stage: impl Fn(usize, usize) -> f32, emit: impl Fn(usize, usize, f32)) {
+        rows_pass::<K, 1, NORM, F, 1>(tid, w, ln, m, 0, n, eps, &stage, &|| {}, &emit)
+    }
+
+    /// Exp4 rows over a few tokens (2..=`FEW`) with nothing staged (029, 2026-10-25): each wave reads its lanes'
+    /// activations straight from memory — the previous launch just wrote them, so they come from the card's L2 — and runs
+    /// its rows' steps back to back, `A` steps' weights and activations loaded ahead of their arithmetic, with no barrier
+    /// anywhere: no wave waits for another. The staged pass's rounds (stage, barrier, load, compute, barrier) held every
+    /// wave of a workgroup to the slowest's pace and left DRAM idle while they computed.
+    ///
+    /// The staged pass's bits: a lane's product is `wl · x` (NORM) or `x` times the weight, as LDS held it; the norm's sum
+    /// of squares is the staged pass's thread `t`'s (`t = 8l + j`: lane `l` reads elements `8l..8l+8` of each step, the
+    /// threads `8l + j` staged), each over its steps in order, then that pass's reduction replayed exactly — the butterfly
+    /// over each wave of 32 threads (masks 1, 2, 4 inside a lane, 8 and 16 across lanes `l ^ 1`, `l ^ 2`), the eight waves'
+    /// sums in order. `x(row, i)`: token `i`'s `K` activations for the wave's first row; `NP` tokens are computed (2 or
+    /// `FEW`: half of the verify steps are two tokens), those past `n` read (their buffers are `TOKENS` deep) and never
+    /// emitted. `WAVES` waves a workgroup (nothing is shared, so a
+    /// workgroup is only the unit the card places): grid `m.div_ceil(WAVES · R)`, no LDS.
+    #[inline(always)]
+    pub unsafe fn exp4_rows_direct<const K: usize, const NORM: bool, const A: usize, const A1: usize, const R: usize, const WAVES: usize, const NP: usize>(tid: u32, w: Exp4<A, A1>, ln: *const u16, m: usize, n: usize, eps: f32, x: impl Fn(usize, usize) -> *const f32, emit: impl Fn(usize, usize, f32)) {
+        const { assert!(NP <= PASS) };
+        let (lane, wave) = (tid % 32, (tid / 32) as usize);
+        let l = lane as usize;
+        let row = (core::arch::amdgpu::workgroup_id_x() as usize * WAVES + wave) * R;
+        if row >= m {
+            return; // no barrier follows: a wave past the matrix simply ends
+        }
+        let mut wr = [<Exp4<A, A1> as Rows<K>>::row(w, row); R];
+        let mut k = 1;
+        while k < R {
+            wr[k] = <Exp4<A, A1> as Rows<K>>::row(w, if row + k < m { row + k } else { m - 1 });
+            k += 1;
+        }
+        let steps = K.div_ceil(256);
+        let mut acc = [[0f32; PASS]; R];
+        let mut ss = [[0f32; 8]; NP];
+        // `A` steps' weights and activations loaded together, then their arithmetic. Issuing the next steps' weights
+        // ahead of this step's arithmetic instead (a pipeline in each wave) measured no faster for `o` and slower for
+        // `sq` (its registers, 2026-10-25), and carrying the activations across steps put them in scratch.
+        let mut s0 = 0;
+        while s0 < steps {
+            let mut f = [Exp4Fetch::<R>::EMPTY; A];
+            let mut xv = [[[0f32; 8]; NP]; A];
+            let mut wl = [[1f32; 8]; A];
+            let mut d = 0;
+            while d < A {
+                let s = s0 + d;
+                let col = s * 256 + l * 8;
+                if s < steps {
+                    f[d] = exp4_fetch::<K, R>(lane, &wr, s);
+                    if col < K {
+                        let mut i = 0;
+                        while i < NP {
+                            xv[d][i] = core::ptr::read(x(row, i).add(col) as *const [f32; 8]);
+                            i += 1;
+                        }
+                        if NORM {
+                            wl[d] = widen8_at(ln.add(col));
+                        }
+                    }
+                }
+                d += 1;
+            }
+            let mut d = 0;
+            while d < A {
+                let s = s0 + d;
+                if s < steps {
+                    if NORM && s * 256 + l * 8 < K {
+                        let mut i = 0;
+                        while i < NP {
+                            let mut j = 0;
+                            while j < 8 {
+                                ss[i][j] += xv[d][i][j] * xv[d][i][j];
+                                j += 1;
+                            }
+                            i += 1;
+                        }
+                    }
+                    let (xd, wd) = (&xv[d], &wl[d]);
+                    exp4_compute_x::<K, NP, R>(lane, &wr, s, &f[d], |i, j| if NORM { wd[j] * xd[i][j] } else { xd[i][j] }, &mut acc);
+                }
+                d += 1;
+            }
+            s0 += A;
+        }
+        let mut rr = [1f32; PASS];
+        if NORM {
+            let mut i = 0;
+            while i < NP {
+                let mut v = ss[i];
+                let mut mb = 1;
+                while mb < 8 {
+                    let old = v;
+                    let mut j = 0;
+                    while j < 8 {
+                        v[j] = old[j] + old[j ^ mb];
+                        j += 1;
+                    }
+                    mb <<= 1;
+                }
+                let mut ml = 1u32;
+                while ml < 4 {
+                    let mut j = 0;
+                    while j < 8 {
+                        v[j] += f32::from_bits(core::arch::amdgpu::ds_bpermute((lane ^ ml) * 4, v[j].to_bits()));
+                        j += 1;
+                    }
+                    ml <<= 1;
+                }
+                let mut total = 0f32;
+                let mut w8 = 0u32;
+                while w8 < 8 {
+                    total += f32::from_bits(core::arch::amdgpu::ds_bpermute(w8 * 4 * 4, v[0].to_bits()));
+                    w8 += 1;
+                }
+                rr[i] = crate::math::rsqrt(total / K as f32 + eps);
+                i += 1;
+            }
+        }
+        let mut k = 0;
+        while k < R {
+            let mut i = 0;
+            while i < NP {
+                let y = wave_sum(lane, acc[k][i]);
+                if lane == 0 && row + k < m && i < n {
+                    emit(row + k, i, if NORM { y * rr[i] } else { y });
+                }
+                i += 1;
+            }
+            k += 1;
         }
     }
 
