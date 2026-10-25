@@ -106,6 +106,32 @@ Three limiters, in the order found:
 Neither lever is built. The select form is in the tree, not deployed (verify steps ~0.2 ms a step at 18k by the
 node-order layer times, 216 → 211 µs a layer a card).
 
+**Sizing (2026-10-25, tcdent: "we need to reevaluate the register and workgroup and wave sizing … optimize the places
+that interact with it to utilize the resources as thoroughly as possible").** A sweep (`bench-exp4 --sweep`, since
+removed with its variants; results in `bringup/box/logs/exp4-sweep-1.txt`) over rows a wave (1, 2, 4) and steps loaded
+ahead at a few tokens (1, 2, 4) and at one (2, 4, 8), each variant in place of one matrix's kernel in node order, bits
+checked against the shipped kernel. One row a wave lost everywhere at 4 tokens (0.72–0.93×). Two rows a wave won for all
+three matrices, and eight steps ahead at one token. Then `rows_h_e4` came out at 129 registers, one past the three
+workgroups a CU its 20.8 KB of LDS allows: the row pointers marked wave-uniform (scalar registers) took it to 125.
+
+| kernel | rows a wave | ahead (few / one) | registers | workgroups a CU |
+|---|---|---|---|---|
+| `rows_h_e4` | 2 | 2 / 8 | 125 | 3 |
+| `rows_part_e4` | 2 | 4 / 8 | 164 | 2 |
+| `rows_d2_e4` | 2 | 2 / 8 | 53 | 3 (LDS) |
+
+The narrow one-row twins (`rows_h1_e4`, `rows_part1_e4`) are gone: at two rows a wave every grid is past the CUs.
+Node order, idle node, µs a layer (sq + fg + o):
+
+| | 4 tokens | × bf16 | 1 token | × bf16 |
+|---|---|---|---|---|
+| bf16 | 222.2 | 1.00 | 203.6 | 1.00 |
+| aff83 (shipped exp4) | 216.3 | 1.03 | 208.0 | 0.98 |
+| sized exp4 | 193.6 | 1.15 | 165.7 | 1.23 |
+
+At 4 tokens `sq` streams 633 GB/s and `o` 575 against ~730 at one token: what is left is the lockstep rounds (stage,
+barrier, load, compute, barrier) — the structure, not the sizing.
+
 **A card hang (2026-10-25):** the one-ahead build hung card 0 in `bench-exp4 --node` at 4 tokens (exp4 sequence; the
 same ELF had passed 1–3 tokens and the bit checks at every width). The node on that card panicked and the box reset.
 Not reproduced or explained; the two-ahead build ran every width twice without it. Benches beside the serving node

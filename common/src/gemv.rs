@@ -569,13 +569,15 @@ pub mod gfx11 {
     /// matrix (`Exp4::at`). A step's lane reads its chunk in one load; the step's two heads (lanes 0–15 one group, 16–31
     /// the next) are wave-uniform, so scalar loads. Each lane rebuilds its weights' bf16 exactly — or, for a group
     /// stored whole, reads its bf16 from `raw` — then the bf16 step's products in its order: the bf16 kernel's bits.
+    ///
+    /// `A` and `A1`: the steps whose loads a round issues before decoding any, at a few tokens and at one (`round`).
     #[derive(Clone, Copy)]
-    pub struct Exp4 {
+    pub struct Exp4<const A: usize, const A1: usize> {
         pub chunk: *const u8,
         pub head: *const u32,
         pub raw: *const u16,
     }
-    impl Exp4 {
+    impl<const A: usize, const A1: usize> Exp4<A, A1> {
         /// The planes of a `[m][K]` matrix stored at `w`.
         #[inline(always)]
         pub unsafe fn at<const K: usize>(w: *const u8, m: usize) -> Self {
@@ -585,38 +587,42 @@ pub mod gfx11 {
             Exp4 { chunk: w, head: head as *const u32, raw: raw as *const u16 }
         }
     }
-    impl<const K: usize> Rows<K> for Exp4 {
+    impl<const K: usize, const A: usize, const A1: usize> Rows<K> for Exp4<A, A1> {
         type Row = (*const u8, *const u32, *const u16);
         const LDS: usize = 0;
         #[inline(always)]
         unsafe fn setup(_: u32, _: *mut f32) {}
         #[inline(always)]
         unsafe fn row(self, row: usize) -> Self::Row {
-            (self.chunk.add(row * (K / 8) * crate::exp4::CHUNK), self.head.add(row * (K / crate::exp4::GROUP)), self.raw)
+            // a row is its wave's: the pointers in scalar registers, not a vector pair each a row (`rows_h_e4` at 129
+            // registers, one past the three workgroups a CU its LDS allows, 2026-10-25)
+            (uniform(self.chunk.add(row * (K / 8) * crate::exp4::CHUNK)), uniform(self.head.add(row * (K / crate::exp4::GROUP))), self.raw)
         }
         #[inline(always)]
         unsafe fn step<const NP: usize, const R: usize>(lane: u32, r: &[Self::Row; R], s: usize, slab: *const f32, _: *const f32, acc: &mut [[f32; PASS]; R]) {
             exp4_row_step::<K, NP, R>(lane, r, s, slab, acc)
         }
-        /// The round's chunks and heads loaded `EXP4_AHEAD` steps at a time before any is decoded: a step's loads alone
+        /// The round's chunks and heads loaded `A` steps at a time (`A1` at one token) before any is decoded: a step's loads alone
         /// (twelve bytes a lane a row) left the few-token kernels waiting a round trip a step, at 0.77 of the bf16
         /// bytes and the same time (bench-exp4 --node 2026-10-25: `o` 1.02×).
         #[inline(always)]
         unsafe fn round<const NP: usize, const R: usize>(lane: u32, r: &[Self::Row; R], s0: usize, count: usize, slab: *const f32, _: *const f32, acc: &mut [[f32; PASS]; R]) {
+            let ahead = if NP == 1 { A1 } else { A };
+            const { assert!(A >= 1 && A <= FLIGHT && A1 >= 1 && A1 <= FLIGHT) };
             let mut k = 0;
-            while k + EXP4_AHEAD <= count {
-                let mut f = [Exp4Fetch::<R>::EMPTY; EXP4_AHEAD];
+            while k + ahead <= count {
+                let mut f = [Exp4Fetch::<R>::EMPTY; FLIGHT];
                 let mut d = 0;
-                while d < EXP4_AHEAD {
+                while d < ahead {
                     f[d] = exp4_fetch::<K, R>(lane, r, s0 + k + d);
                     d += 1;
                 }
                 let mut d = 0;
-                while d < EXP4_AHEAD {
+                while d < ahead {
                     exp4_compute::<K, NP, R>(lane, r, s0 + k + d, &f[d], slab.add((k + d) * NP * STEP), acc);
                     d += 1;
                 }
-                k += EXP4_AHEAD;
+                k += ahead;
             }
             while k < count {
                 exp4_row_step::<K, NP, R>(lane, r, s0 + k, slab.add(k * NP * STEP), acc);
@@ -624,8 +630,6 @@ pub mod gfx11 {
             }
         }
     }
-    /// Steps of a round whose exp4 loads are issued together (`Exp4::round`).
-    pub const EXP4_AHEAD: usize = 2;
     /// A chunk's eight weights as bf16 pairs — weight q in the low half of pair q, weight 4 + q in the high — from its
     /// sign-and-mantissa bytes (`lo` weights 0–3, `hi` 4–7), its nibbles `cb` and its group's base exponent: weights q
     /// and 4 + q at once, their bytes by one byte permute, their codes by a shift and a mask (code q at bit 4q, code

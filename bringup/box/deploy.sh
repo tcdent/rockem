@@ -17,10 +17,11 @@ echo "rebooted $(date +%H:%M:%S)"
 sleep 60
 until timeout 2 bash -c 'echo > /dev/tcp/192.168.88.6/7332' 2>/dev/null; do sleep 5; done; echo "node up $(date +%H:%M:%S)"
 /usr/bin/grep -E "spec     :|panicked|cmdline|prow" $LOG/metatron-console.log | sed -E 's/.*\] //' | cut -c1-200
-# the API: the Nomad job rockem-api on elsenor (service-net 192.168.88.3:8765, behind https://rockem.a10k.co), rebuilt
-# from the api/ tree and rerun — infra.lead's recipe (2026-10-23); it reads the bundle's manifest at startup, so a
-# bundle rebuild alone needs `nomad job restart rockem-api`. One scheduler only: never start a second API on the node
-(cd /home/slomp/Work/rockem/api && TAG=$(git -C /home/slomp/Work/rockem rev-parse --short=12 HEAD) && { [ -z "$(git -C /home/slomp/Work/rockem status --porcelain -- api/rockem api/pyproject.toml api/uv.lock)" ] || TAG=$TAG-dirty-$(date +%Y%m%d%H%M%S); } && timeout 900 podman build --network host -t registry.a10k.co/rockem/api:$TAG -f Containerfile . 2>&1 | tail -n 1 | cut -c1-100 && timeout 300 podman push registry.a10k.co/rockem/api:$TAG 2>&1 | tail -n 1 | cut -c1-100 && sed -i "s|registry.a10k.co/rockem/api:[0-9a-z-]*|registry.a10k.co/rockem/api:$TAG|" api.nomad.hcl && timeout 300 nomad job run api.nomad.hcl 2>&1 | tail -n 2 | cut -c1-100)
+# the API: the Nomad job rockem-api on elsenor (service-net 192.168.88.3:8765, behind https://rockem.a10k.co). rockem.api
+# builds and deploys it (tcdent, 2026-10-25); a node deploy only restarts it, so it rereads the bundle's manifest (a new
+# code object is a new identity: an API on the old one turns every request away, aff83). One scheduler only: never
+# start a second API on the node
+timeout 120 nomad job restart -yes rockem-api 2>&1 | tail -n 1 | cut -c1-100
 until curl -s -m 3 http://192.168.88.3:8765/health >/dev/null; do sleep 3; done; echo "api up   : $(date +%H:%M:%S) $(curl -s -m 3 http://192.168.88.3:8765/health | cut -c1-80)"
 T0=$(date -u +'%Y-%m-%d %H:%M:%S')
 req() { # req <label> <json>: one request, wall time, the hardware watch over the console

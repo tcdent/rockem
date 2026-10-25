@@ -193,6 +193,11 @@ fn head(w: &weights::Kda, h: usize, conv: &[f32], f: &[f32], beta: &[f32], gate:
 pub mod gfx11_consts {
     use crate::*;
     pub const WG: u32 = 256;
+    /// Rows a wave of the exp4 rows kernels at a verify width (`rows_h_e4`, `rows_d2_e4`, `rows_part_e4`; one token
+    /// takes one): the sizing sweep of 2026-10-25 (`bench-exp4 --sweep`, node order, 4 tokens) against 4 — `sq` 1.06×,
+    /// `o` 1.07× (with 4 steps loaded ahead), `fg` 1.16×; 1 lost to both (0.72–0.93×). At 2 the grids are 788 / 256 / 512
+    /// workgroups, past the 84 CUs, so no narrow twin is needed.
+    pub const E4_ROWS: usize = 2;
     /// The rows kernels: 8 rows per workgroup.
     /// Workgroups of a rows launch over `m` rows for `n` tokens, the kernel's `r` rows a wave
     /// (`common::gemv::rows_per_wg`).
@@ -370,25 +375,19 @@ pub mod gfx11 {
         }
     }
 
-    /// The exp4 twins of the decode path's KDA rows kernels (029): the same launches over the lossless 12-bit form of
-    /// the same matrices (`common::exp4`, its planes at `w`), the bf16 kernels' arguments, grids and LDS, their bits.
-    /// Decode and verify steps only (at most `FEW` tokens, `rows_fmt_few`); a prefill step takes the bf16 matrix path.
+    /// The exp4 twins of the decode path's KDA rows kernels (029): the same rows over the lossless 12-bit form of the
+    /// same matrices (`common::exp4`, its planes at `w`), the bf16 kernels' arguments and LDS, their bits; `E4_ROWS` rows
+    /// a wave (grid `rows_grid(m, n, E4_ROWS)`). Decode and verify steps only (at most `FEW` tokens, `rows_fmt_few`); a
+    /// prefill step unpacks to bf16 and takes the matrix path. The steps loaded ahead (`Exp4<A, A1>`: at a few tokens,
+    /// at one) are each matrix's best of the sweep (2026-10-25): eight at one token (`sq` 1.03×, `o` 1.03×, `fg` even),
+    /// two at a few for `sq` and `fg`, four for `o`.
     #[no_mangle]
     pub extern "gpu-kernel" fn rows_h_e4(x: *const f32, ln: *const u16, w: *const u8, out: *mut f32, m: u32, n: u32) {
         unsafe {
             let tid = workitem_id_x();
             let (m, n) = (m as usize, n as usize);
             let t = tid as usize;
-            rows_fmt_few::<H, true, Exp4, ROWS>(tid, Exp4::at::<H>(w, m), ln, m, n, RMS_NORM_EPS, |i, s| *x.add(i * H + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
-        }
-    }
-    #[no_mangle]
-    pub extern "gpu-kernel" fn rows_h1_e4(x: *const f32, ln: *const u16, w: *const u8, out: *mut f32, m: u32, n: u32) {
-        unsafe {
-            let tid = workitem_id_x();
-            let (m, n) = (m as usize, n as usize);
-            let t = tid as usize;
-            rows_fmt_few::<H, true, Exp4, 1>(tid, Exp4::at::<H>(w, m), ln, m, n, RMS_NORM_EPS, |i, s| *x.add(i * H + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
+            rows_fmt_few::<H, true, Exp4<2, 8>, E4_ROWS>(tid, Exp4::<2, 8>::at::<H>(w, m), ln, m, n, RMS_NORM_EPS, |i, s| *x.add(i * H + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
         }
     }
     #[no_mangle]
@@ -397,8 +396,8 @@ pub mod gfx11 {
             let tid = workitem_id_x();
             let (m, n, xs) = (m as usize, n as usize, xs as usize);
             let t = tid as usize;
-            let x = if core::arch::amdgpu::workgroup_id_x() as usize * common::gemv::rows_per_wg(n, ROWS) >= split as usize { x.add(KDA_DIM) } else { x };
-            rows_fmt_few::<KDA_DIM, false, Exp4, ROWS>(tid, Exp4::at::<KDA_DIM>(w, m), core::ptr::null(), m, n, 0.0, |i, s| if s * 256 + t < KDA_DIM { *x.add(i * xs + s * 256 + t) } else { 0.0 }, || {}, |row, i, y| *out.add(i * m + row) = y);
+            let x = if core::arch::amdgpu::workgroup_id_x() as usize * common::gemv::rows_per_wg(n, E4_ROWS) >= split as usize { x.add(KDA_DIM) } else { x };
+            rows_fmt_few::<KDA_DIM, false, Exp4<2, 8>, E4_ROWS>(tid, Exp4::<2, 8>::at::<KDA_DIM>(w, m), core::ptr::null(), m, n, 0.0, |i, s| if s * 256 + t < KDA_DIM { *x.add(i * xs + s * 256 + t) } else { 0.0 }, || {}, |row, i, y| *out.add(i * m + row) = y);
         }
     }
     #[no_mangle]
@@ -407,16 +406,7 @@ pub mod gfx11 {
             let tid = workitem_id_x();
             let (m, n) = (m as usize, n as usize);
             let t = tid as usize;
-            rows_fmt_few::<PART_QKV, false, Exp4, ROWS>(tid, Exp4::at::<PART_QKV>(w, m), core::ptr::null(), m, n, 0.0, |i, s| *x.add(i * PART_QKV + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
-        }
-    }
-    #[no_mangle]
-    pub extern "gpu-kernel" fn rows_part1_e4(x: *const f32, w: *const u8, out: *mut f32, m: u32, n: u32) {
-        unsafe {
-            let tid = workitem_id_x();
-            let (m, n) = (m as usize, n as usize);
-            let t = tid as usize;
-            rows_fmt_few::<PART_QKV, false, Exp4, 1>(tid, Exp4::at::<PART_QKV>(w, m), core::ptr::null(), m, n, 0.0, |i, s| *x.add(i * PART_QKV + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
+            rows_fmt_few::<PART_QKV, false, Exp4<4, 8>, E4_ROWS>(tid, Exp4::<4, 8>::at::<PART_QKV>(w, m), core::ptr::null(), m, n, 0.0, |i, s| *x.add(i * PART_QKV + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
         }
     }
 

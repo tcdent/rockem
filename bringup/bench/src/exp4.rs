@@ -60,8 +60,8 @@ fn main() {
     // stamped launches, as the node runs (deploys keep track-launches): the node-shaped section reads each launch's time
     let k = kfd::Kfd::open(&elf, true, 0);
     let kern = |n: &str| k.kernel(n);
-    let (rows_h, rows_h1, rows_h_e4, rows_h1_e4) = (kern("rows_h"), kern("rows_h1"), kern("rows_h_e4"), kern("rows_h1_e4"));
-    let (rows_part, rows_part1, rows_part_e4, rows_part1_e4) = (kern("rows_part"), kern("rows_part1"), kern("rows_part_e4"), kern("rows_part1_e4"));
+    let (rows_h, rows_h1, rows_h_e4) = (kern("rows_h"), kern("rows_h1"), kern("rows_h_e4"));
+    let (rows_part, rows_part1, rows_part_e4) = (kern("rows_part"), kern("rows_part1"), kern("rows_part_e4"));
     let (rows_d2, rows_d2_e4) = (kern("rows_d2"), kern("rows_d2_e4"));
     let (rows_h_w, rows_part_w, unpack) = (kern("rows_h_w"), kern("rows_part_w"), kern("exp4_unpack"));
     // the first `layers` KDA layers, part 0 of each: the node's slicing
@@ -119,14 +119,16 @@ fn main() {
             let r = if narrow && mat.name != "fg" { 1 } else { common::gemv::ROWS };
             let (kb, ke) = match (mat.name, narrow) {
                 ("sq", false) => (&rows_h, &rows_h_e4),
-                ("sq", true) => (&rows_h1, &rows_h1_e4),
+                ("sq", true) => (&rows_h1, &rows_h_e4),
                 ("o", false) => (&rows_part, &rows_part_e4),
-                ("o", true) => (&rows_part1, &rows_part1_e4),
+                ("o", true) => (&rows_part1, &rows_part_e4),
                 _ => (&rows_d2, &rows_d2_e4),
             };
             let lds = match mat.name { "sq" => g::normed_rows_lds(H, n), "o" => g::rows_lds(g::PART_QKV, n), _ => g::rows_lds(KDA_DIM, n) } as u32;
-            let grid = g::rows_grid(mat.m, n, r);
+            // the exp4 kernels' own rows a wave (`E4_ROWS`), the bf16 kernels' as the node launched them
             let launch = |kernel: &kfd::Kernel, wv: usize, out: usize| {
+                let e4 = std::ptr::eq(kernel, ke);
+                let grid = g::rows_grid(mat.m, n, if e4 { g::E4_ROWS } else { r });
                 let mut a = kfd::Args::new();
                 a.ptr(bx.va);
                 if mat.name == "sq" {
@@ -182,11 +184,11 @@ fn main() {
                 let pick = |m: &Mat| -> (&kfd::Kernel, u32) {
                     let nr = narrow(m.m) && m.name != "fg";
                     let kern = match (m.name, nr, e4) {
-                        ("sq", false, false) => &rows_h, ("sq", true, false) => &rows_h1, ("sq", false, true) => &rows_h_e4, ("sq", true, true) => &rows_h1_e4,
-                        ("o", false, false) => &rows_part, ("o", true, false) => &rows_part1, ("o", false, true) => &rows_part_e4, ("o", true, true) => &rows_part1_e4,
+                        ("sq", false, false) => &rows_h, ("sq", true, false) => &rows_h1, ("sq", _, true) => &rows_h_e4,
+                        ("o", false, false) => &rows_part, ("o", true, false) => &rows_part1, ("o", _, true) => &rows_part_e4,
                         (_, _, false) => &rows_d2, (_, _, true) => &rows_d2_e4,
                     };
-                    (kern, g::rows_grid(m.m, n, if nr { 1 } else { common::gemv::ROWS }))
+                    (kern, g::rows_grid(m.m, n, if e4 { g::E4_ROWS } else if nr { 1 } else { common::gemv::ROWS }))
                 };
                 let one = |m: &Mat, li: usize| {
                     let (kern, grid) = pick(m);
