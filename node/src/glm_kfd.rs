@@ -291,8 +291,8 @@ struct Shared {
     xact: Mem,     // the FFN input's quantized activations [STEP][H] i8 | [STEP][HG] f32 | [STEP][HG] i32, then the picks [STEP][TOP_K] u32 and weights f32: `hc_pre`'s act phase, for the host (XA_*)
     scores_ffn: Mem, // [STEP][ROUTE_ROWS] f32: the FFN half's router over its input (this layer's rows, then the next layer's: the prefetch's predictor), for the host's picks
     labels: Mem,   // [NUM_HIDDEN_LAYERS][STEP][TOP_K] u32: each MoE layer's picks, for the prefetch predictor's pairs on the cards
-    plan: Mem,     // [plan::PLAN] u32: a decode step's plan for the next layer, best first (`pred_step`)
-    plan2: Mem,    // [plan::PLAN] u32: the same from the second pass, behind `hc_post`, over the whole FFN output (093)
+    plan: Mem,     // [2][plan::PLAN] u32: a decode step's plan for the next layer, best first (`pred_step`), then its keys (f32)
+    plan2: Mem,    // [2][plan::PLAN] u32: the same from the second pass, behind `hc_post`, over the whole FFN output (093)
     words: Mem,    // the handoff words, a cache line each: `word()`
 }
 /// A handoff word's byte offset in `Shared::words`: the kind, and the card for a block output.
@@ -686,8 +686,8 @@ impl Cards {
                 xact: k0.host_shared(XA_END, &others),
                 scores_ffn: k0.host_shared(STEP * ROUTE_ROWS * 4, &others),
                 labels: k0.host_shared(NUM_HIDDEN_LAYERS * STEP * TOP_K * 4, &others),
-                plan: k0.host_shared(glm_5_3_flash::plan::PLAN * 4, &others),
-                plan2: k0.host_shared(glm_5_3_flash::plan::PLAN * 4, &others),
+                plan: k0.host_shared(2 * glm_5_3_flash::plan::PLAN * 4, &others),
+                plan2: k0.host_shared(2 * glm_5_3_flash::plan::PLAN * 4, &others),
                 words: {
                     let m = k0.host_shared(CHUNKS * WORD_SET, &others);
                     unsafe { std::ptr::write_bytes(m.ptr() as *mut u8, 0, m.size) };
@@ -2096,22 +2096,30 @@ impl Placed for Cards {
             }
         }
     }
-    fn plan(&mut self, l: usize, out: &mut [usize]) {
+    fn plan(&mut self, l: usize, out: &mut [usize], keys: &mut [f32]) {
+        use glm_5_3_flash::plan::PLAN;
         let f = self.ffns[l].as_ref().unwrap();
         crate::kfd::wait_word(self.word_ptr(W_PLAN, f.card), self.half_seq[l][self.ch][1]);
-        let mut p = [0u32; glm_5_3_flash::plan::PLAN];
+        let mut p = [0u32; 2 * PLAN];
         read(&self.shared.plan, 0, &mut p);
-        for (o, &e) in out.iter_mut().zip(&p) {
+        for (o, &e) in out.iter_mut().zip(&p[..PLAN]) {
             *o = e as usize;
         }
+        for (k, &b) in keys.iter_mut().zip(&p[PLAN..]) {
+            *k = f32::from_bits(b);
+        }
     }
-    fn plan2(&mut self, l: usize, out: &mut [usize]) {
+    fn plan2(&mut self, l: usize, out: &mut [usize], keys: &mut [f32]) {
+        use glm_5_3_flash::plan::PLAN;
         let f = self.ffns[l].as_ref().unwrap();
         crate::kfd::wait_word(self.word_ptr(W_PLAN2, f.card), self.half_seq[l][self.ch][1]);
-        let mut p = [0u32; glm_5_3_flash::plan::PLAN];
+        let mut p = [0u32; 2 * PLAN];
         read(&self.shared.plan2, 0, &mut p);
-        for (o, &e) in out.iter_mut().zip(&p) {
+        for (o, &e) in out.iter_mut().zip(&p[..PLAN]) {
             *o = e as usize;
+        }
+        for (k, &b) in keys.iter_mut().zip(&p[PLAN..]) {
+            *k = f32::from_bits(b);
         }
     }
     fn ffn_logits(&mut self, l: usize, n: usize, x: &mut [f32], logits: &mut [f32]) {

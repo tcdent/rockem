@@ -30,6 +30,7 @@ pub const LR_B: f32 = 1e-2;
 /// The simulation's loss divided by the 40 layer pairs it trained together; kept so its learning rates carry over.
 pub const PAIRS_SCALE: f32 = 40.0;
 /// Experts a decode plan names, best first: the host drops the ones resident on the cards and keeps `PREFETCH_CAP`.
+/// The plan buffer holds the `PLAN` ids, then their keys' bits (f32).
 pub const PLAN: usize = 24;
 
 /// The header: the calibration (ca, cc, ca2 on the second margin), their first moments, their second moments (four
@@ -323,6 +324,9 @@ pub mod gfx11 {
             let r = r as usize;
             if r < PLAN {
                 *plan.add(r) = e as u32;
+                // its key after the ids: Π(1 + eᶻ) over the step's tokens, so 1 − 1/key is the chance some token picks
+                // it if the tokens' calibrated picks are independent (the host's `plan_eval` rows, 2026-10-25)
+                *plan.add(PLAN + r) = key.to_bits();
             }
             fence(Ordering::Release);
             workgroup_sync();
@@ -477,6 +481,9 @@ pub mod gfx11 {
             let r = r as usize;
             if r < PLAN {
                 *plan.add(r) = e as u32;
+                // its key after the ids: Π(1 + eᶻ) over the step's tokens, so 1 − 1/key is the chance some token picks
+                // it if the tokens' calibrated picks are independent (the host's `plan_eval` rows, 2026-10-25)
+                *plan.add(PLAN + r) = key.to_bits();
             }
             fence(Ordering::Release);
             workgroup_sync();

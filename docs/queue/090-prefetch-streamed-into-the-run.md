@@ -84,8 +84,9 @@ information than the last:
 
 1. **Post (the slot): the confidence-ordered, window-budgeted fill.** The plan's rank value is a ranking score —
    `pred_rows` ranks the union by Π(1 + eᶻ), its sigmoid gates calibrated online (`M_CAL`/`V_CAL`, `plan_learn` from
-   realized outcomes). Whether the score reads as P(picked) is not measured (a product over a union is not a probability
-   by construction); the calibration curve in Next is what would tell. The fill stops when the marginal value goes
+   realized outcomes). Each token's sigmoid is trained by BCE to be its P(picked), and the union's key Π(1 + eᶻ) is
+   exactly 1 / P(no token picks it) if the tokens' picks are independent — so 1 − 1/key is the score's P(picked) by
+   design; whether it is calibrated in fact is what `plan_eval` measures (2026-10-25, aff85). The fill stops when the marginal value goes
    negative: `P(e) × bytes(e) × L3-benefit(e)` against the touch cost (~70 µs a core a 272 KB slice) and the pollution
    cost (091's retention curve: 86 % of lines kept at ≤ 10 experts, 56 % at 23+ — past the knee a prefetched expert
    costs a DRAM read and evicts an earlier one). The window is estimated, not assumed: the running quantile of the
@@ -144,5 +145,5 @@ tcdent (2026-10-21); bringup/reads/prefetch.sh (done share, window) and prefetch
   not done at the run); a job is ~430 items, not ~150;
   the not-done tail is mostly untouched (at most an item a core in flight, stopped within 4 KB), so not a double read;
   lines streamed inside a DRAM-bound run free no bandwidth, so the ~0.5–1 ms estimate is withdrawn; the misprediction
-  tax is a bound; the score's calibration is unmeasured; the truth-cut has no window without the keep-open. Added: the
+  tax is a bound; the score's calibration is unmeasured (it is a probability by design, corrected the same day); the truth-cut has no window without the keep-open. Added: the
   job table and the cap sweep as the first measurement.

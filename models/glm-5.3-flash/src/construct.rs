@@ -2000,10 +2000,11 @@ pub trait Placed {
     /// The step's predictor updates, once its layers are done: every pair over the step's `n` tokens at once, a
     /// workgroup a pair (in the layers' waits a decode step's took 23 µs a layer of a ~180 µs wait, 2026-10-21).
     fn plan_learn(&mut self, n: usize);
-    /// A decode step's plan for the layer after l, best first (`plan::PLAN` experts), once the card's word says it is in.
-    fn plan(&mut self, l: usize, out: &mut [usize]);
-    /// The second pass's plan (093), once its word is in.
-    fn plan2(&mut self, l: usize, out: &mut [usize]);
+    /// A decode step's plan for the layer after l, best first (`plan::PLAN` experts), and their keys (Π(1 + eᶻ) over the
+    /// step's tokens), once the card's word says it is in.
+    fn plan(&mut self, l: usize, out: &mut [usize], keys: &mut [f32]);
+    /// The second pass's plan (093) and its keys, once its word is in.
+    fn plan2(&mut self, l: usize, out: &mut [usize], keys: &mut [f32]);
     /// Bring-up: a MoE layer's FFN input (`x: [n][H]`) and its router's logits (`[n][ROUTE_ROWS]`) as the card
     /// made them, for forced picks and the traces' edges; serving reads `ffn_input`'s quantized form instead.
     fn ffn_logits(&mut self, l: usize, n: usize, x: &mut [f32], logits: &mut [f32]);
@@ -2195,6 +2196,19 @@ pub struct CpuModel<'p, R: Routed> {
     b_streams: Vec<f32>,
     /// The layer whose early plan was posted at its slot and whose rows plan amends it at the next dispatch (093).
     amend: Option<usize>,
+    /// The plans for the next MoE layer as the step made them — the early one at the slot, the rows one at the amend —
+    /// with their keys and which experts were resident, until that layer's picks come in (`plan_eval`).
+    plan_early: Option<PlanSeen>,
+    plan_rows: Option<PlanSeen>,
+}
+
+/// A decode plan for layer `l`: its experts best first, their keys, and a bit an expert resident on the cards.
+#[derive(Clone, Copy)]
+struct PlanSeen {
+    l: usize,
+    ids: [usize; plan::PLAN],
+    keys: [f32; plan::PLAN],
+    resident: u32,
 }
 
 impl<'p, R: Routed> CpuModel<'p, R> {
@@ -2271,6 +2285,8 @@ impl<'p, R: Routed> CpuModel<'p, R> {
             #[cfg(feature = "dump-pred")]
             b_streams: vec![0.0; STEP * HC * H],
             amend: None,
+            plan_early: None,
+            plan_rows: None,
             b_out: vec![0.0; STEP * TOP_K * H],
         }
     }
@@ -2872,13 +2888,31 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                         if lp + 1 == l {
                             cpu_zone!("amend");
                             let mut pre2 = [E; plan::PLAN];
-                            pl.plan2(lp, &mut pre2);
+                            let mut keys2 = [0f32; plan::PLAN];
+                            pl.plan2(lp, &mut pre2, &mut keys2);
+                            s.plan_rows = Some(PlanSeen { l, ids: pre2, keys: keys2, resident: (0..plan::PLAN).filter(|&r| pre2[r] < E && pl.resident(l, pre2[r])).fold(0, |m, r| m | 1 << r) });
                             let ranked2: Vec<usize> = pre2.iter().copied().filter(|&e| !pl.resident(l, e)).take(PREFETCH_CAP).collect();
                             s.routed.prefetch_amend(l, &ranked2);
                         }
                     }
                     pl.ffn_input(l, n, &mut s.b_xq[t0 * H..(t0 + n) * H], &mut s.b_xs[t0 * HG..(t0 + n) * HG], &mut s.b_xg[t0 * HG..(t0 + n) * HG], &mut s.b_picks[t0..t0 + n], &mut s.b_wts[t0..t0 + n], s.pool);
                     lap(&mut p.kda_card, "kda_card");
+                    // the predictor's plans for this layer against its picks: each plan's experts best first with their
+                    // keys and residency, and the step's picked experts (their union over its tokens)
+                    #[cfg(feature = "track-experts")]
+                    if n <= SPEC_TOKENS {
+                        let (early, rows) = (s.plan_early.take().filter(|q| q.l == l), s.plan_rows.take().filter(|q| q.l == l));
+                        if let Some(e0) = early {
+                            let ids = |q: &PlanSeen| q.ids.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ");
+                            let keys = |q: &PlanSeen| q.keys.iter().map(|x| format!("{x:.4e}")).collect::<Vec<_>>().join(" ");
+                            let mut union: Vec<usize> = s.b_picks[t0..t0 + n].iter().flatten().copied().collect();
+                            union.sort_unstable();
+                            union.dedup();
+                            let picked = union.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ");
+                            let r = rows.unwrap_or(PlanSeen { l, ids: [E; plan::PLAN], keys: [0.0; plan::PLAN], resident: 0 });
+                            prow::row!("track-experts", "plan_eval", { "layer" => l, "tokens" => n, "early" => ids(&e0).as_str(), "early_keys" => keys(&e0).as_str(), "early_resident" => e0.resident, "rows" => ids(&r).as_str(), "rows_keys" => keys(&r).as_str(), "rows_resident" => r.resident, "amended" => rows.is_some(), "picked" => picked.as_str() });
+                        }
+                    }
                     #[cfg(feature = "dump-pred")]
                     for i in 0..n {
                         pl.streams(l, i, &mut s.b_streams[(t0 + i) * HC * H..(t0 + i + 1) * HC * H]);
@@ -3011,7 +3045,9 @@ impl<'p, R: Routed> CpuModel<'p, R> {
                     // layer prefetched (86 % of its lines at <= 10 experts, 56 % at 23+): past what the L3 retains a
                     // prefetched expert costs a DRAM read and evicts an earlier one (2026-10-20)
                     let z = prow::Timestamp::now();
-                    pl.plan(l, &mut pre_next);
+                    let mut keys_next = [0f32; plan::PLAN];
+                    pl.plan(l, &mut pre_next, &mut keys_next);
+                    s.plan_early = Some(PlanSeen { l: l + 1, ids: pre_next, keys: keys_next, resident: (0..plan::PLAN).filter(|&r| pre_next[r] < E && pl.resident(l + 1, pre_next[r])).fold(0, |m, r| m | 1 << r) });
                     #[cfg(feature = "dump-pred")]
                     {
                         pl.ffn_logits(l, n, &mut s.b_x, &mut s.b_score);
