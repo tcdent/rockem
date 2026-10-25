@@ -47,6 +47,7 @@ pub mod gfx11;
 #[cfg(all(feature = "std", target_os = "linux"))]
 pub mod alloc;
 pub mod copy;
+pub mod exp4;
 pub mod gemv;
 #[cfg(any(test, feature = "std"))]
 pub mod linalg;

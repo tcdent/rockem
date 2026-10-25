@@ -552,6 +552,145 @@ pub mod gfx11 {
             bf16_row_step::<K, NP, R>(lane, r, s, slab, acc)
         }
     }
+    /// Exp4 rows (029, `crate::exp4`): a bf16 matrix stored losslessly in ~12.4 bits a weight — each run of eight
+    /// weights a lane reads as twelve bytes (their sign-and-mantissa bytes, then their 4-bit exponent codes), a group's
+    /// base exponent in a head — the three planes in one buffer in `exp4`'s order (`chunk` `[m][K/8][12]`, `head`
+    /// `[m][K/128]` u32, `raw` `[slots][128]` bf16), so a kernel takes the buffer and `m` as a bf16 kernel takes its
+    /// matrix (`Exp4::at`). A step's lane reads its chunk in one load; the step's two heads (lanes 0–15 one group, 16–31
+    /// the next) are wave-uniform, so scalar loads. Each lane rebuilds its weights' bf16 exactly — or, for a group
+    /// stored whole, reads its bf16 from `raw` — then the bf16 step's products in its order: the bf16 kernel's bits.
+    #[derive(Clone, Copy)]
+    pub struct Exp4 {
+        pub chunk: *const u8,
+        pub head: *const u32,
+        pub raw: *const u16,
+    }
+    impl Exp4 {
+        /// The planes of a `[m][K]` matrix stored at `w`.
+        #[inline(always)]
+        pub unsafe fn at<const K: usize>(w: *const u8, m: usize) -> Self {
+            const { assert!(K % crate::exp4::GROUP == 0) };
+            let head = w.add(m * (K / 8) * crate::exp4::CHUNK);
+            let raw = head.add(4 * m * (K / crate::exp4::GROUP));
+            Exp4 { chunk: w, head: head as *const u32, raw: raw as *const u16 }
+        }
+    }
+    impl<const K: usize> Rows<K> for Exp4 {
+        type Row = (*const u8, *const u32, *const u16);
+        const LDS: usize = 0;
+        #[inline(always)]
+        unsafe fn setup(_: u32, _: *mut f32) {}
+        #[inline(always)]
+        unsafe fn row(self, row: usize) -> Self::Row {
+            (self.chunk.add(row * (K / 8) * crate::exp4::CHUNK), self.head.add(row * (K / crate::exp4::GROUP)), self.raw)
+        }
+        #[inline(always)]
+        unsafe fn step<const NP: usize, const R: usize>(lane: u32, r: &[Self::Row; R], s: usize, slab: *const f32, _: *const f32, acc: &mut [[f32; PASS]; R]) {
+            exp4_row_step::<K, NP, R>(lane, r, s, slab, acc)
+        }
+    }
+    /// Weights a rows step covers (32 lanes × 8): two exp4 groups, so a step's heads are two.
+    const STEP_WEIGHTS: usize = 256;
+    unsafe extern "C" {
+        /// `v_perm_b32`: byte `i` of the result is byte `sel.byte(i)` of `{a, b}` (b's bytes 0–3, a's 4–7), 0x0C a zero.
+        #[link_name = "llvm.amdgcn.perm"]
+        fn perm(a: u32, b: u32, sel: u32) -> u32;
+        /// The first active lane's value: tells the compiler a value is the wave's, so loads through it are scalar.
+        #[link_name = "llvm.amdgcn.readfirstlane.i32"]
+        fn readfirstlane(v: i32) -> i32;
+    }
+    /// A pointer every lane of the wave holds the same value of, as the wave's (scalar) value.
+    #[inline(always)]
+    unsafe fn uniform<T>(p: *const T) -> *const T {
+        let a = p as u64;
+        let (lo, hi) = (readfirstlane(a as u32 as i32) as u32 as u64, readfirstlane((a >> 32) as u32 as i32) as u32 as u64);
+        (lo | (hi << 32)) as *const T
+    }
+    /// `bf16_row_step` for exp4 rows: the lane's eight weights rebuilt as bf16 (`crate::exp4::weight`'s rule), then the
+    /// same widening and the same products in the same order.
+    #[inline(always)]
+    pub unsafe fn exp4_row_step<const K: usize, const NP: usize, const R: usize>(lane: u32, w: &[(*const u8, *const u32, *const u16); R], s: usize, slab: *const f32, acc: &mut [[f32; PASS]; R]) {
+        const { assert!(K % 8 == 0 && NP <= PASS && crate::exp4::GROUP == 128 && STEP_WEIGHTS == 2 * crate::exp4::GROUP) };
+        use crate::exp4::GROUP;
+        let l = lane as usize;
+        let base = s * 256 + l * 8;
+        if base < K {
+            // the rows' eight weights as bf16 pairs, weight q in the low half and weight 4 + q in the high, widened at
+            // each use (the same f32 as the bf16 step's, so the same products): half the registers of eight f32 a row,
+            // which kept `rows_h_e4`'s four rows out of scratch (2026-10-25)
+            let mut pw = [[0u32; 4]; R];
+            // every row's head, bytes and nibbles loaded first and together: they do not depend on each other, so the
+            // three loads of all R rows are in flight at once, as the bf16 step's are. Loading the bytes only after
+            // the head said the group was not raw made each step two trips to VRAM (bench-exp4, 2026-10-25: rows_h_e4
+            // at 0.70× the bf16 kernel)
+            let mut hs = [0u32; R];
+            let mut mbs = [0u64; R];
+            let mut cbs = [0u32; R];
+            // the step's two groups' heads: the same for every lane of the wave (scalar loads), each lane taking its half's
+            let groups = K / GROUP;
+            let g0 = 2 * s;
+            let mut r = 0;
+            while r < R {
+                let (chunk, head, _) = w[r];
+                // the row is the wave's, so its heads are: scalar loads, off the vector memory path the chunks use
+                let head = uniform(head);
+                let h0 = *head.add(g0);
+                let h1 = if g0 + 1 < groups { *head.add(g0 + 1) } else { 0 };
+                hs[r] = if l < 16 { h0 } else { h1 };
+                let p = chunk.add((base / 8) * crate::exp4::CHUNK) as *const u32;
+                let (a, b, c) = (core::ptr::read_unaligned(p), core::ptr::read_unaligned(p.add(1)), core::ptr::read_unaligned(p.add(2)));
+                mbs[r] = a as u64 | ((b as u64) << 32);
+                cbs[r] = c;
+                r += 1;
+            }
+            let mut r = 0;
+            while r < R {
+                let (h, mb, cb) = (hs[r], mbs[r], cbs[r]);
+                let slot = (h >> 8) as usize;
+                if slot != 0 {
+                    // a group stored whole (0.68 % of groups): its bf16 as the bf16 step reads them
+                    let p = w[r].2.add((slot - 1) * GROUP + base % GROUP) as *const u64;
+                    let (a, b) = (core::ptr::read_unaligned(p), core::ptr::read_unaligned(p.add(1)));
+                    let mut q = 0;
+                    while q < 4 {
+                        pw[r][q] = ((a >> (16 * q)) & 0xFFFF) as u32 | ((((b >> (16 * q)) & 0xFFFF) as u32) << 16);
+                        q += 1;
+                    }
+                } else {
+                    // weights q and 4 + q at once, one in each half of a register: their sign-and-mantissa bytes by one
+                    // byte permute, their codes by a shift and a mask (the chunk's codes in nibble order put code q at
+                    // bit 4q and code 4 + q at bit 16 + 4q), the base added to both halves (no half passes 255, so
+                    // nothing carries), then sign, exponent and mantissa into place: about five operations a weight
+                    let (lo, hi) = (mb as u32, (mb >> 32) as u32);
+                    let b2 = (h & 0xFF) * 0x0001_0001;
+                    let mut q = 0;
+                    while q < 4 {
+                        let mq = perm(hi, lo, (q as u32) | 0x0C00 | ((4 + q as u32) << 16) | 0x0C00_0000);
+                        let eq = ((cb >> (4 * q)) & 0x000F_000F) + b2;
+                        pw[r][q] = ((mq & 0x0080_0080) << 8) | (eq << 7) | (mq & 0x007F_007F);
+                        q += 1;
+                    }
+                }
+                r += 1;
+            }
+            let mut i = 0;
+            while i < NP {
+                let x = slab.add(i * STEP + l * STRIDE);
+                let mut j = 0;
+                while j < 4 {
+                    let (xa, xb) = (*x.add(j), *x.add(4 + j));
+                    let mut r = 0;
+                    while r < R {
+                        acc[r][i] += f32::from_bits(pw[r][j] << 16) * xa;
+                        acc[r][i] += f32::from_bits(pw[r][j] & 0xFFFF_0000) * xb;
+                        r += 1;
+                    }
+                    j += 1;
+                }
+                i += 1;
+            }
+        }
+    }
     /// FP8 e4m3 rows with an f32 scale per `FP8_BLOCK`-square block (`super::fp8`'s
     /// layout): a row is its bytes and its block row of scales. The decode is a
     /// an f16 bit transplant in registers (`fp8_row_step`; the 256-entry LDS table of 2026-10-15
@@ -694,6 +833,17 @@ pub mod gfx11 {
         }
     }
 
+    /// `rows_fmt` for a launch of at most `FEW` tokens (a decode or verify step): only the one-token and `FEW` widths
+    /// are compiled, so a format whose decode needs registers is not held to the `PASS`-wide pass's 128 accumulators
+    /// (`rows_h_e4` spilled 100 bytes through it, 2026-10-25). A wider launch is a host error.
+    #[inline(always)]
+    pub unsafe fn rows_fmt_few<const K: usize, const NORM: bool, F: Rows<K>, const R: usize>(tid: u32, w: F, ln: *const u16, m: usize, n: usize, eps: f32, stage: impl Fn(usize, usize) -> f32, ready: impl Fn(), emit: impl Fn(usize, usize, f32)) {
+        match width(n) {
+            1 => rows_pass::<K, 1, NORM, F, 1>(tid, w, ln, m, 0, n, eps, &stage, &ready, &emit),
+            _ => rows_pass::<K, FEW, NORM, F, R>(tid, w, ln, m, 0, n, eps, &stage, &ready, &emit),
+        }
+    }
+
     /// LDS a pass at width `NP` over `[m][K]` uses for its slab, in floats.
     pub const fn slab_floats(k: usize, np: usize) -> usize {
         let steps = k.div_ceil(256);
@@ -744,6 +894,12 @@ pub mod gfx11 {
         let mut acc = [[0f32; PASS]; R];
         let mut ss = [0f32; PASS];
         let live = row < m;
+        // the pass's phases in shader cycles, this wave's (common::stats): the staging rounds, the
+        // weight rounds (the format's decode and dot), and the tail (the norm's reduction, the
+        // ready, the emits). A few-token launch is one pass, so a slot is the phase's whole launch;
+        // a many-token launch's passes overwrite the slab's block, and the last pass is what reads.
+        #[cfg(all(target_arch = "amdgpu", feature = "stats"))]
+        let (mut s_stage, mut s_step, mut s_tail, mut t0) = (0u32, 0u32, 0u32, crate::stats::cycles());
         // a row past the matrix computes the last row again and is never emitted
         let mut wr = [w.row(if row < m { row } else { m - 1 }); R];
         let mut k = 1;
@@ -760,6 +916,12 @@ pub mod gfx11 {
                 k += 1;
             }
             crate::gfx11::workgroup_sync();
+            #[cfg(all(target_arch = "amdgpu", feature = "stats"))]
+            {
+                let t = crate::stats::cycles();
+                s_stage = s_stage.wrapping_add(t.wrapping_sub(t0));
+                t0 = t;
+            }
             if live {
                 let mut k = 0;
                 while k < r {
@@ -768,6 +930,12 @@ pub mod gfx11 {
                 }
             }
             crate::gfx11::workgroup_sync();
+            #[cfg(all(target_arch = "amdgpu", feature = "stats"))]
+            {
+                let t = crate::stats::cycles();
+                s_step = s_step.wrapping_add(t.wrapping_sub(t0));
+                t0 = t;
+            }
             s0 += r;
         }
         // the tail, a runtime trip count so it stays a loop and not another unrolled round
@@ -779,6 +947,12 @@ pub mod gfx11 {
                 k += 1;
             }
             crate::gfx11::workgroup_sync();
+            #[cfg(all(target_arch = "amdgpu", feature = "stats"))]
+            {
+                let t = crate::stats::cycles();
+                s_stage = s_stage.wrapping_add(t.wrapping_sub(t0));
+                t0 = t;
+            }
             if live {
                 let mut k = 0;
                 while k < tail {
@@ -787,6 +961,12 @@ pub mod gfx11 {
                 }
             }
             crate::gfx11::workgroup_sync();
+            #[cfg(all(target_arch = "amdgpu", feature = "stats"))]
+            {
+                let t = crate::stats::cycles();
+                s_step = s_step.wrapping_add(t.wrapping_sub(t0));
+                t0 = t;
+            }
         }
         // the norm's scales: each thread's sum of squares over what it staged, the wave's,
         // the eight waves' in order (`workgroup_sum`'s order); one barrier
@@ -813,6 +993,12 @@ pub mod gfx11 {
                 i += 1;
             }
         }
+        #[cfg(all(target_arch = "amdgpu", feature = "stats"))]
+        {
+            let t = crate::stats::cycles();
+            s_tail = s_tail.wrapping_add(t.wrapping_sub(t0));
+            t0 = t;
+        }
         ready();
         let mut k = 0;
         while k < R {
@@ -825,6 +1011,14 @@ pub mod gfx11 {
                 i += 1;
             }
             k += 1;
+        }
+        #[cfg(all(target_arch = "amdgpu", feature = "stats"))]
+        {
+            let t = crate::stats::cycles();
+            s_tail = s_tail.wrapping_add(t.wrapping_sub(t0));
+            crate::stat!(0, s_stage);
+            crate::stat!(1, s_step);
+            crate::stat!(2, s_tail);
         }
     }
 

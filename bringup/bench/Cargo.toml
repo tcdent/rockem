@@ -147,3 +147,11 @@ path = "src/touch.rs"
 [[bin]]
 name = "bench-pool"
 path = "src/pool.rs"
+
+[[bin]]
+name = "bench-exponents"
+path = "src/exponents.rs"
+
+[[bin]]
+name = "bench-exp4"
+path = "src/exp4.rs"

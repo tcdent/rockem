@@ -256,7 +256,7 @@ pub mod gfx11 {
     //! rows: the output projection). One token is n = 1 through the same kernels.
     pub use super::gfx11_consts::*;
     use crate::*;
-    use common::gemv::gfx11::rows_over;
+    use common::gemv::gfx11::{rows_fmt_few, rows_over, Exp4};
     use common::gemv::{widen, ROWS};
     use common::gfx11::{lds, wave_sum, workgroup_sync};
     use common::math::{exp, rsqrt};
@@ -353,6 +353,56 @@ pub mod gfx11 {
             let (m, n) = (m as usize, n as usize);
             let t = tid as usize;
             rows_over::<PART_QKV, false, 1>(tid, w, core::ptr::null(), m, n, 0.0, |i, s| *x.add(i * PART_QKV + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
+        }
+    }
+
+    /// The exp4 twins of the decode path's KDA rows kernels (029): the same launches over the lossless 12-bit form of
+    /// the same matrices (`common::exp4`, its planes at `w`), the bf16 kernels' arguments, grids and LDS, their bits.
+    /// Decode and verify steps only (at most `FEW` tokens, `rows_fmt_few`); a prefill step takes the bf16 matrix path.
+    #[no_mangle]
+    pub extern "gpu-kernel" fn rows_h_e4(x: *const f32, ln: *const u16, w: *const u8, out: *mut f32, m: u32, n: u32) {
+        unsafe {
+            let tid = workitem_id_x();
+            let (m, n) = (m as usize, n as usize);
+            let t = tid as usize;
+            rows_fmt_few::<H, true, Exp4, ROWS>(tid, Exp4::at::<H>(w, m), ln, m, n, RMS_NORM_EPS, |i, s| *x.add(i * H + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
+        }
+    }
+    #[no_mangle]
+    pub extern "gpu-kernel" fn rows_h1_e4(x: *const f32, ln: *const u16, w: *const u8, out: *mut f32, m: u32, n: u32) {
+        unsafe {
+            let tid = workitem_id_x();
+            let (m, n) = (m as usize, n as usize);
+            let t = tid as usize;
+            rows_fmt_few::<H, true, Exp4, 1>(tid, Exp4::at::<H>(w, m), ln, m, n, RMS_NORM_EPS, |i, s| *x.add(i * H + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
+        }
+    }
+    #[no_mangle]
+    pub extern "gpu-kernel" fn rows_d2_e4(x: *const f32, w: *const u8, out: *mut f32, m: u32, n: u32, split: u32, xs: u32) {
+        unsafe {
+            let tid = workitem_id_x();
+            let (m, n, xs) = (m as usize, n as usize, xs as usize);
+            let t = tid as usize;
+            let x = if core::arch::amdgpu::workgroup_id_x() as usize * common::gemv::rows_per_wg(n, ROWS) >= split as usize { x.add(KDA_DIM) } else { x };
+            rows_fmt_few::<KDA_DIM, false, Exp4, ROWS>(tid, Exp4::at::<KDA_DIM>(w, m), core::ptr::null(), m, n, 0.0, |i, s| if s * 256 + t < KDA_DIM { *x.add(i * xs + s * 256 + t) } else { 0.0 }, || {}, |row, i, y| *out.add(i * m + row) = y);
+        }
+    }
+    #[no_mangle]
+    pub extern "gpu-kernel" fn rows_part_e4(x: *const f32, w: *const u8, out: *mut f32, m: u32, n: u32) {
+        unsafe {
+            let tid = workitem_id_x();
+            let (m, n) = (m as usize, n as usize);
+            let t = tid as usize;
+            rows_fmt_few::<PART_QKV, false, Exp4, ROWS>(tid, Exp4::at::<PART_QKV>(w, m), core::ptr::null(), m, n, 0.0, |i, s| *x.add(i * PART_QKV + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
+        }
+    }
+    #[no_mangle]
+    pub extern "gpu-kernel" fn rows_part1_e4(x: *const f32, w: *const u8, out: *mut f32, m: u32, n: u32) {
+        unsafe {
+            let tid = workitem_id_x();
+            let (m, n) = (m as usize, n as usize);
+            let t = tid as usize;
+            rows_fmt_few::<PART_QKV, false, Exp4, 1>(tid, Exp4::at::<PART_QKV>(w, m), core::ptr::null(), m, n, 0.0, |i, s| *x.add(i * PART_QKV + s * 256 + t), || {}, |row, i, y| *out.add(i * m + row) = y);
         }
     }
 
