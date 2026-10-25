@@ -156,12 +156,26 @@ registers); waves a workgroup 8 / 4 / 2 / 1 (no difference: the grid's quantizat
 not its loop. Gotcha found on the way: a pointer rebuilt from `readfirstlane` loses the global address space, so its
 loads compile as flat loads, which also count on the scalar counter; the chunks' loads waited on every head's wait.
 
+**Deployed as aff84 (2026-10-25).** Long SCORE bit-identical; on a cold boot `gen_ref.sh` matches `bf16-aff81` in
+both parts (24 and 126 tokens). The same check on the deploy's own boot differed from the third character: its "cold"
+was a cache hit on the deploy workload's prompt, and that prompt's cold prefill ran through a burst of corrected link
+errors (15 BadTLP on c1:00.0, 2 APEI records) at 3.4 ms a prompt token instead of ~2.0; a repeat matched itself, and a
+clean reboot matched the reference. Open: whether a cache hit can differ from its cold run ([[rare-divergence]]'s
+cold-vs-hit near-tie), or that cold prefill's state was off. Measured on the clean boot, the 18k workload:
+
+| | aff81 bf16 | aff83 | aff84 |
+|---|---|---|---|
+| ms a verify step, cached decode | 60.0 | 59.1 | 57.4 |
+| verify, ms a token: kda / total | 7.99 / 22.7 | 7.89 / 22.4 | 7.59 / 21.8 |
+| prefill, ms a prompt token | 1.97 | 1.99 | 1.97 |
+
 **A card hang (2026-10-25):** the one-ahead build hung card 0 in `bench-exp4 --node` at 4 tokens (exp4 sequence; the
 same ELF had passed 1–3 tokens and the bit checks at every width). The node on that card panicked and the box reset.
 Not reproduced or explained; the two-ahead build ran every width twice without it. Benches beside the serving node
 share its card: a hang there takes production down.
 
 ## History
+- 2026-10-25 (aff84): exp4 kernels with no staging past one token, at the step's own width — 57.4 ms a verify step (59.1 aff83, 60.0 bf16), bits as bf16.
 - 2026-10-25 (aff83): exp4 deployed — the node holds only exp4, generation bit-identical, ~1.07 GB a card freed.
 - 2026-10-17 (`bdc57ec`): DFloat11 scoped; not built.
 
