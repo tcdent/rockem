@@ -493,8 +493,11 @@ protected lines 4.3; fresh 8.4 by their lost lines; decay by the gap. The node's
 on this model against their 10.6; the rest is what `bench-run`'s 2× is made of — its candidate, from today's facts: eight
 cores reading 2 MiB-strided regions or queue-claimed slices (~8 apart) in the same rhythm meet in the same L3 sets at the
 same moment; a freshly booted box hands out near-contiguous 4 KiB pages too, which is why `--pages 4k` did not differ.
-The node's experts sit at a 51/16 MiB stride (`layout::SHARE` = 3,342,336 B), which does not alias. Test: a 4 KB pad
-after every item (`--pad-kb 4`): `bringup/box/logs/bench-run-pad.txt`.
+The node's experts sit at a 51/16 MiB stride (`layout::SHARE` = 3,342,336 B), which would not alias. **Refuted:** a 4 KB
+pad after every item changes nothing (15.3–15.8 → 15.5 µs fixed-warm on one CCD; 15.2 → 15.4 at the node's shape). Note
+that every `bench-run` fixed-warm figure above was taken with a 3 ms idle window (the decay); at window 0 it reads 8.4,
+so the residual to explain is 8.4 against 4.3, with `bench-run`'s rounds still holding several tens-of-µs barrier and
+build gaps between phases: `bringup/box/logs/bench-run-window0.txt`.
 
 **Why it matters here:** every one of the node's expert runs follows a ~440 µs window of DRAM touching and `mwaitx`
 waits — no L3 hits for the core — so the node's warm items run in the decayed state on every layer; `bench-run`'s

@@ -52,7 +52,10 @@
 //! one (a spin barrier a CCD): the warm reads with the CCD's DRAM path quiet, then the cold ones at full rate — the CCD
 //! delivers the sum either way (099), so the overlap is worth nothing and the interference is.
 //!
-//!   bench-run [--ccd-barrier 0] [--retouch 0] [--ring-kb 1024] [--hold 0] [--stagger-ns 0] [--notouch 0] [--front 0] [--one-phase 0] [--regions 0] [--notime 0] [--plain 0] [--private 0] [--pages 2m] [--fixed 0] [--smt 0] [--multi 0] [--cpus 49-71,73-95] [--steal any] [--plan 45] [--cold 28] [--window-us 440] [--rounds 60] [--pool-mb 600]
+//! `--pad-kb n`: `n` KB of padding after every item in the pool (item stride 128 KB + n): eight cores reading regions or
+//! queue-claimed slices at a 2 MiB stride in the same rhythm meet in the same L3 sets; a pad breaks the stride.
+//!
+//!   bench-run [--pad-kb 0] [--ccd-barrier 0] [--retouch 0] [--ring-kb 1024] [--hold 0] [--stagger-ns 0] [--notouch 0] [--front 0] [--one-phase 0] [--regions 0] [--notime 0] [--plain 0] [--private 0] [--pages 2m] [--fixed 0] [--smt 0] [--multi 0] [--cpus 49-71,73-95] [--steal any] [--plan 45] [--cold 28] [--window-us 440] [--rounds 60] [--pool-mb 600]
 use harness::arg;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -217,7 +220,9 @@ fn main() {
     let w: Vec<i8> = (0..ROWS * K).map(|_| rng.i4()).collect();
     let (pw1, ps1) = common::q4::pack(ROWS, K, &w, &vec![0.01; ROWS * K / common::q4::GROUP]);
     let (ib, sb) = (pw1.len(), ps1.len());
-    let ipool = (pool_mb << 20) / ib;
+    let pad = num("--pad-kb", 0) << 10;
+    let stride = ib + pad;
+    let ipool = (pool_mb << 20) / stride;
     // every CCD's pool filled at once (serially, 12 × 600 MB by one core each was most of a run's wall)
     let pools: Vec<(usize, usize)> = (0..nccd)
         .map(|k| {
@@ -226,9 +231,9 @@ fn main() {
             std::thread::spawn(move || {
                 harness::bench::pin(cpu);
                 // 2 MiB pages, first-touched here (this CCD's node), as the node's experts
-                let wv = huge::alloc_pages(ipool * pw1.len(), pages_huge);
+                let wv = huge::alloc_pages(ipool * stride, pages_huge);
                 for i in 0..ipool {
-                    for (d, &b) in wv[i * pw1.len()..(i + 1) * pw1.len()].iter_mut().zip(pw1.iter()) {
+                    for (d, &b) in wv[i * stride..i * stride + pw1.len()].iter_mut().zip(pw1.iter()) {
                         *d = b ^ (i as u8 & 0x11);
                     }
                 }
@@ -247,7 +252,7 @@ fn main() {
     let pools: &'static [(usize, usize)] = Box::leak(pools.into_boxed_slice());
     println!("pools: {} MiB in 2 MiB pages of {} MiB", huge::huge_mib(), nccd * pool_mb * 129 / 128);
     // an item id: ccd << 32 | index in its pool
-    let wptr = move |id: usize| (pools[id >> 32].0 + (id & 0xffff_ffff) * ib) as *const u8;
+    let wptr = move |id: usize| (pools[id >> 32].0 + (id & 0xffff_ffff) * stride) as *const u8;
     let sptr = move |id: usize| (pools[id >> 32].1 + (id & 0xffff_ffff) * sb * 4) as *const f32;
 
     let ccdq: Arc<Vec<Queue>> = Arc::new((0..nccd).map(|_| Queue::new()).collect());
@@ -370,7 +375,7 @@ fn main() {
                                     break;
                                 }
                                 rt_queue.pop_front();
-                                if !unsafe { touch_node::touch(wptr(rid), 2 * ib, Some(until)) } {
+                                if !(unsafe { touch_node::touch(wptr(rid), ib, Some(until)) } && unsafe { touch_node::touch(wptr(rid + 1), ib, Some(until)) }) {
                                     break;
                                 }
                             }
@@ -378,11 +383,14 @@ fn main() {
                         // a slice touched in 64 KB pieces with the hold between them
                         let mut ok = true;
                         let mut off = 0;
-                        while ok && off < 2 * ib {
-                            let n = (64 << 10).min(2 * ib - off);
-                            ok = unsafe { touch_node::touch(wptr(id).add(off), n, Some(until)) };
-                            off += n;
-                            hold();
+                        for h in 0..2 {
+                            while ok && off < ib {
+                                let n = (64 << 10).min(ib - off);
+                                ok = unsafe { touch_node::touch(wptr(id + h).add(off), n, Some(until)) };
+                                off += n;
+                                hold();
+                            }
+                            off = 0;
                         }
                         ok = ok && unsafe { touch_node::touch(sptr(id) as *const u8, 2 * sb * 4, Some(until)) };
                         if !ok {
