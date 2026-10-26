@@ -504,6 +504,22 @@ touch of fresh lines (one load a line, GB/s a core):
 - Where the CCD's path is the limit (8 cores of one CCD) the sibling changes nothing; where the core's own concurrency
   is (one core, or the whole socket at 3 GB/s a core) an active sibling adds 10–15 %. The mechanism is not measured.
 - Every node and bench measurement before this one ran with the siblings in C2.
+- **With the node's touch it does not hold** (`--touch node`: `touch_node.rs`, construct.rs `touch_avx2` — 32-byte loads,
+  sixteen lines in flight): 46 cores 3.16–3.17 GB/s a core halted, 3.15 / 3.49 spinning (two runs); one core 20.3 vs
+  19.0. The scalar touch's gain is the access pattern's. Benches that touch must use the node's kernel (`bench-window`,
+  `bench-run` do).
+- **An awake sibling costs the compute** (`bench-power --sib-spin`, socket 1, 46 cores; siblings set with
+  `bringup/box/sibling_cstate.sh`):
+
+| siblings | gemm, L3-resident (280 W cap) | gemm from DRAM | DRAM stream |
+|---|---|---|---|
+| C2 (production) | 63.5 GMAC/s a core, 3.11 GHz | 12.6 | 3.13 GB/s |
+| C1 | 63.2, 3.11 GHz | 12.6 | 3.13 |
+| poll | 57.2, 3.20 GHz | 12.5 | 3.12 |
+| spinning `pause` | 57.0, 3.21 GHz | 12.5 | 3.07 |
+
+  An awake sibling takes ~10 % of the core's compute (the clock rises: less power in the core's work) and gives the
+  DRAM stream nothing. Keeping the siblings out of C2 is not a lever.
 
 ### What a store costs, and musl's malloc (measured 2026-10-22, the node's planner on core 7)
 
