@@ -56,7 +56,46 @@ nothing: there was no eviction to prevent). Candidates, to measure: the L3's own
 victim installs (every DRAM line a core streams is written into L3 when its L2 evicts it); the CCD's fabric port; clocks
 under the 280 W cap while DRAM streams.
 
-## Ruled out
+## The interference is the CCD's memory path, not power or the socket (bench-interfere, 2026-10-25)
+One core (56) runs warm items — the production one-token kernel over a set it touched, L3-resident — while j cores
+stream the same kernel over a pool past the caches, on its own CCD (57–63, one L3: `shared_cpu_list` 56-63,152-159) or
+another (65–71). Median warm item, the warm core's clock (APERF/MPERF), the streamers' aggregate:
+
+| j streamers | same CCD: warm item | GHz | streamers GB/s | other CCD: warm item | streamers GB/s |
+|---|---|---|---|---|---|
+| 0 | 4.56 µs | 3.45 | — | — | — |
+| 1 | 4.55 | 3.45 | 17.6 | 4.60 | 18.5 |
+| 2 | 4.59 | 3.45 | 31.0 | 4.56 | 31.2 |
+| 3 | 4.58 | 3.45 | 37.3 | 4.60 | 37.9 |
+| 4 | 5.17 | 3.45 | 38.7 | 4.58 | 40.1 |
+| 5 | 7.11 | 3.45 | 39.5 | 4.57 | 40.3 |
+| 6 | 10.25 | 3.45 | 39.6 | 4.57 | 40.7 |
+| 7 | 12.70 | 3.45 | 40.0 | 4.58 | 40.6 |
+
+- **Not power:** the clock holds at 3.45 GHz throughout.
+- **Not the socket:** streamers on another CCD leave the warm core at 4.6 µs.
+- **The CCD's own path to memory:** a CCD's DRAM reads saturate at ~40 GB/s with 3–4 streaming cores (the GMI2 port,
+  ~51 GB/s by spec, epyc-7r13-topology); every streamer past that adds no bandwidth and slows the CCD's L3-fed cores up
+  to 2.8× (inference: L3 hits queued behind outstanding misses in the CCD's shared request path — which queue is not
+  measured).
+- **Why interleaving lost in the node:** the node's run has all 8 cores of a CCD streaming cold items at once (warm
+  first or interleaved alike), so its warm items run at the clogged ~11.7 µs in every order; interleaving per core keeps
+  every core streaming, and costs the balance. The bench's even, synchronized shape happened to reward it.
+- The same mechanism, seen before from the other side: the main thread's route/dispatch doubled with seven cores
+  streaming beside it on its CCD (8.5 → 18 µs a layer, `PREFETCH_CORES_MAIN`, construct.rs).
+
+## What it suggests (architecture)
+- **A CCD's DRAM streaming capped at its saturation point.** No more than ~3 cores of a CCD stream cold data at once
+  (a per-CCD semaphore on the cold queue); the others take warm items (own or stolen) meanwhile, at 4.6 µs instead of
+  ~12. In production all CCDs stream together, so a CCD's share of a socket's ~145 GB/s is ~24 GB/s and the saturation
+  point is likely ~2 — to measure with all CCDs streaming.
+- **The prefetch window the same way:** 8 touchers a CCD saturate the port as 3 would; fewer touchers leave cores free
+  (for 098's analog, for the main thread's phases) at the same delivery.
+- **Streamers and computers by role:** a CCD's few streamers pull the cold items into the CCD's L3 just ahead of the
+  computing cores (who then never wait on DRAM). The catch to design around: a line a core touches sits in its own L2
+  until evicted (l3-core-boundary), so a streamer's lines reach L3 only ~512 KB later.
+
+
 - **Token count:** at 1 token (the served ~1.15 a verify-step expert) the bench still favours interleaving (350 vs 432 µs).
 - **Item size:** at the served gate/up pair size (~544 KB, 256 rows) still (416 vs 469).
 - **Uneven warm sets** (cores reach their cold items at different times): at 9 ± 6 warm items a core still (357 vs 450).
@@ -88,8 +127,9 @@ under the 280 W cap while DRAM streams.
 
 ## Next
 1. Done: `prefetchnta` (no effect) and the fill counters (no eviction).
-1a. The interference matrix (bench): k cores of a CCD on warm items while j others stream cold, j = 0…7 — the warm
-   item's cost against j, with the cores' effective clock (APERF/MPERF) beside it: L3 or fabric contention, or power.
+1a. Done: the interference matrix (above) — the CCD's memory path.
+1b. The same matrix with every CCD of the socket streaming (the production shape): the saturation point per CCD.
+1c. The cap in the node: a per-CCD limit on concurrent cold claimers in the run (lab A/B), and fewer touchers in the window.
 2. The node's warm item at its best: a lab run with the prefetch posted but no cold traffic (the run's misses forced to
    the cards or skipped) to read the node's own floor for a warm item.
 3. The differences above, one at a time in the bench, until it reproduces the node's sign.

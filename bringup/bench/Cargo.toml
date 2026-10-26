@@ -163,3 +163,7 @@ path = "src/trellis.rs"
 [[bin]]
 name = "bench-order"
 path = "src/order.rs"
+
+[[bin]]
+name = "bench-interfere"
+path = "src/interfere.rs"
