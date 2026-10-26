@@ -1,10 +1,10 @@
 # 099 — The expert run as a system
 
-**Status:** Open — the system is quantified (2026-10-25/26); one lever is bench-proven in the steady state and waits on a
-node lab; the mechanism of the L3-rate state is unidentified
+**Status:** Open — the system is quantified (2026-10-25/26); the re-touch is **deployed** (2026-10-26, 50bbd219); the
+mechanism of the L3-rate state is unidentified
 **Area:** decode, the host's expert run, the cache hierarchy, the pool's scheduling, how the benches measure
-**Gain:** the re-touch, ~10 % of a layer's run in the steady state (~1.5 ms a verify step at width 3, inference); the
-rest of the run is its cold bytes
+**Gain:** the re-touch, deployed: `experts` −13 % at width 2, −4 / −5 % at widths 3 / 4 (−8.4 % over the step mix),
+the 96-token decode request 56–60 → 51.8 ms a step; the rest of the run is its cold bytes
 
 > yeah hang on don't give up on it yet unless you can explain why it's not working then we still have some more
 > discovery to do and modeling the hardware like you're doing at the very edge of our understanding is super valuable
@@ -157,7 +157,7 @@ cross-socket interaction (one socket alone runs the same walls as both); the per
 | lever | wall (gate/up + down) a layer | own item | stolen item | status |
 |---|---|---|---|---|
 | today's schedule | 223 + 122 = **345 µs** | 13.3 µs, 6 % DRAM | 16.6, 17 % | reference |
-| **re-touch** — each worker re-reads the slices it touched 512 KB of touching earlier, through the window | 203–208 + 106 = **310, −10 %** | 11.1 | 12.5, 5 % | **bench-proven; node lab next** |
+| **re-touch** — each worker re-reads the slices it touched 512 KB of touching earlier, through the window | 203–208 + 106 = **310, −10 %** | 11.1 | 12.5, 5 % | **deployed 2026-10-26 (§4.2)** |
 | warm-then-cold a CCD (a barrier before the cold claims) | unchanged | | | nothing |
 | sibling streams the next cold item into the shared L2 | 219 + 125 vs 219 + 122 | 15.1 | 27.5 | zero-sum (cold items 18.5 µs, warm ones slower) |
 | a ring hold (a 1 MB L3 buffer a core read at 256 KB / 50 µs through the window) | worse: own DRAM 6 → 15 % (taken cold) | | | negative: footprint |
@@ -172,11 +172,30 @@ unchanged — the "warm" cores were streamers too, 14–44 % of their lines from
 stolen less); the morning's re-touch (complete experts' DRAM 14 → 9 %, the partial experts' first touches fewer, the
 step unchanged).
 
-### 4.1 What would move the node, from the data
+### 4.2 The re-touch in production (deploy `retouch`, run 50bbd219, 2026-10-26; `bringup/box/logs/deploy-retouch.txt`)
 
-1. **The re-touch, built as the bench ran it** (every slice re-read 512 KB later, kept across the amend, the last 512 KB
-   included), with the loss-map measurement: predicted −10 % of the run, ~1.5 ms a verify step at width 3. If the node
-   does not show it, the disagreement goes back to the bench first (§5).
+Built as the bench ran it (construct.rs `RETOUCH_LAG`: a per-worker queue of touched ranges, keyed by layer so it
+survives the amend, drained once 512 KB more has been touched; no flag). Long SCORE bit-identical. Against the last
+production run (313531f3) on the same 24-decode workload at 18k:
+
+| width | `experts` p50 (ms) | step p50 (ms) | complete experts' lines from DRAM | partial experts' | all host lines |
+|---|---|---|---|---|---|
+| 2 | 14.25 → **12.36 (−13 %)** | 47.3 → 46.3 | 15.1 → **2.9 %** | 42 → 50 % | 31 → 24 % |
+| 3 | 21.29 → 20.51 (−4 %) | 60.8 → 60.2 | 18.6 → 3.2 % | 36 → 45 % | 45 → 38 % |
+| 4 | 29.91 → 28.48 (−5 %) | 71.5 → 70.0 | 21.4 → 3.6 % | 29 → 38 % | 55 → 47 % |
+
+Weighted over the step mix (60 % of verify steps at width 2): −8.4 % on `experts`; the standard 96-token decode request
+56–60 → 51.8 ms a step; the cold 18k prefill 42.7 → 40.1 s. The leak is closed as the bench said (one hit promotes: the
+complete experts' DRAM lines 15–21 → 3 %), and the price is where the bench said (the partial experts' first touches:
+their DRAM share +8 points). **The width dependence is a disagreement with the bench** (which predicted −10 % at width 3
+and got −4): at width 2 the window finishes most of its plan and the re-reads are free; at widths 3–4 the plan is longer
+than the window (missed 4.6 / 8.7 experts a layer) and the re-reads displace first touches. By the rule it goes back to
+the bench: `bench-run` with the window shorter than its plan (the node's widths 3–4), re-touch on and off.
+
+### 4.3 What would move the node next, from the data
+
+1. **The re-touch at widths 3–4:** re-read only while the window has slack, or only the slices most at risk (the oldest
+   tenth: 19 % lost vs 4 % for the newest), after the bench reproduces the width dependence.
 2. **Fewer cold bytes:** the cold items are the run — 098's predictor, residency on the cards, formats.
 3. **The clock under the 280 W cap** (power per MAC, metatron-cpu §4).
 4. **The L3-rate state's mechanism:** if it is a prefetcher or credit setting there may be a knob; if it is replacement
@@ -188,7 +207,8 @@ step unchanged).
   latency rise names the interface, a bandwidth-only loss names concurrency (prefetch depth or credits); the recovery's
   dependence on the number of cores hitting (2 and 4 between 1 and 8).
 - **The node vs the bench, two disagreements, by the rule bench-first:** interleaving (+12 % in the bench warm, −10 % in
-  the node) and the re-touch (−10 % in the bench, nothing in the node lab). What the node has that `bench-run` lacks:
+  the node) and the re-touch's width dependence (−10 % in the bench at width 3, −13 / −4 / −5 % in the node at widths
+  2 / 3 / 4; the morning lab's null was the transient plus the amend). What the node has that `bench-run` lacks:
   the amend mid-window (drops pending re-touches; re-plans), real multi-token items (the bench's 86/12/2 % mix is
   `--multi`), the SwiGLU/quantize between phases, the main thread's route/dispatch on core 1's CCD, the cards' BAR
   traffic and the loader, prow rows. One at a time.
@@ -226,6 +246,7 @@ Each step's finding, and what later superseded it. Logs: `bringup/box/logs/<name
     transient (§2.3, §3.1) after every candidate of Appendix B was refuted; `--warmup` added to both benches.
 17. **The premise re-measured warm**: interleaving +12 %, not +25 % (§1).
 18. **The steady-state node shape**: the re-touch −10 %; the sum of sources holds; sibling streaming zero-sum (§4).
+19. **The re-touch deployed** (50bbd219): `experts` −13 / −4 / −5 % at widths 2 / 3 / 4; the leak closed (§4.2).
 
 ## Appendix B — Refuted candidates (so none is tried twice)
 

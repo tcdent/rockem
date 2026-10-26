@@ -85,6 +85,18 @@ const SLOTS: usize = CORE + MAX_WORKERS;
 /// The decode prefetch's experts a layer at most, its best-ranked first (a CCD's L3 retains about this many; see the
 /// prefetch's comment).
 const PREFETCH_CAP: usize = 13;
+/// A prefetch worker reads every slice it touched a second time, once `RETOUCH_LAG` more bytes of touching have passed
+/// (the slice has left this core's 512 KB L2 by then, so the second read is an L3 hit, not an L2 one). Two effects, both
+/// measured (queue 099, 2026-10-26): an L3 hit promotes a once-referenced line so the L3 keeps it (a stolen item's lines
+/// from DRAM 17 → 5 %), and a core whose L3 hits stop for a window of DRAM touching reads its warm lines up to 2× slower
+/// in the run after — the re-reads keep its hits flowing with no lines of their own. `bench-run`, the node's schedule in
+/// the steady state: a layer's run 345 → 310 µs. The queue is this worker's and survives the amend (the plan changes
+/// within a layer; the ranges touched stay worth re-reading); it empties at the next layer.
+const RETOUCH_LAG: usize = 512 << 10;
+std::thread_local! {
+    /// (layer, the ranges touched in order with the bytes touched when each ended, bytes touched so far)
+    static RETOUCH: std::cell::RefCell<(usize, std::collections::VecDeque<(usize, usize, usize)>, usize)> = const { std::cell::RefCell::new((usize::MAX, std::collections::VecDeque::new(), 0)) };
+}
 /// Workers a CCD lends a prefetch (of its eight), by their rank in the CCD: every core touches, so every core's first
 /// reads are its own lines and the CCD's DRAM phase starts only when its planned reads are done (with four of eight
 /// the other four streamed DRAM beside the takers' planned reads: 83 → 78 % of a completed expert's lines from L3,
@@ -1162,10 +1174,35 @@ impl<'a> CpuExperts<'a> {
                 if !touch(unsafe { std::slice::from_raw_parts(start as *const u8, end - start) }, &|| pool_s.abandoned()) {
                     return;
                 }
+                RETOUCH.with(|r| {
+                    let r = &mut *r.borrow_mut();
+                    if r.0 != l {
+                        *r = (l, std::collections::VecDeque::new(), 0);
+                    }
+                    r.2 += end - start;
+                    r.1.push_back((start, end - start, r.2));
+                });
                 a = b;
             }
             #[cfg(feature = "track-experts")]
             finished[it.0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // the ranges this worker touched at least RETOUCH_LAG ago, read again
+            loop {
+                let next = RETOUCH.with(|r| {
+                    let r = &mut *r.borrow_mut();
+                    match r.1.front() {
+                        Some(&(s0, len, at)) if at + RETOUCH_LAG <= r.2 => {
+                            r.1.pop_front();
+                            Some((s0, len))
+                        }
+                        _ => None,
+                    }
+                });
+                let Some((s0, len)) = next else { break };
+                if !touch(unsafe { std::slice::from_raw_parts(s0 as *const u8, len) }, &|| pool_s.abandoned()) {
+                    return;
+                }
+            }
         };
         let takers = self.pool.prefetch_slotted(n, Box::new(slot), Box::new(f));
         let z = draft_zone("pf.post", z);
