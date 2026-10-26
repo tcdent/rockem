@@ -168,6 +168,39 @@ after the touch, runs of 16 lines) and `--bg` (streamers through the run), the m
   the CCD's other lines meanwhile), the lines of stolen slices (a mate's L2, l3-core-boundary), the partial experts'
   touched slices counted with them.
 
+## The leak reproduced: Milan's L3 drops fresh lines first, and one L3 hit protects them (bench-order --fresh, 2026-10-25)
+The bench's warm sets had been the same lines every iteration (L3-resident from the iterations before, the touch adding
+nothing). `--fresh 1` takes each iteration's warm items from the pool — new lines, touched from DRAM, then run — as the
+node's prefetch touches a new layer's experts. The leak appears. Warm-only (no cold traffic in the run), 8 cores of one
+CCD (56–63), the CCD's touched bytes a round against the warm lines then read from DRAM:
+
+| CCD touched | 3.3 MB | 6.5 MB | 9.8 MB | 15.2 MB | 21.8 MB |
+|---|---|---|---|---|---|
+| warm lines from DRAM | 0.3 % | 2.6 % | 7.2 % | 15.8 % | 33 % |
+
+- **One core alone loses nothing** (2.7 MB touched, 0.1 %); 8 on one CCD lose 7 % at 10 MB — a third of the 32 MB L3.
+  Not LRU capacity: the replacement drops lines with no hit history first. The fixed sets (every line hit each
+  iteration) lost nothing at 46 cores.
+- **One L3 hit protects a line.** The fresh set touched twice or three times before the run:
+
+| CCD touched | order | 1 touch | 2 touches | 3 touches |
+|---|---|---|---|---|
+| 9.8 MB | warm only | 7.0 % | 0.6 % | 0.2 % |
+| 9.8 MB | cold first | 16.3 % | 0.9 % | 0.1 % |
+| 15.2 MB | warm only | 16.4 % | 2.0 % | 0.2 % |
+| 15.2 MB | cold first | 35.0 % | 4.5 % | 0.4 % |
+| 21.8 MB | cold first | 53 % | 11 % | 2.2 % |
+
+- **The node's shape (46 cores, 11 fresh items a core ≈ 1.5 MB, the node's ~11.6 MB a CCD):** one touch loses 6.3 % (warm
+  first) to 21.8 % (cold first) of the warm lines — the node's 14–18 % sits inside; two touches 0.8–1.3 %. The warm item
+  15.6 → 9.3 µs interleaved, 12.4 → 8.1 warm only; the interleaved run 438 → 371 µs (−15 %); warm-first's run is set by its
+  cold phase and does not move (538 → 543).
+- **The second pass's cost:** ~110 µs a core for 1.5–2 MB, L3-fed (11,471 L3 hits, 873 DRAM lines: the lines the first
+  pass already lost); the first pass ~440 µs, DRAM-fed. It is core time in the window, not DRAM bytes.
+- Where it fits the node: the window's DRAM delivery saturates a CCD with ~3 streamers (above), so a CCD's other cores
+  are free to re-touch from L3 what the streamers brought — the re-touch must reach a line after it left its toucher's L2
+  (a mate's read of a line in the toucher's L2 refetches from DRAM, l3-core-boundary).
+
 ## How the bench and the node differ (to quantify, one at a time)
 1. **The shared CCD queue and stealing.** The node's cold items are claimed from one queue by the CCD's 8 cores and its
    warm items can be stolen by mates; the bench's cores own private sets. The queue is the node's load balancer.
@@ -196,6 +229,8 @@ after the touch, runs of 16 lines) and `--bg` (streamers through the run), the m
 1b. Done: with the socket loaded, 3 streamers a CCD saturate it; 5–7 slow its L3-fed cores 2–5×.
 1c. Done: the cap in the node — no gain (above); the bench's mechanism is not the node's limit.
 1d. Done in part: the item's code is not the cost; the DRAM lines inside prefetched items are (above).
+1f. Done: the leak reproduced in the bench (fresh sets) and a second touch removes it (above). Next: a re-touch in the
+    node's prefetch, A/B on one lab boot.
 1e. The node's fill counters by item, with its class (own / CCD / stolen) and its slice's touch time (lab): where a
     complete expert's 14–18 % DRAM lines come from — evicted (own items) or a mate's L2 (stolen).
 2. The node's warm item at its best: a lab run with the prefetch posted but no cold traffic (the run's misses forced to

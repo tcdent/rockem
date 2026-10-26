@@ -12,7 +12,12 @@
 //!
 //! Each item is timed by its class (warm, cold): what an order does to each.
 //!
-//!   bench-order [--cpus 49-71,73-95] [--n 3] [--rows 64] [--warm 9] [--cold 7] [--pool-mb 96] [--iters 200]
+//! `--fresh`: each iteration's warm items are new — the pool's next, last read a pool's length ago (past every cache) —
+//! touched from DRAM and then run, as the node's prefetch touches a new layer's experts; without it the warm set is the
+//! same lines every iteration (L3-resident from the iterations before, the touch adding nothing). `--gap-us g`: the touch
+//! and the run `g` µs apart; `--touches t`: the fresh set touched `t` times over (a second pass hits it in L3) (the cards' phase between the node's prefetch and its run).
+//!
+//!   bench-order [--fresh] [--gap-us 0] [--cpus 49-71,73-95] [--n 3] [--rows 64] [--warm 9] [--cold 7] [--pool-mb 96] [--iters 200]
 use harness::arg;
 use std::sync::{Arc, Barrier, Mutex};
 
@@ -135,6 +140,9 @@ fn main() {
     let dist = num("--dist", 2048);
     let pool_mb = num("--pool-mb", 96);
     let iters = num("--iters", 200);
+    let fresh = arg("--fresh").is_some();
+    let gap_us = num("--gap-us", 0) as u64;
+    let touches = num("--touches", 1);
     let orders = [Order::WarmFirst, Order::ColdFirst, Order::Interleave, Order::WarmOnly, Order::ColdOnly];
     let t = cpus.len();
     // per iteration, per thread: the run's time (ns); per order: the warm and cold items' summed times and counts
@@ -205,16 +213,46 @@ fn main() {
                 };
                 let mut cursor = 0usize;
                 let mut sink = 0u64;
+                // WarmOnly's touch passes: [first, later] × (ns, L3 hits, DRAM lines, passes)
+                let pass_acc = std::cell::Cell::new([[0u64; 4]; 2]);
                 for (oi, &order) in orders.iter().enumerate() {
                     for it in 0..iters + 1 {
                         // the prefetch: this core touches its warm items; the cold ones are the pool's next, untouched for
                         // a pool's length (past every cache)
-                        sink = sink.wrapping_add(touch(&warm_w));
+                        let wsel: Vec<usize> = if fresh { (0..nw).map(|j| (cursor + j) % pool_items).collect() } else { Vec::new() };
+                        if fresh {
+                            cursor = (cursor + nw) % pool_items;
+                            for pass in 0..touches {
+                                let (p0, tp) = (read6(), std::time::Instant::now());
+                                for &k in &wsel {
+                                    sink = sink.wrapping_add(touch(&pool_w[k * ib..(k + 1) * ib]));
+                                    sink = sink.wrapping_add(touch(unsafe { std::slice::from_raw_parts(pool_s.as_ptr().add(k * sb) as *const u8, sb * 4) }));
+                                }
+                                if oi == 3 && it > 0 {
+                                    let p1 = read6();
+                                    let mut x = pass_acc.get();
+                                    let q = pass.min(1);
+                                    x[q][0] += tp.elapsed().as_nanos() as u64;
+                                    x[q][1] += (p1[4].wrapping_sub(p0[4])) & ((1 << 48) - 1);
+                                    x[q][2] += (p1[5].wrapping_sub(p0[5])) & ((1 << 48) - 1);
+                                    x[q][3] += 1;
+                                    pass_acc.set(x);
+                                }
+                            }
+                        } else {
+                            sink = sink.wrapping_add(touch(&warm_w));
+                        }
                         let cold: Vec<usize> = (0..nc).map(|j| (cursor + j) % pool_items).collect();
                         cursor = (cursor + nc) % pool_items;
                         start.wait();
+                        if gap_us > 0 {
+                            let g = std::time::Instant::now();
+                            while g.elapsed().as_micros() < gap_us as u128 {
+                                std::hint::spin_loop();
+                            }
+                        }
                         let t0 = std::time::Instant::now();
-                        let warm = |k: usize| timed(&wsum, &wfill, &|| item(&warm_w, &warm_s, k));
+                        let warm = |k: usize| timed(&wsum, &wfill, &|| if fresh { item(&pool_w, &pool_s, wsel[k]) } else { item(&warm_w, &warm_s, k) });
                         let cold_item = |k: usize| unsafe {
                             if n == 1 && hint != 0 {
                                 gemv_hint::<K>(rows, pool_w.as_ptr().add(cold[k] * ib), pool_s.as_ptr().add(cold[k] * sb), &act(0), op as *mut f32, hint, dist);
@@ -278,6 +316,15 @@ fn main() {
                     wfill.set([0; 6]);
                     cfill.set([0; 6]);
                 }
+                if ti == 0 && fresh {
+                    let x = pass_acc.get();
+                    for (q, name) in [(0, "first"), (1, "later")] {
+                        if x[q][3] > 0 {
+                            let n = x[q][3] as f64;
+                            println!("core {cpu}, WarmOnly, {name} touch pass: {:.1} µs, {:.0} L3 hits, {:.0} DRAM lines ({:.2} MB)", x[q][0] as f64 / n / 1e3, x[q][1] as f64 / n, x[q][2] as f64 / n, nw as f64 * (ib + 4 * sb) as f64 / 1e6);
+                        }
+                    }
+                }
                 std::hint::black_box((sink, out));
             })
         })
@@ -288,6 +335,7 @@ fn main() {
     let times = times.lock().unwrap();
     let mb = |items: usize| (items * (rows * K / 2 + rows * K / 128 * 4)) as f64 / 1e6;
     let cl = class.lock().unwrap();
+    println!("warm set: {}", if fresh { format!("fresh each iteration (touched from DRAM, {touches}×), gap {gap_us} µs") } else { "the same lines every iteration".into() });
     println!("bench-order: {t} cores, {n} tokens, items of {rows} rows, {nw0} ± {spread} warm ({:.2} MB) + {nc} cold ({:.2} MB) a core, {iters} iterations, cold hint {} at {dist} B", mb(nw0), mb(nc), ["none", "nta", "t0"][hint as usize]);
     println!("{:<12} {:>9} {:>9} {:>9} {:>15} {:>14} {:>14}", "order", "p50 µs", "p10 µs", "p90 µs", "cold GB/s (all)", "warm item µs", "cold item µs");
     let fl = fills.lock().unwrap();
