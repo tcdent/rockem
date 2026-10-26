@@ -414,7 +414,7 @@ an item in every row below, 0 from DRAM), after a gap in which the cores do no L
 | gap before the run | item µs | the run's clock |
 |---|---|---|
 | none | 4.35 | 3.4 GHz (the cap) |
-| 50 µs (no pre-touch) | 4.86 | |
+| 20 / 50 / 100 / 200 / 500 µs, no pre-touch (the node's case: nothing primes the run) | 4.64 / 4.86 / 5.21 / 5.52 / 6.33 | |
 | 100 µs | 4.48 | 3.57 |
 | 300 µs | 4.53 | 3.52 |
 | 1 ms | 5.94 | 3.67 |
@@ -496,8 +496,10 @@ same moment; a freshly booted box hands out near-contiguous 4 KiB pages too, whi
 The node's experts sit at a 51/16 MiB stride (`layout::SHARE` = 3,342,336 B), which would not alias. **Refuted:** a 4 KB
 pad after every item changes nothing (15.3–15.8 → 15.5 µs fixed-warm on one CCD; 15.2 → 15.4 at the node's shape). Note
 that every `bench-run` fixed-warm figure above was taken with a 3 ms idle window (the decay); at window 0 it reads 8.4,
-so the residual to explain is 8.4 against 4.3, with `bench-run`'s rounds still holding several tens-of-µs barrier and
-build gaps between phases: `bringup/box/logs/bench-run-window0.txt`.
+so the residual to explain is 8.4 against 4.3. With one phase and window 0 (the fewest gaps it can have) `bench-run`
+reads 8.5 and 10.8 in two runs — run-to-run variance it had not shown — against a no-priming decay curve that prices a
+100 µs gap at 5.2 and 500 µs at 6.3; its main thread is unpinned (it builds the lists and spins in the barriers):
+`bringup/box/logs/bench-run-mainpin.txt`.
 
 **Why it matters here:** every one of the node's expert runs follows a ~440 µs window of DRAM touching and `mwaitx`
 waits — no L3 hits for the core — so the node's warm items run in the decayed state on every layer; `bench-run`'s

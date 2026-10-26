@@ -55,7 +55,10 @@
 //! `--pad-kb n`: `n` KB of padding after every item in the pool (item stride 128 KB + n): eight cores reading regions or
 //! queue-claimed slices at a 2 MiB stride in the same rhythm meet in the same L3 sets; a pad breaks the stride.
 //!
-//!   bench-run [--pad-kb 0] [--ccd-barrier 0] [--retouch 0] [--ring-kb 1024] [--hold 0] [--stagger-ns 0] [--notouch 0] [--front 0] [--one-phase 0] [--regions 0] [--notime 0] [--plain 0] [--private 0] [--pages 2m] [--fixed 0] [--smt 0] [--multi 0] [--cpus 49-71,73-95] [--steal any] [--plan 45] [--cold 28] [--window-us 440] [--rounds 60] [--pool-mb 600]
+//! `--main-pin c`: the main thread (it builds each phase's lists and spins in the barriers) pinned to core `c` (default:
+//! unpinned, wherever the kernel puts it). Reported: the gap from a round's last worker end to the next release.
+//!
+//!   bench-run [--main-pin -] [--pad-kb 0] [--ccd-barrier 0] [--retouch 0] [--ring-kb 1024] [--hold 0] [--stagger-ns 0] [--notouch 0] [--front 0] [--one-phase 0] [--regions 0] [--notime 0] [--plain 0] [--private 0] [--pages 2m] [--fixed 0] [--smt 0] [--multi 0] [--cpus 49-71,73-95] [--steal any] [--plan 45] [--cold 28] [--window-us 440] [--rounds 60] [--pool-mb 600]
 use harness::arg;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -221,6 +224,11 @@ fn main() {
     let (pw1, ps1) = common::q4::pack(ROWS, K, &w, &vec![0.01; ROWS * K / common::q4::GROUP]);
     let (ib, sb) = (pw1.len(), ps1.len());
     let pad = num("--pad-kb", 0) << 10;
+    if let Some(c) = arg("--main-pin") {
+        harness::bench::pin(c.to_str().unwrap().parse().unwrap());
+    }
+    let mut gaps: Vec<u64> = Vec::new();
+    let mut last_end: Option<u64> = None;
     let stride = ib + pad;
     let ipool = (pool_mb << 20) / stride;
     // every CCD's pool filled at once (serially, 12 × 600 MB by one core each was most of a run's wall)
@@ -579,10 +587,17 @@ fn main() {
             if !old.is_null() {
                 drop(unsafe { Box::from_raw(old) });
             }
-            t0s.store(epoch.elapsed().as_nanos() as u64, Ordering::Release);
+            let rel = epoch.elapsed().as_nanos() as u64;
+            if let Some(e) = last_end {
+                if r > 0 {
+                    gaps.push(rel.saturating_sub(e));
+                }
+            }
+            t0s.store(rel, Ordering::Release);
             bar.wait(); // release the phase
             bar.wait(); // the join
             wall[ph] = (epoch.elapsed().as_nanos() as u64).saturating_sub(t0s.load(Ordering::Relaxed));
+            last_end = Some(epoch.elapsed().as_nanos() as u64);
         }
         if r > 0 {
             walls.lock().unwrap().push(wall);
@@ -594,6 +609,10 @@ fn main() {
     bar.wait();
     for h in hs {
         h.join().unwrap();
+    }
+    gaps.sort_unstable();
+    if !gaps.is_empty() {
+        println!("gap from a phase's last end to the next release: p50 {:.1} µs, p90 {:.1}, max {:.1}", gaps[gaps.len() / 2] as f64 / 1e3, gaps[gaps.len() * 9 / 10] as f64 / 1e3, gaps[gaps.len() - 1] as f64 / 1e3);
     }
     let walls = walls.lock().unwrap();
     let ends = ends.lock().unwrap();
