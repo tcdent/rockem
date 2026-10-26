@@ -235,6 +235,47 @@ cores. Recovering them is worth something only from capacity the window does not
 saturation, re-touching what the streamers brought — not yet built or measured), or without a touch at all.
 The node's leak (12–15 %) is larger than the model's (6 %): its ordering and the amend's churn, not yet separated.
 
+## The node's loss map (lab-lossmap, 2026-10-26)
+Built (lab, `lossmap` in construct.rs): every prefetch touch stamps its slice with its CCD's running count of
+first-touched bytes; every run item (counted runs) adds its L3 hits, DRAM lines and time to a histogram over the
+step's width, re-touch on/off, its claim (own deque / a mate's / the CCD queue), who touched its slice (early plan /
+amended plan / no finished touch), its **age** (bytes its CCD first-touched after the slice) and the bytes its CCD's run
+had read before it. 40 decodes at 18k, ~80k layer runs; `bringup/reads/lossmap.sh`.
+
+Own touched items, re-touch off — lines from DRAM, by age (rows) and the CCD's run reads before the item (columns):
+
+| age \ run before | <1 MB | 1–2 | 2–4 | 4–8 | 8+ |
+|---|---|---|---|---|---|
+| <1 MB | 10.7 % | 1.1 | 1.2 | 2.0 | 6.7 |
+| 2–3 MB | 3.8 | 1.0 | 1.5 | 2.3 | 8.0 |
+| 4–6 MB | 3.0 | 1.5 | 2.5 | 3.5 | 11.0 |
+| 6–8 MB | 3.5 | 2.6 | 4.3 | 5.9 | 15.0 |
+| 8–12 MB | 5.5 | 5.8 | 9.3 | 11.4 | 22.9 |
+| 12–16 MB | 10.8 | 13.0 | 18.7 | 22.3 | 35.1 |
+
+and their time (µs an item): 7.8–9.8 at young ages past the run's first MB, 10.7–14 at 8+ MB of run reads before, and
+10–17 in the run's first MB at every age (the run's start, not its lines: those items lose 3–5 %).
+
+- **The node's loss is the bytes model's:** a touched line's risk grows with the fresh bytes inserted after it — the
+  window's touches (age) and the run's own reads (columns) alike. The oldest slices (the early plan's; the front of
+  each deque, which thieves take) are the ones lost.
+- **A layer run's budget** (width 3, re-touch off; per run: items, µs an item, lines from DRAM, core-µs a core, DRAM MB):
+
+| kind | items | µs | DRAM | core-µs | DRAM MB |
+|---|---|---|---|---|---|
+| own, touched | 720 | 10.6 | 9.8 % | 82.7 | 8.7 |
+| stolen, touched | 254 | 13.3 | 21.7 % | 36.7 | 8.0 |
+| own, touch abandoned mid-item | 111 | 13.3 | 55 % | 16.1 | 5.9 |
+| CCD queue (cold) | 335 | 33.5 | 93.9 % | 121.7 | 45.2 |
+
+  At width 2 the touched items carry 36 % of the run's DRAM bytes, at 3 25 %, at 4 16 %. The cold items are ~half the
+  run's core time at width 3 and two thirds at width 4.
+- **What the leak is worth (inference):** touched items at the young, low-churn cells' cost (~8–9.4 µs) instead of their
+  mean (10.6 own, 13.3 stolen) is ~20 % of their time, ~8–11 % of `experts` (~1.4 ms a verify step) — an upper bound:
+  part of that excess is the CCD's streaming beside them, not their own lines.
+- **The re-touch arm** (same boot): touched items 11.3 → 9.7 µs (width 3), their DRAM 13.3 → 9.1 %; per item over the
+  whole run −1.4 to −4 %; the arms' item mixes differ (steps alternate), so the step-level difference is within noise.
+
 ## How the bench and the node differ (to quantify, one at a time)
 1. **The shared CCD queue and stealing.** The node's cold items are claimed from one queue by the CCD's 8 cores and its
    warm items can be stolen by mates; the bench's cores own private sets. The queue is the node's load balancer.
@@ -265,6 +306,8 @@ The node's leak (12–15 %) is larger than the model's (6 %): its ordering and t
 1d. Done in part: the item's code is not the cost; the DRAM lines inside prefetched items are (above).
 1f. Done: the leak reproduced in the bench (fresh sets) and a second touch removes it (above).
 1g. Done: the re-touch in the node (lab) and the window model — the leak falls, the step does not (above).
+1h. Done: the node's loss map by age, run churn, claim and plan (above).
+1i. Next: the owner reads its own deque oldest first (the most-at-risk lines before more bytes land on them), A/B.
 1e. The node's fill counters by item, with its class (own / CCD / stolen) and its slice's touch time (lab): where a
     complete expert's 14–18 % DRAM lines come from — evicted (own items) or a mate's L2 (stolen).
 2. The node's warm item at its best: a lab run with the prefetch posted but no cold traffic (the run's misses forced to
