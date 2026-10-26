@@ -469,8 +469,17 @@ The re-touch protects the stolen lines and returns nothing on the wall, as in th
 warm item's cost is not the decay** (holding the state through the window changes nothing) **but the interference**: in
 every phase a CCD's cold items stream DRAM beside its warm ones, and an L3-fed core slows 2–5× while its mates stream
 (the interference section). The CCD delivers the sum of its sources, not the maximum (measured above), so that overlap
-is worth nothing: the prediction to test is the warm items first with the CCD's DRAM path quiet, then the cold ones
-(`--ccd-barrier 1`), with the re-touch to carry the L3 state across the window: `bringup/box/logs/bench-run-ccdbarrier.txt`.
+is worth nothing: so the warm items first with the CCD's DRAM path quiet, then the cold ones (`--ccd-barrier 1`), with and
+without the re-touch (two repeats each): own items **15.1–15.2 µs** (15.9 with the re-touch) — unchanged; cold items 34.3
+→ 36.5 (less overlap); walls 232 + 129 → 240 + 135. **Not the interference either**, at this shape.
+
+**Where the warm item stands** (L3-fed, 8 cores a CCD, the same kernel): `bench-order` on protected (fixed) lines 4.3 µs;
+on fresh lines touched once this round 8.6 (3–7 % of their lines from DRAM — the lost ones); fresh lines touched twice 5.3;
+`bench-run` on fixed lines with the hold 9.0; `bench-run` at the node's shape 15–16 whatever the variant; the node 10.6 own
+/ 13.3 stolen. Two gaps are unexplained: `bench-run`'s ~2× over `bench-order` on identical lines (its warm numbers are not
+a reference for the hardware; its cold and schedule numbers stand), and fresh lines costing ~2× protected ones under eight
+cores while one core alone reads them at 4.7 — the node's case; its scaling with core count:
+`bringup/box/logs/bench-order-fresh-scaling.txt`.
 
 **Why it matters here:** every one of the node's expert runs follows a ~440 µs window of DRAM touching and `mwaitx`
 waits — no L3 hits for the core — so the node's warm items run in the decayed state on every layer; `bench-run`'s

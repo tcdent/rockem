@@ -174,7 +174,6 @@ fn main() {
     let ring_kb = num("--ring-kb", 1024);
     let retouch = num("--retouch", 0) == 1;
     let ccd_barrier = num("--ccd-barrier", 0) == 1;
-    let ccd_bars: Arc<Vec<Spin>> = Arc::new((0..nccd).map(|k| Spin { n: mates[k].len(), arrived: Line(AtomicUsize::new(0)), gen: Line(AtomicUsize::new(0)) }).collect());
     let pages_huge = !arg("--pages").is_some_and(|v| v.to_str() == Some("4k"));
     // `--share cores`: a CCD's planned slices and cold items in proportion to its workers (the node gives every CCD the
     // same bytes of every expert, whatever its count of workers)
@@ -204,6 +203,7 @@ fn main() {
     let node_of = |c: usize| (0..8).find(|n| std::path::Path::new(&format!("/sys/devices/system/node/node{n}/cpu{c}")).exists()).unwrap();
     let ccd_node: Vec<usize> = (0..nccd).map(|k| node_of(cpus[ccd.iter().position(|&x| x == k).unwrap()])).collect();
     let mates: Vec<Vec<usize>> = (0..nccd).map(|k| (0..cpus.len()).filter(|&w| ccd[w] == k).collect()).collect();
+    let ccd_bars: Arc<Vec<Spin>> = Arc::new((0..nccd).map(|k| Spin { n: mates[k].len(), arrived: Line(AtomicUsize::new(0)), gen: Line(AtomicUsize::new(0)) }).collect());
     let t = cpus.len();
     let pmc_ok = {
         let _ = std::fs::write("/proc/sys/kernel/nmi_watchdog", "0");
