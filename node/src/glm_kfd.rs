@@ -211,13 +211,8 @@ struct Card {
     /// heads' rows `[SPEC_TOKENS][M_SMALL]` and gates `[SPEC_TOKENS][2 · PART_QKV]`, their readouts
     /// `[SPEC_TOKENS][PART_QKV]`, this card's partial logits `[SPEC_TOKENS][E]`, the leader's first-margin scores
     /// `[SPEC_TOKENS][ROUTE_ROWS]` (the analog's at `E`), `an_out`'s arrival count.
-    an_pre: crate::kfd::Kernel,
-    an_rows_sel: crate::kfd::Kernel,
-    an_fg_sel: crate::kfd::Kernel,
-    an_step: crate::kfd::Kernel,
-    an_out: crate::kfd::Kernel,
-    an_streams: Mem,
-    an_streams2: Mem,
+    an_chain: crate::kfd::Kernel,
+    an_send: crate::kfd::Kernel,
     an_x: Mem,
     an_x0: Mem,
     an_c: Mem,
@@ -435,6 +430,8 @@ struct AnalogPart {
     heads: Mem,
     crows: Mem,
     ln: Mem,
+    /// `an_chain`'s table of device addresses (`an::TAB_*`), built once the cards' buffers and the pair's weights exist.
+    tab: Mem,
 }
 
 /// An MLA layer's projections on a card: q_a and kv_a (FP8, over the input-normed
@@ -668,21 +665,16 @@ impl Cards {
                     pred_rows: k.kernel("pred_rows"),
                     pred_learn: k.kernel("pred_learn"),
                     pred_input: k.kernel("pred_input"),
-                    an_pre: k.kernel("an_pre"),
-                    an_rows_sel: k.kernel("an_rows_sel"),
-                    an_fg_sel: k.kernel("an_fg_sel"),
-                    an_step: k.kernel("kda_step_ro"),
-                    an_out: k.kernel("an_out"),
-                    an_streams: k.vram(SPEC_TOKENS * HC * H * 4),
-                    an_streams2: k.vram(SPEC_TOKENS * HC * H * 4),
+                    an_chain: k.kernel("an_chain"),
+                    an_send: k.kernel("an_send"),
                     an_x: k.vram(SPEC_TOKENS * H * 4),
                     an_x0: k.vram(SPEC_TOKENS * H * 4),
                     an_c: k.vram(64),
                     an_k: k.vram(64),
                     an_scratch: k.vram(SPEC_TOKENS * an::PRE_SCRATCH * 4),
                     an_count: {
-                        let m = k.vram_visible(an::PRE_COUNTS * 4);
-                        k.upload(&m, 0, &vec![0u8; an::PRE_COUNTS * 4]);
+                        let m = k.vram_visible(an::CHAIN_COUNTS * 4);
+                        k.upload(&m, 0, &vec![0u8; an::CHAIN_COUNTS * 4]);
                         m
                     },
                     an_smix: k.vram(SPEC_TOKENS * (SMALL_ROWS + 3 * g::PART_QKV) * 4),
@@ -1000,7 +992,8 @@ impl Cards {
                         let lnm = k.vram_visible(H * 2);
                         k.upload(&lnm, 0, raw(&bf16_of(lw1.post_ln)));
                         analog_bytes += hm.size + cm.size + lnm.size;
-                        parts.push(AnalogPart { card: pc, part: i, heads: hm, crows: cm, ln: lnm });
+                        let tab = k.vram_visible(an::TAB_LEN * 8);
+                        parts.push(AnalogPart { card: pc, part: i, heads: hm, crows: cm, ln: lnm, tab });
                     }
                     Some(parts)
                 }
@@ -1100,6 +1093,64 @@ impl Cards {
             println!("gpu      : the draft layer on card {card}: its attention, shared expert and eh_proj ({:.2} GB)", (mt.eh_proj.len() * 2 + gu_w.size + down_w.size) as f64 / 1e9);
             MtpOn { card, eh: up(raw(mt.eh_proj)), post_ln: up(raw(&bf16_of(mt.post_ln))), head_norm: cards.iter().map(|cd| { let m = cd.k.vram_visible(H * 2); cd.k.upload(&m, 0, raw(&bf16_of(mt.head_norm))); m }).collect(), gu_w, gu_s, down_w, down_s, dx: k.vram_visible(STEP * 2 * H * 4) }
         });
+        // the analog's tables (098): a card's chain over the pair's part on it, every address it reads or writes; a
+        // decode step is one chunk at row 0, so the step buffers' bases are the tokens' rows
+        for l in 0..NUM_HIDDEN_LAYERS {
+            let Some(parts) = ffns[l].as_ref().and_then(|f| f.analog.as_ref()) else { continue };
+            let f = ffns[l].as_ref().unwrap();
+            let f1 = ffns[l + 1].as_ref().unwrap();
+            let lay1 = layers[l + 1].as_ref().unwrap();
+            let leader = f.card;
+            assert!(cards.len() == 2, "the analog's handoffs need a peer card");
+            for ap in parts {
+                let c = &cards[ap.card];
+                let p = &lay1.parts[ap.part];
+                let me = ap.card;
+                let lead = me == leader;
+                let hc1 = &f1.hc[me];
+                let mut t = [0u64; an::TAB_LEN];
+                t[an::TAB_STREAMS] = c.streams.va as u64;
+                t[an::TAB_MIX_L] = c.mix.va as u64;
+                t[an::TAB_FYV] = if lead { c.fyv.va } else { peers[me].an_fyv.va } as u64;
+                t[an::TAB_FYV_WORD] = if lead { 0 } else { peers[me].words.at(word(W_AN_FYV, leader)) } as u64;
+                t[an::TAB_A_FN] = hc1[0].0.va as u64;
+                t[an::TAB_A_BASE] = hc1[0].1.va as u64;
+                t[an::TAB_A_SCALE] = hc1[0].2.va as u64;
+                t[an::TAB_F_FN] = hc1[1].0.va as u64;
+                t[an::TAB_F_BASE] = hc1[1].1.va as u64;
+                t[an::TAB_F_SCALE] = hc1[1].2.va as u64;
+                t[an::TAB_X] = c.an_x.va as u64;
+                t[an::TAB_X0] = c.an_x0.va as u64;
+                t[an::TAB_C] = c.an_c.va as u64;
+                t[an::TAB_SCRATCH] = c.an_scratch.va as u64;
+                t[an::TAB_COUNT] = c.an_count.va as u64;
+                t[an::TAB_INPUT_LN] = p.input_ln.va as u64;
+                t[an::TAB_SQ] = p.sq.va as u64;
+                t[an::TAB_SMIX] = c.an_smix.va as u64;
+                t[an::TAB_HEADS] = ap.heads.va as u64;
+                t[an::TAB_FG_W] = p.fg.va as u64;
+                t[an::TAB_FG] = c.an_fg.va as u64;
+                t[an::TAB_TAPS] = p.taps.va as u64;
+                t[an::TAB_WINDOW] = p.window.va as u64;
+                t[an::TAB_DT_BIAS] = p.dt_bias.va as u64;
+                t[an::TAB_A_LOG] = p.a_log.va as u64;
+                t[an::TAB_MEM] = p.mem.va as u64;
+                t[an::TAB_O_NORM] = p.o_norm.va as u64;
+                t[an::TAB_NORMED] = c.an_normed.va as u64;
+                t[an::TAB_CROWS] = ap.crows.va as u64;
+                t[an::TAB_PART] = if lead { c.an_part.va } else { peers[leader].an_part_peer.va } as u64;
+                t[an::TAB_PART_WORD] = if lead { 0 } else { peers[leader].words.at(word(W_AN_PART, me)) } as u64;
+                t[an::TAB_OCOUNT] = c.an_ocount.va as u64;
+                t[an::TAB_LN1] = ap.ln.va as u64;
+                t[an::TAB_ROUTER] = f.router.as_ref().unwrap().va as u64;
+                t[an::TAB_SCORES] = c.an_scores.va as u64;
+                t[an::TAB_K] = c.an_k.va as u64;
+                t[an::TAB_S2] = c.pred_s2.va as u64;
+                t[an::TAB_XL] = c.x.va as u64;
+                t[an::TAB_LN_L] = f.ln.va as u64;
+                c.k.upload(&ap.tab, 0, raw(&t));
+            }
+        }
         // the resident experts' slots last: what each card has free past the reserve, up to the budget
         let resident = {
             let moe = glm_5_3_flash::layout::MOE_LAYERS;
@@ -2177,6 +2228,13 @@ impl Placed for Cards {
             self.rows8(c, &c.ffn_gu, x, Some(f.ln.va), f.gu_w.va, f.gu_s.va, gu, rows, H, n, ROWS_GU);
             self.rows8_at(c, down, gu, 2 * k_width, None, f.down_w.va, f.down_s.va, fyv, H, k_width, n, ROWS, true);
         }
+        // the analog's handoff (098): the shared output to the peer's receiving buffer with the peer's word, behind the
+        // rows that made it — long before the peer's chain (posted at the run) looks for it
+        if let (Some(_), true, Some(j)) = (f.analog.as_ref(), n <= SPEC_TOKENS, (0..self.cards.len()).find(|&j| j != f.card)) {
+            let mut a = Args::new();
+            a.ptr(fyv).ptr(self.peers[j].an_fyv.va).ptr(self.peers[j].words.at(self.wd(W_AN_FYV, f.card))).u32(value).u32(n as u32);
+            c.k.launch(&c.an_send, 1, g::WG, 0, &a);
+        }
         // a dense layer's output half now; a MoE layer's waits for the host's experts and is posted after the
         // resident experts' launches (`ffn_post`): a queue is in order, and the output half spins on the word
         if f.dense {
@@ -2463,54 +2521,28 @@ impl Placed for Cards {
 const _: () = assert!(CONV_DIM == 3 * KDA_QKV && CONV_TAPS == 4);
 
 impl Cards {
-    /// The analog of layer l + 1 for pair l's first margin (098, `analog.rs`), a verify step of `n` tokens, on both
-    /// cards ahead of their `hc_post`: each card's chain over the part of layer l + 1 it holds. The leader (layer l's FFN
-    /// card) starts by copying its shared-expert output to the peer and posting the peer's word; the peer's chain waits
-    /// for it first; the peer's `an_out` writes its partial into the leader's receiving buffer and posts the leader's
-    /// word, which the leader's queue waits for ahead of its own `an_out`. No cycle: the leader's post precedes every
-    /// wait in its queue, the peer posts only after its own wait, and neither chain is behind a `hc_post`.
+    /// The analog of layer l + 1 for pair l's first margin (098, `analog.rs`), a verify step of `n` tokens: one launch
+    /// a card (`an_chain` over its table) ahead of its `hc_post`, each card's chain over the part of layer l + 1 it
+    /// holds. The leader (layer l's FFN card) sent its shared-expert output and the peer's word from `ffn` (behind
+    /// `ffn_down_shared`); the peer's chain waits for that word in-kernel; the peer's chain writes its partial into the
+    /// leader's receiving buffer and posts the leader's word, which the leader's `pred_step` waits for in-kernel. No
+    /// cycle: the leader's send precedes every wait in its queue, the peer posts only after its own wait, and neither
+    /// chain is behind a `hc_post`. A decode step is one chunk at row 0 (the tables' addresses).
     fn analog(&self, l: usize, n: usize) {
+        assert!(self.t0 == 0 && self.cards.len() == 2, "the analog's tables address a one-chunk step at row 0 on two cards");
         let f = self.ffns[l].as_ref().unwrap();
-        let parts = f.analog.as_ref().unwrap();
-        let f1 = self.ffns[l + 1].as_ref().unwrap();
         let lay1 = self.layers[l + 1].as_ref().unwrap();
         let value = self.half_seq[l][self.ch][1];
-        let leader = f.card;
-        let peer = (0..self.cards.len()).find(|&j| j != leader).expect("the analog's handoffs need a peer card");
-        const M_SMALL: usize = SMALL_ROWS + 3 * g::PART_QKV;
-        for ap in parts {
+        for ap in f.analog.as_ref().unwrap() {
             let c = &self.cards[ap.card];
             let p = &lay1.parts[ap.part];
-            let me = c.k.index;
-            let lead = me == leader;
-            let hc1 = &f1.hc[me];
-            if !lead {
-                self.hold_word(c, W_AN_FYV, leader, value);
-            }
-            let (fyv, fyv_dst, fyv_word) = if lead { (self.tok(&c.fyv, H), self.peers[peer].an_fyv.va, self.peers[peer].words.at(self.wd(W_AN_FYV, leader))) } else { (self.peers[me].an_fyv.va, 0, 0) };
+            let f1 = self.ffns[l + 1].as_ref().unwrap();
+            let hc1 = &f1.hc[ap.card];
+            let fyv = if ap.card == f.card { c.fyv.va } else { self.peers[ap.card].an_fyv.va };
             let mut a = Args::new();
-            a.ptr(self.tok(&c.streams, HC * H)).ptr(self.tok(&c.mix, HC_MIX)).ptr(fyv).ptr(fyv_dst).ptr(fyv_word);
-            a.ptr(hc1[0].0.va).ptr(hc1[0].1.va).ptr(hc1[0].2.va).ptr(hc1[1].0.va).ptr(hc1[1].1.va).ptr(hc1[1].2.va);
-            a.ptr(c.an_streams.va).ptr(c.an_streams2.va).ptr(c.an_x.va).ptr(c.an_x0.va).ptr(c.an_c.va).ptr(c.an_scratch.va).ptr(c.an_count.va).u32(value).u32(n as u32);
-            c.k.launch(&c.an_pre, an::PRE_GRID, g::WG, an::PRE_LDS, &a);
-            let mut a = Args::new();
-            a.ptr(c.an_x.va).ptr(p.input_ln.va).ptr(p.sq.va).ptr(c.an_smix.va).ptr(ap.heads.va).u32(n as u32);
-            c.k.launch(&c.an_rows_sel, an::SEL_ROWS.div_ceil(g::E4_WAVES * g::E4_ROWS) as u32, 32 * g::E4_WAVES as u32, 0, &a);
-            let mut a = Args::new();
-            a.ptr(c.an_smix.va).ptr(p.fg.va).ptr(c.an_fg.va).ptr(ap.heads.va).u32(n as u32);
-            c.k.launch(&c.an_fg_sel, an::SEL_FG_ROWS.div_ceil(g::E4_WAVES * g::E4_ROWS) as u32, 32 * g::E4_WAVES as u32, 0, &a);
-            let mut a = Args::new();
-            a.ptr(c.an_smix.at(SMALL_ROWS * 4)).ptr(p.taps.va).ptr(p.window.va).ptr(c.an_fg.va).ptr(p.dt_bias.va).ptr(p.a_log.va).ptr(c.an_smix.at(2 * KDA_DIM * 4)).ptr(c.an_fg.at(g::PART_QKV * 4)).ptr(p.mem.va).ptr(p.o_norm.va).ptr(c.an_normed.va).u32(p.head0 as u32).u32(n as u32).u32(M_SMALL as u32).u32(2 * g::PART_QKV as u32).u32(M_SMALL as u32).ptr(ap.heads.va);
-            c.k.launch(&c.an_step, an::NSEL as u32, g::WG, g::STEP_LDS as u32, &a);
-            if lead {
-                self.hold_word(c, W_AN_PART, peer, value);
-            }
-            let (part, part_word) = if lead { (c.an_part.va, 0) } else { (self.peers[leader].an_part_peer.va, self.peers[leader].words.at(self.wd(W_AN_PART, me))) };
-            let router = f.router.as_ref().unwrap().va;
-            let mut a = Args::new();
-            a.ptr(c.an_normed.va).ptr(ap.heads.va).ptr(ap.crows.va).ptr(part).ptr(part_word).ptr(c.an_ocount.va);
-            a.ptr(if lead { c.an_x0.va } else { 0 }).ptr(ap.ln.va).ptr(router).ptr(c.an_scores.va).ptr(c.an_c.va).ptr(c.an_k.va).u32(value).u32(n as u32);
-            c.k.launch(&c.an_out, if lead { 2 * an::OUT_WGS } else { an::OUT_WGS }, g::WG, an::OUT_LDS, &a);
+            a.ptr(ap.tab.va).ptr(c.streams.va).ptr(fyv).ptr(hc1[0].0.va).ptr(hc1[1].0.va).ptr(p.sq.va).ptr(p.fg.va).ptr(ap.crows.va).ptr(f.router.as_ref().unwrap().va).ptr(c.an_x.va).ptr(c.an_smix.va).ptr(c.an_fg.va).ptr(c.an_normed.va).ptr(p.mem.va);
+            a.u32(p.head0 as u32).u32(value).u32(n as u32);
+            c.k.launch(&c.an_chain, an::CHAIN_GRID, g::WG, an::CHAIN_LDS, &a);
         }
     }
 
@@ -2532,9 +2564,9 @@ impl Cards {
         // the first margin: the analog's scores and partials where the next layer is KDA (098, a decode step), else
         // the route-ahead in `scores_v`
         let peer = (0..self.cards.len()).find(|&j| j != f.card);
-        let (first, pa, pb, pk) = match (f.analog.as_ref(), decode, peer) {
-            (Some(_), true, Some(_)) => (c.an_scores.va, c.an_part.va, self.peers[f.card].an_part_peer.va, c.an_k.va),
-            _ => (self.tok(&c.scores_v, ROUTE_ROWS), 0, 0, 0),
+        let (first, pa, pb, pk, pb_word) = match (f.analog.as_ref(), decode, peer) {
+            (Some(_), true, Some(j)) => (c.an_scores.va, c.an_part.va, self.peers[f.card].an_part_peer.va, c.an_k.va, self.peers[f.card].words.at(self.wd(W_AN_PART, j))),
+            _ => (self.tok(&c.scores_v, ROUTE_ROWS), 0, 0, 0, 0),
         };
         if rows && decode {
             // `hc_post` wrote the input (x + the whole FFN output); the next layer's router, the margins and the plan in
@@ -2546,6 +2578,7 @@ impl Cards {
             return;
         }
         if !rows && decode && f.analog.is_some() {
+            // the chain makes the second margin's scores too (`pred_input` + `hc_route_ahead`'s work, in `pred_s2`)
             self.analog(l, n);
         }
         if rows {
@@ -2557,7 +2590,7 @@ impl Cards {
                 a.ptr(px).ptr(f.ln.va).ptr(router).ptr(ps2).u32(ROUTE_ROWS as u32).u32(n as u32);
                 c.k.launch(&c.rows_h_w, g::wmma_grid(ROUTE_ROWS, n), g::WG, g::WMMA_LDS, &a);
             }
-        } else {
+        } else if !(decode && f.analog.is_some()) {
             let mut a = Args::new();
             a.ptr(px).ptr(self.tok(&c.x, H)).ptr(self.tok(&c.fyv, H)).ptr(0usize).ptr(0usize).u32((n * H) as u32);
             c.k.launch(&c.pred_input, (n * H).div_ceil(256) as u32, g::WG, 0, &a);
@@ -2579,7 +2612,8 @@ impl Cards {
             a.ptr(0).ptr(0);
         }
         // the early decode pass leaves its thresholds and co-routing sums for the rows pass; a long step's does not
-        a.u32(self.half_seq[l][self.ch][1]).u32(n as u32).ptr(c.pred_keys.va).ptr(c.pred_count.va).ptr(if decode && !rows { c.pred_aux.va } else { 0 }).ptr(pa).ptr(pb).ptr(pk);
+        // the early pass waits in-kernel for the peer's partial; the rows pass runs behind it, the partial long in
+        a.u32(self.half_seq[l][self.ch][1]).u32(n as u32).ptr(c.pred_keys.va).ptr(c.pred_count.va).ptr(if decode && !rows { c.pred_aux.va } else { 0 }).ptr(pa).ptr(pb).ptr(pk).ptr(if rows { 0 } else { pb_word });
         c.k.launch(&c.pred_step, if decode { n as u32 } else { PLAN_PRED_WGS as u32 }, PLAN_WG, PLAN_LDS, &a);
     }
 }

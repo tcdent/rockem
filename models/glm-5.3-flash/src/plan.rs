@@ -237,13 +237,22 @@ pub mod gfx11 {
     /// u32. `plan` (null in a long step): the decode plan and the host's `word`. Workgroups of `PLAN_WG`, a thread an
     /// expert; grid 1 for a decode step, `PLAN_PRED_WGS` for a long one.
     #[no_mangle]
-    pub extern "gpu-kernel" fn pred_step(pred: *const f32, scores: *const f32, scores2: *const f32, p_d: *mut f32, p_d2: *mut f32, p_picks: *const u32, plan: *mut u32, word: *mut u32, value: u32, n: u32, keys: *mut f32, count: *mut u32, aux: *mut f32, pa: *const f32, pb: *const f32, pk: *const f32) {
+    pub extern "gpu-kernel" fn pred_step(pred: *const f32, scores: *const f32, scores2: *const f32, p_d: *mut f32, p_d2: *mut f32, p_picks: *const u32, plan: *mut u32, word: *mut u32, value: u32, n: u32, keys: *mut f32, count: *mut u32, aux: *mut f32, pa: *const f32, pb: *const f32, pk: *const f32, pb_word: *const u32) {
         unsafe {
             const RR: usize = crate::hc::gfx11_consts::ROUTE_ROWS;
             let e = workitem_id_x() as usize;
             let (lane, wave) = ((e % 32) as u32, e / 32);
             let wg = workgroup_id_x() as usize;
             let n = n as usize;
+            // the peer's partial of the analog's first margin (098): its word in this card's copy, waited for here so
+            // the leader's own chain never waits on the peer
+            if !pb_word.is_null() {
+                if e == 0 {
+                    common::gfx11::await_word(pb_word, value);
+                }
+                workgroup_sync();
+                fence(Ordering::Acquire);
+            }
             let decode = n <= SPEC_TOKENS;
             let l = lds::<f32>();
             let red = l; // [16]

@@ -17,7 +17,7 @@ VGPR_MAX = 192          # past this a SIMD holds fewer than 8 waves
 # has 84 CUs, 168 SIMD32s of 1536 VGPRs a lane; a kernel past the registers its grid allows hangs, it does not slow
 # down (hc_pre at 189 VGPRs ran 168 of its 192 workgroups and its barriers waited forever, 2026-10-20).
 SIMDS, VGPRS_PER_SIMD, VGPR_GRANULE = 168, 1536, 8
-GRID_RESIDENT = {"hc_pre": (192, 8)}
+GRID_RESIDENT = {"hc_pre": (192, 8), "an_chain": (168, 8)}
 def resident_vgpr_max(wgs, waves):
     per_simd = -(-wgs * waves // SIMDS)
     return VGPRS_PER_SIMD // per_simd // VGPR_GRANULE * VGPR_GRANULE

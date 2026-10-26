@@ -972,13 +972,20 @@ pub mod gfx11 {
     /// is the matrix's row `map(r)` (the analog's rows of its chosen heads, 098); `x` and `emit` see the matrix's row.
     #[inline(always)]
     pub unsafe fn exp4_rows_direct_map<const K: usize, const NORM: bool, const A: usize, const A1: usize, const R: usize, const WAVES: usize, const NP: usize>(tid: u32, w: Exp4<A, A1>, ln: *const u16, m: usize, n: usize, eps: f32, map: impl Fn(usize) -> usize, x: impl Fn(usize, usize) -> *const f32, emit: impl Fn(usize, usize, f32)) {
-        const { assert!(NP <= PASS) };
-        let (lane, wave) = (tid % 32, (tid / 32) as usize);
-        let l = lane as usize;
+        let wave = (tid / 32) as usize;
         let row = (core::arch::amdgpu::workgroup_id_x() as usize * WAVES + wave) * R;
         if row >= m {
             return; // no barrier follows: a wave past the matrix simply ends
         }
+        exp4_rows_direct_rows::<K, NORM, A, A1, R, NP>(tid, w, ln, m, n, eps, row, map, x, emit)
+    }
+    /// `exp4_rows_direct_map` for the wave's `R` rows from `row` (under `m`), given: a kernel that loops its waves
+    /// over a matrix larger than its grid (the analog's fused chain, 098).
+    #[inline(always)]
+    pub unsafe fn exp4_rows_direct_rows<const K: usize, const NORM: bool, const A: usize, const A1: usize, const R: usize, const NP: usize>(tid: u32, w: Exp4<A, A1>, ln: *const u16, m: usize, n: usize, eps: f32, row: usize, map: impl Fn(usize) -> usize, x: impl Fn(usize, usize) -> *const f32, emit: impl Fn(usize, usize, f32)) {
+        const { assert!(NP <= PASS) };
+        let lane = tid % 32;
+        let l = lane as usize;
         // the wave's R rows of the matrix: the selection's consecutive rows, the last repeated past `m`
         let mut rows = [map(row); R];
         let mut k = 1;

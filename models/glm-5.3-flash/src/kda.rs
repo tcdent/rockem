@@ -506,22 +506,10 @@ pub mod gfx11 {
         }
     }
 
-    /// `kda_step` read-only, over the part's heads a table names (098, the expert predictor's analog of the next
-    /// layer): workgroup w steps head `heads[w]` of the part (its index within the part) from the state as it stands,
-    /// carrying it in registers across the step's tokens and storing none of it back — the layer's own step runs
-    /// later on the same state. Grid: the table's length; LDS: STEP_LDS.
-    #[no_mangle]
-    pub extern "gpu-kernel" fn kda_step_ro(mixed: *const f32, taps: *const u16, window: *const f32, f: *const f32, dt_bias: *const f32, a_log: *const f32, beta: *const f32, gate: *const f32, mem: *const f32, o_norm: *const f32, normed: *mut f32, head0: u32, n: u32, ms: u32, fs: u32, bs: u32, heads: *const u32) {
-        unsafe {
-            let hl = *heads.add(workgroup_id_x() as usize) as usize;
-            step_head::<false>(mixed, taps, window as *mut f32, f, dt_bias, a_log, beta, gate, mem as *mut f32, o_norm, normed, head0 as usize + hl, hl, n, ms, fs, bs, core::ptr::null_mut(), core::ptr::null_mut());
-        }
-    }
-
     /// One head through the step's tokens (`kda_step`'s body): head `h` of the layer, `hl` of the part. `WRITE`: the
     /// advanced window and memory stored back (and to the ring when given); else the state is read only.
     #[inline(always)]
-    unsafe fn step_head<const WRITE: bool>(mixed: *const f32, taps: *const u16, window: *mut f32, f: *const f32, dt_bias: *const f32, a_log: *const f32, beta: *const f32, gate: *const f32, mem: *mut f32, o_norm: *const f32, normed: *mut f32, h: usize, hl: usize, n: u32, ms: u32, fs: u32, bs: u32, ring: *mut f32, ring_w: *mut f32) {
+    pub unsafe fn step_head<const WRITE: bool>(mixed: *const f32, taps: *const u16, window: *mut f32, f: *const f32, dt_bias: *const f32, a_log: *const f32, beta: *const f32, gate: *const f32, mem: *mut f32, o_norm: *const f32, normed: *mut f32, h: usize, hl: usize, n: u32, ms: u32, fs: u32, bs: u32, ring: *mut f32, ring_w: *mut f32) {
         {
             // token i's inputs: `mixed[i · ms]`, `f[i · fs]`, `gate[i · fs]`, `beta[i · bs]` — the strides of the launches that made them
             let (ms, fs, bs) = (ms as usize, fs as usize, bs as usize);

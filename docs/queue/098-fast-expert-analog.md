@@ -364,15 +364,60 @@ each way — the fusions in the design are not done; the first measurement says 
 of composed rows + a 64 B head table + 8 KB of norm a part, ~37 MB a card over the 31 pairs, plus ~1.1 MB of scratch
 a card; the resident slots are sized after it, so the slot count in `plan_eval` is honest.
 
-**What the boot needs** (rockem.lead runs it): the node from this tree (`make initramfs` as deploy.sh does); the code
-object `bundles/tools/kernels-an1.gfx1100.elf` (sha256 a15114be…) installed by `bringup/gates/install_elf.sh
-bundles/tools/kernels-an1.gfx1100.elf bundles/glm-5.3-flash-q4rtn glm-5.3-flash` (the manifest's hash with it: a new
-identity, the API restarts as deploy.sh does); no cmdline change. The lab check before the gates: `forward-glm-an1
---cpu <bundle> --gpu --goldens <code-prefix-q4-rtn> --routing-trace <out> --step-ids <ids>` prints the analog's and the
-route-ahead's picks named of 8 on the same positions — the offline golden pair-3 numbers were 5.2 against 4.2 (the
-analog's must be above the route-ahead's; equal or below is a bug, not a result). Then the gates in rockem.lead's
-order: the timeline at widths 1–4 against ~150 µs a card and the plan at ~210 µs, `hc_post`'s wait; long SCORE
-bit-identical; `plan_eval` at 18k against run 50bbd219; experts_ms and the step by width; a 300k+ turn.
+**The first boot (rockem.lead, 2026-10-26, run 1f8f79f2; bringup/box/logs/an1-gates.txt).** Boot clean, long SCORE
+bit-identical. **Accuracy confirmed on production rows** against 50bbd219 (193k vs 57k layer runs, the same 24-decode
+workload at 18k): the early plan at rank 13 .622 → .711 (rank 8 .874 → .939), the rows plan .688 → .787 (.922 → .974);
+the posted 13 picked .812 → .854 / .851 → .888 and cover .658 → .776 / .692 → .809 of the layer's non-resident picks;
+experts_ms p50 at widths 2 / 3 / 4: 12.03 / 18.83 / 26.54 against 12.36 / 20.51 / 28.48 (−3 / −8 / −7 %). **But the plan
+was late:** the slot lap 8.1 / 8.5 / 6.8 / 4.4 ms a step at widths 1–4 (was 0.3–0.4), the step +5.5 / +3.4 / +1.4 ms at
+2 / 3 / 4 — net negative; reverted from production the same day. The card lanes (p50 µs): an_pre 92 (predicted 15),
+an_rows_sel 75, an_fg_sel 11, kda_step_ro 19, an_out 16, the word_wait handshake 60–80, pred_step 19, pred_rows 26, five
+launches a card — a critical path of ~300–350 µs against a run of ~250–350 at widths 2–3 and ~180 at width 1 (the run
+is shorter than the 390 assumed: the re-touch). The lab trace did not run (a glibc binary; the box is musl).
+
+**The second build (098-analog branch, worktree ~/Work/rockem-an; main carries the revert).** Three changes:
+- `an_pre`'s 92 µs was structural: six grid barriers around five latency-bound phases that materialized the stood-in
+  streams twice. The stood-in and no-attention streams are linear in five base vectors a token (layer l's four
+  FFN-input streams and `fyv`), so every coefficient of both hyper-connection halves is a combination of a row's
+  dots with them (48 rows × 4 blocks × 5 vectors) and both norms come from the vectors' 5 × 5 Gram; the collapses
+  are five-term sums. One streaming pass (a row a workgroup, two tokens a pass), one barrier, the mixes on a wave a
+  token, one barrier, the collapses.
+- The handshake off the critical path: `an_send` (the shared output to the peer with its word) is launched in `ffn`
+  behind `ffn_down_shared`, long before the chain; the peer's chain waits for the word in-kernel; the leader's
+  `pred_step` waits in-kernel for the peer's partial (`pb_word`), so the leader's own chain never waits. No
+  `word_wait` launches.
+- One launch a card: `an_chain` (`CHAIN_GRID` 168 workgroups, all resident; `kernel_report.py` holds its registers to
+  the bound) with the phases behind six grid barriers — A (dots, Gram), B (mixes), C (collapses), R (the chosen heads'
+  rows, the waves looping the selection through `exp4_rows_direct_rows`), F (their gates), S (`kda::step_head`
+  read-only), O (the composed rows; the leader's router rows over the no-attention input and over the second margin's
+  input, which `pred_input` + `hc_route_ahead` made before — those two launches are gone on analog pairs). The
+  streamed operands are kernel arguments (an address read from a table is generic: flat loads, which count on the
+  scalar counter), the small pointers a table built at boot. Static report: 192 VGPRs (the resident bound), no
+  scratch (a first form spilled 68 B at four tokens' accumulators; two a pass now), 26 barriers (6 grid, 8 the step's,
+  the rest the phases' workgroup syncs), no `s_trap`, 118 flat loads (the table's small pointers), kernarg 124 =
+  the launch's. Artifacts: `bundles/tools/kernels-an2.gfx1100.elf`, `bundles/tools/forward-glm-an2` (musl).
+
+**Predicted path at width 2 (arithmetic from the first boot's rates):** A ~10, three barriers ~9, B ~5, C ~3, R ~70
+(the 42 MB the first boot read in 75 with a larger grid), F ~5, S 19, O ~10, the launch ~15 → `an_chain` ~145 µs;
+`pred_step` 19 + its launch ~15 → **the plan ~180–190 µs after the run starts**, against ~250–350 at widths 2–3
+(inside: no slot wait) and ~180 at width 1 (the slot waits ~0–30 µs there — tcdent's fork, with this boot's number).
+Not the ≤ 150 asked: the rows phase is the floor, and the cheaper rows did not hold:
+
+**Head selection and the cheaper rows (measured offline, the first-margin shape, W = 10 at R = 6; today 8.87 / 9.25,
+h32 9.31 / 9.56):** heads chosen from calibration data (their measured push on the router) 9.32 / 9.56 — the same as
+by the weights' norm; balanced 16 + 16 a card 9.28 / 9.53 (−.03: the node's per-part selection costs nothing);
+**h32 over the input's top 64 principal directions 9.04 / 9.36 — it keeps only a third of h32's gain,** so the rows
+stay the layer's own 32 heads (42 MB a card). Fewer heads is the one lever left on the rows (h16 as the first margin
+measured +0.27 / +0.16 for ~60 MB a layer): unmeasured between 16 and 32.
+
+**What the second boot needs** (rockem.lead runs it): the node from the 098-analog branch (`make initramfs` as
+deploy.sh does, from the worktree); `bundles/tools/kernels-an2.gfx1100.elf` installed by `bringup/gates/install_elf.sh
+… bundles/glm-5.3-flash-q4rtn glm-5.3-flash`; no cmdline change. The lab check first: `bundles/tools/forward-glm-an2
+--cpu <bundle> --gpu --goldens <code-prefix-q4-rtn> --routing-trace <out> --step-ids <ids>` (musl) prints the analog's
+and the route-ahead's picks named of 8 on the same positions (the analog's must be above; offline on the golden pair
+3, 5.2 against 4.2). Then the gates in rockem.lead's order: the timeline at widths 1–4 (an_chain ~145 µs, the plan
+~190 µs; the slot lap back to ~0.3 ms a step at widths 2–4), long SCORE bit-identical, `plan_eval` at 18k against
+50bbd219 (the first boot's .711 / .787 should repeat), experts_ms and the step by width, a 300k+ turn.
 
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
