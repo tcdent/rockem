@@ -108,6 +108,30 @@ L3-fed cores slow 2–5×. The node's run streams cold items on all 8 cores of e
 - **Eviction of the warm lines:** the fill counters show them L3-resident in every order; `prefetchnta` on the cold
   reads (1 and 4 KB ahead) changes nothing (warm 13.5–13.7 µs in warm-first, as without).
 
+## A per-CCD cap on cold streamers, in the node (lab-cap, 2026-10-25): no gain
+Built: a semaphore a CCD on the run's shared (cold) queues — the first `cap` workers to arrive start on the CCD's queue at
+once, the rest on their own and their mates' warm items, streaming only with a slot; A/B on one clean boot, the cap
+cycling 0 (none, today's) / 3 / 2 step by step, 24 decodes at 18k, ~480 verify steps each:
+
+| | no cap | cap 3 | cap 2 |
+|---|---|---|---|
+| `experts` a step, p50, width 2 / 3 / 4 (ms) | 13.6 / 21.4 / 29.1 | 14.8 / 21.3 / 32.2 | 14.3 / 21.0 / 28.5 |
+| own (warm) item | 11.84 µs | 13.15 | 12.9 |
+| CCD-queue (cold) item | 34.8 µs | 19.6 | 14.9 |
+| stolen (warm) item | 13.39 µs | 14.33 | 14.21 |
+| a pool run, p50 wall | 150 µs | 165 | 185 |
+
+- **Each cold item streams faster, but the CCD delivers fewer:** 8 streamers complete ~0.23 cold items a µs (~31 GB/s a
+  CCD), 2 complete ~0.13. In the node a CCD is not saturated at 3 streamers as the bench's loaded socket was (17–18 GB/s
+  a CCD): the node's CCDs do not all stream at once, or not for the whole run.
+- **The warm items do not get faster.** Whatever holds the node's warm item at ~12 µs (the bench's: 4.6) is not other
+  cores' streaming. Refuted for the node: the CCD-path explanation of its warm items. Long SCORE bit-identical; not taken.
+- **Not the kernel either:** a node gate/up item is two 32-row `gemv`s (one token: `q4::gemm` drops to `gemv`) over
+  ~128 KB plus a 32-wide SwiGLU — the bench's warm item is one 64-row `gemv` over ~128 KB. Same kernel, same bytes, 2.6×
+  the time. Next suspects: where its lines come from by claim class (today's counters are by expert status: 85.7 % of a
+  complete expert's lines from L3, so ~14 % from DRAM), the core clocks under the socket cap with all cores busy, and the
+  touch's age (~400 µs, other cores touching meanwhile).
+
 ## How the bench and the node differ (to quantify, one at a time)
 1. **The shared CCD queue and stealing.** The node's cold items are claimed from one queue by the CCD's 8 cores and its
    warm items can be stolen by mates; the bench's cores own private sets. The queue is the node's load balancer.
@@ -134,7 +158,8 @@ L3-fed cores slow 2–5×. The node's run streams cold items on all 8 cores of e
 1. Done: `prefetchnta` (no effect) and the fill counters (no eviction).
 1a. Done: the interference matrix (above) — the CCD's memory path.
 1b. Done: with the socket loaded, 3 streamers a CCD saturate it; 5–7 slow its L3-fed cores 2–5×.
-1c. The cap in the node: a per-CCD limit on concurrent cold claimers in the run (lab A/B), and fewer touchers in the window.
+1c. Done: the cap in the node — no gain (above); the bench's mechanism is not the node's limit.
+1d. The node's fill counters by claim class (own / CCD / stolen) and its cores' clocks during the run (lab): why its warm item costs 12 µs.
 2. The node's warm item at its best: a lab run with the prefetch posted but no cold traffic (the run's misses forced to
    the cards or skipped) to read the node's own floor for a warm item.
 3. The differences above, one at a time in the bench, until it reproduces the node's sign.
