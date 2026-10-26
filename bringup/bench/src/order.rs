@@ -17,9 +17,62 @@
 //! same lines every iteration (L3-resident from the iterations before, the touch adding nothing). `--gap-us g`: the touch
 //! and the run `g` µs apart; `--touches t`: the fresh set touched `t` times over (a second pass hits it in L3) (the cards' phase between the node's prefetch and its run).
 //!
-//!   bench-order [--fresh] [--gap-us 0] [--cpus 49-71,73-95] [--n 3] [--rows 64] [--warm 9] [--cold 7] [--pool-mb 96] [--iters 200]
+//! `--shared 4k|2m`: every core's warm set is a slice of ONE allocation (one mmap, in 4 KiB or 2 MiB pages), each slice
+//! still first-touched by its own core — bench-run's memory shape; default: a private Vec a core.
+//!
+//! `--spin 1`: the cores released into each run by a spin barrier (within nanoseconds of each other, as the node's workers
+//! start on a generation word) instead of std's futex barrier (tens of µs of stagger).
+//!
+//! `--gap-mode pause|busy|mwaitx|l3|dram`: how a core spends `--gap-us` — spinning on `pause`, a register-only busy
+//! loop, the node's `wait_on` (monitorx/mwaitx with its ~30 µs timeout, re-armed until the gap ends), reading a 1 MB
+//! L3-resident buffer of its own over and over (L3 traffic, as a run's), or streaming fresh lines from the pool (DRAM
+//! traffic, as the node's window); `l3one`: only the first listed core reads its L3 buffer, the rest `pause`; `dramnta`:
+//! fresh lines streamed with `prefetchnta` (DRAM traffic that leaves the L3 alone); `l2`: a 192 KB L2-resident buffer
+//! read over and over (L2 traffic, no L3 requests); `l3duty`: 50 µs slots, `--duty` percent of them reading the L3 buffer,
+//! the rest `pause` (NB: a slot reads the whole 1 MB buffer once whenever its share is nonzero — ~40 µs — so this mode
+//! only distinguishes some L3 traffic from none); `l3ring`: 50 µs slots, `--duty-kb` KB of a rotating 1 MB ring read in
+//! each (a line re-read after a full ring, past the L2: an L3 hit), the rest `pause` — the least L3 traffic that holds
+//! the state; `pause_l3`: `--gap-us` of pause, then `--gap2-us` of full-rate L3 reads (the recovery time after a decay). With a gap, WarmOnly also
+//! reports the core clock (APERF/MPERF) over the gap and over the run, and the warm items' µs by position (first third /
+//! middle / last third).
+//!
+//! `--pretouch 0`: no touch of the warm set before each run (the fixed set stays L3-resident from the runs before).
+//!
+//!   bench-order [--pretouch 1] [--gap-mode pause] [--spin 0] [--shared none] [--fresh] [--gap-us 0] [--cpus 49-71,73-95] [--n 3] [--rows 64] [--warm 9] [--cold 7] [--pool-mb 96] [--iters 200]
 use harness::arg;
 use std::sync::{Arc, Barrier, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// A barrier: std's (a futex wake) or a spinning one on padded lines.
+#[repr(align(64))]
+struct Line(AtomicUsize);
+enum Bar {
+    Futex(Barrier),
+    Spin { n: usize, arrived: Line, gen: Line },
+}
+impl Bar {
+    fn new(n: usize, spin: bool) -> Self {
+        if spin { Bar::Spin { n, arrived: Line(AtomicUsize::new(0)), gen: Line(AtomicUsize::new(0)) } } else { Bar::Futex(Barrier::new(n)) }
+    }
+    fn wait(&self) {
+        match self {
+            Bar::Futex(b) => {
+                b.wait();
+            }
+            Bar::Spin { n, arrived, gen } => {
+                let g = gen.0.load(Ordering::Acquire);
+                if arrived.0.fetch_add(1, Ordering::AcqRel) + 1 == *n {
+                    arrived.0.store(0, Ordering::Relaxed);
+                    gen.0.store(g + 1, Ordering::Release);
+                } else {
+                    while gen.0.load(Ordering::Acquire) == g {
+                        std::hint::spin_loop();
+                    }
+                }
+            }
+        }
+    }
+}
 
 const K: usize = 4096;
 
@@ -49,6 +102,8 @@ fn touch(b: &[u8]) -> u64 {
 
 #[path = "gemv_hint.rs"]
 mod gemv_hint;
+#[path = "huge.rs"]
+mod huge;
 use gemv_hint::gemv_hint;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -81,6 +136,7 @@ fn main() {
     let fresh = arg("--fresh").is_some();
     let gap_us = num("--gap-us", 0) as u64;
     let touches = num("--touches", 1);
+    let shared = arg("--shared").map(|v| v.to_str().unwrap().to_string()).unwrap_or("none".into());
     let orders = [Order::WarmFirst, Order::ColdFirst, Order::Interleave, Order::WarmOnly, Order::ColdOnly];
     let t = cpus.len();
     // per iteration, per thread: the run's time (ns); per order: the warm and cold items' summed times and counts
@@ -93,12 +149,30 @@ fn main() {
         let ok = cpus.iter().all(|&c| common::pmc::Pmc::open(c).is_some_and(|p| p.program(&common::pmc::FILLS)));
         ok && common::pmc::allow_rdpmc()
     };
-    let start = Arc::new(Barrier::new(t));
+    let (ibytes, sbytes) = (rows * K / 2, rows * K / 128 * 4);
+    let per = (nw0 + spread) * ibytes + 64;
+    let shared_w: Option<usize> = match shared.as_str() {
+        "4k" => Some(huge::alloc_pages(t * per, false).as_ptr() as usize),
+        "2m" => Some(huge::alloc_pages(t * per, true).as_ptr() as usize),
+        _ => None,
+    };
+    let shared_s: Option<usize> = shared_w.map(|_| huge::alloc_pages(t * ((nw0 + spread) * sbytes + 64), shared == "2m").as_ptr() as usize);
+    let spin = num("--spin", 0) == 1;
+    let gap_mode = arg("--gap-mode").map(|v| v.to_str().unwrap().to_string()).unwrap_or("pause".into());
+    let duty = num("--duty", 10);
+    let pretouch = num("--pretouch", 1) == 1;
+    let duty_kb = num("--duty-kb", 16);
+    let gap2_us = num("--gap2-us", 0) as u64;
+    // clocks: [gap aperf, gap mperf, run aperf, run mperf]; items by position: [ns, n] × 3
+    let clocks: Arc<Mutex<[u64; 4]>> = Arc::new(Mutex::new([0; 4]));
+    let bypos: Arc<Mutex<[[u64; 2]; 3]>> = Arc::new(Mutex::new([[0; 2]; 3]));
+    let start = Arc::new(Bar::new(t, spin));
     let handles: Vec<_> = cpus
         .iter()
         .enumerate()
         .map(|(ti, &cpu)| {
             let (start, times, class, fills) = (start.clone(), times.clone(), class.clone(), fills.clone());
+            let (clocks, bypos, gap_mode) = (clocks.clone(), bypos.clone(), gap_mode.clone());
             let nw = if spread == 0 { nw0 } else { (nw0 + spread).saturating_sub((ti * (2 * spread + 1)) / t.max(1)).max(1) };
             std::thread::spawn(move || {
                 use common::q4::{pack, Act, QAct, GROUP};
@@ -113,6 +187,18 @@ fn main() {
                 };
                 let pool_items = ((pool_mb << 20) / ib).max(nc * 4);
                 let (warm_w, warm_s) = mk(nw);
+                // --shared: this core's slice of the one allocation, written (first-touched) here
+                let (warm_w, warm_s): (Vec<u8>, Vec<f32>) = match shared_w {
+                    None => (warm_w, warm_s),
+                    Some(base) => {
+                        let wp = unsafe { std::slice::from_raw_parts_mut((base + ti * per) as *mut u8, nw * ib) };
+                        wp.copy_from_slice(&warm_w);
+                        let sp = unsafe { std::slice::from_raw_parts_mut((shared_s.unwrap() + ti * ((nw0 + spread) * sbytes + 64)) as *mut f32, nw * sb) };
+                        sp.copy_from_slice(&warm_s);
+                        // Vecs over the slices, never freed (the bench ends with the process)
+                        unsafe { (Vec::from_raw_parts(wp.as_mut_ptr(), wp.len(), wp.len()), Vec::from_raw_parts(sp.as_mut_ptr(), sp.len(), sp.len())) }
+                    }
+                };
                 let (pool_w, pool_s) = mk(pool_items);
                 let (mut q, mut s, mut g) = (vec![0i8; n * K], vec![0f32; n * K / GROUP], vec![0i32; n * K / GROUP]);
                 for i in 0..n {
@@ -151,6 +237,9 @@ fn main() {
                 };
                 let mut cursor = 0usize;
                 let mut sink = 0u64;
+                let gapbuf: Vec<u8> = (0..(1usize << 20)).map(|i| i as u8).collect();
+                let gap_cursor = std::cell::Cell::new(pool_items / 2);
+                let ring_at = std::cell::Cell::new(0usize);
                 // WarmOnly's touch passes: [first, later] × (ns, L3 hits, DRAM lines, passes)
                 let pass_acc = std::cell::Cell::new([[0u64; 4]; 2]);
                 for (oi, &order) in orders.iter().enumerate() {
@@ -177,18 +266,152 @@ fn main() {
                                     pass_acc.set(x);
                                 }
                             }
-                        } else {
+                        } else if pretouch {
                             sink = sink.wrapping_add(touch(&warm_w));
                         }
                         let cold: Vec<usize> = (0..nc).map(|j| (cursor + j) % pool_items).collect();
                         cursor = (cursor + nc) % pool_items;
                         start.wait();
+                        let msr = |reg: u64| -> u64 {
+                            use std::os::unix::fs::FileExt;
+                            let f = std::fs::File::open(format!("/dev/cpu/{cpu}/msr")).expect("msr");
+                            let mut b = [0u8; 8];
+                            f.read_exact_at(&mut b, reg).expect("msr read");
+                            u64::from_le_bytes(b)
+                        };
+                        let timed_run = gap_us > 0 && order == Order::WarmOnly && it > 0;
                         if gap_us > 0 {
+                            let (a0, m0) = if timed_run { (msr(0xE8), msr(0xE7)) } else { (0, 0) };
                             let g = std::time::Instant::now();
-                            while g.elapsed().as_micros() < gap_us as u128 {
-                                std::hint::spin_loop();
+                            let d = std::time::Duration::from_micros(gap_us);
+                            match gap_mode.as_str() {
+                                "busy" => {
+                                    let mut x = 1u64;
+                                    while g.elapsed() < d {
+                                        for _ in 0..64 {
+                                            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                                        }
+                                    }
+                                    std::hint::black_box(x);
+                                }
+                                "l3one" if ti == 0 => {
+                                    let mut x = 0u64;
+                                    while g.elapsed() < d {
+                                        x = x.wrapping_add(touch(&gapbuf));
+                                    }
+                                    std::hint::black_box(x);
+                                }
+                                "dramnta" => {
+                                    use std::arch::x86_64::*;
+                                    let mut x = 0u64;
+                                    while g.elapsed() < d {
+                                        let k = gap_cursor.get();
+                                        let b = &pool_w[k * ib..(k + 1) * ib];
+                                        let mut i = 0;
+                                        while i + 4096 <= b.len() {
+                                            // prefetch the next 4 KB non-temporally, then read this 4 KB (hits the prefetched lines)
+                                            let mut l = 0;
+                                            while l < 4096 && i + 4096 + l < b.len() {
+                                                unsafe { _mm_prefetch::<_MM_HINT_NTA>(b.as_ptr().add(i + 4096 + l) as *const i8) };
+                                                l += 64;
+                                            }
+                                            x = x.wrapping_add(touch(&b[i..i + 4096]));
+                                            i += 4096;
+                                        }
+                                        gap_cursor.set((k + 1) % pool_items);
+                                    }
+                                    std::hint::black_box(x);
+                                }
+                                "l2" => {
+                                    let mut x = 0u64;
+                                    while g.elapsed() < d {
+                                        x = x.wrapping_add(touch(&gapbuf[..192 << 10]));
+                                    }
+                                    std::hint::black_box(x);
+                                }
+                                "l3duty" => {
+                                    let mut x = 0u64;
+                                    let slot = std::time::Duration::from_micros(50);
+                                    let on = std::time::Duration::from_micros(duty as u64 * 50 / 100);
+                                    while g.elapsed() < d {
+                                        let s0 = std::time::Instant::now();
+                                        while s0.elapsed() < on {
+                                            x = x.wrapping_add(touch(&gapbuf));
+                                        }
+                                        while s0.elapsed() < slot {
+                                            std::hint::spin_loop();
+                                        }
+                                    }
+                                    std::hint::black_box(x);
+                                }
+                                "l3ring" => {
+                                    let mut x = 0u64;
+                                    let slot = std::time::Duration::from_micros(50);
+                                    let step = (duty_kb << 10).min(gapbuf.len());
+                                    while g.elapsed() < d {
+                                        let s0 = std::time::Instant::now();
+                                        let at = ring_at.get();
+                                        let end = (at + step).min(gapbuf.len());
+                                        x = x.wrapping_add(touch(&gapbuf[at..end]));
+                                        ring_at.set(if end >= gapbuf.len() { 0 } else { end });
+                                        while s0.elapsed() < slot {
+                                            std::hint::spin_loop();
+                                        }
+                                    }
+                                    std::hint::black_box(x);
+                                }
+                                "pause_l3" => {
+                                    while g.elapsed() < d {
+                                        std::hint::spin_loop();
+                                    }
+                                    let d2 = std::time::Duration::from_micros(gap2_us);
+                                    let g2 = std::time::Instant::now();
+                                    let mut x = 0u64;
+                                    while g2.elapsed() < d2 {
+                                        x = x.wrapping_add(touch(&gapbuf));
+                                    }
+                                    std::hint::black_box(x);
+                                }
+                                "l3" => {
+                                    // this core's own 1 MB, read in full each pass (L3-resident after the first)
+                                    let mut x = 0u64;
+                                    while g.elapsed() < d {
+                                        x = x.wrapping_add(touch(&gapbuf));
+                                    }
+                                    std::hint::black_box(x);
+                                }
+                                "dram" => {
+                                    let mut x = 0u64;
+                                    while g.elapsed() < d {
+                                        let k = gap_cursor.get();
+                                        x = x.wrapping_add(touch(&pool_w[k * ib..(k + 1) * ib]));
+                                        gap_cursor.set((k + 1) % pool_items);
+                                    }
+                                    std::hint::black_box(x);
+                                }
+                                "mwaitx" => {
+                                    let word = std::sync::atomic::AtomicU64::new(0);
+                                    while g.elapsed() < d {
+                                        unsafe {
+                                            core::arch::asm!("monitorx", in("rax") &word as *const _ as *const u8, in("ecx") 0u32, in("edx") 0u32, options(nostack, preserves_flags));
+                                            core::arch::asm!("push rbx", "mov ebx, {t:e}", "mwaitx", "pop rbx", t = in(reg) 100_000u32, in("eax") 0u32, in("ecx") 2u32, options(nostack, preserves_flags));
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    while g.elapsed() < d {
+                                        std::hint::spin_loop();
+                                    }
+                                }
+                            }
+                            if timed_run {
+                                let (a1, m1) = (msr(0xE8), msr(0xE7));
+                                let mut c = clocks.lock().unwrap();
+                                c[0] += a1 - a0;
+                                c[1] += m1 - m0;
                             }
                         }
+                        let (ra0, rm0) = if timed_run { (msr(0xE8), msr(0xE7)) } else { (0, 0) };
                         let t0 = std::time::Instant::now();
                         let warm = |k: usize| {
                             timed(&wsum, &wfill, &|| {
@@ -235,10 +458,27 @@ fn main() {
                                     }
                                 }
                             }
-                            Order::WarmOnly => (0..nw).for_each(warm),
+                            Order::WarmOnly => {
+                                for k in 0..nw {
+                                    let t1 = std::time::Instant::now();
+                                    warm(k);
+                                    if timed_run {
+                                        let p = (k * 3 / nw).min(2);
+                                        let mut b = bypos.lock().unwrap();
+                                        b[p][0] += t1.elapsed().as_nanos() as u64;
+                                        b[p][1] += 1;
+                                    }
+                                }
+                            }
                             Order::ColdOnly => (0..nc).for_each(cold_run),
                         }
                         let dt = t0.elapsed().as_nanos() as u64;
+                        if timed_run {
+                            let (ra1, rm1) = (msr(0xE8), msr(0xE7));
+                            let mut c = clocks.lock().unwrap();
+                            c[2] += ra1 - ra0;
+                            c[3] += rm1 - rm0;
+                        }
                         if it > 0 {
                             times.lock().unwrap()[oi][it - 1][ti] = dt;
                         }
@@ -273,6 +513,11 @@ fn main() {
                     }
                 }
                 std::hint::black_box((sink, out));
+                if shared_w.is_some() {
+                    // the Vecs over the shared slices are not malloc's: never freed
+                    std::mem::forget(warm_w);
+                    std::mem::forget(warm_s);
+                }
             })
         })
         .collect();
@@ -282,6 +527,15 @@ fn main() {
     let times = times.lock().unwrap();
     let mb = |items: usize| (items * (rows * K / 2 + rows * K / 128 * 4)) as f64 / 1e6;
     let cl = class.lock().unwrap();
+    if gap_us > 0 {
+        let c = clocks.lock().unwrap();
+        let b = bypos.lock().unwrap();
+        let ghz = |a: u64, m: u64| 2.65 * a as f64 / m.max(1) as f64;
+        let us = |x: [u64; 2]| x[0] as f64 / x[1].max(1) as f64 / 1e3;
+        println!("gap {gap_us} µs as {gap_mode}: clock over the gap {:.2} GHz, over the WarmOnly run {:.2} GHz; warm item µs by position: first third {:.2}, middle {:.2}, last third {:.2}", ghz(c[0], c[1]), ghz(c[2], c[3]), us(b[0]), us(b[1]), us(b[2]));
+    }
+    println!("release: {}", if spin { "spin barrier" } else { "std (futex) barrier" });
+    println!("warm memory: {}", match shared.as_str() { "4k" => "one shared allocation, 4 KiB pages", "2m" => "one shared allocation, 2 MiB pages", _ => "a private Vec a core" });
     println!("warm set: {}", if fresh { format!("fresh each iteration (touched from DRAM, {touches}×), gap {gap_us} µs") } else { "the same lines every iteration".into() });
     println!("bench-order: {t} cores, {n} tokens, items of {rows} rows, {nw0} ± {spread} warm ({:.2} MB) + {nc} cold ({:.2} MB) a core, {iters} iterations, cold hint {} at {dist} B", mb(nw0), mb(nc), ["none", "nta", "t0"][hint as usize]);
     println!("{:<12} {:>9} {:>9} {:>9} {:>15} {:>14} {:>14}", "order", "p50 µs", "p10 µs", "p90 µs", "cold GB/s (all)", "warm item µs", "cold item µs");

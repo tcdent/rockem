@@ -247,7 +247,8 @@ like. Finer items (`SUB_FEW` 4) cut the tail without moving the wall. This 375 i
    but the hinted gemv reads ~35 % slower (2026-10-26).
 7. **A core's L3 read rate decays when its L3 hits stop** (2026-10-26, queue 099): after 1 ms without L3 hits a core
    reads L3-resident lines 37 % slower, after 3 ms ~70 %, after 10 ms 4×; uniform over the run that follows, at a higher
-   clock; not held by compute, L2 hits or DRAM misses, held by full-rate L3 reads (≥ ~1 GB/s begins to help); per core.
+   clock; not held by compute, L2 hits or DRAM misses; held by ~5 GB/s of L3 hits a core (a rotating ring, 256 KB every
+   50 µs); recovery after a decay takes ~0.5–1 ms of full-rate hits; DRAM-fed reads are unaffected; per core.
    Every node run follows a window of DRAM touching and `mwaitx` — its warm items run decayed. Mechanism not identified.
    Benches that read L3-resident sets must state what the cores did just before (`bench-order --gap-us/--gap-mode`).
 8. **Interference, separate from loss:** a CCD's DRAM path saturates at ~40 GB/s with 3–4 streaming cores alone, ~17–18

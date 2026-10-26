@@ -429,16 +429,24 @@ an item in every row below, 0 from DRAM), after a gap in which the cores do no L
   7.09. **Full-rate L3 reads of any data (a 1 MB buffer of its own): 4.30 — no decay.**
 - **Per core:** one core reading L3 does not hold its seven mates (7.28); CCD 8 reading L3 flat out does not hold CCD 7
   (7.44, CCD 8 itself 4.36). Not a package or fabric state the others can keep up.
-- **Holding it is not cheap:** a rotating 1 MB ring read in 50 µs slots — 1, 4, 16 KB a slot: 7.5–7.7 (nothing held); 64
-  KB a slot (~1.3 GB/s): 5.94 (part); the full buffer each slot (~20 GB/s): 4.3. The curve above 64 KB and the recovery
-  time after a decay: `bench-gap-recovery.txt` (running). (An earlier "2 % duty holds it" reading was a bench error: that
-  mode read the whole buffer whenever its share was nonzero.)
+- **What holds it:** a rotating 1 MB ring read in 50 µs slots (lines re-read after a full ring: L3 hits) — 1, 4, 16 KB a
+  slot: 7.5–7.7 (nothing held); 64 KB (~1.3 GB/s): 5.94; 128 KB (2.6 GB/s): 4.67; **256 KB (~5 GB/s): 4.40**; 512 KB: 4.37.
+  About a fifth of a core's L3 read rate, as hits, holds the state. (An earlier "2 % duty holds it" reading was a bench
+  error: that mode read the whole buffer whenever its share was nonzero.)
+- **Recovery after a decay** (10 ms idle, then full-rate L3 reads): 100 µs of reads → 16.6 µs an item; 300 µs → 10.9;
+  **1 ms → 4.35**. Recovery takes ~0.5–1 ms of hits — longer than a node run (~400 µs), so a decayed core stays decayed
+  through its run.
+- **DRAM-fed reads are unaffected:** cold items 24.34 µs without a gap, 24.40 after 3 ms (the same run's warm items 4.37 →
+  12.76). The state sets the L3-hit delivery rate only.
 - **L3 misses do not count** (`dramnta`, the node's window), only hits.
 
 **What it is** is not identified: a per-core state, driven by the core's own L3-hit traffic, with a time constant of
 milliseconds, that sets the rate at which L3 hits are delivered to that core, independent of its clock. Candidates not yet
 separated: the L2 prefetcher's adaptive throttle, a per-core request-credit allocation, a power state of the core's L3
 interface.
+
+**The prediction before any node change** (`bench-run --hold kb`: each worker reads `kb` KB of its own L3 ring every 50 µs
+through the window's touches and its waits): `bringup/box/logs/bench-run-hold.txt`.
 
 **Why it matters here:** every one of the node's expert runs follows a ~440 µs window of DRAM touching and `mwaitx`
 waits — no L3 hits for the core — so the node's warm items run in the decayed state on every layer; `bench-run`'s
