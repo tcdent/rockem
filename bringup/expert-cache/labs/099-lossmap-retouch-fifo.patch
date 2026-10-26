@@ -1,0 +1,308 @@
+diff --git a/models/glm-5.3-flash/src/construct.rs b/models/glm-5.3-flash/src/construct.rs
+index 6f6d3d9..c573c1b 100644
+--- a/models/glm-5.3-flash/src/construct.rs
++++ b/models/glm-5.3-flash/src/construct.rs
+@@ -85,6 +85,76 @@ const SLOTS: usize = CORE + MAX_WORKERS;
+ /// The decode prefetch's experts a layer at most, its best-ranked first (a CCD's L3 retains about this many; see the
+ /// prefetch's comment).
+ const PREFETCH_CAP: usize = 13;
++/// LAB (099's re-touch, 2026-10-26): whether a decode step's prefetch touches its lines a second time, set per step by
++/// the node's lab cycle.
++pub static LAB_RETOUCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++/// LAB (099, 2026-10-26): the owner claims its own deque from the front — its oldest touched slices first, the most at
++/// risk — instead of the back; set per step by the node's lab cycle.
++pub static LAB_FIFO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++/// A prefetch's touches by this worker, for the re-touch (099): its job's tag, the ranges touched in order, the bytes
++/// touched so far. Milan's L3 drops lines with no hit history first (8 cores of a CCD lost 7 % of a fresh 10 MB set,
++/// 16 % at 15 MB); one L3 hit protects a line. A range is touched again once `RETOUCH_LAG` more bytes have been touched
++/// after it — out of this core's L2 (512 KB) by then, so the second read is an L3 hit, not an L2 one.
++const RETOUCH_LAG: usize = 512 << 10;
++std::thread_local! {
++    static RETOUCH: std::cell::RefCell<(usize, std::collections::VecDeque<(usize, usize, usize)>, usize)> = const { std::cell::RefCell::new((0, std::collections::VecDeque::new(), 0)) };
++}
++static PREFETCH_TAG: AtomicUsize = AtomicUsize::new(1);
++/// LAB (099's loss map, 2026-10-26): where a prefetched line is lost, measured in the node. Per CCD, the bytes its
++/// workers have first-touched for a prefetch (monotonic) and the bytes its workers' run items have read; per (expert,
++/// slice), the CCD-touched count when its touch finished, with the layer and whether the early plan's job touched it.
++pub mod lossmap {
++    use std::sync::atomic::{AtomicU64, Ordering};
++    pub const CCDS: usize = super::MAX_CCDS;
++    pub static TOUCHED: [AtomicU64; CCDS] = [const { AtomicU64::new(0) }; CCDS];
++    pub static RUN_READ: [AtomicU64; CCDS] = [const { AtomicU64::new(0) }; CCDS];
++    const SL: usize = super::GU_ITEMS + super::DOWN_ITEMS;
++    /// (layer + 1) << 48 | early << 47 | touched KB at the touch's end
++    pub static STAMP: [AtomicU64; crate::E * SL] = [const { AtomicU64::new(0) }; crate::E * SL];
++    pub fn stamp(l: usize, e: usize, slice: usize, early: bool, ccd: usize, bytes: usize) {
++        let t = TOUCHED[ccd].fetch_add(bytes as u64, Ordering::Relaxed) + bytes as u64;
++        STAMP[e * SL + slice].store(((l as u64 + 1) << 48) | ((early as u64) << 47) | (t >> 10), Ordering::Relaxed);
++    }
++    /// The histogram: retouch (2) × claim (own, stolen, CCD queue) × plan (early, amend, untouched) × age (bytes the
++    /// CCD touched after the slice: 9 buckets) × run (bytes the CCD's run read before the item: 5 buckets); each cell
++    /// (items, L3 lines, DRAM lines, ns). Per CCD, so a cell's atomics stay on its CCD.
++    pub const AGES: [u64; 8] = [1 << 20, 2 << 20, 3 << 20, 4 << 20, 6 << 20, 8 << 20, 12 << 20, 16 << 20];
++    pub const RUNS: [u64; 4] = [1 << 20, 2 << 20, 4 << 20, 8 << 20];
++    pub const CELLS: usize = 4 * 2 * 3 * 3 * 9 * 5;
++    pub static HIST: [[[AtomicU64; 4]; CELLS]; CCDS] = [const { [const { [const { AtomicU64::new(0) }; 4] }; CELLS] }; CCDS];
++    std::thread_local! {
++        pub static WORKER_CCD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
++        /// The claim of the item in hand: 0 own, 1 a mate's (stolen), 2 a shared queue.
++        pub static CLAIM: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
++    }
++    pub fn bucket(v: u64, edges: &[u64]) -> usize {
++        edges.iter().position(|&e| v < e).unwrap_or(edges.len())
++    }
++    /// An item of the run: its slice's stamp read against the CCD's counters now and at the run's start.
++    #[allow(clippy::too_many_arguments)]
++    pub fn record(l: usize, n: usize, e: usize, slice: usize, retouch: bool, run0: &[u64; CCDS], bytes: usize, hit: u64, miss: u64, ns: u64) {
++        let ccd = WORKER_CCD.with(|c| c.get());
++        let claim = CLAIM.with(|c| c.get()) as usize;
++        let st = STAMP[e * SL + slice].load(Ordering::Relaxed);
++        let (plan, age) = if st >> 48 == l as u64 + 1 {
++            let t = (st & ((1 << 47) - 1)) << 10;
++            (if st & (1 << 47) != 0 { 0 } else { 1 }, bucket(TOUCHED[ccd].load(Ordering::Relaxed).saturating_sub(t), &AGES))
++        } else {
++            (2, 0)
++        };
++        let before = RUN_READ[ccd].fetch_add(bytes as u64, Ordering::Relaxed).saturating_sub(run0[ccd]);
++        let run = bucket(before, &RUNS);
++        let cell = ((((n.clamp(1, 4) - 1) * 2 + retouch as usize) * 3 + claim) * 3 + plan) * 45 + age * 5 + run;
++        let c = &HIST[ccd][cell];
++        c[0].fetch_add(1, Ordering::Relaxed);
++        c[1].fetch_add(hit, Ordering::Relaxed);
++        c[2].fetch_add(miss, Ordering::Relaxed);
++        c[3].fetch_add(ns, Ordering::Relaxed);
++    }
++    pub fn snapshot() -> [u64; CCDS] {
++        std::array::from_fn(|c| RUN_READ[c].load(Ordering::Relaxed))
++    }
++}
+ /// Workers a CCD lends a prefetch (of its eight), by their rank in the CCD: every core touches, so every core's first
+ /// reads are its own lines and the CCD's DRAM phase starts only when its planned reads are done (with four of eight
+ /// the other four streamed DRAM beside the takers' planned reads: 83 → 78 % of a completed expert's lines from L3,
+@@ -230,7 +300,7 @@ fn claim_deque(c: &std::sync::atomic::AtomicU64, owner: bool) -> Option<usize> {
+         if front >= back {
+             return None;
+         }
+-        let (nv, i) = if owner { (v - (1 << 32), back - 1) } else { (v + 1, front) };
++        let (nv, i) = if owner && !LAB_FIFO.load(Ordering::Relaxed) { (v - (1 << 32), back - 1) } else { (v + 1, front) };
+         match c.compare_exchange_weak(v, nv, Ordering::AcqRel, Ordering::Acquire) {
+             Ok(_) => return Some(i as usize),
+             Err(cur) => v = cur,
+@@ -275,6 +345,7 @@ unsafe fn work(job: *const Job, order: &[usize], node: usize, who: usize) {
+                 j.core_start[who].store(at.max(1), Ordering::Relaxed);
+             }
+             let item = j.order[i] as usize;
++            lossmap::CLAIM.with(|c| c.set(if s < CORE { 2 } else if s - CORE == who { 0 } else { 1 }));
+             if j.light {
+                 j.taker[item].store(who as u8, Ordering::Relaxed);
+                 (j.light_f.as_ref().unwrap())(item);
+@@ -321,6 +392,7 @@ impl Threads {
+             mates[ccd_of(c)].push(who);
+         }
+         let main_ccd = ccd_of(cores[0]);
++        lossmap::WORKER_CCD.with(|c| c.set(main_ccd));
+         let shared = std::sync::Arc::new(Shared { gen: Gen(std::sync::atomic::AtomicU64::new(0)), job: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()), active: AtomicUsize::new(0), busy: std::sync::atomic::AtomicBool::new(false), quit: std::sync::atomic::AtomicBool::new(false) });
+         let mut touchers = vec![0usize; MAX_CCDS];
+         for (who, &core) in cores.iter().enumerate().skip(1) {
+@@ -333,6 +405,7 @@ impl Threads {
+             touchers[ccd] += touches as usize;
+             std::thread::spawn(move || {
+                 pin(core);
++                lossmap::WORKER_CCD.with(|c| c.set(ccd));
+                 let mut seen = 0u64;
+                 loop {
+                     let g = sh.gen.0.load(Ordering::Acquire);
+@@ -987,6 +1060,12 @@ struct RunData {
+     #[cfg(feature = "track-experts")]
+     counted: std::sync::atomic::AtomicBool,
+     #[cfg(feature = "track-experts")]
++    retouch: bool,
++    #[cfg(feature = "track-experts")]
++    run0: std::sync::Mutex<[u64; lossmap::CCDS]>,
++    #[cfg(feature = "track-experts")]
++    run0c: std::sync::OnceLock<[u64; lossmap::CCDS]>,
++    #[cfg(feature = "track-experts")]
+     rdpmc: bool,
+     #[cfg(feature = "track-experts")]
+     gu_bytes: usize,
+@@ -1048,6 +1127,7 @@ impl<'a> CpuExperts<'a> {
+     /// With a `prior` (the early plan's job, 093): its items already taken are skipped — their lines are in their
+     /// takers' caches — and keep their takers in the merged `Planned`; the rest are reposted in the new order.
+     fn prefetch_with(&self, l: usize, idx: &[usize], prior: Option<Planned>) {
++        let prior_was_none = prior.is_none();
+         // the stream lives as long as the process (the node leaks it; the gate's outlives every token):
+         // the job that owns these closures is gone within the token
+         let stream: &'static expert::Stream<'static> = unsafe { std::mem::transmute::<&expert::Stream, &'static expert::Stream<'static>>(self.stream) };
+@@ -1140,6 +1220,9 @@ impl<'a> CpuExperts<'a> {
+         // the touch reads the abandon flag every 4 KB inside its stream: the run that overtakes this job waits only for
+         // the chunks in flight
+         let pool_s: &'static dyn Pool = unsafe { std::mem::transmute::<&dyn Pool, &'static dyn Pool>(pool) };
++        let retouch = LAB_RETOUCH.load(Ordering::Relaxed);
++        let tag = PREFETCH_TAG.fetch_add(1, Ordering::Relaxed);
++        let early = prior_was_none;
+         let f = move |i: usize| {
+             let (it, slices) = (&i3.0[i], &i3.1);
+             let w = expert::Weights::at(stream, l, idx[it.0]);
+@@ -1162,10 +1245,44 @@ impl<'a> CpuExperts<'a> {
+                 if !touch(unsafe { std::slice::from_raw_parts(start as *const u8, end - start) }, &|| pool_s.abandoned()) {
+                     return;
+                 }
++                let ccd = lossmap::WORKER_CCD.with(|c| c.get());
++                for &j in &run[a..b] {
++                    let j = j as usize;
++                    lossmap::stamp(l, idx[it.0], j, early, ccd, bytes_of(j).len());
++                }
++                if retouch {
++                    RETOUCH.with(|r| {
++                        let r = &mut *r.borrow_mut();
++                        if r.0 != tag {
++                            *r = (tag, std::collections::VecDeque::new(), 0);
++                        }
++                        r.2 += end - start;
++                        r.1.push_back((start, end - start, r.2));
++                    });
++                }
+                 a = b;
+             }
+             #[cfg(feature = "track-experts")]
+             finished[it.0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++            // the ranges this worker touched at least `RETOUCH_LAG` ago, touched again (L3 hits: their lines now have one)
++            if retouch {
++                loop {
++                    let next = RETOUCH.with(|r| {
++                        let r = &mut *r.borrow_mut();
++                        match r.1.front() {
++                            Some(&(s0, len, at)) if at + RETOUCH_LAG <= r.2 => {
++                                r.1.pop_front();
++                                Some((s0, len))
++                            }
++                            _ => None,
++                        }
++                    });
++                    let Some((s0, len)) = next else { break };
++                    if !touch(unsafe { std::slice::from_raw_parts(s0 as *const u8, len) }, &|| pool_s.abandoned()) {
++                        return;
++                    }
++                }
++            }
+         };
+         let takers = self.pool.prefetch_slotted(n, Box::new(slot), Box::new(f));
+         let z = draft_zone("pf.post", z);
+@@ -1557,6 +1674,12 @@ fn plan_run(ctx: &Ctx, l: usize, idx: &[[usize; TOP_K]], xq: &[i8], xs: &[f32],
+         #[cfg(feature = "track-experts")]
+         counted: std::sync::atomic::AtomicBool::new(false),
+         #[cfg(feature = "track-experts")]
++        retouch: LAB_FIFO.load(Ordering::Relaxed),
++        #[cfg(feature = "track-experts")]
++        run0: std::sync::Mutex::new([0; lossmap::CCDS]),
++        #[cfg(feature = "track-experts")]
++        run0c: std::sync::OnceLock::new(),
++        #[cfg(feature = "track-experts")]
+         rdpmc: ctx.rdpmc,
+         #[cfg(feature = "track-experts")]
+         gu_bytes,
+@@ -1576,6 +1699,17 @@ fn plan_run(ctx: &Ctx, l: usize, idx: &[[usize; TOP_K]], xq: &[i8], xs: &[f32],
+         d.item_ns[item].store(t_item.elapsed().as_nanos().min(u32::MAX as u128) as u32, Ordering::Relaxed);
+         if d.counted.load(Ordering::Relaxed) {
+             let (h, m) = (common::pmc::rdpmc(4).wrapping_sub(c0.0), common::pmc::rdpmc(5).wrapping_sub(c0.1));
++            {
++                let (e, slice, bytes) = if item < d.ng {
++                    let (j, c0, _) = d.gitem(item);
++                    (d.experts[j], c0 / expert::SUB, d.gu_bytes)
++                } else {
++                    let (j, c) = ((item - d.ng) / expert::DOWN_PARTS, (item - d.ng) % expert::DOWN_PARTS);
++                    (d.experts[j], GU_ITEMS + c / expert::SUB, expert::DOWN_ROWS * D_FF / 2 + expert::DOWN_ROWS * (D_FF / common::q4::GROUP) * 4)
++                };
++                let run0 = d.run0c.get_or_init(|| *d.run0.lock().unwrap());
++                lossmap::record(d.l, d.n, e, slice, d.retouch, run0, bytes, h & ((1 << 48) - 1), m & ((1 << 48) - 1), t_item.elapsed().as_nanos() as u64);
++            }
+             d.item_fill[item][0].store((h & ((1 << 48) - 1)).min(u16::MAX as u64) as u16, Ordering::Relaxed);
+             d.item_fill[item][1].store((m & ((1 << 48) - 1)).min(u16::MAX as u64) as u16, Ordering::Relaxed);
+         }
+@@ -1801,6 +1935,10 @@ impl CpuExperts<'_> {
+         #[allow(unused_variables)]
+         let (l, n) = (d.l, d.n);
+         d.out_p.store(out.as_mut_ptr() as usize, Ordering::Release);
++        #[cfg(feature = "track-experts")]
++        {
++            *d.run0.lock().unwrap() = lossmap::snapshot();
++        }
+         // `track-experts`: this run's host experts against the prefetch made for this layer, as it stands now — predicted
+         // and every item touched, predicted but not finished when the run began, not predicted (decode's L3 question,
+         // 2026-10-20); each expert's status for the items' fill counts
+@@ -1868,6 +2006,41 @@ impl CpuExperts<'_> {
+ fn run_rows(plan: Box<RunPlan>) {
+     #[cfg(feature = "track-experts")]
+     {
++        // LAB (099's loss map): the cumulative histogram every 2048 runs, summed over the CCDs, and each CCD's totals
++        static RUNS_SEEN: AtomicUsize = AtomicUsize::new(0);
++        let k = RUNS_SEEN.fetch_add(1, Ordering::Relaxed);
++        if k % 2048 == 2047 {
++            let seq = k / 2048;
++            for cell in 0..lossmap::CELLS {
++                let mut v = [0u64; 4];
++                for c in 0..lossmap::CCDS {
++                    for x in 0..4 {
++                        v[x] += lossmap::HIST[c][cell][x].load(Ordering::Relaxed);
++                    }
++                }
++                if v[0] > 0 {
++                    let (runb, rest) = (cell % 5, cell / 5);
++                    let (age, rest) = (rest % 9, rest / 9);
++                    let (pl, rest) = (rest % 3, rest / 3);
++                    let (claim, rest) = (rest % 3, rest / 3);
++                    let (rt, width) = (rest % 2, rest / 2 + 1);
++                    prow::row!("track-experts", "lossmap", { "seq" => seq, "width" => width, "retouch" => rt, "claim" => claim, "plan" => pl, "age" => age, "runb" => runb, "items" => v[0], "l3" => v[1], "dram" => v[2], "ns" => v[3] });
++                }
++            }
++            for c in 0..lossmap::CCDS {
++                let mut v = [0u64; 6];
++                for cell in 0..lossmap::CELLS {
++                    let pl = cell / 5 / 9 % 3;
++                    let o = if pl == 2 { 3 } else { 0 };
++                    v[o] += lossmap::HIST[c][cell][0].load(Ordering::Relaxed);
++                    v[o + 1] += lossmap::HIST[c][cell][1].load(Ordering::Relaxed);
++                    v[o + 2] += lossmap::HIST[c][cell][2].load(Ordering::Relaxed);
++                }
++                if v[0] + v[3] > 0 {
++                    prow::row!("track-experts", "lossmap_ccd", { "seq" => seq, "ccd" => c, "touched_items" => v[0], "touched_l3" => v[1], "touched_dram" => v[2], "cold_items" => v[3], "cold_l3" => v[4], "cold_dram" => v[5] });
++                }
++            }
++        }
+         let d = &plan.data;
+         let (l, n) = (d.l, d.n);
+         let ng = d.ng;
+@@ -1899,7 +2072,7 @@ fn run_rows(plan: Box<RunPlan>) {
+             }
+         }
+         if let Some(u) = *d.pf_use.lock().unwrap() {
+-            prow::row!("track-experts", "prefetch_use", { "layer" => l, "tokens" => n, "host_experts" => u[0], "complete" => u[1], "partial" => u[2], "missed" => u[3], "used_items" => u[4], "used_items_done" => u[5], "predicted" => u[6], "items" => u[7] / 1_000_000, "items_done" => u[7] % 1_000_000, "counted" => counted as u8, "c_hit" => f[0], "c_miss" => f[1], "p_hit" => f[2], "p_miss" => f[3], "m_hit" => f[4], "m_miss" => f[5], "run_us" => 0.0 });
++            prow::row!("track-experts", "prefetch_use", { "layer" => l, "tokens" => n, "host_experts" => u[0], "complete" => u[1], "partial" => u[2], "missed" => u[3], "used_items" => u[4], "used_items_done" => u[5], "predicted" => u[6], "items" => u[7] / 1_000_000, "items_done" => u[7] % 1_000_000, "counted" => counted as u8, "c_hit" => f[0], "c_miss" => f[1], "p_hit" => f[2], "p_miss" => f[3], "m_hit" => f[4], "m_miss" => f[5], "run_us" => 0.0, "retouch" => d.retouch as u8 });
+         }
+     }
+     drop(plan);
+diff --git a/node/src/glm.rs b/node/src/glm.rs
+index b819758..61ca9e6 100644
+--- a/node/src/glm.rs
++++ b/node/src/glm.rs
+@@ -180,6 +180,7 @@ impl Glm {
+             "local_items" => p.local_items, "items" => p.items, "prefetched" => p.prefetched, "prefetch_items" => p.prefetch_items,
+             "runs" => p.runs, "run_last_ms" => ms(p.run_last), "run_slot_ms" => ms(p.run_slot), "run_wake_ms" => ms(p.run_wake), "run_tail_ms" => ms(p.run_tail),
+             "post_sort_ms" => ms(p.post_sort), "post_drain_ms" => ms(p.post_drain), "post_free_ms" => ms(p.post_free),
++            "retouch" => glm_5_3_flash::construct::LAB_FIFO.load(std::sync::atomic::Ordering::Relaxed) as u8,
+         });
+         for d in 0..p.node_items.len() {
+             if p.node_items[d] > 0 {
+@@ -258,6 +259,12 @@ impl Engine for Glm {
+     /// One token after another: `n` tokens are `n` steps.
+     fn run(&mut self, toks: &[u32], pos: usize, trace: bool, all_logits: bool) {
+         assert!(!toks.is_empty() && toks.len() <= STEP);
++        // LAB (099's re-touch, 2026-10-26): a decode step's prefetch re-touches its lines on alternate steps
++        if toks.len() <= glm_5_3_flash::SPEC_TOKENS {
++            static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
++            let k = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++            glm_5_3_flash::construct::LAB_FIFO.store(k % 2 == 1, std::sync::atomic::Ordering::Relaxed);
++        }
+         self.last_pos = pos;
+         if trace || self.model.placed.is_none() || toks.len() == 1 {
+             // a token at a time: every token's logits (scoring, tracing), or the CPU realization
