@@ -78,6 +78,9 @@
 //! `--warmup n`: `n` untimed rounds before the measured ones (default 0 — NB: a core's L3 read rate recovers from idle
 //! over milliseconds of hits, metatron-cpu §3.8; without a warm-up the first ~50 rounds are 2× slow and every comparison
 //! made before 2026-10-26 evening was taken in that transient). Simple mode prints the recovery curve: every 10th round.
+//! The pool must hold every round's items without wrapping — (warmup + rounds) × ~15 MB a CCD at the node's shape (a
+//! wrapped pool's "cold" items were 35 % L3 hits: the two-class policy keeps lines hit twice) — so `--pool-mb 2048` for
+//! 130 rounds.
 //!
 //!   bench-run [--warmup 0] [--raw 0] [--vecs 0] [--simple 0] [--priv-pages 0] [--rotate 0] [--main-pin -] [--pad-kb 0] [--ccd-barrier 0] [--retouch 0] [--ring-kb 1024] [--hold 0] [--stagger-ns 0] [--notouch 0] [--front 0] [--one-phase 0] [--regions 0] [--notime 0] [--plain 0] [--private 0] [--pages 2m] [--fixed 0] [--smt 0] [--multi 0] [--cpus 49-71,73-95] [--steal any] [--plan 45] [--cold 28] [--window-us 440] [--rounds 60] [--pool-mb 600]
 use harness::arg;
