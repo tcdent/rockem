@@ -201,6 +201,40 @@ CCD (56–63), the CCD's touched bytes a round against the warm lines then read 
   are free to re-touch from L3 what the streamers brought — the re-touch must reach a line after it left its toucher's L2
   (a mate's read of a line in the toucher's L2 refetches from DRAM, l3-core-boundary).
 
+## The re-touch in the node: the leak falls a third, the step does not move (lab-retouch, 2026-10-26)
+Built (lab): each prefetch worker touches again every range it touched at least 512 KB earlier (`RETOUCH_LAG`, out of
+its L2), after each item; on alternate decode steps (`LAB_RETOUCH`, `retouch` on the `step` and `prefetch_use` rows);
+24 decodes at 18k on one boot (`bringup/reads/retouch_ab.sh`):
+
+| | width 2 | width 3 | width 4 |
+|---|---|---|---|
+| `experts` p50 a step, off → on (ms) | 12.27 → 12.21 | 17.97 → 18.35 | 26.55 → 24.99 |
+| complete experts' lines from DRAM | 12.2 → 9.0 % | 14.5 → 9.3 % | 15.4 → 9.9 % |
+| partial experts' lines from DRAM | 40.2 → 42.6 % | 32.4 → 37.3 % | 27.1 → 31.3 % |
+| DRAM lines a layer run, per host expert (k) | 52.0 → 49.9 | 74.4 → 75.1 | 97.9 → 92.7 |
+
+- The complete experts' leak falls by a third, not to the bench's ~1 %: a worker's last 512 KB is never re-touched (a
+  third of its ~1.5 MB), and the amend's new job drops the early plan's pending re-touches.
+- **The re-touch costs window time:** the partial experts' first touches fall behind by about what the complete ones
+  save; the run's DRAM lines per expert do not move, nor does the step.
+
+**The window modelled (`bench-window`, 46 cores):** each core touches fresh planned items for 440 µs (the node's
+window; it reaches 10.4 items ≈ 1.4 MB a core, the node's ~11.6 MB a CCD), then the run — its touched items newest first,
+the plan's rest, 4 cold items:
+
+| re-touch | run p50 | touched a core | touched lines from DRAM | run DRAM lines a core |
+|---|---|---|---|---|
+| off | 645 µs | 10.43 items | 6.2 % | 21,032 |
+| 512 KB behind | 655 µs | 10.11 | 1.4 % | 21,122 |
+| 1024 KB behind | 632 µs | 10.35 | 3.5 % | 21,234 |
+
+The re-touch removes the leak and buys nothing: the window is the limit, and what a re-touch protects it pays for in
+first touches not made. **Correction:** the "−16–20 % of `experts`, ~3 ms a verify step" estimate above assumed the
+leaked lines could be recovered at no window cost; at the node's window they cannot, by re-touching on the touching
+cores. Recovering them is worth something only from capacity the window does not use (cores past a CCD's DRAM
+saturation, re-touching what the streamers brought — not yet built or measured), or without a touch at all.
+The node's leak (12–15 %) is larger than the model's (6 %): its ordering and the amend's churn, not yet separated.
+
 ## How the bench and the node differ (to quantify, one at a time)
 1. **The shared CCD queue and stealing.** The node's cold items are claimed from one queue by the CCD's 8 cores and its
    warm items can be stolen by mates; the bench's cores own private sets. The queue is the node's load balancer.
@@ -229,8 +263,8 @@ CCD (56–63), the CCD's touched bytes a round against the warm lines then read 
 1b. Done: with the socket loaded, 3 streamers a CCD saturate it; 5–7 slow its L3-fed cores 2–5×.
 1c. Done: the cap in the node — no gain (above); the bench's mechanism is not the node's limit.
 1d. Done in part: the item's code is not the cost; the DRAM lines inside prefetched items are (above).
-1f. Done: the leak reproduced in the bench (fresh sets) and a second touch removes it (above). Next: a re-touch in the
-    node's prefetch, A/B on one lab boot.
+1f. Done: the leak reproduced in the bench (fresh sets) and a second touch removes it (above).
+1g. Done: the re-touch in the node (lab) and the window model — the leak falls, the step does not (above).
 1e. The node's fill counters by item, with its class (own / CCD / stolen) and its slice's touch time (lab): where a
     complete expert's 14–18 % DRAM lines come from — evicted (own items) or a mate's L2 (stolen).
 2. The node's warm item at its best: a lab run with the prefetch posted but no cold traffic (the run's misses forced to
