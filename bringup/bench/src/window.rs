@@ -11,7 +11,10 @@
 //! `--cold-nta 1`: the items nobody touched (read once, from DRAM) read with `prefetchnta` `--dist` bytes ahead: their
 //! lines kept out of the L3 they would otherwise churn.
 //!
-//!   bench-window [--cold-nta 0] [--dist 2048] [--oldest-first 0] [--cpus 49-71,73-95] [--plan 16] [--cold 4] [--window-us 440] [--retouch-kb 0] [--iters 100]
+//! `--smt a`: each core's SMT sibling (cpu + 96) streams the core's untouched items (the plan's rest, then the cold ones)
+//! into their shared L2, up to `a` items ahead of the core, from the run's start (beside its warm items).
+//!
+//!   bench-window [--smt 0] [--cold-nta 0] [--dist 2048] [--oldest-first 0] [--cpus 49-71,73-95] [--plan 16] [--cold 4] [--window-us 440] [--retouch-kb 0] [--iters 100]
 use harness::arg;
 use std::sync::{Arc, Barrier, Mutex};
 #[path = "gemv_hint.rs"]
@@ -58,6 +61,9 @@ fn main() {
     let iters = num("--iters", 100);
     let oldest = num("--oldest-first", 0) == 1;
     let cold_nta = num("--cold-nta", 0) == 1;
+    let smt = num("--smt", 0);
+    // `--smt-idle 1`: the siblings spawned and spinning, never streaming (the control for what a busy sibling does)
+    let smt_idle = num("--smt-idle", 0) == 1;
     let dist = num("--dist", 2048);
     let pool_mb = num("--pool-mb", 160);
     let t = cpus.len();
@@ -76,7 +82,52 @@ fn main() {
             let (start, runs, acc) = (start.clone(), runs.clone(), acc.clone());
             std::thread::spawn(move || {
                 use common::q4::{pack, Act, QAct, GROUP};
+                use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
                 harness::bench::pin(cpu);
+                // the sibling streamer: a round's list (base address, item bytes, ids) and the core's position in it
+                let sib_list: Arc<Mutex<Vec<(usize, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+                let (sib_gen, sib_pos, sib_quit) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicUsize::new(0)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
+                if smt_idle {
+                    let quit = sib_quit.clone();
+                    std::thread::spawn(move || {
+                        harness::bench::pin(cpu + 96);
+                        while !quit.load(Ordering::Relaxed) {
+                            std::hint::spin_loop();
+                        }
+                    });
+                }
+                if smt > 0 {
+                    let (list, gen, pos, quit) = (sib_list.clone(), sib_gen.clone(), sib_pos.clone(), sib_quit.clone());
+                    std::thread::spawn(move || {
+                        harness::bench::pin(cpu + 96);
+                        let mut seen = 0;
+                        while !quit.load(Ordering::Relaxed) {
+                            let g = gen.load(Ordering::Acquire);
+                            if g == seen {
+                                std::hint::spin_loop();
+                                continue;
+                            }
+                            seen = g;
+                            let l = list.lock().unwrap().clone();
+                            for (i, &(a, n)) in l.iter().enumerate() {
+                                while i >= pos.load(Ordering::Acquire) + smt && gen.load(Ordering::Relaxed) == g {
+                                    std::hint::spin_loop();
+                                }
+                                if gen.load(Ordering::Relaxed) != g {
+                                    break;
+                                }
+                                let p = a as *const u8;
+                                let mut x = 0u64;
+                                let mut o = 0;
+                                while o < n {
+                                    x = x.wrapping_add(unsafe { std::ptr::read_volatile(p.add(o)) } as u64);
+                                    o += 64;
+                                }
+                                std::hint::black_box(x);
+                            }
+                        }
+                    });
+                }
                 let mut rng = common::testing::Rng::new(31 + ti as u64);
                 let w: Vec<i8> = (0..ROWS * K).map(|_| rng.i4()).collect();
                 let (pw1, ps1) = pack(ROWS, K, &w, &vec![0.01; ROWS * K / GROUP]);
@@ -128,6 +179,12 @@ fn main() {
                     }
                     start.wait();
                     // the run: touched items newest first, then the plan's rest, then the cold ones
+                    let rest: Vec<usize> = planned[done..].iter().chain(cold.iter()).copied().collect();
+                    if smt > 0 {
+                        *sib_list.lock().unwrap() = rest.iter().map(|&k| (pool_w.as_ptr() as usize + k * ib, ib)).collect();
+                        sib_pos.store(0, Ordering::Release);
+                        sib_gen.fetch_add(1, Ordering::AcqRel);
+                    }
                     let t0 = std::time::Instant::now();
                     let mut run_dram = 0u64;
                     let mut item = |k: usize, warm: bool| {
@@ -154,9 +211,11 @@ fn main() {
                             item(k, true);
                         }
                     }
-                    for &k in planned[done..].iter().chain(cold.iter()) {
+                    for (i, &k) in rest.iter().enumerate() {
+                        sib_pos.store(i, Ordering::Release);
                         item(k, false);
                     }
+                    sib_pos.store(usize::MAX / 2, Ordering::Release);
                     let dt = t0.elapsed().as_nanos() as u64;
                     if it > 0 {
                         runs.lock().unwrap()[it - 1][ti] = dt;
@@ -169,6 +228,7 @@ fn main() {
                 for i in 0..5 {
                     a2[i] += mine[i];
                 }
+                sib_quit.store(true, Ordering::Relaxed);
                 std::hint::black_box(out);
             })
         })
@@ -182,10 +242,11 @@ fn main() {
     let a = acc.lock().unwrap();
     let n = a[4] as f64;
     println!(
-        "bench-window: {t} cores, plan {plan} + cold {nc} items (136 KB) a core, window {window} µs, {} first, re-touch {}, cold reads {} | run p50 {:.1} µs p90 {:.1} | touched {:.2} items a core | touched lines from DRAM {:.1} % | run DRAM lines a core {:.0}",
+        "bench-window: {t} cores, plan {plan} + cold {nc} items (136 KB) a core, window {window} µs, {} first, re-touch {}, cold reads {}, smt {smt}{} | run p50 {:.1} µs p90 {:.1} | touched {:.2} items a core | touched lines from DRAM {:.1} % | run DRAM lines a core {:.0}",
         if oldest { "oldest" } else { "newest" },
         if lag == 0 { "off".to_string() } else { format!("{} KB behind", lag >> 10) },
         if cold_nta { "nta" } else { "plain" },
+        if smt_idle { " (idle siblings spinning)" } else { "" },
         span[span.len() / 2] as f64 / 1e3,
         span[span.len() * 9 / 10] as f64 / 1e3,
         a[0] as f64 / n,

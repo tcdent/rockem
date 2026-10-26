@@ -300,6 +300,26 @@ and their time (µs an item): 7.8–9.8 at young ages past the run's first MB, 1
   DRAM path. The levers on them are fewer cold bytes (the predictor, 098; residency; formats) and the clock (power
   per MAC).
 
+## Where the run leaves the hardware idle, and the SMT siblings (2026-10-26)
+- **The run against its floor:** at width 3 a layer's run is ~420 µs and reads ~68 MB from DRAM (~165 GB/s); the box's
+  ~290 GB/s would read them in ~235 µs. Per verify step the pool runs' cores wait ~3.2 ms for each run's last core
+  (`pool_run`: end_max − end_p50, decode runs; 27.3 s of pool runs over 1,840 steps, 5.9 s of it that tail).
+- **The idle hardware:** the 96 SMT siblings. `bench-window --smt a` gives each core's sibling the core's untouched items
+  (the plan's rest, then the cold ones) to stream into their shared L2 up to `a` items ahead, from the run's start:
+
+| siblings | run p50 (4 cold a core) | touched a core | run p50 (8 cold) |
+|---|---|---|---|
+| halted (C2) | 587–598 µs | 10.6–11.1 | 786 µs |
+| spinning, no streaming (control) | 564–575 | 12.0–12.3 | |
+| streaming 1 ahead | 518 | 11.0 | |
+| 2 ahead | 537 | 12.3 | 735 |
+| 3 ahead | 505 | 12.4 | |
+
+  Against the spinning control (the fair one: a busy sibling alone speeds a core's DRAM touches 10–15 %, metatron-cpu
+  §3), streaming is worth ~8–10 % of the bench's run. Fill counters do not compare across these rows (the sibling's
+  fetches count on its own thread). Streaming raises the touched lines' loss (6 → 11–15 %): its bytes land in the L3
+  while the warm items wait, as the bytes model says.
+
 ## How the bench and the node differ (to quantify, one at a time)
 1. **The shared CCD queue and stealing.** The node's cold items are claimed from one queue by the CCD's 8 cores and its
    warm items can be stolen by mates; the bench's cores own private sets. The queue is the node's load balancer.

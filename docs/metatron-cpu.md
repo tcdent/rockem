@@ -487,6 +487,24 @@ the share of each tenth that came back from DRAM (one load a line; the reader is
   at the node's window (`bench-window`, 46 cores): the loss is 6.4 % of the touched lines either way the run is ordered
   (oldest or newest first), and re-touching all of it (1.4 %) leaves the run's DRAM lines and time unchanged.
 
+### A core's DRAM rate depends on its SMT sibling's state (measured 2026-10-26, `bench-l3life`, socket 1)
+
+The pool's siblings (96–191) have no threads; the kernel (`acpi_idle`, menu governor) parks them in C2. A core's first
+touch of fresh lines (one load a line, GB/s a core):
+
+| touching | sibling in C2 (production) | C2 disabled (C1) | C1, C2 disabled (poll) | sibling spinning `pause` |
+|---|---|---|---|---|
+| 1 core (56), 8 MB | 21.6–22.2 | | | 24.7–24.9 |
+| 46 cores, 1.5 MB each | 3.03–3.10 | 3.13–3.17 | 3.21 | 3.37 |
+| 8 cores of one CCD | 5.54–5.56 | | | 5.58–5.60 |
+
+- Not the clock: one core reads 3.45 GHz (APERF/MPERF) with its sibling halted or spinning. (Reading the MSRs around
+  each touch on 46 cores desynchronized them and changed the rate itself, 3.06 → 3.72: those clock readings are not
+  used.)
+- Where the CCD's path is the limit (8 cores of one CCD) the sibling changes nothing; where the core's own concurrency
+  is (one core, or the whole socket at 3 GB/s a core) an active sibling adds 10–15 %. The mechanism is not measured.
+- Every node and bench measurement before this one ran with the siblings in C2.
+
 ### What a store costs, and musl's malloc (measured 2026-10-22, the node's planner on core 7)
 
 A store into a line this core does not own costs ~35 ns, and it costs the same whether the line was last *read* by

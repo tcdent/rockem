@@ -4,7 +4,10 @@
 //! share of its lines that came from DRAM at the reread. One load a line throughout. All cores in step (a barrier at each
 //! phase).
 //!
-//!   bench-l3life [--cpus 56] [--set-kb 8192] [--gap-us 0] [--filler-kb 0] [--reps 20] [--pool-mb 1024]
+//! `--sib-spin 1`: each core's SMT sibling (cpu + 96) spins throughout (`pause`), instead of halting. Reported also: the
+//! first touch's rate a core (GB/s).
+//!
+//!   bench-l3life [--sib-spin 0] [--cpus 56] [--set-kb 8192] [--gap-us 0] [--filler-kb 0] [--reps 20] [--pool-mb 1024]
 use harness::arg;
 use std::sync::{Arc, Barrier, Mutex};
 
@@ -44,6 +47,29 @@ fn main() {
     let filler = num("--filler-kb", 0) << 10;
     let reps = num("--reps", 20);
     let pool = num("--pool-mb", 1024) << 20;
+    let sib_spin = num("--sib-spin", 0) == 1;
+    let quit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if sib_spin {
+        for &c in &cpus {
+            let q = quit.clone();
+            std::thread::spawn(move || {
+                harness::bench::pin(c + 96);
+                while !q.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::hint::spin_loop();
+                }
+            });
+        }
+    }
+    let touch_ns: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+    // APERF / MPERF over the first touches, summed over the cores: their effective clock
+    let perf: Arc<Mutex<[u64; 2]>> = Arc::new(Mutex::new([0; 2]));
+    fn msr(cpu: usize, reg: u64) -> u64 {
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::File::open(format!("/dev/cpu/{cpu}/msr")).expect("msr");
+        let mut b = [0u8; 8];
+        f.read_exact_at(&mut b, reg).expect("msr read");
+        u64::from_le_bytes(b)
+    }
     let t = cpus.len();
     let _ = std::fs::write("/proc/sys/kernel/nmi_watchdog", "0");
     assert!(cpus.iter().all(|&c| common::pmc::Pmc::open(c).is_some_and(|p| p.program(&common::pmc::FILLS))) && common::pmc::allow_rdpmc(), "pmc");
@@ -54,7 +80,7 @@ fn main() {
     let hs: Vec<_> = cpus
         .iter()
         .map(|&cpu| {
-            let (acc, first, bar) = (acc.clone(), first.clone(), bar.clone());
+            let (acc, first, bar, touch_ns, perf) = (acc.clone(), first.clone(), bar.clone(), touch_ns.clone(), perf.clone());
             std::thread::spawn(move || {
                 harness::bench::pin(cpu);
                 let mem = vec![1u8; pool];
@@ -71,7 +97,15 @@ fn main() {
                     at += step;
                     bar.wait();
                     let c0 = fills();
+                    let (a0, m0) = (msr(cpu, 0xE8), msr(cpu, 0xE7));
+                    let tt = std::time::Instant::now();
                     std::hint::black_box(touch(sp, set));
+                    if rep > 0 {
+                        *touch_ns.lock().unwrap() += tt.elapsed().as_nanos() as u64;
+                        let mut p = perf.lock().unwrap();
+                        p[0] += msr(cpu, 0xE8) - a0;
+                        p[1] += msr(cpu, 0xE7) - m0;
+                    }
                     let c1 = fills();
                     bar.wait();
                     if filler > 0 {
@@ -115,15 +149,19 @@ fn main() {
     for h in hs {
         h.join().unwrap();
     }
+    quit.store(true, std::sync::atomic::Ordering::Relaxed);
     let a = acc.lock().unwrap();
     let (h, m): (u64, u64) = (a.iter().map(|x| x[0]).sum(), a.iter().map(|x| x[1]).sum());
     let f = first.lock().unwrap();
     let dec: Vec<String> = a.iter().map(|x| format!("{:.1}", 100.0 * x[1] as f64 / (x[0] + x[1]).max(1) as f64)).collect();
     println!(
-        "{t} cores × {} KB (CCD total {:.1} MB), gap {gap} µs, filler {} KB a core | first touch from DRAM {:.0} % | reread from DRAM {:.1} % | by decile of touch order: {}",
+        "{t} cores × {} KB (CCD total {:.1} MB), gap {gap} µs, filler {} KB a core{} | first touch {:.2} GB/s a core at {:.2} GHz, from DRAM {:.0} % | reread from DRAM {:.1} % | by decile of touch order: {}",
         set >> 10,
         (t * set) as f64 / (1 << 20) as f64,
         filler >> 10,
+        if sib_spin { ", siblings spinning" } else { "" },
+        (set as f64 * reps as f64 * t as f64) / *touch_ns.lock().unwrap() as f64,
+        { let p = perf.lock().unwrap(); 2.65 * p[0] as f64 / p[1].max(1) as f64 },
         100.0 * f[1] as f64 / (f[0] + f[1]).max(1) as f64,
         100.0 * m as f64 / (h + m).max(1) as f64,
         dec.join(" ")
