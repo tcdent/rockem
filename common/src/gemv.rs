@@ -966,6 +966,12 @@ pub mod gfx11 {
     /// workgroup is only the unit the card places): grid `m.div_ceil(WAVES · R)`, no LDS.
     #[inline(always)]
     pub unsafe fn exp4_rows_direct<const K: usize, const NORM: bool, const A: usize, const A1: usize, const R: usize, const WAVES: usize, const NP: usize>(tid: u32, w: Exp4<A, A1>, ln: *const u16, m: usize, n: usize, eps: f32, x: impl Fn(usize, usize) -> *const f32, emit: impl Fn(usize, usize, f32)) {
+        exp4_rows_direct_map::<K, NORM, A, A1, R, WAVES, NP>(tid, w, ln, m, n, eps, |r| r, x, emit)
+    }
+    /// `exp4_rows_direct` over a selection of the matrix's rows: the launch covers `m` rows `0..m` of which row `r`
+    /// is the matrix's row `map(r)` (the analog's rows of its chosen heads, 098); `x` and `emit` see the matrix's row.
+    #[inline(always)]
+    pub unsafe fn exp4_rows_direct_map<const K: usize, const NORM: bool, const A: usize, const A1: usize, const R: usize, const WAVES: usize, const NP: usize>(tid: u32, w: Exp4<A, A1>, ln: *const u16, m: usize, n: usize, eps: f32, map: impl Fn(usize) -> usize, x: impl Fn(usize, usize) -> *const f32, emit: impl Fn(usize, usize, f32)) {
         const { assert!(NP <= PASS) };
         let (lane, wave) = (tid % 32, (tid / 32) as usize);
         let l = lane as usize;
@@ -973,12 +979,20 @@ pub mod gfx11 {
         if row >= m {
             return; // no barrier follows: a wave past the matrix simply ends
         }
-        let mut wr = [<Exp4<A, A1> as Rows<K>>::row(w, row); R];
+        // the wave's R rows of the matrix: the selection's consecutive rows, the last repeated past `m`
+        let mut rows = [map(row); R];
         let mut k = 1;
         while k < R {
-            wr[k] = <Exp4<A, A1> as Rows<K>>::row(w, if row + k < m { row + k } else { m - 1 });
+            rows[k] = map(if row + k < m { row + k } else { m - 1 });
             k += 1;
         }
+        let mut wr = [<Exp4<A, A1> as Rows<K>>::row(w, rows[0]); R];
+        let mut k = 1;
+        while k < R {
+            wr[k] = <Exp4<A, A1> as Rows<K>>::row(w, rows[k]);
+            k += 1;
+        }
+        let (vrow, row) = (row, rows[0]);
         let steps = K.div_ceil(256);
         let mut acc = [[0f32; PASS]; R];
         let mut ss = [[0f32; 8]; NP];
@@ -1070,8 +1084,8 @@ pub mod gfx11 {
             let mut i = 0;
             while i < NP {
                 let y = wave_sum(lane, acc[k][i]);
-                if lane == 0 && row + k < m && i < n {
-                    emit(row + k, i, if NORM { y * rr[i] } else { y });
+                if lane == 0 && vrow + k < m && i < n {
+                    emit(rows[k], i, if NORM { y * rr[i] } else { y });
                 }
                 i += 1;
             }

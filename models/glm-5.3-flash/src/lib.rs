@@ -117,6 +117,7 @@ pub const DRAFT_DEPTH: usize = 3;
 pub const DRAFT_KEEP: f64 = 0.5;
 const _: () = assert!(DRAFT_DEPTH + 1 <= SPEC_TOKENS, "a verify step holds the token and its drafts");
 
+pub mod analog;
 pub mod expert;
 pub mod ffn;
 pub mod hc;

@@ -222,12 +222,22 @@ pub mod gfx11 {
         thr
     }
 
+    /// The first margin's logit of expert `e` at token `i`: the next layer's router over `scores` (`[n][ROUTE_ROWS]`,
+    /// from `E`) — the route-ahead, or, with `pa` given, the analog's no-attention term (098) plus `pk[i]` times the
+    /// two cards' composed partials `pa` and `pb` (`[n][E]` each): `s0 + (c / rms(x0)) · (p_leader + p_peer)`.
+    #[inline(always)]
+    unsafe fn margin1(scores: *const f32, pa: *const f32, pb: *const f32, pk: *const f32, i: usize, e: usize) -> f32 {
+        const RR: usize = crate::hc::gfx11_consts::ROUTE_ROWS;
+        let s = *scores.add(i * RR + E + e);
+        if pa.is_null() { s } else { s + *pk.add(i) * (*pa.add(i * E + e) + *pb.add(i * E + e)) }
+    }
+
     /// Pair l's prediction (see the module): its state, the route-ahead scores (`[n][ROUTE_ROWS]`, the next layer's
     /// from `E`), the second margin's (likewise), the margins it keeps `[n][E]` each, the picks at l `[n][TOP_K]`
     /// u32. `plan` (null in a long step): the decode plan and the host's `word`. Workgroups of `PLAN_WG`, a thread an
     /// expert; grid 1 for a decode step, `PLAN_PRED_WGS` for a long one.
     #[no_mangle]
-    pub extern "gpu-kernel" fn pred_step(pred: *const f32, scores: *const f32, scores2: *const f32, p_d: *mut f32, p_d2: *mut f32, p_picks: *const u32, plan: *mut u32, word: *mut u32, value: u32, n: u32, keys: *mut f32, count: *mut u32, aux: *mut f32) {
+    pub extern "gpu-kernel" fn pred_step(pred: *const f32, scores: *const f32, scores2: *const f32, p_d: *mut f32, p_d2: *mut f32, p_picks: *const u32, plan: *mut u32, word: *mut u32, value: u32, n: u32, keys: *mut f32, count: *mut u32, aux: *mut f32, pa: *const f32, pb: *const f32, pk: *const f32) {
         unsafe {
             const RR: usize = crate::hc::gfx11_consts::ROUTE_ROWS;
             let e = workitem_id_x() as usize;
@@ -248,7 +258,7 @@ pub mod gfx11 {
             let mut key = 1f32;
             let mut i = first;
             while i < n {
-                let g1 = sigmoid(*scores.add(i * RR + E + e)) + bn;
+                let g1 = sigmoid(margin1(scores, pa, pb, pk, i, e)) + bn;
                 let t1 = eighth(g1, lane, wave, cand, red);
                 let g2 = sigmoid(*scores2.add(i * RR + E + e)) + bn;
                 let t2 = eighth(g2, lane, wave, cand, red);
@@ -344,7 +354,7 @@ pub mod gfx11 {
     /// keys and ranks into `plan`, then `word`. Three launches (27 + 33 µs and a 10 µs add) were ~60 µs on the card's
     /// critical chain behind `hc_post`; the chain is the point, so the margins run a token a workgroup.
     #[no_mangle]
-    pub extern "gpu-kernel" fn pred_rows(xn: *const u16, ss: *const f32, router: *const u16, scores2: *mut f32, pred: *const f32, scores: *const f32, p_d: *mut f32, p_d2: *mut f32, aux: *const f32, plan: *mut u32, word: *mut u32, value: u32, n: u32, keys: *mut f32, count: *mut u32) {
+    pub extern "gpu-kernel" fn pred_rows(xn: *const u16, ss: *const f32, router: *const u16, scores2: *mut f32, pred: *const f32, scores: *const f32, p_d: *mut f32, p_d2: *mut f32, aux: *const f32, plan: *mut u32, word: *mut u32, value: u32, n: u32, keys: *mut f32, count: *mut u32, pa: *const f32, pb: *const f32, pk: *const f32) {
         unsafe {
             const RR: usize = crate::hc::gfx11_consts::ROUTE_ROWS;
             let e = workitem_id_x() as usize;
@@ -425,7 +435,7 @@ pub mod gfx11 {
             let (ca, cc, ca2) = (*pred.add(HDR), *pred.add(HDR + 1), *pred.add(HDR + 2));
             let (bn, bias) = (*pred.add(BN + e), *pred.add(BIAS + e));
             // the first margin's threshold and the co-routing sum from the early pass (the same tokens, the same scores)
-            let g1 = sigmoid(*scores.add(i * RR + E + e)) + bn;
+            let g1 = sigmoid(margin1(scores, pa, pb, pk, i, e)) + bn;
             let t1 = *aux.add(SPEC_TOKENS * E + i);
             let co = *aux.add(i * E + e);
             let g2 = sigmoid(*scores2.add(i * RR + E + e)) + bn;

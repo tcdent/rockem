@@ -1,0 +1,16 @@
+[package]
+name = "analog-dump"
+version = "0.0.0"
+edition = "2021"
+description = "Expert-predictor analog study (queue 098): the f32 reference over a teacher-forced passage with the bundle's INT4 experts, each MoE layer's inputs saved; then the predictor columns (today's margins and the analogs of the next layer) for the offline simulation. Dev box only."
+
+[dependencies]
+harness = { path = "../harness" }
+common = { path = "../../common" }
+glm_5_3_flash = { path = "../../models/glm-5.3-flash", features = ["std"] }
+memmap2 = "0.9"
+matrixmultiply = "0.3"
+
+[profile.release]
+opt-level = 3
+debug = 1
