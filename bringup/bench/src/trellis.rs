@@ -11,7 +11,10 @@
 //! core of `--cpus` at once (default the node's pool, 1-23,25-47,49-71,73-95). Reports GMAC/s a core, G weights/s in
 //! all (decoded a second), and the code bytes a second that implies.
 //!
-//!   bench-trellis [--n 1,3] [--mb 96] [--passes 3] [--cpus 1-23,25-47,49-71,73-95] [--one 1]
+//! `lut4 decode only` is the decode without the dot (its rate alone); `lut4 pair-acc` takes tables of 0–15 so two chunks'
+//! products add in 16 bits before widening.
+//!
+//!   bench-trellis [--kernels q4,lut4,decode,pair,hash16] [--n 1,3] [--mb 96] [--passes 3] [--cpus 1-23,25-47,49-71,73-95] [--one 1]
 use harness::arg;
 use std::arch::x86_64::*;
 use std::sync::{Arc, Barrier};
@@ -97,6 +100,69 @@ unsafe fn lut4<const N: usize>(m: usize, w: *const u8, t: &[__m256i; 4], acts: &
     }
 }
 
+/// `lut4` without the dot: the decode alone (its values folded into one register so nothing is dropped), the decode's
+/// own rate.
+#[target_feature(enable = "avx2")]
+unsafe fn lut4_decode(m: usize, w: *const u8, t: &[__m256i; 4], out: *mut f32) {
+    for r in 0..m {
+        let row = w.add(r * ROW);
+        let mut acc = _mm256_setzero_si256();
+        let mut cur = unpack(row);
+        for c in 0..CHUNKS {
+            let nxt = unpack(row.add((c + 1) * 16));
+            let (s1, s2, s3) = windows(cur, nxt);
+            let wv = _mm256_add_epi8(
+                _mm256_add_epi8(_mm256_shuffle_epi8(t[0], cur), _mm256_shuffle_epi8(t[1], s1)),
+                _mm256_add_epi8(_mm256_shuffle_epi8(t[2], s2), _mm256_shuffle_epi8(t[3], s3)),
+            );
+            acc = _mm256_xor_si256(acc, wv);
+            cur = nxt;
+        }
+        *out.add(r) = hsum(acc) as f32;
+    }
+}
+/// `lut4` with tables of 0–15 (a value 0–60, the signed value less 30): a pair of `vpmaddubsw` products is then at most
+/// 15,240, so two chunks add in 16 bits before one `vpmaddwd` widens them — 2.5 instructions a token per 32 weights
+/// instead of 3.
+#[target_feature(enable = "avx2")]
+unsafe fn lut4_pair<const N: usize>(m: usize, w: *const u8, t: &[__m256i; 4], acts: &[*const i8; N], asum: &[i32; N], out: *mut f32) {
+    let ones = _mm256_set1_epi16(1);
+    for r in 0..m {
+        let row = w.add(r * ROW);
+        let mut acc = [_mm256_setzero_si256(); N];
+        let mut cur = unpack(row);
+        let mut c = 0;
+        while c < CHUNKS {
+            let mut wv = [_mm256_setzero_si256(); 2];
+            let mut h = 0;
+            while h < 2 {
+                let nxt = unpack(row.add((c + h + 1) * 16));
+                let (s1, s2, s3) = windows(cur, nxt);
+                wv[h] = _mm256_add_epi8(
+                    _mm256_add_epi8(_mm256_shuffle_epi8(t[0], cur), _mm256_shuffle_epi8(t[1], s1)),
+                    _mm256_add_epi8(_mm256_shuffle_epi8(t[2], s2), _mm256_shuffle_epi8(t[3], s3)),
+                );
+                cur = nxt;
+                h += 1;
+            }
+            let mut i = 0;
+            while i < N {
+                let a0 = _mm256_loadu_si256(acts[i].add(c * 32) as *const __m256i);
+                let a1 = _mm256_loadu_si256(acts[i].add(c * 32 + 32) as *const __m256i);
+                let p = _mm256_add_epi16(_mm256_maddubs_epi16(wv[0], a0), _mm256_maddubs_epi16(wv[1], a1));
+                acc[i] = _mm256_add_epi32(acc[i], _mm256_madd_epi16(p, ones));
+                i += 1;
+            }
+            c += 2;
+        }
+        let mut i = 0;
+        while i < N {
+            *out.add(i * m + r) = (hsum(acc[i]) - 30 * asum[i]) as f32 * 1e-3;
+            i += 1;
+        }
+    }
+}
+
 /// The V1s-shaped trellis: the 16-bit window (c_w | c_w+1 << 4 | c_w+2 << 8 | c_w+3 << 12) hashed in 16-bit lanes —
 /// x ^= x >> 7, two chained `vpmullw`, the two bytes summed by `vpmaddubsw`, centred, a cubic stretch by three
 /// `vpmulhrsw` — then an int16 dot (`vpmaddwd`) against each token's 16-bit activations.
@@ -143,6 +209,8 @@ unsafe fn hash16<const N: usize>(m: usize, w: *const u8, acts: &[*const i16; N],
 enum Kernel {
     Q4,
     Lut4,
+    Lut4Decode,
+    Lut4Pair,
     Hash16,
 }
 impl Kernel {
@@ -150,6 +218,8 @@ impl Kernel {
         match self {
             Kernel::Q4 => "q4 (production)",
             Kernel::Lut4 => "lut4 trellis",
+            Kernel::Lut4Decode => "lut4 decode only",
+            Kernel::Lut4Pair => "lut4 pair-acc",
             Kernel::Hash16 => "hash16 trellis",
         }
     }
@@ -191,13 +261,14 @@ fn run(kernel: Kernel, n: usize, rows: usize, passes: usize, seed: u64, start: &
             }
             t0.elapsed().as_secs_f64()
         }
-        Kernel::Lut4 | Kernel::Hash16 => {
+        Kernel::Lut4 | Kernel::Lut4Decode | Kernel::Lut4Pair | Kernel::Hash16 => {
             let mut w = vec![0u8; rows * ROW];
             fill(seed, &mut w);
             let mut tb = [[0u8; 32]; 4];
             for t in tb.iter_mut() {
+                let span = if kernel == Kernel::Lut4Pair { 16 } else { 32 };
                 for (j, x) in t.iter_mut().enumerate() {
-                    *x = ((j * 7 + seed as usize) % 32) as u8;
+                    *x = ((j * 7 + seed as usize) % span) as u8;
                 }
                 let (a, b) = t.split_at_mut(16);
                 b.copy_from_slice(a);
@@ -214,6 +285,11 @@ fn run(kernel: Kernel, n: usize, rows: usize, passes: usize, seed: u64, start: &
                         (Kernel::Lut4, 2) => lut4::<2>(rows, w.as_ptr(), &tables, &[p8[0], p8[1]], &[asum[0], asum[1]], out.as_mut_ptr()),
                         (Kernel::Lut4, 3) => lut4::<3>(rows, w.as_ptr(), &tables, &[p8[0], p8[1], p8[2]], &[asum[0], asum[1], asum[2]], out.as_mut_ptr()),
                         (Kernel::Lut4, 4) => lut4::<4>(rows, w.as_ptr(), &tables, &[p8[0], p8[1], p8[2], p8[3]], &[asum[0], asum[1], asum[2], asum[3]], out.as_mut_ptr()),
+                        (Kernel::Lut4Decode, _) => lut4_decode(rows, w.as_ptr(), &tables, out.as_mut_ptr()),
+                        (Kernel::Lut4Pair, 1) => lut4_pair::<1>(rows, w.as_ptr(), &tables, &[p8[0]], &[asum[0]], out.as_mut_ptr()),
+                        (Kernel::Lut4Pair, 2) => lut4_pair::<2>(rows, w.as_ptr(), &tables, &[p8[0], p8[1]], &[asum[0], asum[1]], out.as_mut_ptr()),
+                        (Kernel::Lut4Pair, 3) => lut4_pair::<3>(rows, w.as_ptr(), &tables, &[p8[0], p8[1], p8[2]], &[asum[0], asum[1], asum[2]], out.as_mut_ptr()),
+                        (Kernel::Lut4Pair, 4) => lut4_pair::<4>(rows, w.as_ptr(), &tables, &[p8[0], p8[1], p8[2], p8[3]], &[asum[0], asum[1], asum[2], asum[3]], out.as_mut_ptr()),
                         (Kernel::Hash16, 1) => hash16::<1>(rows, w.as_ptr(), &[p16[0]], out.as_mut_ptr()),
                         (Kernel::Hash16, 2) => hash16::<2>(rows, w.as_ptr(), &[p16[0], p16[1]], out.as_mut_ptr()),
                         (Kernel::Hash16, 3) => hash16::<3>(rows, w.as_ptr(), &[p16[0], p16[1], p16[2]], out.as_mut_ptr()),
@@ -239,7 +315,9 @@ fn main() {
     let big = (mb << 20) / (K / 2) / 32 * 32;
     println!("bench-trellis: {K}-wide rows at 4 bits a weight; cache-resident 32 rows, DRAM {big} rows ({mb} MB) a thread x {passes} passes; pool {} cores", pool.len());
     println!("{:<16} {:>2} {:<6} {:>7} {:>13} {:>14} {:>13}", "kernel", "n", "rows", "threads", "GMAC/s a core", "G weights/s", "code GB/s");
-    for kernel in [Kernel::Q4, Kernel::Lut4, Kernel::Hash16] {
+    let want = arg("--kernels").map_or("q4,lut4,decode,pair,hash16".to_string(), |v| v.to_str().unwrap().to_string());
+    let kernels: Vec<Kernel> = want.split(',').map(|k| match k { "q4" => Kernel::Q4, "lut4" => Kernel::Lut4, "decode" => Kernel::Lut4Decode, "pair" => Kernel::Lut4Pair, "hash16" => Kernel::Hash16, _ => panic!("kernel {k}") }).collect();
+    for kernel in kernels {
         for &n in &ns {
             for (regime, rows, reps) in [("cache", 32usize, 0usize), ("dram", big, passes)] {
                 for cpus in [vec![one], pool.clone()] {

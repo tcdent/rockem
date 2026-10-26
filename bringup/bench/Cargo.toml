@@ -159,3 +159,7 @@ path = "src/exp4.rs"
 [[bin]]
 name = "bench-trellis"
 path = "src/trellis.rs"
+
+[[bin]]
+name = "bench-order"
+path = "src/order.rs"

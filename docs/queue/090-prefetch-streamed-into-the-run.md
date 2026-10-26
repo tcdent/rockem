@@ -104,6 +104,18 @@ partials and dilutes every expert's L3 share; the share of all the run's lines s
 reached them in full), and posting more gains nothing. What moves the L3-served share is more window — the plan
 earlier, as good as the rows plan (098) — or more delivery inside it. `PREFETCH_CAP` stays 13.
 
+## The run's order (bench-order, 2026-10-25): interleave the cold experts with the warm
+Each of socket 1's 46 pool cores gets 9 warm items it touches just before the run (1.25 MB, as the prefetch does) and 7
+cold items from a pool past the caches (0.97 MB, as the experts nobody prefetched) — a verify step's layer at 18k per
+core; all cores start together; the production kernel at 3 tokens (`bringup/bench/src/order.rs`), p50 of 200
+iterations: warm first (today's: the plan's order runs the prefetched experts first) **491 µs**; cold first 442;
+**interleaved 369**; warm only 118; cold only 327. Warm-first is slower than warm-only plus cold-only: the bus idles
+while the cores compute on L3 lines, then the cold tail is bus-bound with nothing to overlap. Interleaving keeps the
+bus streaming throughout and lands within ~40 µs of the cold set alone. Applied to the served run (~388 µs a layer),
+the same ratio is ~290 µs: ~4 ms a verify step, ~1.5 ms a token — the largest lever measured in this item, and a
+change to the run's order, not to the prefetch. To build: `prepare_batch_act`/`prepare_slotted` order each core's
+queue so its missed (unposted or not-done) experts' items interleave with its prefetched ones.
+
 ## Design: a re-targetable stream with a strength-ordered budget
 
 The job stops being a batch with a deadline and becomes a stream with three correction points, each with better
