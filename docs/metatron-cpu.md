@@ -236,24 +236,27 @@ like. Finer items (`SUB_FEW` 4) cut the tail without moving the wall. This 375 i
 3. **Expiry is bytes, not time.** A low-class line's risk is the fresh bytes its CCD inserts after it: at 12 MB a CCD
    the oldest tenth of a touched set loses ~19 %, the newest ~4 %; 24 MB loses 41 %; idle time inside a layer changes
    nothing (2026-10-26, `bench-l3life`).
-4. **What fresh lines lose to:** the previous round's lines the run *read* (protected, useless). Flushing them restores
+4. **What a lost line costs in a warm read:** an L3-fed gemv stream pays ~10 ns for each of its lines that comes from
+   DRAM instead (8 cores a CCD: 387 of 2,176 lines lost → 8.4 µs an item against 4.3; one extra L3 hit a line → 71 lost,
+   4.7 µs) (2026-10-26, `bench-order --fresh --touches`).
+5. **What fresh lines lose to:** the previous round's lines the run *read* (protected, useless). Flushing them restores
    ~100 % but costs 12.4 ns a line (~350 µs a core a layer); a second touch pass (an L3 hit a line) costs ~200 µs a layer
    on the touching cores, which the decode prefetch window does not have; re-touching pays only where a line's loss
    probability exceeds ~25 % (an L3 re-touch ~4× cheaper than a DRAM first touch) (2026-10-22, 2026-10-26).
-5. **Ordering moves loss, it does not remove it:** reading the oldest touched lines first loses the newest instead (the
+6. **Ordering moves loss, it does not remove it:** reading the oldest touched lines first loses the newest instead (the
    node's own deques, 2026-10-26, queue 099). **Once-read cold lines are useful victims:** reading them `prefetchnta`
    raises the next window's loss (4.2 → 8.4 %, `bench-window`). Loss is set by the fresh bytes a CCD inserts.
-6. **A non-temporal read does not protect:** the run's warm reads with `prefetchnta` cut the next round's loss 15 → 3 %,
+7. **A non-temporal read does not protect:** the run's warm reads with `prefetchnta` cut the next round's loss 15 → 3 %,
    but the hinted gemv reads ~35 % slower (2026-10-26).
-7. **A core's L3 read rate decays when its L3 hits stop** (2026-10-26, queue 099): after 1 ms without L3 hits a core
+8. **A core's L3 read rate decays when its L3 hits stop** (2026-10-26, queue 099): after 1 ms without L3 hits a core
    reads L3-resident lines 37 % slower, after 3 ms ~70 %, after 10 ms 4×; uniform over the run that follows, at a higher
    clock; not held by compute, L2 hits or DRAM misses; held by ~5 GB/s of L3 hits a core (a rotating ring, 256 KB every
    50 µs); recovery after a decay takes ~0.5–1 ms of full-rate hits; DRAM-fed reads are unaffected; per core.
    Every node run follows a window of DRAM touching and `mwaitx` — its warm items run decayed. Mechanism not identified.
    Benches that read L3-resident sets must state what the cores did just before (`bench-order --gap-us/--gap-mode`).
-8. **Interference, separate from loss:** a CCD's DRAM path saturates at ~40 GB/s with 3–4 streaming cores alone, ~17–18
+9. **Interference, separate from loss:** a CCD's DRAM path saturates at ~40 GB/s with 3–4 streaming cores alone, ~17–18
    GB/s each with the whole socket streaming; streamers past saturation slow the CCD's L3-fed cores 2–5× (queue 099).
-9. **Benches:** `bench-l3` (keep/stream, CAT), `bench-reuse` (self/peer), `bench-l3life` (survival by position),
+10. **Benches:** `bench-l3` (keep/stream, CAT), `bench-reuse` (self/peer), `bench-l3life` (survival by position),
    `bench-order --fresh` (a run's warm/cold mix), `bench-window` (the decode window then the run), `bench-interfere`,
    `bench-item`. Fixed warm sets are L3-protected by their own reuse: model the node with **fresh** lines.
 

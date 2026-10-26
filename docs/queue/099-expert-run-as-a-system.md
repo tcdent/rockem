@@ -478,8 +478,23 @@ on fresh lines touched once this round 8.6 (3–7 % of their lines from DRAM —
 `bench-run` on fixed lines with the hold 9.0; `bench-run` at the node's shape 15–16 whatever the variant; the node 10.6 own
 / 13.3 stolen. Two gaps are unexplained: `bench-run`'s ~2× over `bench-order` on identical lines (its warm numbers are not
 a reference for the hardware; its cold and schedule numbers stand), and fresh lines costing ~2× protected ones under eight
-cores while one core alone reads them at 4.7 — the node's case; its scaling with core count:
-`bringup/box/logs/bench-order-fresh-scaling.txt`.
+cores while one core alone reads them at 4.7 — the node's case. **Resolved** (`bench-order --fresh`, CCD 7, 15 items a core):
+
+| cores touching fresh sets | lines from DRAM an item (of 2,176) | item µs | touched twice: DRAM lines → µs |
+|---|---|---|---|
+| 1 | 11 | 4.31 | 2 → 4.27 |
+| 2 | 32 | 4.47 | 2 → 4.27 |
+| 4 | 125 | 5.35 | 7 → 4.31 |
+| 8 | 387 (18 %) | 8.41 | 71 → 4.72 |
+
+A warm item costs **~4.3 µs + ~10 ns a DRAM line in its stream**; the DRAM lines are the bytes model's losses (growing with
+the CCD's fresh bytes), and one L3 hit promotes them (18 → 3 % lost). So `bench-order`'s numbers are all accounted for:
+protected lines 4.3; fresh 8.4 by their lost lines; decay by the gap. The node's own items (6.5 % DRAM) price at ~5.8 µs
+on this model against their 10.6; the rest is what `bench-run`'s 2× is made of — its candidate, from today's facts: eight
+cores reading 2 MiB-strided regions or queue-claimed slices (~8 apart) in the same rhythm meet in the same L3 sets at the
+same moment; a freshly booted box hands out near-contiguous 4 KiB pages too, which is why `--pages 4k` did not differ.
+The node's experts sit at a 51/16 MiB stride (`layout::SHARE` = 3,342,336 B), which does not alias. Test: a 4 KB pad
+after every item (`--pad-kb 4`): `bringup/box/logs/bench-run-pad.txt`.
 
 **Why it matters here:** every one of the node's expert runs follows a ~440 µs window of DRAM touching and `mwaitx`
 waits — no L3 hits for the core — so the node's warm items run in the decayed state on every layer; `bench-run`'s
