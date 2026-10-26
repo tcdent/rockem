@@ -61,7 +61,14 @@
 //! `--rotate 1`: worker w (by rank in its CCD) starts its own items 3·w items into its list and wraps (the CCD's eight
 //! streams at different offsets at any moment).
 //!
-//!   bench-run [--rotate 0] [--main-pin -] [--pad-kb 0] [--ccd-barrier 0] [--retouch 0] [--ring-kb 1024] [--hold 0] [--stagger-ns 0] [--notouch 0] [--front 0] [--one-phase 0] [--regions 0] [--notime 0] [--plain 0] [--private 0] [--pages 2m] [--fixed 0] [--smt 0] [--multi 0] [--cpus 49-71,73-95] [--steal any] [--plan 45] [--cold 28] [--window-us 440] [--rounds 60] [--pool-mb 600]
+//! `--priv-pages 1`: each worker's activations (q, scales, gsum) and its `out` in private pages instead of musl's malloc
+//! (whose size-class groups put different threads' small buffers in adjacent slots, sharing cache lines: a store into a
+//! line another core reads costs ~35 ns, every item).
+//!
+//! `--simple 1`: after the first round, the workers run `--rounds` more rounds among themselves — a worker-only spin barrier,
+//! each worker's own list from that first round, nothing from the main thread in the loop (the round machinery removed).
+//!
+//!   bench-run [--simple 0] [--priv-pages 0] [--rotate 0] [--main-pin -] [--pad-kb 0] [--ccd-barrier 0] [--retouch 0] [--ring-kb 1024] [--hold 0] [--stagger-ns 0] [--notouch 0] [--front 0] [--one-phase 0] [--regions 0] [--notime 0] [--plain 0] [--private 0] [--pages 2m] [--fixed 0] [--smt 0] [--multi 0] [--cpus 49-71,73-95] [--steal any] [--plan 45] [--cold 28] [--window-us 440] [--rounds 60] [--pool-mb 600]
 use harness::arg;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -180,6 +187,8 @@ fn main() {
     let regions = num("--regions", 0) == 1;
     let stagger_ns = num("--stagger-ns", 0) as u64;
     let rotate = num("--rotate", 0) == 1;
+    let priv_pages = num("--priv-pages", 0) == 1;
+    let simple = num("--simple", 0) == 1;
     let hold_kb = num("--hold", 0);
     let ring_kb = num("--ring-kb", 1024);
     let retouch = num("--retouch", 0) == 1;
@@ -215,6 +224,8 @@ fn main() {
     let mates: Vec<Vec<usize>> = (0..nccd).map(|k| (0..cpus.len()).filter(|&w| ccd[w] == k).collect()).collect();
     let ccd_bars: Arc<Vec<Spin>> = Arc::new((0..nccd).map(|k| Spin { n: mates[k].len(), arrived: Line(AtomicUsize::new(0)), gen: Line(AtomicUsize::new(0)) }).collect());
     let t = cpus.len();
+    let wbar: Arc<Spin> = Arc::new(Spin { n: t, arrived: Line(AtomicUsize::new(0)), gen: Line(AtomicUsize::new(0)) });
+    let simple_ns: Arc<Vec<Line>> = Arc::new((0..t).map(|_| Line(AtomicUsize::new(0))).collect());
     let pmc_ok = {
         let _ = std::fs::write("/proc/sys/kernel/nmi_watchdog", "0");
         cpus.iter().all(|&c| common::pmc::Pmc::open(c).is_some_and(|p| p.program(&common::pmc::FILLS))) && common::pmc::allow_rdpmc()
@@ -295,6 +306,7 @@ fn main() {
         .map(|wi| {
             let (ccdq, planq, deques, takers, bar, done, cls, measuring, round_end, t0s, phase_data) = (ccdq.clone(), planq.clone(), deques.clone(), takers.clone(), bar.clone(), done.clone(), cls.clone(), measuring.clone(), round_end.clone(), t0s.clone(), phase_data.clone());
             let ccd_bars = ccd_bars.clone();
+            let (wbar, simple_ns) = (wbar.clone(), simple_ns.clone());
             let (cpu, my_ccd, my_node) = (cpus[wi], ccd[wi], ccd_node[ccd[wi]]);
             let mates_w: Vec<usize> = mates[my_ccd].iter().copied().filter(|&m| m != wi).collect();
             let node_ccds: Vec<usize> = (0..nccd).filter(|&k| k != my_ccd && ccd_node[k] == my_node).collect();
@@ -307,13 +319,30 @@ fn main() {
                 harness::bench::pin(cpu);
                 let mut rng = common::testing::Rng::new(100 + wi as u64);
                 let x: Vec<f32> = (0..K).map(|_| rng.unit()).collect();
-                let (mut q, mut s, mut g) = (vec![0i8; 3 * K], vec![0f32; 3 * K / GROUP], vec![0i32; 3 * K / GROUP]);
+                // the activations and the output: musl's malloc, or private pages of this worker's own
+                let (q, s, g, mut out): (&mut [i8], &mut [f32], &mut [i32], &mut [f32]) = if priv_pages {
+                    let pg = huge::alloc_pages(4 << 20, false);
+                    let (q, rest) = pg.split_at_mut(3 * K);
+                    let (sb_, rest) = rest.split_at_mut(4096);
+                    let (gb_, rest) = rest.split_at_mut(4096);
+                    let ob_ = &mut rest[..4096];
+                    unsafe {
+                        (
+                            std::slice::from_raw_parts_mut(q.as_mut_ptr() as *mut i8, 3 * K),
+                            std::slice::from_raw_parts_mut(sb_.as_mut_ptr() as *mut f32, 3 * K / GROUP),
+                            std::slice::from_raw_parts_mut(gb_.as_mut_ptr() as *mut i32, 3 * K / GROUP),
+                            std::slice::from_raw_parts_mut(ob_.as_mut_ptr() as *mut f32, 3 * ROWS),
+                        )
+                    }
+                } else {
+                    (vec![0i8; 3 * K].leak(), vec![0f32; 3 * K / GROUP].leak(), vec![0i32; 3 * K / GROUP].leak(), vec![0f32; 3 * ROWS].leak())
+                };
                 for i in 0..3 {
                     QAct { q: &mut q[i * K..(i + 1) * K], scale: &mut s[i * K / GROUP..(i + 1) * K / GROUP], gsum: &mut g[i * K / GROUP..(i + 1) * K / GROUP] }.quantize(&x);
                 }
+                let (q, s, g): (&[i8], &[f32], &[i32]) = (q, s, g);
                 let a = Act { q: &q[..K], scale: &s[..K / GROUP], gsum: &g[..K / GROUP] };
                 let act = |i: usize| Act { q: &q[i * K..(i + 1) * K], scale: &s[i * K / GROUP..(i + 1) * K / GROUP], gsum: &g[i * K / GROUP..(i + 1) * K / GROUP] };
-                let mut out = vec![0f32; 3 * ROWS];
                 // the sibling: streams the item whose id (+ 1) is posted in its slot, into the L2 it shares with this core
                 let slot: Arc<Line> = Arc::new(Line(AtomicUsize::new(0)));
                 if smt {
@@ -414,7 +443,7 @@ fn main() {
                         std::hint::spin_loop();
                     }
                     bar.wait(); // the main thread builds the run's queues
-                    for phase in 0..2 {
+                    for phase in 0..(if simple { 1 } else { 2 }) {
                         bar.wait();
                         let t0 = t0s.load(Ordering::Acquire);
                         if stagger_ns > 0 {
@@ -525,6 +554,27 @@ fn main() {
                         let end = (epoch.elapsed().as_nanos() as u64).saturating_sub(t0);
                         round_end[wi][phase].0.store(end as usize, Ordering::Release);
                         bar.wait(); // the join
+                        if simple && phase == 0 {
+                            // the workers alone: `rounds` rounds over this same list, timed per worker
+                            let ids: Vec<usize> = own_s.clone();
+                            let mut total = 0u64;
+                            for _ in 0..rounds {
+                                wbar.wait();
+                                let r0 = std::time::Instant::now();
+                                for &id in ids.iter().rev() {
+                                    run(id, 0);
+                                }
+                                total += r0.elapsed().as_nanos() as u64;
+                                wbar.wait();
+                            }
+                            simple_ns[wi].0.store((total / rounds as u64) as usize, Ordering::Release);
+                            for (c, v) in local.borrow().iter().enumerate() {
+                                for x in 0..5 {
+                                    cls[c][x].fetch_add(v[x], Ordering::Relaxed);
+                                }
+                            }
+                            return;
+                        }
                     }
                 }
             })
@@ -532,7 +582,7 @@ fn main() {
         .collect();
 
     let mut cursor = vec![0usize; nccd];
-    for r in 0..rounds + 1 {
+    for r in 0..(if simple { 1 } else { rounds + 1 }) {
         if fixed {
             cursor.iter_mut().for_each(|c| *c = 0);
         }
@@ -577,7 +627,7 @@ fn main() {
             }
         }
         let mut wall = [0u64; 2];
-        for (ph, items) in phase_items.iter().enumerate() {
+        for (ph, items) in phase_items.iter().enumerate().take(if simple { 1 } else { 2 }) {
             let mut own: Vec<Vec<usize>> = vec![Vec::new(); t];
             let mut q: Vec<Vec<usize>> = vec![Vec::new(); nccd];
             for &(k, id, tk) in items {
@@ -614,6 +664,23 @@ fn main() {
             let re: [Vec<u64>; 2] = std::array::from_fn(|ph| (0..t).map(|w| round_end[w][ph].0.load(Ordering::Acquire) as u64).collect());
             ends.lock().unwrap().push(re);
         }
+    }
+    if simple {
+        for h in hs {
+            h.join().unwrap();
+        }
+        let mut v: Vec<usize> = simple_ns.iter().map(|l| l.0.load(Ordering::Relaxed)).collect();
+        v.sort_unstable();
+        println!("simple rounds: a worker's run of its {} items, p50 {:.1} µs, max {:.1}", 0, v[v.len() / 2] as f64 / 1e3, v[v.len() - 1] as f64 / 1e3);
+        let n = 1.0;
+        for (c, name) in ["own", "stolen", "CCD queue", "node's CCD", "socket's CCD", "far socket"].iter().enumerate() {
+            let v: Vec<u64> = cls[c].iter().map(|x| x.load(Ordering::Relaxed)).collect();
+            if v[0] > 0 {
+                let (items, lines) = (v[0] as f64, (v[2] + v[3] + v[4]) as f64);
+                println!("  {name:<10} {:>7.0} items, {:>6.2} µs an item, {:>5.1} % of lines from DRAM | lines an item: {:.0} demand L3 / {:.0} prefetch L3 / {:.0} DRAM", items / n, v[1] as f64 / items / 1e3, 100.0 * v[4] as f64 / lines.max(1.0), v[2] as f64 / items, v[3] as f64 / items, v[4] as f64 / items);
+            }
+        }
+        return;
     }
     done.store(usize::MAX, Ordering::Release);
     bar.wait();

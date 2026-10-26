@@ -502,7 +502,43 @@ reads 8.5 and 10.8 in two runs — run-to-run variance it had not shown — agai
 matter (unpinned 8.4 / 10.8, core 0 10.9, core 48 9.8 / 10.1; a core of the measured CCD collides with its worker); the
 variance stands. What varies between runs is only which physical 2 MiB pages the pool gets — with `--regions` each
 worker's 2 MB region is one huge page, so the eight streams differ only in page-level address bits — hence `--pages 4k`
-(scattered) and `--rotate 1` (different offsets at any moment), repeated: `bringup/box/logs/bench-run-pagesvar.txt`.
+(scattered) and `--rotate 1` (different offsets at any moment), repeated: 4 KiB 8.4–9.9, 2 MiB 8.5–10.1, rotated 9.4–9.8
+— **refuted**. Each worker's small buffers (`out`, scales, gsum) in private pages instead of musl's shared size-class slots
+(the ~35 ns unowned-line store): 10.0–10.6 against 8.65 — **refuted**. The round machinery removed (`--simple 1`: after the
+first round the workers run 60 rounds among themselves over the same lists, a worker-only spin barrier, nothing from the
+main thread): **6.6 µs an item** (105–108 µs for 16 items, three runs within 3 %). So the residual decomposes: ~2 µs an item
+was the inter-round gaps (40–80 µs without L3 hits, as the unprimed decay curve prices), and a **1.4× remains unexplained**
+between two loops that are now the same gemv over the same lines on the same cores (`bench-run --simple` 6.6 vs
+`bench-order` 4.4–4.9). Left open here.
+
+## The state of the question (2026-10-26, end of day)
+**Established, with the bench that holds it:**
+- A warm (L3-fed) item costs ~4.3 µs + ~10 ns per line that comes from DRAM instead; the DRAM lines are the bytes model's
+  losses, promoted by one L3 hit (`bench-order --fresh --touches`).
+- A core's L3 read rate decays when its L3 hits stop: unprimed 100 µs → +20 %, 500 µs → +45 %, 3 ms → +70 %, 10 ms → 4×;
+  held by ~5 GB/s of L3 hits; recovery 0.5–1 ms of hits; DRAM-fed reads unaffected; per core (`bench-order --gap-*`).
+- A CCD's DRAM path saturates at 3–4 streaming cores (~40 GB/s alone, ~17–18 GB/s each with the socket streaming), and
+  L3-fed cores beside saturated streamers slow 2–5× (`bench-interfere`).
+- The CCD's run time is the sum of its sources' times, not their maximum (`bench-run` all-warm / all-cold / the mix).
+- An awake SMT sibling costs the core ~10 % of its compute under the cap and gives the DRAM stream nothing
+  (`bench-power --sib-spin`); sibling streaming of the next cold item is zero-sum (`bench-run --smt`).
+- Page size (4 KiB / 2 MiB) does not change the gemv stream's rate from L3 or DRAM (`bench-run --pages`).
+
+**Levers measured at the node's shape and found zero-sum or negative:** a per-CCD streaming cap (lab), the re-touch
+(lab and bench), oldest-first, non-temporal warm or cold reads, a ring hold through the window, the warm-then-cold
+barrier, sibling streaming. Each moves bytes or time between the CCD's one path.
+
+**The node against the benches:** the node's own items 10.6 µs and stolen 13.3 (lab); `bench-run` at the node's shape
+15–16; `bench-run --simple` on fixed lines 6.6; `bench-order` 4.3 protected / 8.4 fresh. The node's items are priced by
+the model at ~5.8 (own, 6.5 % DRAM lines) + the decay of its ~440 µs window (+45 %) ≈ 8.4; its 10.6 carries ~1.25× more,
+in the range of `bench-run`'s unexplained residual — which the node may share, since the node is the system `bench-run`
+copies.
+
+**What would move the node, from the data:** the cold items (half to two thirds of the run's core time, DRAM-bound, ~24
+GB/s a CCD) — fewer cold bytes (098's predictor, residency, formats) and the clock under the cap; for the warm items,
+the decay is the one measured mechanism with a hold that costs nothing in bytes *if* its L3 hits can be had without
+footprint — the re-touch did not deliver it in the bench, and why not is the next question (its hits may come too late:
+the window's last 512 KB is never re-read, and the run starts ~immediately). The unexplained 1.4× is the other.
 
 **Why it matters here:** every one of the node's expert runs follows a ~440 µs window of DRAM touching and `mwaitx`
 waits — no L3 hits for the core — so the node's warm items run in the decayed state on every layer; `bench-run`'s
