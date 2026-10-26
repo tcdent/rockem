@@ -561,8 +561,14 @@ fn main() {
                             for _ in 0..rounds {
                                 wbar.wait();
                                 let r0 = std::time::Instant::now();
-                                for &id in ids.iter().rev() {
-                                    run(id, 0);
+                                if front {
+                                    for &id in ids.iter() {
+                                        run(id, 0);
+                                    }
+                                } else {
+                                    for &id in ids.iter().rev() {
+                                        run(id, 0);
+                                    }
                                 }
                                 total += r0.elapsed().as_nanos() as u64;
                                 wbar.wait();

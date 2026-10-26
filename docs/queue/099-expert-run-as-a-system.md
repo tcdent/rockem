@@ -509,7 +509,11 @@ first round the workers run 60 rounds among themselves over the same lists, a wo
 main thread): **6.6 µs an item** (105–108 µs for 16 items, three runs within 3 %). So the residual decomposes: ~2 µs an item
 was the inter-round gaps (40–80 µs without L3 hits, as the unprimed decay curve prices), and a **1.4× remains unexplained**
 between two loops that are now the same gemv over the same lines on the same cores (`bench-run --simple` 6.6 vs
-`bench-order` 4.4–4.9). Left open here.
+`bench-order` 4.4–4.9). In simple mode the item is 6.6 whatever the read order, a 4 KB item pad or 4 KiB pages (105–108
+µs for 16 items, four runs), and `bench-order` at `bench-run`'s exact layout — shared regions at a 2 MiB + 64 B stride,
+16 items — reads 4.36–4.40. **Left open:** two loops that are the same gemv over the same lines on the same cores at the
+same gap, 1.45× apart (`bringup/box/logs/bench-run-simple2.txt`). It matters because the node is the system `bench-run`
+copies: whatever it is, the node may carry it.
 
 ## The state of the question (2026-10-26, end of day)
 **Established, with the bench that holds it:**
