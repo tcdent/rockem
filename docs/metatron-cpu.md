@@ -223,6 +223,31 @@ like. Finer items (`SUB_FEW` 4) cut the tail without moving the wall. This 375 i
 
 ## 3. Caches
 
+**The L3 model in one place (read this before any cache experiment; every line is measured below).**
+
+1. **Victim cache.** A DRAM fill lands in the reading core's L1/L2; it reaches the CCD's L3 only when that L2 evicts it.
+   A line still in a core's L2 is not in L3: a CCD-mate reading it gets local-homed memory from DRAM, not forwarded
+   (remote-homed is forwarded). So the core that touches a line must be the core that reads it ("A touched line is
+   not yet an L3 line", 2026-10-21/22).
+2. **Two classes of line.** A line that entered L3 once, as an L2 victim, is in the low class: replacement takes those
+   first, oldest first. A line that has *hit* in L3 is protected (95 % of a 24 MB read set kept). Re-referencing a line
+   while it is still in L1/L2 does not promote it; a dirty victim is not kept at all; a `prefetcht0` touch keeps ~7–9 %
+   (touch with loads) (2026-10-22).
+3. **Expiry is bytes, not time.** A low-class line's risk is the fresh bytes its CCD inserts after it: at 12 MB a CCD
+   the oldest tenth of a touched set loses ~19 %, the newest ~4 %; 24 MB loses 41 %; idle time inside a layer changes
+   nothing (2026-10-26, `bench-l3life`).
+4. **What fresh lines lose to:** the previous round's lines the run *read* (protected, useless). Flushing them restores
+   ~100 % but costs 12.4 ns a line (~350 µs a core a layer); a second touch pass (an L3 hit a line) costs ~200 µs a layer
+   on the touching cores, which the decode prefetch window does not have; re-touching pays only where a line's loss
+   probability exceeds ~25 % (an L3 re-touch ~4× cheaper than a DRAM first touch) (2026-10-22, 2026-10-26).
+5. **A non-temporal read does not protect:** the run's warm reads with `prefetchnta` cut the next round's loss 15 → 3 %,
+   but the hinted gemv reads ~35 % slower (2026-10-26).
+6. **Interference, separate from loss:** a CCD's DRAM path saturates at ~40 GB/s with 3–4 streaming cores alone, ~17–18
+   GB/s each with the whole socket streaming; streamers past saturation slow the CCD's L3-fed cores 2–5× (queue 099).
+7. **Benches:** `bench-l3` (keep/stream, CAT), `bench-reuse` (self/peer), `bench-l3life` (survival by position),
+   `bench-order --fresh` (a run's warm/cold mix), `bench-window` (the decode window then the run), `bench-interfere`,
+   `bench-item`. Fixed warm sets are L3-protected by their own reuse: model the node with **fresh** lines.
+
 **How Milan's L3 fills** (architecture facts, from `l3-intentional-expert-path`, 2026-10-02):
 
 - The L3 is a victim cache of L2. A DRAM fill lands in L1/L2 and reaches L3 only when L2 evicts it.
