@@ -116,6 +116,18 @@ the same ratio is ~290 µs: ~4 ms a verify step, ~1.5 ms a token — the largest
 change to the run's order, not to the prefetch. To build: `prepare_batch_act`/`prepare_slotted` order each core's
 queue so its missed (unposted or not-done) experts' items interleave with its prefetched ones.
 
+**In the node it is slower (lab086ab, 2026-10-25): not taken.** Built (each worker's own deque interleaved with its
+CCD's queue in proportion to its share of each, then the rest of its order) and A/B'd on one clean boot, the order
+alternating step by step, 480 verify steps each, 16 × 107-token decodes at 18k: warm first **6.89** ms a token of
+`experts` (p50 6.75), interleaved **7.58** (p50 7.40); total 21.27 against 22.03. Long SCORE bit-identical either way. The
+bench's 25 % did not transfer — the opposite sign. Not explained; hypotheses for whoever picks it up: the served run's
+warm slices sit in the toucher's 512 KB L2 as well as L3, and cold items streamed through that L2 before them cost more
+than the bench's model (its warm set per core was all past L2); a verify step's experts see ~1.15 tokens each, so the
+served run is closer to one-token gemv rates than the bench's 3-token gemm; the CCD queue's cold items include partial
+experts' untouched slices whose neighbours are warm; and the hardware stream prefetchers may lose sequential streams when
+a core alternates. A faithful bench (both sockets' placement, the served item sizes, ~1.15 tokens an expert, the touch's
+real L2/L3 split) comes before trying again.
+
 ## Design: a re-targetable stream with a strength-ordered budget
 
 The job stops being a batch with a deadline and becomes a stream with three correction points, each with better
