@@ -6,7 +6,9 @@
 //! its untouched planned items, then `--cold` items nobody planned. Reported: the run's time (its slowest core), the
 //! items a core touched in the window, the touched items' lines from DRAM at the run, the run's DRAM lines.
 //!
-//!   bench-window [--cpus 49-71,73-95] [--plan 16] [--cold 4] [--window-us 440] [--retouch-kb 0] [--iters 100]
+//! `--oldest-first 1`: the run takes its touched items oldest first (the most bytes inserted after them: the most at risk).
+//!
+//!   bench-window [--oldest-first 0] [--cpus 49-71,73-95] [--plan 16] [--cold 4] [--window-us 440] [--retouch-kb 0] [--iters 100]
 use harness::arg;
 use std::sync::{Arc, Barrier, Mutex};
 
@@ -49,6 +51,7 @@ fn main() {
     let window = num("--window-us", 440) as u64;
     let lag = num("--retouch-kb", 0) << 10;
     let iters = num("--iters", 100);
+    let oldest = num("--oldest-first", 0) == 1;
     let pool_mb = num("--pool-mb", 160);
     let t = cpus.len();
     let pmc_ok = {
@@ -131,8 +134,14 @@ fn main() {
                             mine[2] += m;
                         }
                     };
-                    for &k in planned[..done].iter().rev() {
-                        item(k, true);
+                    if oldest {
+                        for &k in planned[..done].iter() {
+                            item(k, true);
+                        }
+                    } else {
+                        for &k in planned[..done].iter().rev() {
+                            item(k, true);
+                        }
                     }
                     for &k in planned[done..].iter().chain(cold.iter()) {
                         item(k, false);
@@ -162,7 +171,8 @@ fn main() {
     let a = acc.lock().unwrap();
     let n = a[4] as f64;
     println!(
-        "bench-window: {t} cores, plan {plan} + cold {nc} items (136 KB) a core, window {window} µs, re-touch {} | run p50 {:.1} µs p90 {:.1} | touched {:.2} items a core | touched lines from DRAM {:.1} % | run DRAM lines a core {:.0}",
+        "bench-window: {t} cores, plan {plan} + cold {nc} items (136 KB) a core, window {window} µs, {} first, re-touch {} | run p50 {:.1} µs p90 {:.1} | touched {:.2} items a core | touched lines from DRAM {:.1} % | run DRAM lines a core {:.0}",
+        if oldest { "oldest" } else { "newest" },
         if lag == 0 { "off".to_string() } else { format!("{} KB behind", lag >> 10) },
         span[span.len() / 2] as f64 / 1e3,
         span[span.len() * 9 / 10] as f64 / 1e3,

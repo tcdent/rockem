@@ -433,6 +433,32 @@ window does not have. So a touch-based prefetch into this L3 keeps ~90 % of its 
 85 % is that plus its run's own installs, and the last five points cost more than the ~0.3–0.4 ms a verify step they
 would return (CAT with cores split by item kind, or a partial second pass).
 
+### A touched line's lifetime is bytes, not time, and the oldest go first (measured 2026-10-26, `bench-l3life`, CCD 7)
+
+Each core touches a fresh set, then the set is reread in touch order with the fill counters read every tenth of it;
+the share of each tenth that came back from DRAM (one load a line; the reader is the toucher):
+
+| shape | between touch and reread | lost | oldest tenth → newest tenth |
+|---|---|---|---|
+| 1 core × 12 MB | nothing | 16.5 % | 32.6 29.5 26.7 21.1 16.9 11.3 9.4 6.8 5.0 5.6 |
+| 8 cores × 1.5 MB (12 MB a CCD) | nothing | 10.7 % | 18.7 16.3 15.5 14.1 11.3 8.4 6.9 5.9 6.2 4.2 |
+| 8 × 1.5 MB | 2 ms idle | 11.0 % | 23.1 … 2.9 |
+| 8 × 1.5 MB | 50 ms idle | 19.0 % | 30.3 … 10.9 |
+| 8 × 1.5 MB | 1 MB a core of other fresh lines | 26.1 % | 40.7 … 12.8 |
+| 8 × 3 MB (24 MB a CCD) | nothing | 41.2 % | 72.5 … 15.8 |
+
+- Within the once-referenced class the replacement is age-ordered: a line's risk is the fresh bytes the CCD has inserted
+  after it. Time alone does not matter on the scale of a layer (2 ms idle: no change); 50 ms of idle raises it, the
+  box's background traffic (not separated).
+- A non-temporal read keeps a line out of the protected class (`bench-order --warm-hint nta`, one CCD, 15 MB fresh a
+  round): the next round's warm-only loss 15.2 → 2.8 %, cold-first 34 → 10 %; but the hinted gemv reads ~35 % slower
+  (8.7 → 11.7 µs an item), so no run got faster.
+- **The re-touch's break-even:** a re-touch reads from L3 at ~14 GB/s a core, a first touch from DRAM at ~3.3 GB/s a core
+  in the window (1.5 MB in 440 µs), ~4× apart. Re-touching a line saves its loss probability p of a DRAM line and costs
+  ~1/4 of a first touch, so it pays where p > ~25 % — at the node's 12 MB a CCD, only the oldest tenth or two. Measured
+  at the node's window (`bench-window`, 46 cores): the loss is 6.4 % of the touched lines either way the run is ordered
+  (oldest or newest first), and re-touching all of it (1.4 %) leaves the run's DRAM lines and time unchanged.
+
 ### What a store costs, and musl's malloc (measured 2026-10-22, the node's planner on core 7)
 
 A store into a line this core does not own costs ~35 ns, and it costs the same whether the line was last *read* by

@@ -136,6 +136,9 @@ fn main() {
     // cold items
     let spread = num("--warm-spread", 0);
     // `--cold-hint nta|t0` with `--dist` bytes: the cold items' reads prefetched non-temporally (or ordinarily) ahead
+    // `--warm-hint nta|t0`: the warm items' reads prefetched non-temporally (or ordinarily) `--dist` ahead: does a run that
+    // reads its L3 lines non-temporally leave them unprotected for the next round's fresh lines (099)?
+    let whint: u8 = match arg("--warm-hint").map(|v| v.to_str().unwrap().to_string()).as_deref() { Some("nta") => 1, Some("t0") => 2, _ => 0 };
     let hint: u8 = match arg("--cold-hint").map(|v| v.to_str().unwrap().to_string()).as_deref() { Some("nta") => 1, Some("t0") => 2, _ => 0 };
     let dist = num("--dist", 2048);
     let pool_mb = num("--pool-mb", 96);
@@ -252,7 +255,16 @@ fn main() {
                             }
                         }
                         let t0 = std::time::Instant::now();
-                        let warm = |k: usize| timed(&wsum, &wfill, &|| if fresh { item(&pool_w, &pool_s, wsel[k]) } else { item(&warm_w, &warm_s, k) });
+                        let warm = |k: usize| {
+                            timed(&wsum, &wfill, &|| {
+                                let (wp, sp, kk) = if fresh { (&pool_w, &pool_s, wsel[k]) } else { (&warm_w, &warm_s, k) };
+                                if n == 1 && whint != 0 {
+                                    unsafe { gemv_hint::<K>(rows, wp.as_ptr().add(kk * ib), sp.as_ptr().add(kk * sb), &act(0), op as *mut f32, whint, dist) };
+                                } else {
+                                    item(wp, sp, kk);
+                                }
+                            })
+                        };
                         let cold_item = |k: usize| unsafe {
                             if n == 1 && hint != 0 {
                                 gemv_hint::<K>(rows, pool_w.as_ptr().add(cold[k] * ib), pool_s.as_ptr().add(cold[k] * sb), &act(0), op as *mut f32, hint, dist);
