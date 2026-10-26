@@ -320,6 +320,43 @@ and their time (µs an item): 7.8–9.8 at young ages past the run's first MB, 1
   fetches count on its own thread). Streaming raises the touched lines' loss (6 → 11–15 %): its bytes land in the L3
   while the warm items wait, as the bytes model says.
 
+## The run's reference: `bench-run` (2026-10-26, a bench boot)
+> youre trying to get the hode to match the bench not the bench to match the node — tcdent
+
+The bench is the reference for what the hardware delivers under a schedule; where the node falls short, the shortfall is
+the node's, and the bench measures each node element's cost by adding it as a variable — the bench is not tuned to look
+like the node.
+
+`bench-run` runs the node's schedule (construct.rs `work`/`slot_order`): each CCD's planned slices touched in the window
+by whichever of its cores claims them, then two phases (gate/up, down) with a join, each worker claiming its own deque
+from the back, its mates' from the front, its CCD's queue, its node's other CCDs. Run on a bench boot
+(`bringup/box/dev.cmdline.bench`: the serving command line without the bundle and the hugepage reservation, so the benches
+have all four nodes' memory). At the node's width-3 shape (45 slices touched + 28 cold items a CCD ≈ 118 items):
+
+| | gate/up | down |
+|---|---|---|
+| wall | 214 µs | 122 µs |
+| workers' ends p10 / p50 / p90 / max | 155 / 168 / 206 / 213 | 76 / 88 / 116 / 121 |
+
+per item: own 11.2 µs (6 % DRAM), stolen 14.2 (17 %), CCD queue 31.5 (96 %), the node's other CCDs 30.6 (98 %). Repeats
+agree to a microsecond; one socket alone gives the same walls (214 / 122): the sockets do not interact.
+
+What building it measured on the way (each a bench flaw first, then fixed — and each a property the node must keep):
+- **Workers that start through a mutex** (each taking the phase's lists under a lock): 92 handoffs across the sockets
+  staggered the starts; walls 287 → 214. The node publishes its job through an atomic pointer.
+- **A futex barrier's wake** (tens of µs) as the phase's start; the node's workers spin on a generation word.
+- **Shared per-item counters** (one set of atomics, 4 adds an item from 92 cores) and a barrier's arrivals on the
+  spinners' line: each cost ~35–75 µs a phase across the sockets.
+- **Stealing across the sockets** (`--steal any`): a far-socket cold item 625 µs, the gate/up wall 1,084 µs. The node
+  never does (its last slot is the unplaced-item queue, not the other socket's CCDs).
+- **The resident node slows these benches:** socket 1 alone, the same run, walls 287 / 155 µs with the node resident
+  against 197 / 125 µs with its memory free (before the barrier fixes; the cause — its memory, its pages, its threads —
+  is not separated). Bench numbers taken beside the resident node earlier in 099 carry this.
+
+Against the node: at width 3 the node's run is ~390–420 µs a layer for the same item count against the bench's 336.
+Before the difference is the node's to close, one workload element is still missing from the bench: experts picked by
+two or three of the step's tokens (`gemm` over n tokens, more compute an item).
+
 ## How the bench and the node differ (to quantify, one at a time)
 1. **The shared CCD queue and stealing.** The node's cold items are claimed from one queue by the CCD's 8 cores and its
    warm items can be stolen by mates; the bench's cores own private sets. The queue is the node's load balancer.

@@ -7,8 +7,13 @@
 //! `--sib-spin 1`: each core's SMT sibling (cpu + 96) spins throughout (`pause`), instead of halting. Reported also: the
 //! first touch's rate a core (GB/s).
 //!
-//!   bench-l3life [--sib-spin 0] [--cpus 56] [--set-kb 8192] [--gap-us 0] [--filler-kb 0] [--reps 20] [--pool-mb 1024]
+//! `--touch node`: every touch and reread with the node's prefetch touch (`touch_node.rs`: 32-byte loads, sixteen lines in
+//! flight) instead of one scalar load a line.
+//!
+//!   bench-l3life [--clock 0] [--touch scalar|node] [--sib-spin 0] [--cpus 56] [--set-kb 8192] [--gap-us 0] [--filler-kb 0] [--reps 20] [--pool-mb 1024]
 use harness::arg;
+#[path = "touch_node.rs"]
+mod touch_node;
 use std::sync::{Arc, Barrier, Mutex};
 
 fn list(spec: &str) -> Vec<usize> {
@@ -24,8 +29,13 @@ fn list(spec: &str) -> Vec<usize> {
 fn num(name: &str, d: usize) -> usize {
     arg(name).map_or(d, |v| v.to_str().unwrap().parse().unwrap())
 }
+static NODE_TOUCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 #[inline(never)]
 fn touch(p: *const u8, len: usize) -> u64 {
+    if NODE_TOUCH.load(std::sync::atomic::Ordering::Relaxed) {
+        unsafe { touch_node::touch(p, len, None) };
+        return 0;
+    }
     let mut s = 0u64;
     let mut i = 0;
     while i < len {
@@ -48,6 +58,11 @@ fn main() {
     let reps = num("--reps", 20);
     let pool = num("--pool-mb", 1024) << 20;
     let sib_spin = num("--sib-spin", 0) == 1;
+    // `--clock 1`: APERF/MPERF around every first touch (MSR reads between the phases desynchronize the cores: on 46 cores
+    // they changed the rate itself, 3.06 → 3.72 GB/s; off by default)
+    let clock = num("--clock", 0) == 1;
+    let node_touch = arg("--touch").is_some_and(|v| v.to_str() == Some("node"));
+    NODE_TOUCH.store(node_touch, std::sync::atomic::Ordering::Relaxed);
     let quit = Arc::new(std::sync::atomic::AtomicBool::new(false));
     if sib_spin {
         for &c in &cpus {
@@ -97,14 +112,16 @@ fn main() {
                     at += step;
                     bar.wait();
                     let c0 = fills();
-                    let (a0, m0) = (msr(cpu, 0xE8), msr(cpu, 0xE7));
+                    let (a0, m0) = if clock { (msr(cpu, 0xE8), msr(cpu, 0xE7)) } else { (0, 0) };
                     let tt = std::time::Instant::now();
                     std::hint::black_box(touch(sp, set));
                     if rep > 0 {
                         *touch_ns.lock().unwrap() += tt.elapsed().as_nanos() as u64;
-                        let mut p = perf.lock().unwrap();
-                        p[0] += msr(cpu, 0xE8) - a0;
-                        p[1] += msr(cpu, 0xE7) - m0;
+                        if clock {
+                            let mut p = perf.lock().unwrap();
+                            p[0] += msr(cpu, 0xE8) - a0;
+                            p[1] += msr(cpu, 0xE7) - m0;
+                        }
                     }
                     let c1 = fills();
                     bar.wait();
@@ -159,7 +176,7 @@ fn main() {
         set >> 10,
         (t * set) as f64 / (1 << 20) as f64,
         filler >> 10,
-        if sib_spin { ", siblings spinning" } else { "" },
+        if sib_spin { ", siblings spinning" } else { "" } .to_string() + if node_touch { ", node touch" } else { ", scalar touch" },
         (set as f64 * reps as f64 * t as f64) / *touch_ns.lock().unwrap() as f64,
         { let p = perf.lock().unwrap(); 2.65 * p[0] as f64 / p[1].max(1) as f64 },
         100.0 * f[1] as f64 / (f[0] + f[1]).max(1) as f64,

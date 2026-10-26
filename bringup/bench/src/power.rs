@@ -6,7 +6,10 @@
 //! byte from DRAM costs here, and what the clock does once a socket reaches its power cap (metatron:
 //! 280 W a socket, 2026-10-20). A row a run:
 //!
-//!   bench-power --mode M --cpus 1-23,25-47 [--secs 5] [--n 32]
+//! `--sib-spin 1`: each listed core's SMT sibling (cpu + 96) spins on `pause` throughout (an awake, idle sibling; the
+//! production siblings are parked by the kernel, metatron-cpu §3).
+//!
+//!   bench-power --mode M --cpus 1-23,25-47 [--secs 5] [--n 32] [--sib-spin 0]
 //!
 //! modes: idle; chain (dependent scalar adds); vmadd (`vpmaddubsw` on registers only); l1 / l2 / l3
 //! (AVX2 loads over 16 KB / 256 KB / 2 MB a core); dram (AVX2 loads over 256 MB a core, streamed);
@@ -146,6 +149,18 @@ fn main() {
     let ready = Barrier::new(list.len() + 1);
     let (go, stop) = (Barrier::new(list.len() + 1), AtomicBool::new(false));
     let measuring = AtomicBool::new(false);
+    let sib_quit = std::sync::Arc::new(AtomicBool::new(false));
+    if num("--sib-spin", 0) == 1 {
+        for &c in &list {
+            let q = sib_quit.clone();
+            std::thread::spawn(move || {
+                harness::bench::pin(c + 96);
+                while !q.load(Ordering::Relaxed) {
+                    std::hint::spin_loop();
+                }
+            });
+        }
+    }
     let rows = std::sync::Mutex::new(Vec::new());
     std::thread::scope(|sc| {
         for (t, &cpu) in list.iter().enumerate() {

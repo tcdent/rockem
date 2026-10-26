@@ -11,7 +11,7 @@
 //! `--cold-nta 1`: the items nobody touched (read once, from DRAM) read with `prefetchnta` `--dist` bytes ahead: their
 //! lines kept out of the L3 they would otherwise churn.
 //!
-//! `--smt a`: each core's SMT sibling (cpu + 96) streams the core's untouched items (the plan's rest, then the cold ones)
+//! Every touch is the node's (`touch_node.rs`). `--smt a`: each core's SMT sibling (cpu + 96) streams the core's untouched items (the plan's rest, then the cold ones)
 //! into their shared L2, up to `a` items ahead of the core, from the run's start (beside its warm items).
 //!
 //!   bench-window [--smt 0] [--cold-nta 0] [--dist 2048] [--oldest-first 0] [--cpus 49-71,73-95] [--plan 16] [--cold 4] [--window-us 440] [--retouch-kb 0] [--iters 100]
@@ -19,6 +19,8 @@ use harness::arg;
 use std::sync::{Arc, Barrier, Mutex};
 #[path = "gemv_hint.rs"]
 mod gemv_hint;
+#[path = "touch_node.rs"]
+mod touch_node;
 
 const K: usize = 4096;
 const ROWS: usize = 64;
@@ -36,20 +38,9 @@ fn list(spec: &str) -> Vec<usize> {
 fn num(name: &str, d: usize) -> usize {
     arg(name).map_or(d, |v| v.to_str().unwrap().parse().unwrap())
 }
-/// Every line of `b` read once, the deadline checked every 4 KB; false when it passed first.
+/// Every line of `b` read once with the node's touch, the deadline checked every 4 KB; false when it passed first.
 fn touch(b: &[u8], until: std::time::Instant) -> bool {
-    let mut s = 0u64;
-    let mut i = 0;
-    while i < b.len() {
-        if i % 4096 == 0 && std::time::Instant::now() >= until {
-            std::hint::black_box(s);
-            return false;
-        }
-        s = s.wrapping_add(unsafe { std::ptr::read_volatile(b.as_ptr().add(i)) } as u64);
-        i += 64;
-    }
-    std::hint::black_box(s);
-    true
+    unsafe { touch_node::touch(b.as_ptr(), b.len(), Some(until)) }
 }
 
 fn main() {
@@ -116,14 +107,7 @@ fn main() {
                                 if gen.load(Ordering::Relaxed) != g {
                                     break;
                                 }
-                                let p = a as *const u8;
-                                let mut x = 0u64;
-                                let mut o = 0;
-                                while o < n {
-                                    x = x.wrapping_add(unsafe { std::ptr::read_volatile(p.add(o)) } as u64);
-                                    o += 64;
-                                }
-                                std::hint::black_box(x);
+                                unsafe { touch_node::touch(a as *const u8, n, None) };
                             }
                         }
                     });

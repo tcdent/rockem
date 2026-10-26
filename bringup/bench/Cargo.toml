@@ -179,3 +179,7 @@ path = "src/window.rs"
 [[bin]]
 name = "bench-l3life"
 path = "src/l3life.rs"
+
+[[bin]]
+name = "bench-run"
+path = "src/run.rs"
