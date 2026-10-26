@@ -58,7 +58,10 @@
 //! `--main-pin c`: the main thread (it builds each phase's lists and spins in the barriers) pinned to core `c` (default:
 //! unpinned, wherever the kernel puts it). Reported: the gap from a round's last worker end to the next release.
 //!
-//!   bench-run [--main-pin -] [--pad-kb 0] [--ccd-barrier 0] [--retouch 0] [--ring-kb 1024] [--hold 0] [--stagger-ns 0] [--notouch 0] [--front 0] [--one-phase 0] [--regions 0] [--notime 0] [--plain 0] [--private 0] [--pages 2m] [--fixed 0] [--smt 0] [--multi 0] [--cpus 49-71,73-95] [--steal any] [--plan 45] [--cold 28] [--window-us 440] [--rounds 60] [--pool-mb 600]
+//! `--rotate 1`: worker w (by rank in its CCD) starts its own items 3·w items into its list and wraps (the CCD's eight
+//! streams at different offsets at any moment).
+//!
+//!   bench-run [--rotate 0] [--main-pin -] [--pad-kb 0] [--ccd-barrier 0] [--retouch 0] [--ring-kb 1024] [--hold 0] [--stagger-ns 0] [--notouch 0] [--front 0] [--one-phase 0] [--regions 0] [--notime 0] [--plain 0] [--private 0] [--pages 2m] [--fixed 0] [--smt 0] [--multi 0] [--cpus 49-71,73-95] [--steal any] [--plan 45] [--cold 28] [--window-us 440] [--rounds 60] [--pool-mb 600]
 use harness::arg;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -176,6 +179,7 @@ fn main() {
     let one_phase = num("--one-phase", 0) == 1;
     let regions = num("--regions", 0) == 1;
     let stagger_ns = num("--stagger-ns", 0) as u64;
+    let rotate = num("--rotate", 0) == 1;
     let hold_kb = num("--hold", 0);
     let ring_kb = num("--ring-kb", 1024);
     let retouch = num("--retouch", 0) == 1;
@@ -451,7 +455,13 @@ fn main() {
                         // the slot order as a sequence of claims: own (back), mates (front), this CCD's queue, the node's
                         // other CCDs, then farther as `--steal` allows
                         if plain {
-                            if front {
+                            if rotate {
+                                let n = own_s.len();
+                                let rank = mates_w.iter().filter(|&&m| m < wi).count();
+                                for i in 0..n {
+                                    run(own_s[(i + 3 * rank) % n.max(1)], 0);
+                                }
+                            } else if front {
                                 for &id in own_s.iter() {
                                     run(id, 0);
                                 }

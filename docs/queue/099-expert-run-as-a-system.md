@@ -498,8 +498,11 @@ pad after every item changes nothing (15.3–15.8 → 15.5 µs fixed-warm on one
 that every `bench-run` fixed-warm figure above was taken with a 3 ms idle window (the decay); at window 0 it reads 8.4,
 so the residual to explain is 8.4 against 4.3. With one phase and window 0 (the fewest gaps it can have) `bench-run`
 reads 8.5 and 10.8 in two runs — run-to-run variance it had not shown — against a no-priming decay curve that prices a
-100 µs gap at 5.2 and 500 µs at 6.3; its main thread is unpinned (it builds the lists and spins in the barriers):
-`bringup/box/logs/bench-run-mainpin.txt`.
+100 µs gap at 5.2 and 500 µs at 6.3. Its inter-run gap measures 40–80 µs (p50) and its main thread's placement does not
+matter (unpinned 8.4 / 10.8, core 0 10.9, core 48 9.8 / 10.1; a core of the measured CCD collides with its worker); the
+variance stands. What varies between runs is only which physical 2 MiB pages the pool gets — with `--regions` each
+worker's 2 MB region is one huge page, so the eight streams differ only in page-level address bits — hence `--pages 4k`
+(scattered) and `--rotate 1` (different offsets at any moment), repeated: `bringup/box/logs/bench-run-pagesvar.txt`.
 
 **Why it matters here:** every one of the node's expert runs follows a ~440 µs window of DRAM touching and `mwaitx`
 waits — no L3 hits for the core — so the node's warm items run in the decayed state on every layer; `bench-run`'s
