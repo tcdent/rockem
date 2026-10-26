@@ -538,6 +538,23 @@ phenomenon from the other side (eight cores read once-touched lines at 8.4 µs, 
 not named; what fits is a shared L3 structure whose benefit eight cores' hits re-earn slowly and which idle ages away.
 (`bench-run-recovery.txt`)
 
+## The node's shape in the steady state (2026-10-26, late; `bench-run --warmup 100 --pool-mb 2048`, two repeats each)
+The pool sized so no round re-reads a wrapped line (a 256 MB pool wrapped 17 times made the "cold" items 35 % L3 hits —
+the two-class policy keeps twice-hit lines; `bench-run-warm-nodeshape.txt`); here the cold items are 95 % DRAM:
+
+| | gate/up + down wall | own item | stolen item | cold item |
+|---|---|---|---|---|
+| today's schedule | 223 + 122 = **345 µs** | 13.3 µs, 6 % DRAM | 16.6, 17 % | 34.3, 95 % |
+| **re-touch** (each worker re-reads slices it touched 512 KB earlier) | 203–208 + 106 = **310 µs, −10 %** | 11.1 | 12.5, **5 %** | 34.2 |
+
+The re-touch is the hold with no footprint: L3 hits through the window (the state), promotion of the touched lines
+(the stolen items' losses 17 → 5 %), no extra lines. In the steady state it is worth ~10 % of a layer's run — ~35 µs a
+layer, ~1.5 ms a verify step at width 3 (inference from the per-step layer count). The warm-then-cold barrier adds
+nothing (`bench-run-warm-nodeshape.txt`). The node lab of the morning (1g) saw the step unchanged with the same re-touch;
+by the rule, that disagreement is the next thing to take back to the bench: what the node has that the bench lacks —
+the amend dropping pending re-touches, real multi-token items, the two phases' join — one at a time, before the node
+changes again.
+
 ## The state of the question (2026-10-26, end of day)
 **Established, with the bench that holds it:**
 - A warm (L3-fed) item costs ~4.3 µs + ~10 ns per line that comes from DRAM instead; the DRAM lines are the bytes model's
