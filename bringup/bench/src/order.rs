@@ -38,7 +38,11 @@
 //!
 //! `--pretouch 0`: no touch of the warm set before each run (the fixed set stays L3-resident from the runs before).
 //!
-//!   bench-order [--pretouch 1] [--gap-mode pause] [--spin 0] [--shared none] [--fresh] [--gap-us 0] [--cpus 49-71,73-95] [--n 3] [--rows 64] [--warm 9] [--cold 7] [--pool-mb 96] [--iters 200]
+//! `--ballast-mb n [--ballast-pages 2m|4k]`: before the run, a thread on the first listed core allocates and fills `n` MB
+//! of pool exactly as bench-run does (one mapping, `MADV_HUGEPAGE` or not, never read again): does its presence slow the
+//! cores' L3-fed reads?
+//!
+//!   bench-order [--ballast-mb 0] [--pretouch 1] [--gap-mode pause] [--spin 0] [--shared none] [--fresh] [--gap-us 0] [--cpus 49-71,73-95] [--n 3] [--rows 64] [--warm 9] [--cold 7] [--pool-mb 96] [--iters 200]
 use harness::arg;
 use std::sync::{Arc, Barrier, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -158,6 +162,22 @@ fn main() {
     };
     let shared_s: Option<usize> = shared_w.map(|_| huge::alloc_pages(t * ((nw0 + spread) * sbytes + 64), shared == "2m").as_ptr() as usize);
     let spin = num("--spin", 0) == 1;
+    let ballast_mb = num("--ballast-mb", 0);
+    if ballast_mb > 0 {
+        let hugep = !arg("--ballast-pages").is_some_and(|v| v.to_str() == Some("4k"));
+        let core0 = cpus[0];
+        std::thread::spawn(move || {
+            harness::bench::pin(core0);
+            let b = huge::alloc_pages(ballast_mb << 20, hugep);
+            for (i, x) in b.iter_mut().enumerate() {
+                *x = (i as u8) ^ 0x11;
+            }
+            std::hint::black_box(&b);
+        })
+        .join()
+        .unwrap();
+        println!("ballast: {ballast_mb} MB filled on core {core0} ({} MiB of the process in 2 MiB pages)", huge::huge_mib());
+    }
     let gap_mode = arg("--gap-mode").map(|v| v.to_str().unwrap().to_string()).unwrap_or("pause".into());
     let duty = num("--duty", 10);
     let pretouch = num("--pretouch", 1) == 1;

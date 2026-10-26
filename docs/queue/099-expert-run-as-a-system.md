@@ -512,8 +512,26 @@ between two loops that are now the same gemv over the same lines on the same cor
 `bench-order` 4.4–4.9). In simple mode the item is 6.6 whatever the read order, a 4 KB item pad or 4 KiB pages (105–108
 µs for 16 items, four runs), and `bench-order` at `bench-run`'s exact layout — shared regions at a 2 MiB + 64 B stride,
 16 items — reads 4.36–4.40. **Left open:** two loops that are the same gemv over the same lines on the same cores at the
-same gap, 1.45× apart (`bringup/box/logs/bench-run-simple2.txt`). It matters because the node is the system `bench-run`
-copies: whatever it is, the node may carry it.
+same gap, 1.45× apart (`bringup/box/logs/bench-run-simple2.txt`).
+
+**Resolved (2026-10-26, late): it is the L3-rate state's recovery, measured from its slow side.** `bench-run`'s rounds are
+not stationary — worker 0's 16 items: the first 10 rounds 158–168 µs (~10 µs an item), the last 10 of 60 rounds 84, the
+last 10 of 600 rounds **72.7 µs = 4.5 µs an item, `bench-order`'s number** (`bench-run-stationary.txt`). The cores enter
+the rounds deeply decayed (seconds of idle through the pool fill and setup) and recover over milliseconds of hits; a
+60-round average sits in the recovery. `bench-order` never showed it because its WarmOnly order runs last of five, after
+hundreds of iterations of L3 hits — it measures the steady state. The per-run variance (8.4–10.9) was how long each
+run's setup idled. On the way, every other candidate was refuted with a measurement, which is what makes this one stand:
+the compiled gemv (121 vs 125 instructions, identical loads), the clock (3.45 vs 3.63 GHz), memory placement (pages, pad,
+rotation, per-worker Vecs, a shared allocation in `bench-order`), small-buffer false sharing (staggered private pages),
+the main thread's placement, the round machinery (`--simple`), the per-item wrapper (`--raw`), the pool as ballast, and
+the fill counters (all L3, equal counts) — `bench-run-{pagesvar,privpages,mainpin,simple,simple2,raw,vecs,counters}.txt`,
+`bench-ballast.txt`.
+
+**Consequences.** (1) Every `bench-run` comparison above (hold, re-touch, warm-then-cold barrier, sibling streaming,
+pages, shares) was taken in the transient; `--warmup` exists now and they are to be redone in the steady state before any
+is believed. (2) The node's cores alternate ~440 µs without L3 hits and ~400 µs with: they live in this regime
+permanently, and their 10.6 µs own item is the decayed rate. The recovery curve (8 cores vs 1) and the one-core case's
+apparent immunity: `bench-run-recovery.txt`.
 
 ## The state of the question (2026-10-26, end of day)
 **Established, with the bench that holds it:**

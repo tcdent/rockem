@@ -61,14 +61,25 @@
 //! `--rotate 1`: worker w (by rank in its CCD) starts its own items 3·w items into its list and wraps (the CCD's eight
 //! streams at different offsets at any moment).
 //!
-//! `--priv-pages 1`: each worker's activations (q, scales, gsum) and its `out` in private pages instead of musl's malloc
+//! `--priv-pages 1|2`: each worker's activations (q, scales, gsum) and its `out` in private pages instead of musl's malloc
 //! (whose size-class groups put different threads' small buffers in adjacent slots, sharing cache lines: a store into a
-//! line another core reads costs ~35 ns, every item).
+//! line another core reads costs ~35 ns, every item); 1 at page-aligned offsets (which alias in the L1's sets), 2 at
+//! staggered offsets (64 B, 16 KB + 1088, 32 KB + 2112, 48 KB + 3136).
 //!
 //! `--simple 1`: after the first round, the workers run `--rounds` more rounds among themselves — a worker-only spin barrier,
 //! each worker's own list from that first round, nothing from the main thread in the loop (the round machinery removed).
 //!
-//!   bench-run [--simple 0] [--priv-pages 0] [--rotate 0] [--main-pin -] [--pad-kb 0] [--ccd-barrier 0] [--retouch 0] [--ring-kb 1024] [--hold 0] [--stagger-ns 0] [--notouch 0] [--front 0] [--one-phase 0] [--regions 0] [--notime 0] [--plain 0] [--private 0] [--pages 2m] [--fixed 0] [--smt 0] [--multi 0] [--cpus 49-71,73-95] [--steal any] [--plan 45] [--cold 28] [--window-us 440] [--rounds 60] [--pool-mb 600]
+//! `--vecs 1` (with `--private --regions --fixed`): each worker's region is a separate `Vec` it allocates and first-touches
+//! itself (bench-order's memory: eight threads faulting concurrently, physically interleaved) instead of its slice of the
+//! CCD's one pool (faulted sequentially by one core: near-contiguous physical pages).
+//!
+//! `--raw 1` (simple mode): the gemv called directly with precomputed pointers, no per-item counters or clock.
+//!
+//! `--warmup n`: `n` untimed rounds before the measured ones (default 0 — NB: a core's L3 read rate recovers from idle
+//! over milliseconds of hits, metatron-cpu §3.8; without a warm-up the first ~50 rounds are 2× slow and every comparison
+//! made before 2026-10-26 evening was taken in that transient). Simple mode prints the recovery curve: every 10th round.
+//!
+//!   bench-run [--warmup 0] [--raw 0] [--vecs 0] [--simple 0] [--priv-pages 0] [--rotate 0] [--main-pin -] [--pad-kb 0] [--ccd-barrier 0] [--retouch 0] [--ring-kb 1024] [--hold 0] [--stagger-ns 0] [--notouch 0] [--front 0] [--one-phase 0] [--regions 0] [--notime 0] [--plain 0] [--private 0] [--pages 2m] [--fixed 0] [--smt 0] [--multi 0] [--cpus 49-71,73-95] [--steal any] [--plan 45] [--cold 28] [--window-us 440] [--rounds 60] [--pool-mb 600]
 use harness::arg;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -187,8 +198,11 @@ fn main() {
     let regions = num("--regions", 0) == 1;
     let stagger_ns = num("--stagger-ns", 0) as u64;
     let rotate = num("--rotate", 0) == 1;
-    let priv_pages = num("--priv-pages", 0) == 1;
+    let priv_pages = num("--priv-pages", 0);
     let simple = num("--simple", 0) == 1;
+    let vecs = num("--vecs", 0) == 1;
+    let raw = num("--raw", 0) == 1;
+    let warmup = num("--warmup", 0);
     let hold_kb = num("--hold", 0);
     let ring_kb = num("--ring-kb", 1024);
     let retouch = num("--retouch", 0) == 1;
@@ -224,8 +238,11 @@ fn main() {
     let mates: Vec<Vec<usize>> = (0..nccd).map(|k| (0..cpus.len()).filter(|&w| ccd[w] == k).collect()).collect();
     let ccd_bars: Arc<Vec<Spin>> = Arc::new((0..nccd).map(|k| Spin { n: mates[k].len(), arrived: Line(AtomicUsize::new(0)), gen: Line(AtomicUsize::new(0)) }).collect());
     let t = cpus.len();
+    // --vecs: each worker's (weights, scales) base, published before the first round
+    let vec_pools: Arc<Vec<[AtomicUsize; 2]>> = Arc::new((0..t).map(|_| [AtomicUsize::new(0), AtomicUsize::new(0)]).collect());
     let wbar: Arc<Spin> = Arc::new(Spin { n: t, arrived: Line(AtomicUsize::new(0)), gen: Line(AtomicUsize::new(0)) });
     let simple_ns: Arc<Vec<Line>> = Arc::new((0..t).map(|_| Line(AtomicUsize::new(0))).collect());
+    let simple_ghz: Arc<Vec<Line>> = Arc::new((0..t).map(|_| Line(AtomicUsize::new(0))).collect());
     let pmc_ok = {
         let _ = std::fs::write("/proc/sys/kernel/nmi_watchdog", "0");
         cpus.iter().all(|&c| common::pmc::Pmc::open(c).is_some_and(|p| p.program(&common::pmc::FILLS))) && common::pmc::allow_rdpmc()
@@ -306,7 +323,11 @@ fn main() {
         .map(|wi| {
             let (ccdq, planq, deques, takers, bar, done, cls, measuring, round_end, t0s, phase_data) = (ccdq.clone(), planq.clone(), deques.clone(), takers.clone(), bar.clone(), done.clone(), cls.clone(), measuring.clone(), round_end.clone(), t0s.clone(), phase_data.clone());
             let ccd_bars = ccd_bars.clone();
-            let (wbar, simple_ns) = (wbar.clone(), simple_ns.clone());
+            let (wbar, simple_ns, simple_ghz, vec_pools) = (wbar.clone(), simple_ns.clone(), simple_ghz.clone(), vec_pools.clone());
+            let (pw1_w, ps1_w) = (pw1.clone(), ps1.clone());
+            let my_mates: Vec<usize> = mates[ccd[wi]].clone();
+            // --vecs: this worker's region is 2·plan/workers items of its CCD
+            let items_per = (2 * plan_k[ccd[wi]] / my_mates.len().max(1)).max(1);
             let (cpu, my_ccd, my_node) = (cpus[wi], ccd[wi], ccd_node[ccd[wi]]);
             let mates_w: Vec<usize> = mates[my_ccd].iter().copied().filter(|&m| m != wi).collect();
             let node_ccds: Vec<usize> = (0..nccd).filter(|&k| k != my_ccd && ccd_node[k] == my_node).collect();
@@ -317,21 +338,50 @@ fn main() {
             std::thread::spawn(move || {
                 use common::q4::{Act, QAct, GROUP};
                 harness::bench::pin(cpu);
+                // --vecs: this worker's own region as Vecs of its own
+                if vecs {
+                    let wv: Vec<u8> = (0..items_per).flat_map(|i| pw1_w.iter().map(move |&b| b ^ (i as u8 & 0x11))).collect();
+                    let sv: Vec<f32> = (0..items_per).flat_map(|_| ps1_w.iter().copied()).collect();
+                    vec_pools[wi][0].store(wv.as_ptr() as usize, Ordering::Release);
+                    vec_pools[wi][1].store(sv.as_ptr() as usize, Ordering::Release);
+                    std::mem::forget(wv);
+                    std::mem::forget(sv);
+                }
+                // an item's bytes: the CCD pool's, or (--vecs) the owning worker's Vec's — the owner of item i of CCD k is
+                // its region's worker (regions: slice s → mates[s·n/plan], item i = 2s or 2s + 1)
+                let (mm1, vp1, mm2, vp2) = (my_mates.clone(), vec_pools.clone(), my_mates.clone(), vec_pools.clone());
+                let wptr = move |id: usize| -> *const u8 {
+                    if vecs {
+                        let i = id & 0xffff_ffff;
+                        let w = mm1[(i / items_per).min(mm1.len() - 1)];
+                        (vp1[w][0].load(Ordering::Acquire) + (i % items_per) * ib) as *const u8
+                    } else {
+                        wptr(id)
+                    }
+                };
+                let sptr = move |id: usize| -> *const f32 {
+                    if vecs {
+                        let i = id & 0xffff_ffff;
+                        let w = mm2[(i / items_per).min(mm2.len() - 1)];
+                        (vp2[w][1].load(Ordering::Acquire) + (i % items_per) * sb * 4) as *const f32
+                    } else {
+                        sptr(id)
+                    }
+                };
+                let (wptr_s, sptr_s) = (wptr.clone(), sptr.clone());
                 let mut rng = common::testing::Rng::new(100 + wi as u64);
                 let x: Vec<f32> = (0..K).map(|_| rng.unit()).collect();
                 // the activations and the output: musl's malloc, or private pages of this worker's own
-                let (q, s, g, mut out): (&mut [i8], &mut [f32], &mut [i32], &mut [f32]) = if priv_pages {
+                let (q, s, g, mut out): (&mut [i8], &mut [f32], &mut [i32], &mut [f32]) = if priv_pages > 0 {
                     let pg = huge::alloc_pages(4 << 20, false);
-                    let (q, rest) = pg.split_at_mut(3 * K);
-                    let (sb_, rest) = rest.split_at_mut(4096);
-                    let (gb_, rest) = rest.split_at_mut(4096);
-                    let ob_ = &mut rest[..4096];
+                    let base = pg.as_mut_ptr();
+                    let (oq, os, og, oo) = if priv_pages == 2 { (64usize, (16 << 10) + 1088, (32 << 10) + 2112, (48 << 10) + 3136) } else { (0, 3 * K, 3 * K + 4096, 3 * K + 8192) };
                     unsafe {
                         (
-                            std::slice::from_raw_parts_mut(q.as_mut_ptr() as *mut i8, 3 * K),
-                            std::slice::from_raw_parts_mut(sb_.as_mut_ptr() as *mut f32, 3 * K / GROUP),
-                            std::slice::from_raw_parts_mut(gb_.as_mut_ptr() as *mut i32, 3 * K / GROUP),
-                            std::slice::from_raw_parts_mut(ob_.as_mut_ptr() as *mut f32, 3 * ROWS),
+                            std::slice::from_raw_parts_mut(base.add(oq) as *mut i8, 3 * K),
+                            std::slice::from_raw_parts_mut(base.add(os) as *mut f32, 3 * K / GROUP),
+                            std::slice::from_raw_parts_mut(base.add(og) as *mut i32, 3 * K / GROUP),
+                            std::slice::from_raw_parts_mut(base.add(oo) as *mut f32, 3 * ROWS),
                         )
                     }
                 } else {
@@ -364,8 +414,8 @@ fn main() {
                             if v != 0 {
                                 let id = v - 1;
                                 unsafe {
-                                    touch_node::touch(wptr(id), ib, None);
-                                    touch_node::touch(sptr(id) as *const u8, sb * 4, None);
+                                    touch_node::touch(wptr_s(id), ib, None);
+                                    touch_node::touch(sptr_s(id) as *const u8, sb * 4, None);
                                 }
                             }
                         }
@@ -456,6 +506,7 @@ fn main() {
                         }
                         let pd: &PhaseData = unsafe { &*phase_data.load(Ordering::Acquire) };
                         let (own_s, ccd_s) = (&pd.own[wi], &pd.ccd);
+                        let out_p = out.as_mut_ptr() as usize;
                         let mut run = |id: usize, class: usize| {
                             let c0 = if notime { (0, 0, 0) } else { read3() };
                             let ts = std::time::Instant::now();
@@ -557,11 +608,43 @@ fn main() {
                         if simple && phase == 0 {
                             // the workers alone: `rounds` rounds over this same list, timed per worker
                             let ids: Vec<usize> = own_s.clone();
+                            // --raw: the items' pointers once, the loop a bare gemv
+                            let ptrs: Vec<(usize, usize)> = ids.iter().rev().map(|&id| (wptr(id) as usize, sptr(id) as usize)).collect();
                             let mut total = 0u64;
-                            for _ in 0..rounds {
+                            let mut fills6 = [0u64; 6];
+                            let mut per_round: Vec<u64> = Vec::with_capacity(rounds);
+                            let mut nitems = 0u64;
+                            let read6 = || -> [u64; 6] { if pmc_ok { std::array::from_fn(|i| common::pmc::rdpmc(i as u32)) } else { [0; 6] } };
+                            let msr = |reg: u64| -> u64 {
+                                use std::os::unix::fs::FileExt;
+                                let f = std::fs::File::open(format!("/dev/cpu/{cpu}/msr")).expect("msr");
+                                let mut b = [0u8; 8];
+                                f.read_exact_at(&mut b, reg).expect("msr read");
+                                u64::from_le_bytes(b)
+                            };
+                            let (mut ap, mut mp) = (0u64, 0u64);
+                            for rr in 0..rounds + warmup {
                                 wbar.wait();
+                                if rr < warmup {
+                                    for &(w, sc) in ptrs.iter() {
+                                        unsafe { common::q4::avx2::gemv::<K>(ROWS, w as *const u8, sc as *const f32, &a, out_p as *mut f32) };
+                                    }
+                                    wbar.wait();
+                                    continue;
+                                }
+                                let (a0, m0) = (msr(0xE8), msr(0xE7));
                                 let r0 = std::time::Instant::now();
-                                if front {
+                                if raw {
+                                    for &(w, sc) in ptrs.iter() {
+                                        let f0 = read6();
+                                        unsafe { common::q4::avx2::gemv::<K>(ROWS, w as *const u8, sc as *const f32, &a, out_p as *mut f32) };
+                                        let f1 = read6();
+                                        for i in 0..6 {
+                                            fills6[i] += f1[i].wrapping_sub(f0[i]) & ((1 << 48) - 1);
+                                        }
+                                        nitems += 1;
+                                    }
+                                } else if front {
                                     for &id in ids.iter() {
                                         run(id, 0);
                                     }
@@ -570,10 +653,27 @@ fn main() {
                                         run(id, 0);
                                     }
                                 }
-                                total += r0.elapsed().as_nanos() as u64;
+                                let dt = r0.elapsed().as_nanos() as u64;
+                                total += dt;
+                                per_round.push(dt);
+                                let (a1, m1) = (msr(0xE8), msr(0xE7));
+                                ap += a1 - a0;
+                                mp += m1 - m0;
                                 wbar.wait();
                             }
                             simple_ns[wi].0.store((total / rounds as u64) as usize, Ordering::Release);
+                            if wi == 0 && per_round.len() >= 20 {
+                                let n = per_round.len();
+                                let avg = |v: &[u64]| v.iter().sum::<u64>() as f64 / v.len() as f64 / 1e3;
+                                println!("worker 0 rounds: first 10 {:.1} µs, last 10 {:.1}, min {:.1}, max {:.1}", avg(&per_round[..10]), avg(&per_round[n - 10..]), *per_round.iter().min().unwrap() as f64 / 1e3, *per_round.iter().max().unwrap() as f64 / 1e3);
+                                let curve: Vec<String> = (0..n).step_by(10).map(|i| format!("{:.0}", per_round[i] as f64 / 1e3)).collect();
+                                println!("worker 0 every 10th round (µs): {}", curve.join(" "));
+                            }
+                            if wi == 0 && nitems > 0 {
+                                let v: Vec<String> = fills6.iter().map(|&x| format!("{:.0}", x as f64 / nitems as f64)).collect();
+                                println!("worker 0 lines an item: {} ({})", v.join(" / "), common::pmc::FILL_NAMES.join(" / "));
+                            }
+                            simple_ghz[wi].0.store((2650.0 * ap as f64 / mp.max(1) as f64) as usize, Ordering::Release);
                             for (c, v) in local.borrow().iter().enumerate() {
                                 for x in 0..5 {
                                     cls[c][x].fetch_add(v[x], Ordering::Relaxed);
@@ -588,7 +688,7 @@ fn main() {
         .collect();
 
     let mut cursor = vec![0usize; nccd];
-    for r in 0..(if simple { 1 } else { rounds + 1 }) {
+    for r in 0..(if simple { 1 } else { rounds + 1 + warmup }) {
         if fixed {
             cursor.iter_mut().for_each(|c| *c = 0);
         }
@@ -615,7 +715,7 @@ fn main() {
             }
             planq[k].set((0..plan_k[k]).map(|s| (plan_slices[k][s] << 16) | s).collect());
         }
-        measuring.store(r > 0, Ordering::Relaxed);
+        measuring.store(r > warmup, Ordering::Relaxed);
         bar.wait(); // window
         bar.wait(); // window over: build the run
         let mut phase_items: [Vec<(usize, usize, Option<usize>)>; 2] = [Vec::new(), Vec::new()];
@@ -655,7 +755,7 @@ fn main() {
             }
             let rel = epoch.elapsed().as_nanos() as u64;
             if let Some(e) = last_end {
-                if r > 0 {
+                if r > warmup {
                     gaps.push(rel.saturating_sub(e));
                 }
             }
@@ -665,7 +765,7 @@ fn main() {
             wall[ph] = (epoch.elapsed().as_nanos() as u64).saturating_sub(t0s.load(Ordering::Relaxed));
             last_end = Some(epoch.elapsed().as_nanos() as u64);
         }
-        if r > 0 {
+        if r > warmup {
             walls.lock().unwrap().push(wall);
             let re: [Vec<u64>; 2] = std::array::from_fn(|ph| (0..t).map(|w| round_end[w][ph].0.load(Ordering::Acquire) as u64).collect());
             ends.lock().unwrap().push(re);
@@ -677,7 +777,9 @@ fn main() {
         }
         let mut v: Vec<usize> = simple_ns.iter().map(|l| l.0.load(Ordering::Relaxed)).collect();
         v.sort_unstable();
-        println!("simple rounds: a worker's run of its {} items, p50 {:.1} µs, max {:.1}", 0, v[v.len() / 2] as f64 / 1e3, v[v.len() - 1] as f64 / 1e3);
+        let mut gz: Vec<usize> = simple_ghz.iter().map(|l| l.0.load(Ordering::Relaxed)).collect();
+        gz.sort_unstable();
+        println!("simple rounds: a worker's run of its items, p50 {:.1} µs, max {:.1}; clock over the runs {:.2}–{:.2} GHz", v[v.len() / 2] as f64 / 1e3, v[v.len() - 1] as f64 / 1e3, gz[0] as f64 / 1e3, gz[gz.len() - 1] as f64 / 1e3);
         let n = 1.0;
         for (c, name) in ["own", "stolen", "CCD queue", "node's CCD", "socket's CCD", "far socket"].iter().enumerate() {
             let v: Vec<u64> = cls[c].iter().map(|x| x.load(Ordering::Relaxed)).collect();
