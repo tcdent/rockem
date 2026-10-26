@@ -17,6 +17,12 @@
 interleaves its cold experts with its warm ones 25 % faster than warm-first. In the node the same change was 10 %
 slower (A/B on one boot). The two disagree in sign, so the bench is missing part of the system.
 
+> **Re-measured 2026-10-26, late, with the cores warmed up** (`bench-order --warmup 300`; the orders run in sequence,
+> WarmFirst first on cold cores — the recovery transient found at the end of this document): WarmFirst 440 → 413 µs (its
+> warm item 17.1 → 11.7), Interleave 358 → 362 (13.4 → 12.0). Interleaving's advantage is 12 %, not 19–25 %; a third of
+> the original effect was the transient. The sign disagreement with the node stands, smaller
+> (`bringup/box/logs/bench-order-premise.txt`).
+
 ## Measured, per item, by class (2026-10-25)
 The node (lab-order3: `pool_run` rows with each item timed by where it was claimed — the core's own deque, its CCD's
 queue, a mate's deque; orders cycled per step, 480 verify steps each, decodes at 18k):

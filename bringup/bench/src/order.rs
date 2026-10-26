@@ -42,7 +42,11 @@
 //! of pool exactly as bench-run does (one mapping, `MADV_HUGEPAGE` or not, never read again): does its presence slow the
 //! cores' L3-fed reads?
 //!
-//!   bench-order [--ballast-mb 0] [--pretouch 1] [--gap-mode pause] [--spin 0] [--shared none] [--fresh] [--gap-us 0] [--cpus 49-71,73-95] [--n 3] [--rows 64] [--warm 9] [--cold 7] [--pool-mb 96] [--iters 200]
+//! `--warmup n`: `n` untimed WarmOnly iterations before the orders (the cores' L3 read rate recovers from idle over
+//! milliseconds of hits, metatron-cpu §3.8; the orders run in sequence, so without this WarmFirst — first — is measured
+//! in the recovery and WarmOnly — fourth — in the steady state).
+//!
+//!   bench-order [--warmup 0] [--ballast-mb 0] [--pretouch 1] [--gap-mode pause] [--spin 0] [--shared none] [--fresh] [--gap-us 0] [--cpus 49-71,73-95] [--n 3] [--rows 64] [--warm 9] [--cold 7] [--pool-mb 96] [--iters 200]
 use harness::arg;
 use std::sync::{Arc, Barrier, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -163,6 +167,7 @@ fn main() {
     let shared_s: Option<usize> = shared_w.map(|_| huge::alloc_pages(t * ((nw0 + spread) * sbytes + 64), shared == "2m").as_ptr() as usize);
     let spin = num("--spin", 0) == 1;
     let ballast_mb = num("--ballast-mb", 0);
+    let warmup_iters = num("--warmup", 0);
     if ballast_mb > 0 {
         let hugep = !arg("--ballast-pages").is_some_and(|v| v.to_str() == Some("4k"));
         let core0 = cpus[0];
@@ -262,6 +267,13 @@ fn main() {
                 let ring_at = std::cell::Cell::new(0usize);
                 // WarmOnly's touch passes: [first, later] × (ns, L3 hits, DRAM lines, passes)
                 let pass_acc = std::cell::Cell::new([[0u64; 4]; 2]);
+                for _ in 0..warmup_iters {
+                    start.wait();
+                    for k in 0..nw {
+                        if fresh { item(&pool_w, &pool_s, k % pool_items) } else { item(&warm_w, &warm_s, k) }
+                    }
+                    start.wait();
+                }
                 for (oi, &order) in orders.iter().enumerate() {
                     for it in 0..iters + 1 {
                         // the prefetch: this core touches its warm items; the cold ones are the pool's next, untouched for
