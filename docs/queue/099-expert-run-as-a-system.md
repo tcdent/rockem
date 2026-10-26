@@ -1,254 +1,250 @@
-# 099 — The expert run as a system: what the bench does not model
+# 099 — The expert run as a system
 
-**Status:** Open — an investigation (tcdent, 2026-10-25), with measurements below
-**Area:** decode, the host's expert run, the cache hierarchy, the pool's scheduling
-**Gain:** unknown; the warm-item eviction tax below bounds one lever at ~3 ms a verify step if it is real
+**Status:** Open — the system is quantified (2026-10-25/26); one lever is bench-proven in the steady state and waits on a
+node lab; the mechanism of the L3-rate state is unidentified
+**Area:** decode, the host's expert run, the cache hierarchy, the pool's scheduling, how the benches measure
+**Gain:** the re-touch, ~10 % of a layer's run in the steady state (~1.5 ms a verify step at width 3, inference); the
+rest of the run is its cold bytes
 
 > yeah hang on don't give up on it yet unless you can explain why it's not working then we still have some more
 > discovery to do and modeling the hardware like you're doing at the very edge of our understanding is super valuable
 > — tcdent
 
-> let's think about ways in which it differs … quantifying the different systems that are running and the way that it's
-> being incorporated i'm okay with this spawning off into an effort for us to rethink parts of our architecture
-> fundamentally as well — tcdent
+> youre trying to get the hode to match the bench not the bench to match the node — tcdent
 
-## What started it
-090's `bench-order` (46 cores, per-core warm and cold sets sized as a verify step's layer at 18k) found a run that
-interleaves its cold experts with its warm ones 25 % faster than warm-first. In the node the same change was 10 %
-slower (A/B on one boot). The two disagree in sign, so the bench is missing part of the system.
+> page sizes and many other things can change on the node if you find gains in performance. we're trying to match best
+> case cache hits and dram throughput and the stack can adjust in any way necessary — tcdent
 
-> **Re-measured 2026-10-26, late, with the cores warmed up** (`bench-order --warmup 300`; the orders run in sequence,
-> WarmFirst first on cold cores — the recovery transient found at the end of this document): WarmFirst 440 → 413 µs (its
-> warm item 17.1 → 11.7), Interleave 358 → 362 (13.4 → 12.0). Interleaving's advantage is 12 %, not 19–25 %; a third of
-> the original effect was the transient. The sign disagreement with the node stands, smaller
-> (`bringup/box/logs/bench-order-premise.txt`).
+> I still want to try to figure out this unexplained portion. It's very strange to me that we can't definitively
+> quantify that — tcdent
 
-## Measured, per item, by class (2026-10-25)
-The node (lab-order3: `pool_run` rows with each item timed by where it was claimed — the core's own deque, its CCD's
-queue, a mate's deque; orders cycled per step, 480 verify steps each, decodes at 18k):
+This document is the current account. Appendix A is the record of how it was reached, kept because the order of
+discovery is itself evidence; Appendix B is the list of candidates refuted on the way, kept so none is tried twice;
+Appendix C holds the data tables. Where a number was taken in a regime later found misleading, it says so.
 
-| per item | warm first | interleaved | interleaved, a third of the CCD queue held back |
-|---|---|---|---|
-| own deque (warm) | 11.66 µs | 12.81 | 12.79 |
-| CCD queue (cold) | 34.3 µs | 32.0 | 31.8 |
-| stolen from a mate (warm) | 13.07 µs | 13.6 | 14.5 |
-| a run's last core done (median) | 144 µs | 166 | 184 (more items: wider steps) |
-| `experts`, ms a token | 6.81 | 7.55 | 7.06 |
+## 1. The question
 
-The bench (1 token, 64-row items ≈ 136 KB, the node's decode item size):
+The host's expert run is, per verify step, ~42 layers × one pool run of ~1,000–1,400 items over 92 cores: each item a
+gemv over a 128–136 KB slice of an expert (gate/up or down), claimed from a per-worker deque (slices this core touched in
+the prefetch window), from a mate's deque, or from the CCD's shared queue (slices nobody touched: cold). The window before
+the run (~440 µs, the cards' phase) touches the predicted experts' slices from DRAM so the run finds them in L3.
 
-| per item | warm only | warm first | interleaved |
-|---|---|---|---|
-| warm | 5.55 µs | 12.37 | 7.81 |
-| cold | — | 36.87 | 30.07 |
+090's bench found interleaving a run's cold items with its warm ones 25 % faster than warm-first; the node, 10 % slower.
+A bench and the node disagreeing in sign meant the bench was missing part of the system; this document is what the
+system turned out to be. Re-measured with warmed-up cores at the end (§3, rule 1), the bench's advantage is 12 %, not
+25 % — a third of the premise was a measurement artefact. The sign disagreement stands, smaller, and is open (§5).
 
-What this says:
-- **In the node interleaving costs the warm items (+10 %) and buys the cold ones little (−7 %).** In the bench it
-  bought both (warm −37 %, cold −20 %). The balance it removes (the CCD queue is the run's balancer) widens the end
-  spread; holding a reserve recovers part of it.
-- **The warm-item interference tax.** In the bench a warm item costs 5.55 µs alone and 12.4 when the CCD's other cores
-  stream cold data — not eviction (the counters below: its lines come from L3 either way) but interference. The node's
-  warm items cost 11.7 µs in every order: it may be paying this tax all the time. With ~470 warm items a pool run at ~6 µs
-  each, that is ~30 µs a run on 92 cores, ~3 ms a verify step — if the bench's 5.55 is reachable in the node.
+## 2. The system as measured
 
-## Where the lines come from (bench, fill counters, 2026-10-25)
-`bench-order` now reads the node's six fill counters (`common::pmc::FILLS`) around every item. Lines an item (2,176),
-L2-prefetch hits in L3 / L2-prefetch misses in L3 (DRAM): the warm items **~2,190–2,200 / 2–11 in every order**,
-warm-first included; the cold items ~19–33 / ~2,170–2,185. Demand fills are negligible (the L2 prefetcher fetches every
-line ahead of the kernel). So **the warm items are L3-resident in every order: nothing evicts them.** Yet a warm item
-costs 12.85 µs in warm-first against 5.67 alone (and 7.78 interleaved, 8.75 cold-first) with the same source: an L3-fed
-item runs ~2.3× slower while its CCD's other cores stream from DRAM. The non-temporal prefetch result agrees (it changes
-nothing: there was no eviction to prevent). Candidates, to measure: the L3's own bandwidth shared with the cold lines'
-victim installs (every DRAM line a core streams is written into L3 when its L2 evicts it); the CCD's fabric port; clocks
-under the 280 W cap while DRAM streams.
+### 2.1 The node's run, by item class (lab-order3 and lab-lossmap, 40–80k layer runs at 18k)
 
-## The interference is the CCD's memory path, not power or the socket (bench-interfere, 2026-10-25)
-One core (56) runs warm items — the production one-token kernel over a set it touched, L3-resident — while j cores
-stream the same kernel over a pool past the caches, on its own CCD (57–63, one L3: `shared_cpu_list` 56-63,152-159) or
-another (65–71). Median warm item, the warm core's clock (APERF/MPERF), the streamers' aggregate:
+A layer run at width 3, per run (the loss map, 2026-10-26; `bringup/reads/lossmap.sh`, `items.sh`):
 
-| j streamers | same CCD: warm item | GHz | streamers GB/s | other CCD: warm item | streamers GB/s |
+| item kind | items | µs an item | lines from DRAM | core-µs a core | DRAM MB |
 |---|---|---|---|---|---|
-| 0 | 4.56 µs | 3.45 | — | — | — |
-| 1 | 4.55 | 3.45 | 17.6 | 4.60 | 18.5 |
-| 2 | 4.59 | 3.45 | 31.0 | 4.56 | 31.2 |
-| 3 | 4.58 | 3.45 | 37.3 | 4.60 | 37.9 |
-| 4 | 5.17 | 3.45 | 38.7 | 4.58 | 40.1 |
-| 5 | 7.11 | 3.45 | 39.5 | 4.57 | 40.3 |
-| 6 | 10.25 | 3.45 | 39.6 | 4.57 | 40.7 |
-| 7 | 12.70 | 3.45 | 40.0 | 4.58 | 40.6 |
+| own deque, touched | 720 | 10.6 | 9.8 % | 82.7 | 8.7 |
+| a mate's deque (stolen), touched | 254 | 13.3 | 21.7 % | 36.7 | 8.0 |
+| own, touch abandoned mid-item | 111 | 13.3 | 55 % | 16.1 | 5.9 |
+| CCD queue (cold) | 335 | 33.5 | 93.9 % | 121.7 | 45.2 |
 
-- **Not power:** the clock holds at 3.45 GHz throughout.
-- **Not the socket:** streamers on another CCD leave the warm core at 4.6 µs.
-- **The CCD's own path to memory:** a CCD's DRAM reads saturate at ~40 GB/s with 3–4 streaming cores (the GMI2 port,
-  ~51 GB/s by spec, epyc-7r13-topology); every streamer past that adds no bandwidth and slows the CCD's L3-fed cores up
-  to 2.8× (inference: L3 hits queued behind outstanding misses in the CCD's shared request path — which queue is not
-  measured).
-- **Why interleaving lost in the node:** the node's run has all 8 cores of a CCD streaming cold items at once (warm
-  first or interleaved alike), so its warm items run at the clogged ~11.7 µs in every order; interleaving per core keeps
-  every core streaming, and costs the balance. The bench's even, synchronized shape happened to reward it.
-- The same mechanism, seen before from the other side: the main thread's route/dispatch doubled with seven cores
-  streaming beside it on its CCD (8.5 → 18 µs a layer, `PREFETCH_CORES_MAIN`, construct.rs).
+The cold items are ~half the run's core time at width 3, two thirds at width 4; the touched items carry 36 / 25 / 16 % of
+the run's DRAM bytes at widths 2 / 3 / 4. A run's workers end 23–50 µs apart (p10 to max); per verify step the pool's
+cores wait ~3.2 ms in these tails (`pool_run` rows). A touched slice's lines come from DRAM at the run in proportion to
+the fresh bytes its CCD inserted after it — its age in the window, and the run's own reads before it: 1–2 % young and
+before the run's first MB, 23–35 % past 8 MB of either (Appendix C). The oldest slices — the early plan's, the front of
+each deque, which thieves take — are the ones lost.
 
-**With every CCD of the socket streaming (the production shape; `--bg`: 38 streamers on socket 1's other five CCDs,
-134.9 GB/s):** the warm CCD's own sweep — j streamers: warm item µs / the CCD's streamers' GB/s — 0: 4.67 / —; 1: 4.60 /
-8.8; 2: 4.67 / 14.0; 3: 4.74 / 16.8; 4: 5.56 / 17.7; **5: 9.48 / 18.3; 6: 16.28 / 18.5; 7: 22.96 / 18.7** (clock 3.45 GHz
-throughout). With the socket loaded, a CCD's share saturates at ~17–18 GB/s with **3** streamers, and past that its
-L3-fed cores slow 2–5×. The node's run streams cold items on all 8 cores of every CCD.
+### 2.2 How the L3 behaves (the model; measurements in docs/metatron-cpu.md §3)
 
-## What it suggests (architecture)
-- **A CCD's DRAM streaming capped at its saturation point.** No more than ~3 cores of a CCD stream cold data at once
-  (a per-CCD semaphore on the cold queue); the others take warm items (own or stolen) meanwhile, at 4.6 µs instead of
-  ~12. Measured with the socket loaded: the saturation point is 3 streamers a CCD (~17–18 GB/s each CCD).
-- **The prefetch window the same way:** 8 touchers a CCD saturate the port as 3 would; fewer touchers leave cores free
-  (for 098's analog, for the main thread's phases) at the same delivery.
-- **Streamers and computers by role:** a CCD's few streamers pull the cold items into the CCD's L3 just ahead of the
-  computing cores (who then never wait on DRAM). The catch to design around: a line a core touches sits in its own L2
-  until evicted (l3-core-boundary), so a streamer's lines reach L3 only ~512 KB later.
+- **Victim cache; the toucher must be the reader.** A line a core touched sits in its L2 until evicted; a CCD-mate's
+  read of it refetches local-homed memory from DRAM (l3-core-boundary, 2026-10-22).
+- **Two classes.** A line that entered L3 once (an L2 victim) is replaced first, oldest first; a line that has hit in L3
+  is protected. One L3 hit promotes a line.
+- **Expiry is bytes, not time.** At 12 MB a CCD the oldest tenth of a touched set loses ~19 %, the newest ~4 %; 24 MB
+  loses 41 %; idle time changes nothing. Fresh lines lose to the previous round's read (protected) lines.
+- **A warm item's price:** ~4.3 µs + ~10 ns per line that comes from DRAM instead of L3 (8 cores of a CCD, steady state).
+  Fresh lines read once: 8.4 µs (387 of 2,176 lines lost); touched twice: 4.7 (71 lost). One core alone loses nothing.
+- Dirty victims are not kept; `prefetcht0` touches keep ~7 %; a non-temporal read does not protect (and the hinted gemv
+  reads ~35 % slower); ordering moves the loss, it does not remove it (oldest-first loses the newest instead);
+  non-temporal cold reads raise it (the cold lines are the fresh lines' cheapest victims).
 
+### 2.3 The L3-rate state (found 2026-10-26; `bench-order --gap-*`, `bench-run --simple`)
 
-- **Token count:** at 1 token (the served ~1.15 a verify-step expert) the bench still favours interleaving (350 vs 432 µs).
-- **Item size:** at the served gate/up pair size (~544 KB, 256 rows) still (416 vs 469).
-- **Uneven warm sets** (cores reach their cold items at different times): at 9 ± 6 warm items a core still (357 vs 450).
-- **A warm set inside L2:** interleaving's gain shrinks (330 vs 350) and the warm items slow (7.65 → 11.25 µs).
-- **Eviction of the warm lines:** the fill counters show them L3-resident in every order; `prefetchnta` on the cold
-  reads (1 and 4 KB ahead) changes nothing (warm 13.5–13.7 µs in warm-first, as without).
+A core's rate of L3-hit delivery depends on its recent L3-hit traffic, with millisecond dynamics:
 
-## A per-CCD cap on cold streamers, in the node (lab-cap, 2026-10-25): no gain
-Built: a semaphore a CCD on the run's shared (cold) queues — the first `cap` workers to arrive start on the CCD's queue at
-once, the rest on their own and their mates' warm items, streaming only with a slot; A/B on one clean boot, the cap
-cycling 0 (none, today's) / 3 / 2 step by step, 24 decodes at 18k, ~480 verify steps each:
+| what the core did before reading its L3-resident set (8 cores a CCD) | item µs |
+|---|---|
+| continuous L3 hits (steady state) | 4.35 |
+| 100 / 500 µs without hits, unprimed | 5.21 / 6.33 |
+| 1 / 3 / 10 ms without hits | 5.94 / 7.5 / 17.4 |
+| 3 ms of `pause`, a register-only loop, `mwaitx`, L2-resident reads or DRAM streaming (`prefetchnta`) | 7.1–7.8 (all decay) |
+| 3 ms of L3 reads of any data at ≥ ~5 GB/s (256 KB every 50 µs) | 4.3–4.4 (held) |
 
-| | no cap | cap 3 | cap 2 |
-|---|---|---|---|
-| `experts` a step, p50, width 2 / 3 / 4 (ms) | 13.6 / 21.4 / 29.1 | 14.8 / 21.3 / 32.2 | 14.3 / 21.0 / 28.5 |
-| own (warm) item | 11.84 µs | 13.15 | 12.9 |
-| CCD-queue (cold) item | 34.8 µs | 19.6 | 14.9 |
-| stolen (warm) item | 13.39 µs | 14.33 | 14.21 |
-| a pool run, p50 wall | 150 µs | 165 | 185 |
+- Uniform over the run that follows; the core clock is *higher* after a gap (3.72 vs 3.52 GHz) — not the clock.
+- Per core: one core's hits do not hold its mates; another CCD's traffic does not hold this one.
+- DRAM-fed reads are unaffected. Only L3 hits hold or restore it; L3 misses do not.
+- **It costs only under load, and recovers slowly under load:** one core recovers within one 2 MB round; eight cores
+  sharing an L3 take ~130 rounds (~10 ms: 263 → 125 → 93 → 81 → 72 µs a 16-item round from cold).
+- **The node lives in it:** every run follows a ~440 µs window of DRAM touching and `mwaitx` waits — no hits — so its
+  warm items run at the decayed rate on every layer. The node's 10.6 µs own item is this plus its lost lines.
+- Mechanism not identified. A per-core structure does not fit the recovery (one core: one round; eight: 130); a shared
+  L3 structure whose benefit many cores' hits re-earn slowly, and which idle ages away, fits everything measured.
+  Candidates not separated: the L2 prefetcher's adaptive depth, L3 request credits, replacement-state convergence.
 
-- **Each cold item streams faster, but the CCD delivers fewer:** 8 streamers complete ~0.23 cold items a µs (~31 GB/s a
-  CCD), 2 complete ~0.13. In the node a CCD is not saturated at 3 streamers as the bench's loaded socket was (17–18 GB/s
-  a CCD): the node's CCDs do not all stream at once, or not for the whole run.
-- **The warm items do not get faster.** Whatever holds the node's warm item at ~12 µs (the bench's: 4.6) is not other
-  cores' streaming. Refuted for the node: the CCD-path explanation of its warm items. Long SCORE bit-identical; not taken.
-- **Not the kernel either:** a node gate/up item is two 32-row `gemv`s (one token: `q4::gemm` drops to `gemv`) over
-  ~128 KB plus a 32-wide SwiGLU — the bench's warm item is one 64-row `gemv` over ~128 KB. Same kernel, same bytes, 2.6×
-  the time. Next suspects: where its lines come from by claim class (today's counters are by expert status: 85.7 % of a
-  complete expert's lines from L3, so ~14 % from DRAM), the core clocks under the socket cap with all cores busy, and the
-  touch's age (~400 µs, other cores touching meanwhile).
+### 2.4 The CCD's DRAM path, and the sum of sources
 
-## The node's warm items are not warm: the cost is the DRAM lines inside them (bench-item, 2026-10-25)
-`bench-item` (one core, 56, a set it touched just before) runs the node's item shapes one element at a time. Alone, every
-shape is the bench's 4.6 µs: the gate/up part as `gu_f` runs it (two 32-row `gemm`s over the layout's halves, SwiGLU into
-`h`) 4.71, with its group quantize 4.76, the down part with its `sfence` 4.55; the activations and `h` rewritten each rep
-by a core on its CCD, another CCD or socket 0 change nothing. **The item's code is not the cost.**
+`bench-interfere` (2026-10-25; its warm core ran continuous hits, so it stands): a CCD's DRAM reads saturate at ~40 GB/s
+with 3–4 streaming cores alone, ~17–18 GB/s each with the whole socket streaming; every streamer past saturation adds no
+bandwidth and slows the CCD's L3-fed cores 2–5× (a warm core 4.6 µs alone, 12.7 beside 7 streamers on its CCD, 23 with
+the socket loaded). Not power (3.45 GHz throughout), not the socket (streamers on another CCD change nothing). The node's
+run streams cold items on every core of every CCD.
 
-The node's own counters (`prefetch_use`, verify steps) say what is: lines from DRAM by the expert's prefetch status —
+**A CCD's run time is the sum of its sources' times, not their maximum** — re-measured in the steady state
+(`bench-run --warmup 100 --pool-mb 2560`, both sockets, ~16 MB a CCD a round): all-warm 176 + 104 = 280 µs, all-cold
+470 + 232 = 702, the node's mix 219 + 122 = 340 against a sum of 381 and a maximum of 214. L3-fed and DRAM-fed reads on
+a CCD do not overlap; so interleaving, caps, barriers and sibling streaming move time between sources under one path.
+(The all-warm configuration's 15.3 µs an item is the decayed rate: its 3 ms touching window has no hits in it.)
 
-| tokens | complete | partial | missed |
-|---|---|---|---|
-| 2 | 14.0 % | 43.8 % | 94.5 % |
-| 3 | 16.4 % | 32.9 % | 94.2 % |
-| 4 | 18.3 % | 27.4 % | 93.8 % |
+### 2.5 What does not matter (measured)
 
-Every slice of a complete expert was touched by the core that runs it (`slot_tab`: a planned slice goes to its taker's
-own deque), yet a seventh of its lines come from DRAM at the run. With `--cold-pct p` (p % of the item's lines flushed
-after the touch, runs of 16 lines) and `--bg` (streamers through the run), the median gemv64 item:
+The compiled kernel (121 vs 125 instructions, identical loads, in both benches); the item's code (the node's gate/up
+part with SwiGLU and group quantize, the down part with its `sfence`: 4.55–4.76 µs on one core, as a bare gemv);
+page size (4 KiB / 2 MiB: no change to the gemv's stream from L3 or DRAM); memory shape (one shared allocation or
+private Vecs, 2 MiB-aligned regions or odd strides, item padding, read order, rotation); small-buffer false sharing
+(private staggered buffers); the main thread's placement; start synchronization (futex vs spin); the SMT siblings'
+C-state (an awake sibling costs the core ~10 % of its compute under the power cap and gives the DRAM stream nothing);
+cross-socket interaction (one socket alone runs the same walls as both); the per-CCD share of items by worker count.
 
-| load | 0 % cold | 14 % | 40 % | 100 % |
+## 3. How to measure this (the rules that would have saved a day)
+
+1. **Warm the cores up.** A bench that reads L3-resident sets measures the recovery of §2.3 unless its cores have done
+   hundreds of rounds of hits first: `bench-run --warmup`, `bench-order --warmup`. `bench-order`'s orders run in sequence
+   (WarmFirst first, WarmOnly fourth): without a warm-up the first order is in the transient and the fourth is not —
+   which is how 090's 25 % and `bench-run`'s "unexplained 1.45×" both arose. Every `bench-run` and `bench-window` number
+   before the evening of 2026-10-26 was taken in the transient; Appendix A says which were re-measured.
+2. **The pool must not wrap.** (warm-up + measured rounds) × ~15 MB a CCD at the node's shape; a 256 MB pool wrapped 17
+   times made the "cold" items 35 % L3 hits (the two-class policy keeps twice-hit lines). `--pool-mb 2048` for 130 rounds.
+3. **Model the node with fresh lines.** A fixed set is protected by its own reuse and loses nothing; the node touches a
+   new layer's experts every window.
+4. **One core proves nothing about eight.** One core alone reads fresh lines at 4.7 µs, recovers from idle in one round
+   and loses no lines; the node's effects appear with the CCD's eight.
+5. **Record homing, the toucher, and what the cores did in the millisecond before.** `/proc/<pid>/numa_maps`, free memory
+   a node, toucher = reader (l3-core-boundary); the resident node slows benches run beside it (socket 1 alone: 287 µs a
+   phase with the node resident, 197 with its memory free) — use the bench boot `bringup/box/dev.cmdline.bench`.
+6. **Counters:** `common::pmc::FILLS` = demand fills from L3 / local DRAM / far, L2-prefetch hits in L2 / in L3 / misses.
+   An L3-fed gemv item is ~2,190 prefetch hits in L3 and ~20 demand fills; the L2 prefetcher brings every line. Fill
+   counters are not comparable across `prefetchnta` reads or sibling-streamed items. Reading MSRs between phases on many
+   cores desynchronizes them and changes the rate (46 cores: 3.06 → 3.72 GB/s); take clocks around whole runs only.
+7. **`box.sh` returns at the command's end marker** (before 2026-10-26 it waited its whole limit; a 10 s bench blocked
+   200 s). A bench round is ~0.1 s of measurement; `bench-run` fills pools in parallel. A failed build must stop the chain
+   (`exit ${PIPESTATUS[0]}`), or the previous binary runs under the new flags and reports a baseline as a result.
+8. **The benches and what each answers** (bringup/bench/src; musl binaries in bundles/tools; logs in bringup/box/logs):
+   `bench-run` — the node's schedule as the reference (deques, stealing, CCD queues, two phases, window; `--warmup`,
+   `--retouch`, `--hold`, `--smt`, `--ccd-barrier`, `--multi`, `--simple`/`--raw` for the bare loop); `bench-order` — a
+   warm/cold mix in five orders, fresh sets, gap modes (`--gap-us --gap-mode pause|busy|mwaitx|l2|l3|l3ring|dramnta|
+   pause_l3`), the L3-rate state; `bench-interfere` — one warm core against j streamers; `bench-item` — the node's item
+   shapes on one core, with cold-line fractions and background streamers; `bench-l3life` — a touched set's survival by
+   position, gap, filler; `bench-window` — a private-list model of window then run (superseded by `bench-run`; its numbers
+   were taken cold); `bench-power --sib-spin` — power and clock by sibling state; `bench-l3`, `bench-reuse` — the
+   2026-10-22 core-boundary work. The lab node code (loss map, re-touch, oldest-first) is
+   `bringup/expert-cache/labs/099-lossmap-retouch-fifo.patch`; the reads are `bringup/reads/{lossmap,retouch_ab,items}.sh`.
+
+## 4. Levers, with steady-state numbers
+
+`bench-run` at the node's width-3 shape, both sockets, `--warmup 100 --pool-mb 2048`, cold items 95 % DRAM, two repeats
+(`bench-run-warm-clean.txt`, `bench-run-warm-ceilings.txt`):
+
+| lever | wall (gate/up + down) a layer | own item | stolen item | status |
 |---|---|---|---|---|
-| none | 4.5 µs | 5.4 | 5.9 | 7.0 |
-| 7 streamers on its CCD (43 GB/s) | 11.8 | 15.2 | 20.3 | 23.7 |
-| 45 streamers over the socket (149 GB/s) | 17.5 | 25.7 | 40.7 | 48.4 |
+| today's schedule | 223 + 122 = **345 µs** | 13.3 µs, 6 % DRAM | 16.6, 17 % | reference |
+| **re-touch** — each worker re-reads the slices it touched 512 KB of touching earlier, through the window | 203–208 + 106 = **310, −10 %** | 11.1 | 12.5, 5 % | **bench-proven; node lab next** |
+| warm-then-cold a CCD (a barrier before the cold claims) | unchanged | | | nothing |
+| sibling streams the next cold item into the shared L2 | 219 + 125 vs 219 + 122 | 15.1 | 27.5 | zero-sum (cold items 18.5 µs, warm ones slower) |
+| a ring hold (a 1 MB L3 buffer a core read at 256 KB / 50 µs through the window) | worse: own DRAM 6 → 15 % (taken cold) | | | negative: footprint |
 
-- Both mechanisms are real and they stack: an L3-fed item slows while its CCD streams (above), and each DRAM line in it
-  costs the loaded rate. The node's cold items (34 µs) sit between the two loads.
-- **Why the cap gave nothing:** the uncapped "warm" cores pull 14–44 % of their lines from DRAM — they are streamers too.
-  The cap moved who streams; the CCD's DRAM bytes stayed the same.
-- **The lever is the DRAM bytes, and a fifth of them are prefetched lines that went missing.** In expert-equivalents of
-  DRAM lines a layer: tokens 2 — complete 0.97, partial 1.38, missed 2.56 (the leak 20 % of the total); tokens 3 — 1.36,
-  1.09, 5.87 (16 %). If the run is bound by its DRAM bytes, removing the leak is −16–20 % of `experts` (inference, not
-  measured: ~2.7–3.4 ms a verify step at widths 2–3).
-- Open: where a touched line goes before its run. Candidates: L3 eviction between the touch and the run (the touch's age,
-  the CCD's other lines meanwhile), the lines of stolen slices (a mate's L2, l3-core-boundary), the partial experts'
-  touched slices counted with them.
+The re-touch is the hold of §2.3 with no footprint: L3 hits through the window (holds the state), promotion of the
+touched lines (protects them: the stolen items' losses 17 → 5 %), no extra lines. Its earlier null results — the node lab
+of 2026-10-26 morning, `bench-window`, cold `bench-run` — were taken in the transient; in the node lab the amend also drops
+the pending re-touches and a worker's last 512 KB is never re-read.
 
-## The leak reproduced: Milan's L3 drops fresh lines first, and one L3 hit protects them (bench-order --fresh, 2026-10-25)
-The bench's warm sets had been the same lines every iteration (L3-resident from the iterations before, the touch adding
-nothing). `--fresh 1` takes each iteration's warm items from the pool — new lines, touched from DRAM, then run — as the
-node's prefetch touches a new layer's experts. The leak appears. Warm-only (no cold traffic in the run), 8 cores of one
-CCD (56–63), the CCD's touched bytes a round against the warm lines then read from DRAM:
+Measured in the node and found zero-sum: a per-CCD cap on cold streamers (cold items 2× faster, fewer of them, the step
+unchanged — the "warm" cores were streamers too, 14–44 % of their lines from DRAM); oldest-first (own items lose more,
+stolen less); the morning's re-touch (complete experts' DRAM 14 → 9 %, the partial experts' first touches fewer, the
+step unchanged).
 
-| CCD touched | 3.3 MB | 6.5 MB | 9.8 MB | 15.2 MB | 21.8 MB |
-|---|---|---|---|---|---|
-| warm lines from DRAM | 0.3 % | 2.6 % | 7.2 % | 15.8 % | 33 % |
+### 4.1 What would move the node, from the data
 
-- **One core alone loses nothing** (2.7 MB touched, 0.1 %); 8 on one CCD lose 7 % at 10 MB — a third of the 32 MB L3.
-  Not LRU capacity: the replacement drops lines with no hit history first. The fixed sets (every line hit each
-  iteration) lost nothing at 46 cores.
-- **One L3 hit protects a line.** The fresh set touched twice or three times before the run:
+1. **The re-touch, built as the bench ran it** (every slice re-read 512 KB later, kept across the amend, the last 512 KB
+   included), with the loss-map measurement: predicted −10 % of the run, ~1.5 ms a verify step at width 3. If the node
+   does not show it, the disagreement goes back to the bench first (§5).
+2. **Fewer cold bytes:** the cold items are the run — 098's predictor, residency on the cards, formats.
+3. **The clock under the 280 W cap** (power per MAC, metatron-cpu §4).
+4. **The L3-rate state's mechanism:** if it is a prefetcher or credit setting there may be a knob; if it is replacement
+   convergence there is not. Until named, the hold is the lever.
 
-| CCD touched | order | 1 touch | 2 touches | 3 touches |
-|---|---|---|---|---|
-| 9.8 MB | warm only | 7.0 % | 0.6 % | 0.2 % |
-| 9.8 MB | cold first | 16.3 % | 0.9 % | 0.1 % |
-| 15.2 MB | warm only | 16.4 % | 2.0 % | 0.2 % |
-| 15.2 MB | cold first | 35.0 % | 4.5 % | 0.4 % |
-| 21.8 MB | cold first | 53 % | 11 % | 2.2 % |
+## 5. Open
 
-- **The node's shape (46 cores, 11 fresh items a core ≈ 1.5 MB, the node's ~11.6 MB a CCD):** one touch loses 6.3 % (warm
-  first) to 21.8 % (cold first) of the warm lines — the node's 14–18 % sits inside; two touches 0.8–1.3 %. The warm item
-  15.6 → 9.3 µs interleaved, 12.4 → 8.1 warm only; the interleaved run 438 → 371 µs (−15 %); warm-first's run is set by its
-  cold phase and does not move (538 → 543).
-- **The second pass's cost:** ~110 µs a core for 1.5–2 MB, L3-fed (11,471 L3 hits, 873 DRAM lines: the lines the first
-  pass already lost); the first pass ~440 µs, DRAM-fed. It is core time in the window, not DRAM bytes.
-- Where it fits the node: the window's DRAM delivery saturates a CCD with ~3 streamers (above), so a CCD's other cores
-  are free to re-touch from L3 what the streamers brought — the re-touch must reach a line after it left its toucher's L2
-  (a mate's read of a line in the toucher's L2 refetches from DRAM, l3-core-boundary).
+- **The mechanism of §2.3.** Discriminating experiments: a pointer chase (latency) in the decayed vs steady state — a
+  latency rise names the interface, a bandwidth-only loss names concurrency (prefetch depth or credits); the recovery's
+  dependence on the number of cores hitting (2 and 4 between 1 and 8).
+- **The node vs the bench, two disagreements, by the rule bench-first:** interleaving (+12 % in the bench warm, −10 % in
+  the node) and the re-touch (−10 % in the bench, nothing in the node lab). What the node has that `bench-run` lacks:
+  the amend mid-window (drops pending re-touches; re-plans), real multi-token items (the bench's 86/12/2 % mix is
+  `--multi`), the SwiGLU/quantize between phases, the main thread's route/dispatch on core 1's CCD, the cards' BAR
+  traffic and the loader, prow rows. One at a time.
+- **The node's residual:** its own item prices at ~5.8 µs by §2.2 plus the decay of its window; it measures 10.6.
+- **The 3.2 ms of tails a step** (workers waiting for a run's last core): the two phases' join and the queue's end have
+  no bench model yet.
 
-## The re-touch in the node: the leak falls a third, the step does not move (lab-retouch, 2026-10-26)
-Built (lab): each prefetch worker touches again every range it touched at least 512 KB earlier (`RETOUCH_LAG`, out of
-its L2), after each item; on alternate decode steps (`LAB_RETOUCH`, `retouch` on the `step` and `prefetch_use` rows);
-24 decodes at 18k on one boot (`bringup/reads/retouch_ab.sh`):
+## Appendix A — The record (2026-10-25/26), in the order it happened
 
-| | width 2 | width 3 | width 4 |
-|---|---|---|---|
-| `experts` p50 a step, off → on (ms) | 12.27 → 12.21 | 17.97 → 18.35 | 26.55 → 24.99 |
-| complete experts' lines from DRAM | 12.2 → 9.0 % | 14.5 → 9.3 % | 15.4 → 9.9 % |
-| partial experts' lines from DRAM | 40.2 → 42.6 % | 32.4 → 37.3 % | 27.1 → 31.3 % |
-| DRAM lines a layer run, per host expert (k) | 52.0 → 49.9 | 74.4 → 75.1 | 97.9 → 92.7 |
+Each step's finding, and what later superseded it. Logs: `bringup/box/logs/<name>.txt`.
 
-- The complete experts' leak falls by a third, not to the bench's ~1 %: a worker's last 512 KB is never re-touched (a
-  third of its ~1.5 MB), and the amend's new job drops the early plan's pending re-touches.
-- **The re-touch costs window time:** the partial experts' first touches fall behind by about what the complete ones
-  save; the run's DRAM lines per expert do not move, nor does the step.
+1. **Per-class item times in the node** (lab-order3): own 11.7 µs, stolen 13.1, cold 34.3; interleaving +10 %. Stands.
+2. **The bench's fill counters** (`bench-order`): warm items L3-resident in every order yet 2.3× slower beside
+   streamers — "interference, not eviction". Stands as the §2.4 mechanism; it is not the node's warm-item cost.
+3. **The interference matrix** (`bench-interfere`, `-bg`): 3–4 streamers saturate a CCD; the socket loaded, 3. Stands.
+   Led to the cap, and to an "architecture" sketch of streamers and computers by role that the cap refuted.
+4. **The cap in the node** (lab-cap): no gain; the "warm" cores were streamers too. Stands.
+5. **`bench-item`**: the item's code is not the cost (4.5–4.8 µs on one core, every shape). Stands. The DRAM lines
+   inside prefetched items named as the cost and "removing the leak −16–20 %, ~3 ms a step" estimated — retracted at 7.
+6. **The leak reproduced** (`bench-order --fresh`): Milan's L3 drops fresh lines first, one hit protects. Stands (§2.2);
+   it was already in docs/metatron-cpu.md §3 from 2026-10-22, unread — the day's first avoidable repetition.
+7. **The re-touch in the node** (lab-retouch) and `bench-window`: the leak falls a third, the step does not move; the
+   −3 ms estimate retracted. Superseded in part: both were cold measurements; the steady-state bench says −10 % (§4).
+8. **The loss map** (lab-lossmap): loss by age and run churn; the layer budget (§2.1). Stands.
+9. **Oldest-first** (lab-fifo) and **non-temporal cold reads** (`bench-window`): move or raise the loss. Stands.
+10. **`bench-run`** built as the schedule reference; its construction measured mutex starts, futex wakes, shared
+    counters, cross-socket steals (a far-socket item 625 µs), and the resident node's drag on benches. Stands as rules.
+11. **2 MiB pages, per-CCD shares, token mix, sibling streaming** in `bench-run`: taken cold; sibling streaming re-measured
+    warm (zero-sum, §4); the others do not matter (§2.5).
+12. **"One delivery path, the sum not the max"**: taken cold; re-measured warm and holds (§2.4).
+13. **The L3-rate decay**, found by refusing the two benches' 3× disagreement on identical lines (§2.3). Stands.
+14. **The ring hold** at the node's shape: negative (footprint). Stands. The re-touch as the footprint-free hold.
+15. **Warm-then-cold barrier**: nothing. Stands.
+16. **The 1.45× residual** between `bench-run --simple` and `bench-order` on identical lines: resolved as the recovery
+    transient (§2.3, §3.1) after every candidate of Appendix B was refuted; `--warmup` added to both benches.
+17. **The premise re-measured warm**: interleaving +12 %, not +25 % (§1).
+18. **The steady-state node shape**: the re-touch −10 %; the sum of sources holds; sibling streaming zero-sum (§4).
 
-**The window modelled (`bench-window`, 46 cores):** each core touches fresh planned items for 440 µs (the node's
-window; it reaches 10.4 items ≈ 1.4 MB a core, the node's ~11.6 MB a CCD), then the run — its touched items newest first,
-the plan's rest, 4 cold items:
+## Appendix B — Refuted candidates (so none is tried twice)
 
-| re-touch | run p50 | touched a core | touched lines from DRAM | run DRAM lines a core |
-|---|---|---|---|---|
-| off | 645 µs | 10.43 items | 6.2 % | 21,032 |
-| 512 KB behind | 655 µs | 10.11 | 1.4 % | 21,122 |
-| 1024 KB behind | 632 µs | 10.35 | 3.5 % | 21,234 |
+For the node's warm item and the benches' disagreements, each refuted by a measurement: the item's code (bench-item);
+CCD streaming interference as the node's warm-item cost (the cap; the warm-then-cold barrier); eviction of warm lines
+in the bench's fixed sets (fill counters); power and clock under these loads (3.45 GHz throughout bench-interfere; 3.45
+vs 3.63 GHz between the benches); the socket (other CCDs' streamers); page size; 2 MiB-stride and page-level aliasing
+(pad, rotation, 4 KiB pages, odd strides in bench-order); memory shape (shared allocation vs private Vecs, both ways);
+small-buffer false sharing (staggered private pages; the page-aligned variant aliased in L1 and read 7 % slower — a
+confound to remember); the main thread's placement and spinning; the round machinery, the per-item wrapper, the deque
+claims (`--simple`, `--raw`); a big pool as ballast; the compiled gemv; the SMT siblings' C-state as a DRAM lever (an
+awake sibling costs ~10 % compute; the scalar touch's +10 % was the access pattern's, not the node's touch); a per-CCD
+cap; a ring hold; oldest-first; `prefetchnta` on warm or cold reads; `bench-window`'s sibling-streaming gain (cold,
+private lists; not reproduced by the faithful schedule, cold or warm).
 
-The re-touch removes the leak and buys nothing: the window is the limit, and what a re-touch protects it pays for in
-first touches not made. **Correction:** the "−16–20 % of `experts`, ~3 ms a verify step" estimate above assumed the
-leaked lines could be recovered at no window cost; at the node's window they cannot, by re-touching on the touching
-cores. Recovering them is worth something only from capacity the window does not use (cores past a CCD's DRAM
-saturation, re-touching what the streamers brought — not yet built or measured), or without a touch at all.
-The node's leak (12–15 %) is larger than the model's (6 %): its ordering and the amend's churn, not yet separated.
+## Appendix C — Tables kept from the record
 
-## The node's loss map (lab-lossmap, 2026-10-26)
-Built (lab, `lossmap` in construct.rs): every prefetch touch stamps its slice with its CCD's running count of
-first-touched bytes; every run item (counted runs) adds its L3 hits, DRAM lines and time to a histogram over the
-step's width, re-touch on/off, its claim (own deque / a mate's / the CCD queue), who touched its slice (early plan /
-amended plan / no finished touch), its **age** (bytes its CCD first-touched after the slice) and the bytes its CCD's run
-had read before it. 40 decodes at 18k, ~80k layer runs; `bringup/reads/lossmap.sh`.
-
-Own touched items, re-touch off — lines from DRAM, by age (rows) and the CCD's run reads before the item (columns):
+**The node's loss map** (own touched items, re-touch off; lines from DRAM by age — fresh bytes the CCD touched after the
+slice — and the CCD's run reads before the item):
 
 | age \ run before | <1 MB | 1–2 | 2–4 | 4–8 | 8+ |
 |---|---|---|---|---|---|
@@ -259,386 +255,33 @@ Own touched items, re-touch off — lines from DRAM, by age (rows) and the CCD's
 | 8–12 MB | 5.5 | 5.8 | 9.3 | 11.4 | 22.9 |
 | 12–16 MB | 10.8 | 13.0 | 18.7 | 22.3 | 35.1 |
 
-and their time (µs an item): 7.8–9.8 at young ages past the run's first MB, 10.7–14 at 8+ MB of run reads before, and
-10–17 in the run's first MB at every age (the run's start, not its lines: those items lose 3–5 %).
+**The node's lines from DRAM by prefetch status** (`prefetch_use`, verify steps): complete experts 14.0 / 16.4 / 18.3 %
+at widths 2 / 3 / 4; partial 43.8 / 32.9 / 27.4 %; missed ~94 %.
 
-- **The node's loss is the bytes model's:** a touched line's risk grows with the fresh bytes inserted after it — the
-  window's touches (age) and the run's own reads (columns) alike. The oldest slices (the early plan's; the front of
-  each deque, which thieves take) are the ones lost.
-- **A layer run's budget** (width 3, re-touch off; per run: items, µs an item, lines from DRAM, core-µs a core, DRAM MB):
+**The cap in the node** (24 decodes at 18k, the cap cycling per step): `experts` a step p50 at widths 2 / 3 / 4 — no cap
+13.6 / 21.4 / 29.1 ms, cap 3 14.8 / 21.3 / 32.2, cap 2 14.3 / 21.0 / 28.5; cold items 34.8 → 19.6 → 14.9 µs, own items
+11.8 → 13.2 → 12.9, a run's wall 150 → 165 → 185 µs.
 
-| kind | items | µs | DRAM | core-µs | DRAM MB |
-|---|---|---|---|---|---|
-| own, touched | 720 | 10.6 | 9.8 % | 82.7 | 8.7 |
-| stolen, touched | 254 | 13.3 | 21.7 % | 36.7 | 8.0 |
-| own, touch abandoned mid-item | 111 | 13.3 | 55 % | 16.1 | 5.9 |
-| CCD queue (cold) | 335 | 33.5 | 93.9 % | 121.7 | 45.2 |
+**The lab re-touch** (alternate steps, 24 decodes): `experts` p50 off → on at widths 2 / 3 / 4: 12.27 → 12.21, 17.97 →
+18.35, 26.55 → 24.99 ms; complete experts' DRAM lines 12.2 → 9.0 / 14.5 → 9.3 / 15.4 → 9.9 %; partial experts' 40 → 43 /
+32 → 37 / 27 → 31 %.
 
-  At width 2 the touched items carry 36 % of the run's DRAM bytes, at 3 25 %, at 4 16 %. The cold items are ~half the
-  run's core time at width 3 and two thirds at width 4.
-- **What the leak is worth (inference):** touched items at the young, low-churn cells' cost (~8–9.4 µs) instead of their
-  mean (10.6 own, 13.3 stolen) is ~20 % of their time, ~8–11 % of `experts` (~1.4 ms a verify step) — an upper bound:
-  part of that excess is the CCD's streaming beside them, not their own lines.
-- **The re-touch arm** (same boot): touched items 11.3 → 9.7 µs (width 3), their DRAM 13.3 → 9.1 %; per item over the
-  whole run −1.4 to −4 %; the arms' item mixes differ (steps alternate), so the step-level difference is within noise.
+**Fresh-line loss by the CCD's touched bytes** (8 cores, warm only): 3.3 MB 0.3 %, 6.5 MB 2.6 %, 9.8 MB 7.2 %, 15.2 MB
+15.8 %, 21.8 MB 33 %; touched twice at 15.2 MB: 2.0 %; three times: 0.2 %. By core count, 15 items each, lines lost of
+2,176 → item µs: 1 core 11 → 4.31; 2 32 → 4.47; 4 125 → 5.35; 8 387 → 8.41; touched twice at 8: 71 → 4.72.
 
-## Ordering and hints do not reduce the loss; they move it (2026-10-26)
-- **Oldest first** (lab-fifo: the owner claims its deque from the front on alternate steps, re-touch off, the same loss
-  map): own items lose more (8.8 → 12.4 % at width 2, 10.2 → 13.4 % at 3, 11.0 → 15.0 % at 4) and stolen ones less (17.4 →
-  10.3 %, 22.2 → 12.0 %, 24.4 → 14.2 %); the newest slices, safe in their toucher's L2 under newest-first, now wait out the
-  run once evicted. Within a layer the loss is set by the bytes a CCD inserts; the order picks which lines pay. Not
-  taken.
-- **Cold reads non-temporal** (`bench-window --cold-nta 1`, the items nobody touched read with `prefetchnta`): the
-  touched lines' loss rises (4.2 → 8.4–9.3 %; with 8 cold items 3.3 → 5.7 %), the run unchanged. The cold lines in the L3
-  are the cheapest victims the next window's fresh lines find; without them the fresh lines displace each other. (The
-  fill counters under `prefetchnta` are not comparable for the hinted reads themselves.) Not taken.
+**The gap curve** (8 cores, 15 L3-resident items each, unprimed): 20 µs 4.64, 50 4.86, 100 5.21, 200 5.52, 500 6.33;
+primed by a pre-touch: 1 ms 5.94, 3 ms 7.3–7.6, 10 ms 17.4. Hold by a rotating 1 MB ring per 50 µs slot: 1–16 KB nothing,
+64 KB 5.94, 128 KB 4.67, 256 KB 4.40, 512 KB 4.37. Recovery after 10 ms idle, by full-rate L3 reads: 100 µs 16.6, 300 µs
+10.9, 1 ms 4.35.
 
-## The run as quantified (2026-10-26)
-- **A touched line's survival** is the CCD's fresh bytes after it (the window's touches and the run's own reads), the
-  once-referenced class replaced oldest first, the previous layer's read lines protected (metatron-cpu §3).
-- **The leak's ceiling** is ~8–11 % of `experts` (inference, the loss map's budget); every way of buying it back measured
-  so far costs about what it returns: a re-touch costs window time (first touches), a flush 12.4 ns a line, the
-  non-temporal warm read ~35 % of the gemv, ordering only moves it, non-temporal cold reads make it worse.
-- **A warm item that loses nothing** costs ~7.8 µs in the node against 4.6 alone in the bench: the socket's power cap
-  (3.04 vs 3.44 GHz under the gemm, metatron-cpu §4: → ~5.2 µs) and the CCD's streaming beside it (~2.6 µs; the
-  interference section above).
-- **The cold items are the run:** ~half its core time at width 3, two thirds at width 4, at 30–36 µs an item, the CCD's
-  DRAM path. The levers on them are fewer cold bytes (the predictor, 098; residency; formats) and the clock (power
-  per MAC).
+**The recovery curve from cold** (`bench-run --simple`, 8 cores, 16 items a worker, every 10th round, µs): 263 125 110 93
+95 89 92 90 86 80 81 79 75 73 75 73 72 72 74 75 72 … 72; one core: 142 then 69.
 
-## Where the run leaves the hardware idle, and the SMT siblings (2026-10-26)
-- **The run against its floor:** at width 3 a layer's run is ~420 µs and reads ~68 MB from DRAM (~165 GB/s); the box's
-  ~290 GB/s would read them in ~235 µs. Per verify step the pool runs' cores wait ~3.2 ms for each run's last core
-  (`pool_run`: end_max − end_p50, decode runs; 27.3 s of pool runs over 1,840 steps, 5.9 s of it that tail).
-- **The idle hardware:** the 96 SMT siblings. `bench-window --smt a` gives each core's sibling the core's untouched items
-  (the plan's rest, then the cold ones) to stream into their shared L2 up to `a` items ahead, from the run's start:
+**bench-interfere** (one warm core on CCD 7, j streamers on its CCD / another): j = 0 4.56 µs; 1 4.55 / 4.60; 2 4.59 /
+4.56; 3 4.58 / 4.60; 4 5.17 / 4.58; 5 7.11 / 4.57; 6 10.25 / 4.57; 7 12.70 / 4.58; the CCD's streamers 17.6 → 40.0 GB/s,
+saturating at 3–4; with the socket loaded (38 streamers elsewhere) the CCD saturates at 3 streamers, 17–18 GB/s, and the
+warm item reaches 23 µs at 7.
 
-| siblings | run p50 (4 cold a core) | touched a core | run p50 (8 cold) |
-|---|---|---|---|
-| halted (C2) | 587–598 µs | 10.6–11.1 | 786 µs |
-| spinning, no streaming (control) | 564–575 | 12.0–12.3 | |
-| streaming 1 ahead | 518 | 11.0 | |
-| 2 ahead | 537 | 12.3 | 735 |
-| 3 ahead | 505 | 12.4 | |
-
-  Against the spinning control (the fair one: a busy sibling alone speeds a core's DRAM touches 10–15 %, metatron-cpu
-  §3), streaming is worth ~8–10 % of the bench's run. Fill counters do not compare across these rows (the sibling's
-  fetches count on its own thread). Streaming raises the touched lines' loss (6 → 11–15 %): its bytes land in the L3
-  while the warm items wait, as the bytes model says.
-
-## The run's reference: `bench-run` (2026-10-26, a bench boot)
-> youre trying to get the hode to match the bench not the bench to match the node — tcdent
-
-The bench is the reference for what the hardware delivers under a schedule; where the node falls short, the shortfall is
-the node's, and the bench measures each node element's cost by adding it as a variable — the bench is not tuned to look
-like the node.
-
-`bench-run` runs the node's schedule (construct.rs `work`/`slot_order`): each CCD's planned slices touched in the window
-by whichever of its cores claims them, then two phases (gate/up, down) with a join, each worker claiming its own deque
-from the back, its mates' from the front, its CCD's queue, its node's other CCDs. Run on a bench boot
-(`bringup/box/dev.cmdline.bench`: the serving command line without the bundle and the hugepage reservation, so the benches
-have all four nodes' memory). At the node's width-3 shape (45 slices touched + 28 cold items a CCD ≈ 118 items):
-
-| | gate/up | down |
-|---|---|---|
-| wall | 214 µs | 122 µs |
-| workers' ends p10 / p50 / p90 / max | 155 / 168 / 206 / 213 | 76 / 88 / 116 / 121 |
-
-per item: own 11.2 µs (6 % DRAM), stolen 14.2 (17 %), CCD queue 31.5 (96 %), the node's other CCDs 30.6 (98 %). Repeats
-agree to a microsecond; one socket alone gives the same walls (214 / 122): the sockets do not interact.
-
-What building it measured on the way (each a bench flaw first, then fixed — and each a property the node must keep):
-- **Workers that start through a mutex** (each taking the phase's lists under a lock): 92 handoffs across the sockets
-  staggered the starts; walls 287 → 214. The node publishes its job through an atomic pointer.
-- **A futex barrier's wake** (tens of µs) as the phase's start; the node's workers spin on a generation word.
-- **Shared per-item counters** (one set of atomics, 4 adds an item from 92 cores) and a barrier's arrivals on the
-  spinners' line: each cost ~35–75 µs a phase across the sockets.
-- **Stealing across the sockets** (`--steal any`): a far-socket cold item 625 µs, the gate/up wall 1,084 µs. The node
-  never does (its last slot is the unplaced-item queue, not the other socket's CCDs).
-- **The resident node slows these benches:** socket 1 alone, the same run, walls 287 / 155 µs with the node resident
-  against 197 / 125 µs with its memory free (before the barrier fixes; the cause — its memory, its pages, its threads —
-  is not separated). Bench numbers taken beside the resident node earlier in 099 carry this.
-
-Against the node: at width 3 the node's run is ~390–420 µs a layer for the same item count against the bench's 336.
-Before the difference is the node's to close, one workload element is still missing from the bench: experts picked by
-two or three of the step's tokens (`gemm` over n tokens, more compute an item).
-
-## `bench-run` on 2 MiB pages, and the SMT siblings in the reference (2026-10-26)
-- **Every bench before this used 4 KiB pages:** metatron's THP is `madvise` and no bench advised; the node's experts are
-  hugetlb 2 MiB pages. `huge.rs` (mmap, `MADV_HUGEPAGE`, verified in `smaps_rollup`) is now `bench-run`'s pool. On 4 KiB
-  pages the NUMA nodes' runs differed by up to 28 % and the pattern moved between allocations (node 3 slowest in one
-  session, node 2 in another); on 2 MiB pages every CCD ends within 212–225 µs and repeats agree to 1 µs. The per-item
-  times rise (own 11.6 → 15.2 µs, the walls 218 → 228 / 124 → 127 µs) — not explained. **Reference, the node's width-3
-  shape, 2 MiB pages: gate/up 225–229 µs, down 127–128 µs.**
-- **Per-CCD shares by worker count** (`--share cores`; four CCDs have seven workers): no change — those CCDs were not
-  the stragglers.
-- **Stealing across the socket's two nodes** (`--steal socket`, 4 KiB pages): every CCD ends together, the wall does
-  not move (218 µs).
-- **Siblings streaming the next cold item** (`--smt 1`: each worker claims one ahead and its sibling, waiting in
-  `mwaitx`, touches a cold next item into their L2): the cold items become L2-fed (33.6 → 18.8 µs, 95 → 6 % DRAM) and the
-  warm ones slow (own 15.2 → 17.3, stolen 18.8 → 29.6); walls 225–227 → 229 / 127–128 → 132 µs. Zero-sum: the sibling
-  moves bytes under a ceiling it cannot raise. In `bench-window` (private lists, 4 KiB pages) the same idea gave −9 %;
-  the faithful schedule does not reproduce it. Not a lever as built.
-
-## A CCD delivers through one path: the run's time is the sum of its sources (2026-10-26, `bench-run`, 2 MiB pages)
-> page sizes and many other things can change on the node if you find gains in performance. we're trying to match best
-> case cache hits and dram throughput and the stack can adjust in any way necessary — tcdent
-
-The same schedule, both sockets, ~118 items (16 MB) a CCD a round, with every item warm, every item cold, and the mix:
-
-| items a CCD | gate/up + down | a CCD's delivery |
-|---|---|---|
-| all warm, fresh (59 slices touched, the window long enough) | 174 + 104 = 278 µs | ~58 GB/s |
-| all warm, **fixed** (the same lines every round: protected in L3, 0.1 % DRAM) | 179 + 103 = 282 µs | ~57 GB/s |
-| all cold | 448 + 220 = 668 µs | ~24 GB/s (×12 ≈ 288 GB/s, the box's DRAM ceiling) |
-| the node's mix (45 slices warm + 28 cold) | 225 + 126 = 351 µs | |
-
-- **The mix costs the sum, not the maximum:** its 12.2 MB warm at 58 GB/s (211 µs) plus 3.8 MB cold at 24 (159 µs) is
-  370 µs; measured 351. L3-fed and DRAM-fed reads do not overlap on a CCD: they share one delivery path (phase 0's "a
-  CCD delivers ~60–70 GB/s whatever the source", now on the node's schedule and pages). This is why the cap, the
-  re-touch and the siblings' streaming were zero-sum: they move bytes between the sources under one path.
-- **A warm item's 15 µs is that path, not its lines:** the fixed set (no DRAM lines) costs 15.0 µs an item, the fresh set
-  (8.5 % DRAM) 15.35. **Superseded the same day:** the ~58 GB/s is `bench-run`'s window-decayed state (below), not the
-  CCD's L3 delivery — `bench-order` reads the same lines on the same 8 cores at 4.3 µs an item, ~250 GB/s a CCD. The
-  cold (DRAM) rows stand.
-- **The design consequence:** a layer's run is bounded by Σ bytes ÷ the CCD's rate for their source. Every byte a CCD
-  reads in the run costs ~17 ns a KB from L3 and ~42 from DRAM; the levers are fewer bytes in the run (into the window,
-  onto the cards, smaller formats) and the rates themselves (pages: below).
-
-## A core's L3 read rate decays when its L3 hits stop (2026-10-26, `bench-order --gap-us`, CCD 7)
-> youre trying to get the hode to match the bench not the bench to match the node — tcdent
-
-Found by taking the two benches' disagreement to the bottom. `bench-run` read L3-resident items at 15–17 µs on 8 cores of
-a CCD, `bench-order` the same kernel over the same lines at 4.3; neither per-item timing, deque claims, stealing, core
-count, memory shape (one shared allocation, 4 KiB or 2 MiB pages), start synchronization, read order, phases nor
-regions moved either (`bringup/box/logs/bench-run-{bisect,ladder,cores}.txt`, `bench-order-shared.txt`,
-`bench-sync.txt`). One core alone: 4.27 µs in both. What `bench-run` had was a 3 ms window before every run.
-
-**The effect.** Eight cores of CCD 7, each reading its fixed 2 MB set (15 items, L3-resident: ~2,190 prefetch hits in L3
-an item in every row below, 0 from DRAM), after a gap in which the cores do no L3 reading:
-
-| gap before the run | item µs | the run's clock |
-|---|---|---|
-| none | 4.35 | 3.4 GHz (the cap) |
-| 20 / 50 / 100 / 200 / 500 µs, no pre-touch (the node's case: nothing primes the run) | 4.64 / 4.86 / 5.21 / 5.52 / 6.33 | |
-| 100 µs | 4.48 | 3.57 |
-| 300 µs | 4.53 | 3.52 |
-| 1 ms | 5.94 | 3.67 |
-| 3 ms | 7.3–7.6 | 3.72 |
-| 10 ms | 17.4 (4×) | 3.72 |
-
-- **Uniform over the run** (first third / middle / last third 7.37 / 7.72 / 7.58 at 3 ms; 11.5 flat over 30 items, 345 µs,
-  at 10 ms): a rate, not a wake-up; it does not recover inside a run.
-- **Not the clock:** the cores run faster after a gap (3.72 vs 3.52 GHz) and the items are slower.
-- **How the gap is spent does not matter:** `pause`, a register-only busy loop, the node's `mwaitx` wait — all 7.3–7.6 at
-  3 ms. L2-resident reads (192 KB, no L3 requests): 7.81. DRAM streaming with `prefetchnta` (L3 misses, no pollution):
-  7.09. **Full-rate L3 reads of any data (a 1 MB buffer of its own): 4.30 — no decay.**
-- **Per core:** one core reading L3 does not hold its seven mates (7.28); CCD 8 reading L3 flat out does not hold CCD 7
-  (7.44, CCD 8 itself 4.36). Not a package or fabric state the others can keep up.
-- **What holds it:** a rotating 1 MB ring read in 50 µs slots (lines re-read after a full ring: L3 hits) — 1, 4, 16 KB a
-  slot: 7.5–7.7 (nothing held); 64 KB (~1.3 GB/s): 5.94; 128 KB (2.6 GB/s): 4.67; **256 KB (~5 GB/s): 4.40**; 512 KB: 4.37.
-  About a fifth of a core's L3 read rate, as hits, holds the state. (An earlier "2 % duty holds it" reading was a bench
-  error: that mode read the whole buffer whenever its share was nonzero.)
-- **Recovery after a decay** (10 ms idle, then full-rate L3 reads): 100 µs of reads → 16.6 µs an item; 300 µs → 10.9;
-  **1 ms → 4.35**. Recovery takes ~0.5–1 ms of hits — longer than a node run (~400 µs), so a decayed core stays decayed
-  through its run.
-- **DRAM-fed reads are unaffected:** cold items 24.34 µs without a gap, 24.40 after 3 ms (the same run's warm items 4.37 →
-  12.76). The state sets the L3-hit delivery rate only.
-- **L3 misses do not count** (`dramnta`, the node's window), only hits.
-
-**What it is** is not identified: a per-core state, driven by the core's own L3-hit traffic, with a time constant of
-milliseconds, that sets the rate at which L3 hits are delivered to that core, independent of its clock. Candidates not yet
-separated: the L2 prefetcher's adaptive throttle, a per-core request-credit allocation, a power state of the core's L3
-interface.
-
-**The prediction before any node change** (`bench-run`, the node's width-3 shape on both sockets, two repeats each):
-
-| hold | gate/up + down wall | own item | stolen item |
-|---|---|---|---|
-| none | 232 + 129 µs | 15.2 µs, 6.5 % DRAM | 18.8 µs, 15.5 % DRAM |
-| a 1 MB ring a core, 256 KB every 50 µs through the window | **258 + 135** | 17.8, **14.6 %** | 19.6, **34.6 %** |
-
-The ring holds the state (one CCD, all warm, fixed: 15.5 → 9.0 µs an item, the wall 182 → 95) but at the node's shape it
-costs more than it returns: its lines are L3 hits, so protected, and 8 MB of them a CCD displace the window's
-once-referenced planned lines (the bytes model) — the warm items lose twice the DRAM share. The instrument with no
-footprint is the planned lines themselves: re-reading slices touched 512 KB earlier is L3 hits (the hold), promotes them
-(the protection) and adds no lines — the re-touch of 1g, whose lab gain (warm items 11.3 → 9.7 µs) has this second
-mechanism behind it. Measured at the node's shape (two repeats each):
-
-| | wall | own item | stolen item |
-|---|---|---|---|
-| none | 232 + 131 µs | 15.3 µs, 7.3 % DRAM | 18.8, 16.0 % |
-| re-touch | 237–241 + 127 | 16.0–16.2, 7.0 % | 18.3, **5.0 %** |
-| a 576 KB ring held at 256 KB / 50 µs | 257 + 132 | 17.9, 10.4 % | 19.1, 26.3 % |
-
-The re-touch protects the stolen lines and returns nothing on the wall, as in the node lab. **So at the node's shape the
-warm item's cost is not the decay** (holding the state through the window changes nothing) **but the interference**: in
-every phase a CCD's cold items stream DRAM beside its warm ones, and an L3-fed core slows 2–5× while its mates stream
-(the interference section). The CCD delivers the sum of its sources, not the maximum (measured above), so that overlap
-is worth nothing: so the warm items first with the CCD's DRAM path quiet, then the cold ones (`--ccd-barrier 1`), with and
-without the re-touch (two repeats each): own items **15.1–15.2 µs** (15.9 with the re-touch) — unchanged; cold items 34.3
-→ 36.5 (less overlap); walls 232 + 129 → 240 + 135. **Not the interference either**, at this shape.
-
-**Where the warm item stands** (L3-fed, 8 cores a CCD, the same kernel): `bench-order` on protected (fixed) lines 4.3 µs;
-on fresh lines touched once this round 8.6 (3–7 % of their lines from DRAM — the lost ones); fresh lines touched twice 5.3;
-`bench-run` on fixed lines with the hold 9.0; `bench-run` at the node's shape 15–16 whatever the variant; the node 10.6 own
-/ 13.3 stolen. Two gaps are unexplained: `bench-run`'s ~2× over `bench-order` on identical lines (its warm numbers are not
-a reference for the hardware; its cold and schedule numbers stand), and fresh lines costing ~2× protected ones under eight
-cores while one core alone reads them at 4.7 — the node's case. **Resolved** (`bench-order --fresh`, CCD 7, 15 items a core):
-
-| cores touching fresh sets | lines from DRAM an item (of 2,176) | item µs | touched twice: DRAM lines → µs |
-|---|---|---|---|
-| 1 | 11 | 4.31 | 2 → 4.27 |
-| 2 | 32 | 4.47 | 2 → 4.27 |
-| 4 | 125 | 5.35 | 7 → 4.31 |
-| 8 | 387 (18 %) | 8.41 | 71 → 4.72 |
-
-A warm item costs **~4.3 µs + ~10 ns a DRAM line in its stream**; the DRAM lines are the bytes model's losses (growing with
-the CCD's fresh bytes), and one L3 hit promotes them (18 → 3 % lost). So `bench-order`'s numbers are all accounted for:
-protected lines 4.3; fresh 8.4 by their lost lines; decay by the gap. The node's own items (6.5 % DRAM) price at ~5.8 µs
-on this model against their 10.6; the rest is what `bench-run`'s 2× is made of — its candidate, from today's facts: eight
-cores reading 2 MiB-strided regions or queue-claimed slices (~8 apart) in the same rhythm meet in the same L3 sets at the
-same moment; a freshly booted box hands out near-contiguous 4 KiB pages too, which is why `--pages 4k` did not differ.
-The node's experts sit at a 51/16 MiB stride (`layout::SHARE` = 3,342,336 B), which would not alias. **Refuted:** a 4 KB
-pad after every item changes nothing (15.3–15.8 → 15.5 µs fixed-warm on one CCD; 15.2 → 15.4 at the node's shape). Note
-that every `bench-run` fixed-warm figure above was taken with a 3 ms idle window (the decay); at window 0 it reads 8.4,
-so the residual to explain is 8.4 against 4.3. With one phase and window 0 (the fewest gaps it can have) `bench-run`
-reads 8.5 and 10.8 in two runs — run-to-run variance it had not shown — against a no-priming decay curve that prices a
-100 µs gap at 5.2 and 500 µs at 6.3. Its inter-run gap measures 40–80 µs (p50) and its main thread's placement does not
-matter (unpinned 8.4 / 10.8, core 0 10.9, core 48 9.8 / 10.1; a core of the measured CCD collides with its worker); the
-variance stands. What varies between runs is only which physical 2 MiB pages the pool gets — with `--regions` each
-worker's 2 MB region is one huge page, so the eight streams differ only in page-level address bits — hence `--pages 4k`
-(scattered) and `--rotate 1` (different offsets at any moment), repeated: 4 KiB 8.4–9.9, 2 MiB 8.5–10.1, rotated 9.4–9.8
-— **refuted**. Each worker's small buffers (`out`, scales, gsum) in private pages instead of musl's shared size-class slots
-(the ~35 ns unowned-line store): 10.0–10.6 against 8.65 — **refuted**. The round machinery removed (`--simple 1`: after the
-first round the workers run 60 rounds among themselves over the same lists, a worker-only spin barrier, nothing from the
-main thread): **6.6 µs an item** (105–108 µs for 16 items, three runs within 3 %). So the residual decomposes: ~2 µs an item
-was the inter-round gaps (40–80 µs without L3 hits, as the unprimed decay curve prices), and a **1.4× remains unexplained**
-between two loops that are now the same gemv over the same lines on the same cores (`bench-run --simple` 6.6 vs
-`bench-order` 4.4–4.9). In simple mode the item is 6.6 whatever the read order, a 4 KB item pad or 4 KiB pages (105–108
-µs for 16 items, four runs), and `bench-order` at `bench-run`'s exact layout — shared regions at a 2 MiB + 64 B stride,
-16 items — reads 4.36–4.40. **Left open:** two loops that are the same gemv over the same lines on the same cores at the
-same gap, 1.45× apart (`bringup/box/logs/bench-run-simple2.txt`).
-
-**Resolved (2026-10-26, late): it is the L3-rate state's recovery, measured from its slow side.** `bench-run`'s rounds are
-not stationary — worker 0's 16 items: the first 10 rounds 158–168 µs (~10 µs an item), the last 10 of 60 rounds 84, the
-last 10 of 600 rounds **72.7 µs = 4.5 µs an item, `bench-order`'s number** (`bench-run-stationary.txt`). The cores enter
-the rounds deeply decayed (seconds of idle through the pool fill and setup) and recover over milliseconds of hits; a
-60-round average sits in the recovery. `bench-order` never showed it because its WarmOnly order runs last of five, after
-hundreds of iterations of L3 hits — it measures the steady state. The per-run variance (8.4–10.9) was how long each
-run's setup idled. On the way, every other candidate was refuted with a measurement, which is what makes this one stand:
-the compiled gemv (121 vs 125 instructions, identical loads), the clock (3.45 vs 3.63 GHz), memory placement (pages, pad,
-rotation, per-worker Vecs, a shared allocation in `bench-order`), small-buffer false sharing (staggered private pages),
-the main thread's placement, the round machinery (`--simple`), the per-item wrapper (`--raw`), the pool as ballast, and
-the fill counters (all L3, equal counts) — `bench-run-{pagesvar,privpages,mainpin,simple,simple2,raw,vecs,counters}.txt`,
-`bench-ballast.txt`.
-
-**Consequences.** (1) Every `bench-run` comparison above (hold, re-touch, warm-then-cold barrier, sibling streaming,
-pages, shares) was taken in the transient; `--warmup` exists now and they are to be redone in the steady state before any
-is believed. (2) The node's cores alternate ~440 µs without L3 hits and ~400 µs with: they live in this regime
-permanently, and their 10.6 µs own item is the decayed rate. The recovery curve: 8 cores from cold, every 10th round, 263 125 110 93 95 89
-92 90 86 80 81 79 75 73 … 72 µs (16 items; steady 71.9 = 4.5 µs an item; ~130 rounds, ~10 ms); **1 core: 142 then 69
-from round 1** — one core recovers in one round, eight sharing the L3 in ~130. After 300 warm-up rounds: 71.4–71.9, max
-72.9. So the decayed state costs only when the L3 is under several cores' load, and the fresh-line result is the same
-phenomenon from the other side (eight cores read once-touched lines at 8.4 µs, one core at 4.7). The mechanism is still
-not named; what fits is a shared L3 structure whose benefit eight cores' hits re-earn slowly and which idle ages away.
-(`bench-run-recovery.txt`)
-
-## The node's shape in the steady state (2026-10-26, late; `bench-run --warmup 100 --pool-mb 2048`, two repeats each)
-The pool sized so no round re-reads a wrapped line (a 256 MB pool wrapped 17 times made the "cold" items 35 % L3 hits —
-the two-class policy keeps twice-hit lines; `bench-run-warm-nodeshape.txt`); here the cold items are 95 % DRAM:
-
-| | gate/up + down wall | own item | stolen item | cold item |
-|---|---|---|---|---|
-| today's schedule | 223 + 122 = **345 µs** | 13.3 µs, 6 % DRAM | 16.6, 17 % | 34.3, 95 % |
-| **re-touch** (each worker re-reads slices it touched 512 KB earlier) | 203–208 + 106 = **310 µs, −10 %** | 11.1 | 12.5, **5 %** | 34.2 |
-
-The re-touch is the hold with no footprint: L3 hits through the window (the state), promotion of the touched lines
-(the stolen items' losses 17 → 5 %), no extra lines. In the steady state it is worth ~10 % of a layer's run — ~35 µs a
-layer, ~1.5 ms a verify step at width 3 (inference from the per-step layer count). The warm-then-cold barrier adds
-nothing (`bench-run-warm-nodeshape.txt`). The node lab of the morning (1g) saw the step unchanged with the same re-touch;
-by the rule, that disagreement is the next thing to take back to the bench: what the node has that the bench lacks —
-the amend dropping pending re-touches, real multi-token items, the two phases' join — one at a time, before the node
-changes again.
-
-## The state of the question (2026-10-26, end of day)
-**Established, with the bench that holds it:**
-- A warm (L3-fed) item costs ~4.3 µs + ~10 ns per line that comes from DRAM instead; the DRAM lines are the bytes model's
-  losses, promoted by one L3 hit (`bench-order --fresh --touches`).
-- A core's L3 read rate decays when its L3 hits stop: unprimed 100 µs → +20 %, 500 µs → +45 %, 3 ms → +70 %, 10 ms → 4×;
-  held by ~5 GB/s of L3 hits; recovery 0.5–1 ms of hits; DRAM-fed reads unaffected; per core (`bench-order --gap-*`).
-- A CCD's DRAM path saturates at 3–4 streaming cores (~40 GB/s alone, ~17–18 GB/s each with the socket streaming), and
-  L3-fed cores beside saturated streamers slow 2–5× (`bench-interfere`).
-- The CCD's run time is the sum of its sources' times, not their maximum (`bench-run` all-warm / all-cold / the mix).
-- An awake SMT sibling costs the core ~10 % of its compute under the cap and gives the DRAM stream nothing
-  (`bench-power --sib-spin`); sibling streaming of the next cold item is zero-sum (`bench-run --smt`).
-- Page size (4 KiB / 2 MiB) does not change the gemv stream's rate from L3 or DRAM (`bench-run --pages`).
-
-**Levers measured at the node's shape and found zero-sum or negative:** a per-CCD streaming cap (lab), the re-touch
-(lab and bench), oldest-first, non-temporal warm or cold reads, a ring hold through the window, the warm-then-cold
-barrier, sibling streaming. Each moves bytes or time between the CCD's one path.
-
-**The node against the benches:** the node's own items 10.6 µs and stolen 13.3 (lab); `bench-run` at the node's shape
-15–16; `bench-run --simple` on fixed lines 6.6; `bench-order` 4.3 protected / 8.4 fresh. The node's items are priced by
-the model at ~5.8 (own, 6.5 % DRAM lines) + the decay of its ~440 µs window (+45 %) ≈ 8.4; its 10.6 carries ~1.25× more,
-in the range of `bench-run`'s unexplained residual — which the node may share, since the node is the system `bench-run`
-copies.
-
-**What would move the node, from the data:** the cold items (half to two thirds of the run's core time, DRAM-bound, ~24
-GB/s a CCD) — fewer cold bytes (098's predictor, residency, formats) and the clock under the cap; for the warm items,
-the decay is the one measured mechanism with a hold that costs nothing in bytes *if* its L3 hits can be had without
-footprint — the re-touch did not deliver it in the bench, and why not is the next question (its hits may come too late:
-the window's last 512 KB is never re-read, and the run starts ~immediately). The unexplained 1.4× is the other.
-
-**Why it matters here:** every one of the node's expert runs follows a ~440 µs window of DRAM touching and `mwaitx`
-waits — no L3 hits for the core — so the node's warm items run in the decayed state on every layer; `bench-run`'s
-window-shaped rounds reproduced the node's 15–17 µs warm item for that reason. The node's own 11.7–12 µs (lab-order3) is
-this plus its lines' 10–14 % DRAM share. If the state could be held (or the mechanism switched off), the warm items go
-~4.5–5 µs: at width 3 that is ~55 core-µs of the ~257 a layer, ~20 % of the run, ~3 ms a verify step — inference from the
-budget above, to be predicted by `bench-run` with a hold before it is built in the node.
-
-## The benches since 2026-10-26, and their wrapper
-- `bringup/box/box.sh` returns when the command's end marker arrives (it waited its whole limit before: a 10 s bench
-  blocked for the 200 s I passed). `bench-run` fills its pools in parallel, 256 MB a CCD. A bench round is ~0.1 s of
-  measurement; the rest was these two.
-- `bench-run`'s own residual: at window 0 it reads L3-resident items at 8.4 µs where `bench-order` reads 4.3 on the same
-  cores and lines; its rounds' barriers and builds are gaps of tens of µs, which the curve above prices at ~10 %, not 2×.
-  Open. Its DRAM-fed (cold) numbers and the schedule comparisons stand; its warm numbers carry this.
-
-## How the bench and the node differ (to quantify, one at a time)
-1. **The shared CCD queue and stealing.** The node's cold items are claimed from one queue by the CCD's 8 cores and its
-   warm items can be stolen by mates; the bench's cores own private sets. The queue is the node's load balancer.
-2. **Two phases.** The node runs gate/up then down as separate pool runs with a join between; the bench one.
-3. **Both sockets and NUMA placement.** The node's experts are placed across the four nodes and its 92 cores span both
-   sockets; the bench used socket 1 (socket 0's memory is full while the node is resident).
-4. **The prefetch window before the run.** The node's warm lines were touched up to ~460 µs earlier by the same core,
-   during a window when other cores touched theirs; the bench touches immediately before.
-5. **What else runs.** The node's main thread drives the cards and the step (route, dispatch, join) on core 1; the
-   cards' BAR traffic and the loader's expert loads cross the fabric; prow rows and zones are written.
-6. **Power and clocks.** The node runs steps back to back under the 280 W socket cap; the bench in bursts.
-
-## Directions this opens (architecture)
-- **Keep cold streams out of the warm lines' way.** `prefetchnta` on the cold items' reads (testing, below); Zen 3's
-  L3 QoS (resctrl CAT) cannot tell a core's warm reads from its cold ones, but SMT siblings can be given different
-  classes: the 96 idle hyperthreads as DRAM streamers with a small L3 mask, the cores computing on what they stream into
-  L2.
-- **Balance with the bus in mind.** Keep a shared queue for the end of the run (the reserve variant) and spread the cold
-  demand over the run's length without taking the balancer away.
-- **Fewer cold bytes at all.** The predictor (098), the cards' residency, and formats (the trellis) all act on how much
-  of a layer is cold.
-
-## Next
-1. Done: `prefetchnta` (no effect) and the fill counters (no eviction).
-1a. Done: the interference matrix (above) — the CCD's memory path.
-1b. Done: with the socket loaded, 3 streamers a CCD saturate it; 5–7 slow its L3-fed cores 2–5×.
-1c. Done: the cap in the node — no gain (above); the bench's mechanism is not the node's limit.
-1d. Done in part: the item's code is not the cost; the DRAM lines inside prefetched items are (above).
-1f. Done: the leak reproduced in the bench (fresh sets) and a second touch removes it (above).
-1g. Done: the re-touch in the node (lab) and the window model — the leak falls, the step does not (above).
-1h. Done: the node's loss map by age, run churn, claim and plan (above).
-1i. Done: oldest first (moves the loss) and non-temporal cold reads (raise it) — above.
-1e. The node's fill counters by item, with its class (own / CCD / stolen) and its slice's touch time (lab): where a
-    complete expert's 14–18 % DRAM lines come from — evicted (own items) or a mate's L2 (stolen).
-2. The node's warm item at its best: a lab run with the prefetch posted but no cold traffic (the run's misses forced to
-   the cards or skipped) to read the node's own floor for a warm item.
-3. The differences above, one at a time in the bench, until it reproduces the node's sign.
+**The 090 premise, warm** (`bench-order --warmup 300`, 46 cores, 9 warm + 7 cold fresh items a core): WarmFirst 413 µs
+(warm item 11.7), ColdFirst 434, Interleave 362 (12.0), WarmOnly 101 (8.3), ColdOnly 311; cold: 440 / 472 / 358 / 112 / 303.
