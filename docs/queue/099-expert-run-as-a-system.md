@@ -84,11 +84,16 @@ another (65–71). Median warm item, the warm core's clock (APERF/MPERF), the st
 - The same mechanism, seen before from the other side: the main thread's route/dispatch doubled with seven cores
   streaming beside it on its CCD (8.5 → 18 µs a layer, `PREFETCH_CORES_MAIN`, construct.rs).
 
+**With every CCD of the socket streaming (the production shape; `--bg`: 38 streamers on socket 1's other five CCDs,
+134.9 GB/s):** the warm CCD's own sweep — j streamers: warm item µs / the CCD's streamers' GB/s — 0: 4.67 / —; 1: 4.60 /
+8.8; 2: 4.67 / 14.0; 3: 4.74 / 16.8; 4: 5.56 / 17.7; **5: 9.48 / 18.3; 6: 16.28 / 18.5; 7: 22.96 / 18.7** (clock 3.45 GHz
+throughout). With the socket loaded, a CCD's share saturates at ~17–18 GB/s with **3** streamers, and past that its
+L3-fed cores slow 2–5×. The node's run streams cold items on all 8 cores of every CCD.
+
 ## What it suggests (architecture)
 - **A CCD's DRAM streaming capped at its saturation point.** No more than ~3 cores of a CCD stream cold data at once
   (a per-CCD semaphore on the cold queue); the others take warm items (own or stolen) meanwhile, at 4.6 µs instead of
-  ~12. In production all CCDs stream together, so a CCD's share of a socket's ~145 GB/s is ~24 GB/s and the saturation
-  point is likely ~2 — to measure with all CCDs streaming.
+  ~12. Measured with the socket loaded: the saturation point is 3 streamers a CCD (~17–18 GB/s each CCD).
 - **The prefetch window the same way:** 8 touchers a CCD saturate the port as 3 would; fewer touchers leave cores free
   (for 098's analog, for the main thread's phases) at the same delivery.
 - **Streamers and computers by role:** a CCD's few streamers pull the cold items into the CCD's L3 just ahead of the
@@ -128,7 +133,7 @@ another (65–71). Median warm item, the warm core's clock (APERF/MPERF), the st
 ## Next
 1. Done: `prefetchnta` (no effect) and the fill counters (no eviction).
 1a. Done: the interference matrix (above) — the CCD's memory path.
-1b. The same matrix with every CCD of the socket streaming (the production shape): the saturation point per CCD.
+1b. Done: with the socket loaded, 3 streamers a CCD saturate it; 5–7 slow its L3-fed cores 2–5×.
 1c. The cap in the node: a per-CCD limit on concurrent cold claimers in the run (lab A/B), and fewer touchers in the window.
 2. The node's warm item at its best: a lab run with the prefetch posted but no cold traffic (the run's misses forced to
    the cards or skipped) to read the node's own floor for a warm item.

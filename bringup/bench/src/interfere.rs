@@ -5,7 +5,9 @@
 //! Reported per j: the warm item's median time, the warm core's effective clock (APERF/MPERF over its items), the
 //! streamers' aggregate GB/s.
 //!
-//!   bench-interfere [--warm-core 56] [--same 57-63] [--other 65-71] [--warm 9] [--reps 300]
+//! `--bg` adds streamers that run throughout on other CCDs (every CCD of the socket streaming, as in a layer's run).
+//!
+//!   bench-interfere [--warm-core 56] [--same 57-63] [--other 65-71] [--bg cores] [--warm 9] [--reps 300]
 use harness::arg;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -61,6 +63,37 @@ fn main() {
     let other = list(arg("--other").map(|p| p.to_str().unwrap().to_string()).as_deref().unwrap_or("65-71"));
     let nw: usize = arg("--warm").map_or(9, |v| v.to_str().unwrap().parse().unwrap());
     let reps: usize = arg("--reps").map_or(300, |v| v.to_str().unwrap().parse().unwrap());
+    // `--bg cores`: streamers that run throughout on other CCDs (the production shape: every CCD of the socket streaming)
+    let bg = arg("--bg").map_or(Vec::new(), |p| list(p.to_str().unwrap()));
+    let bg_stop = Arc::new(AtomicBool::new(false));
+    let bg_bytes = Arc::new(AtomicU64::new(0));
+    let bg_threads: Vec<_> = bg
+        .iter()
+        .enumerate()
+        .map(|(i, &cpu)| {
+            let (stop, bytes) = (bg_stop.clone(), bg_bytes.clone());
+            std::thread::spawn(move || {
+                harness::bench::pin(cpu);
+                let pool = set((96 << 20) / (ROWS * K / 2), 500 + i as u64);
+                let (q, s, g) = act(70 + i as u64);
+                let a = common::q4::Act { q: &q, scale: &s, gsum: &g };
+                let mut out = vec![0f32; ROWS];
+                let mut k = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    unsafe { common::q4::avx2::gemv::<K>(ROWS, pool.w.as_ptr().add(k * pool.ib), pool.s.as_ptr().add(k * pool.sb), &a, out.as_mut_ptr()) };
+                    bytes.fetch_add(pool.ib as u64, Ordering::Relaxed);
+                    k = (k + 1) % pool.items;
+                }
+                std::hint::black_box(out);
+            })
+        })
+        .collect();
+    if !bg.is_empty() {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let (b0, t0) = (bg_bytes.load(Ordering::Relaxed), std::time::Instant::now());
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        println!("background: {} streamers on {:?}, {:.1} GB/s", bg.len(), bg, (bg_bytes.load(Ordering::Relaxed) - b0) as f64 / t0.elapsed().as_secs_f64() / 1e9);
+    }
     println!("bench-interfere: warm core {warm_core}, {nw} warm items of {ROWS} rows (one token); streamers on its CCD {same:?} or another {other:?}");
     println!("{:<6} {:>3} {:>14} {:>14} {:>16}", "where", "j", "warm item µs", "warm GHz", "streamers GB/s");
     for (place, cores) in [("same", &same), ("other", &other)] {
@@ -135,5 +168,12 @@ fn main() {
             }
             println!("{place:<6} {j:>3} {:>14.2} {:>14.2} {:>16.1}", wt.0, wt.1, ghz);
         }
+        if !bg.is_empty() {
+            break; // with a background, the warm CCD's own sweep is the question
+        }
+    }
+    bg_stop.store(true, Ordering::Relaxed);
+    for h in bg_threads {
+        h.join().unwrap();
     }
 }
