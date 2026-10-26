@@ -530,8 +530,13 @@ the fill counters (all L3, equal counts) — `bench-run-{pagesvar,privpages,main
 **Consequences.** (1) Every `bench-run` comparison above (hold, re-touch, warm-then-cold barrier, sibling streaming,
 pages, shares) was taken in the transient; `--warmup` exists now and they are to be redone in the steady state before any
 is believed. (2) The node's cores alternate ~440 µs without L3 hits and ~400 µs with: they live in this regime
-permanently, and their 10.6 µs own item is the decayed rate. The recovery curve (8 cores vs 1) and the one-core case's
-apparent immunity: `bench-run-recovery.txt`.
+permanently, and their 10.6 µs own item is the decayed rate. The recovery curve: 8 cores from cold, every 10th round, 263 125 110 93 95 89
+92 90 86 80 81 79 75 73 … 72 µs (16 items; steady 71.9 = 4.5 µs an item; ~130 rounds, ~10 ms); **1 core: 142 then 69
+from round 1** — one core recovers in one round, eight sharing the L3 in ~130. After 300 warm-up rounds: 71.4–71.9, max
+72.9. So the decayed state costs only when the L3 is under several cores' load, and the fresh-line result is the same
+phenomenon from the other side (eight cores read once-touched lines at 8.4 µs, one core at 4.7). The mechanism is still
+not named; what fits is a shared L3 structure whose benefit eight cores' hits re-earn slowly and which idle ages away.
+(`bench-run-recovery.txt`)
 
 ## The state of the question (2026-10-26, end of day)
 **Established, with the bench that holds it:**

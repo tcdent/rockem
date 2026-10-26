@@ -248,12 +248,14 @@ like. Finer items (`SUB_FEW` 4) cut the tail without moving the wall. This 375 i
    raises the next window's loss (4.2 → 8.4 %, `bench-window`). Loss is set by the fresh bytes a CCD inserts.
 7. **A non-temporal read does not protect:** the run's warm reads with `prefetchnta` cut the next round's loss 15 → 3 %,
    but the hinted gemv reads ~35 % slower (2026-10-26).
-8. **A core's L3 read rate decays when its L3 hits stop** (2026-10-26, queue 099): after 1 ms without L3 hits a core
-   reads L3-resident lines 37 % slower, after 3 ms ~70 %, after 10 ms 4× (unprimed: 100 µs → +20 %, 500 µs → +45 %); uniform over the run that follows, at a higher
-   clock; not held by compute, L2 hits or DRAM misses; held by ~5 GB/s of L3 hits a core (a rotating ring, 256 KB every
-   50 µs); recovery after a decay takes ~0.5–1 ms of full-rate hits; DRAM-fed reads are unaffected; per core.
-   Every node run follows a window of DRAM touching and `mwaitx` — its warm items run decayed. Mechanism not identified.
-   Benches that read L3-resident sets must state what the cores did just before (`bench-order --gap-us/--gap-mode`).
+8. **A core's L3 read rate decays when its L3 hits stop** (2026-10-26, queue 099): unprimed, 100 µs without hits →
+   +20 %, 500 µs → +45 %, 3 ms → +70 %, 10 ms → 4×, uniform over the run that follows, at a higher clock; not held by
+   compute, L2 hits or DRAM misses; held by ~5 GB/s of L3 hits (any lines); DRAM-fed reads unaffected; per core. **It
+   costs only under load:** one core recovers within one 2 MB round, eight cores sharing the L3 take ~130 rounds (~10 ms,
+   `bench-run --simple` from cold: 263 → 125 → 93 → 81 → 72 µs a 16-item round). Every node run follows a window without
+   hits — its warm items run decayed. **Every bench that reads L3-resident sets must warm the cores up first** (hundreds
+   of rounds: `bench-run --warmup`) or it measures the recovery — `bench-run`'s "unexplained 1.45×" of 2026-10-26 was that.
+   Mechanism not identified (a shared L3 structure that eight cores' hits re-earn slowly fits; a per-core one does not).
 9. **Interference, separate from loss:** a CCD's DRAM path saturates at ~40 GB/s with 3–4 streaming cores alone, ~17–18
    GB/s each with the whole socket streaming; streamers past saturation slow the CCD's L3-fed cores 2–5× (queue 099).
 10. **Benches:** `bench-l3` (keep/stream, CAT), `bench-reuse` (self/peer), `bench-l3life` (survival by position),
