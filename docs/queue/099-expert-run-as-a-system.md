@@ -132,6 +132,42 @@ cycling 0 (none, today's) / 3 / 2 step by step, 24 decodes at 18k, ~480 verify s
   complete expert's lines from L3, so ~14 % from DRAM), the core clocks under the socket cap with all cores busy, and the
   touch's age (~400 µs, other cores touching meanwhile).
 
+## The node's warm items are not warm: the cost is the DRAM lines inside them (bench-item, 2026-10-25)
+`bench-item` (one core, 56, a set it touched just before) runs the node's item shapes one element at a time. Alone, every
+shape is the bench's 4.6 µs: the gate/up part as `gu_f` runs it (two 32-row `gemm`s over the layout's halves, SwiGLU into
+`h`) 4.71, with its group quantize 4.76, the down part with its `sfence` 4.55; the activations and `h` rewritten each rep
+by a core on its CCD, another CCD or socket 0 change nothing. **The item's code is not the cost.**
+
+The node's own counters (`prefetch_use`, verify steps) say what is: lines from DRAM by the expert's prefetch status —
+
+| tokens | complete | partial | missed |
+|---|---|---|---|
+| 2 | 14.0 % | 43.8 % | 94.5 % |
+| 3 | 16.4 % | 32.9 % | 94.2 % |
+| 4 | 18.3 % | 27.4 % | 93.8 % |
+
+Every slice of a complete expert was touched by the core that runs it (`slot_tab`: a planned slice goes to its taker's
+own deque), yet a seventh of its lines come from DRAM at the run. With `--cold-pct p` (p % of the item's lines flushed
+after the touch, runs of 16 lines) and `--bg` (streamers through the run), the median gemv64 item:
+
+| load | 0 % cold | 14 % | 40 % | 100 % |
+|---|---|---|---|---|
+| none | 4.5 µs | 5.4 | 5.9 | 7.0 |
+| 7 streamers on its CCD (43 GB/s) | 11.8 | 15.2 | 20.3 | 23.7 |
+| 45 streamers over the socket (149 GB/s) | 17.5 | 25.7 | 40.7 | 48.4 |
+
+- Both mechanisms are real and they stack: an L3-fed item slows while its CCD streams (above), and each DRAM line in it
+  costs the loaded rate. The node's cold items (34 µs) sit between the two loads.
+- **Why the cap gave nothing:** the uncapped "warm" cores pull 14–44 % of their lines from DRAM — they are streamers too.
+  The cap moved who streams; the CCD's DRAM bytes stayed the same.
+- **The lever is the DRAM bytes, and a fifth of them are prefetched lines that went missing.** In expert-equivalents of
+  DRAM lines a layer: tokens 2 — complete 0.97, partial 1.38, missed 2.56 (the leak 20 % of the total); tokens 3 — 1.36,
+  1.09, 5.87 (16 %). If the run is bound by its DRAM bytes, removing the leak is −16–20 % of `experts` (inference, not
+  measured: ~2.7–3.4 ms a verify step at widths 2–3).
+- Open: where a touched line goes before its run. Candidates: L3 eviction between the touch and the run (the touch's age,
+  the CCD's other lines meanwhile), the lines of stolen slices (a mate's L2, l3-core-boundary), the partial experts'
+  touched slices counted with them.
+
 ## How the bench and the node differ (to quantify, one at a time)
 1. **The shared CCD queue and stealing.** The node's cold items are claimed from one queue by the CCD's 8 cores and its
    warm items can be stolen by mates; the bench's cores own private sets. The queue is the node's load balancer.
@@ -159,7 +195,9 @@ cycling 0 (none, today's) / 3 / 2 step by step, 24 decodes at 18k, ~480 verify s
 1a. Done: the interference matrix (above) — the CCD's memory path.
 1b. Done: with the socket loaded, 3 streamers a CCD saturate it; 5–7 slow its L3-fed cores 2–5×.
 1c. Done: the cap in the node — no gain (above); the bench's mechanism is not the node's limit.
-1d. The node's fill counters by claim class (own / CCD / stolen) and its cores' clocks during the run (lab): why its warm item costs 12 µs.
+1d. Done in part: the item's code is not the cost; the DRAM lines inside prefetched items are (above).
+1e. The node's fill counters by item, with its class (own / CCD / stolen) and its slice's touch time (lab): where a
+    complete expert's 14–18 % DRAM lines come from — evicted (own items) or a mate's L2 (stolen).
 2. The node's warm item at its best: a lab run with the prefetch posted but no cold traffic (the run's misses forced to
    the cards or skipped) to read the node's own floor for a warm item.
 3. The differences above, one at a time in the bench, until it reproduces the node's sign.

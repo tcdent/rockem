@@ -167,3 +167,7 @@ path = "src/order.rs"
 [[bin]]
 name = "bench-interfere"
 path = "src/interfere.rs"
+
+[[bin]]
+name = "bench-item"
+path = "src/item.rs"
