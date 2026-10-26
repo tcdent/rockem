@@ -10,12 +10,13 @@
 //! cores, 56 % of the run's lines from L3): `--warm 9 --cold 7` items of 64 rows × 4096 (≈ 1.2 MB warm, 0.95 MB cold a
 //! core). Run on socket 1's pool cores (their memory local).
 //!
-//!   bench-order [--cpus 49-71,73-95] [--n 3] [--warm 9] [--cold 7] [--pool-mb 96] [--iters 200]
+//! Each item is timed by its class (warm, cold): what an order does to each.
+//!
+//!   bench-order [--cpus 49-71,73-95] [--n 3] [--rows 64] [--warm 9] [--cold 7] [--pool-mb 96] [--iters 200]
 use harness::arg;
 use std::sync::{Arc, Barrier, Mutex};
 
 const K: usize = 4096;
-const ROWS: usize = 64;
 
 fn list(spec: &str) -> Vec<usize> {
     let mut v = Vec::new();
@@ -41,6 +42,75 @@ fn touch(b: &[u8]) -> u64 {
     s
 }
 
+/// The production one-token kernel (`common::q4::avx2::gemv`, copied: its helpers are private) with a software prefetch
+/// `dist` bytes ahead of its weight reads: `hint` 0 none (the production kernel's behaviour), 1 `prefetchnta` (the line
+/// marked non-temporal: kept out of the cache levels it would otherwise displace), 2 `prefetcht0` (the control: a
+/// prefetch with ordinary allocation).
+#[target_feature(enable = "avx2")]
+unsafe fn gemv_hint<const K: usize>(m: usize, w: *const u8, ws: *const f32, act: &common::q4::Act, out: *mut f32, hint: u8, dist: usize) {
+    use common::q4::{GROUP, TILE, WBIAS};
+    use std::arch::x86_64::*;
+    #[inline(always)]
+    unsafe fn dot64(w: *const u8, a_lo: __m256i, a_hi: __m256i, mask: __m256i, ones: __m256i, acc: __m256i) -> __m256i {
+        let p = _mm256_loadu_si256(w as *const __m256i);
+        let lo = _mm256_and_si256(p, mask);
+        let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(p), mask);
+        let s = _mm256_add_epi16(_mm256_maddubs_epi16(lo, a_lo), _mm256_maddubs_epi16(hi, a_hi));
+        _mm256_add_epi32(acc, _mm256_madd_epi16(s, ones))
+    }
+    #[inline(always)]
+    unsafe fn hsum4(a: __m256i, b: __m256i, c: __m256i, d: __m256i) -> __m128i {
+        let ab = _mm256_hadd_epi32(a, b);
+        let cd = _mm256_hadd_epi32(c, d);
+        let x = _mm256_hadd_epi32(ab, cd);
+        _mm_add_epi32(_mm256_castsi256_si128(x), _mm256_extracti128_si256::<1>(x))
+    }
+    let ngroups = K / GROUP;
+    let mask = _mm256_set1_epi8(0x0F);
+    let ones = _mm256_set1_epi16(1);
+    let a = act.q.as_ptr();
+    for t in 0..m / TILE {
+        let wt = w.add(t * K * 2);
+        let st = ws.add(t * ngroups * TILE);
+        let mut y = _mm_setzero_ps();
+        for g in 0..ngroups {
+            let ag = a.add(g * GROUP);
+            let a0 = _mm256_loadu_si256(ag as *const __m256i);
+            let a1 = _mm256_loadu_si256(ag.add(32) as *const __m256i);
+            let a2 = _mm256_loadu_si256(ag.add(64) as *const __m256i);
+            let a3 = _mm256_loadu_si256(ag.add(96) as *const __m256i);
+            let wg = wt.add(g * (GROUP / 2) * TILE);
+            // the group's 256 bytes are four lines: each prefetched `dist` ahead
+            if hint != 0 {
+                let mut l = 0;
+                while l < 256 {
+                    let p = wg.add(dist + l) as *const i8;
+                    if hint == 1 { _mm_prefetch::<_MM_HINT_NTA>(p) } else { _mm_prefetch::<_MM_HINT_T0>(p) }
+                    l += 64;
+                }
+            }
+            let mut c0 = _mm256_setzero_si256();
+            let mut c1 = _mm256_setzero_si256();
+            let mut c2 = _mm256_setzero_si256();
+            let mut c3 = _mm256_setzero_si256();
+            c0 = dot64(wg, a0, a1, mask, ones, c0);
+            c0 = dot64(wg.add(32), a2, a3, mask, ones, c0);
+            c1 = dot64(wg.add(64), a0, a1, mask, ones, c1);
+            c1 = dot64(wg.add(96), a2, a3, mask, ones, c1);
+            c2 = dot64(wg.add(128), a0, a1, mask, ones, c2);
+            c2 = dot64(wg.add(160), a2, a3, mask, ones, c2);
+            c3 = dot64(wg.add(192), a0, a1, mask, ones, c3);
+            c3 = dot64(wg.add(224), a2, a3, mask, ones, c3);
+            let sums = hsum4(c0, c1, c2, c3);
+            let bias = _mm_set1_epi32(WBIAS * *act.gsum.get_unchecked(g));
+            let s = _mm_cvtepi32_ps(_mm_sub_epi32(sums, bias));
+            let sc = _mm_mul_ps(_mm_loadu_ps(st.add(g * TILE)), _mm_set1_ps(*act.scale.get_unchecked(g)));
+            y = _mm_add_ps(y, _mm_mul_ps(s, sc));
+        }
+        _mm_storeu_ps(out.add(t * TILE), y);
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Order {
     WarmFirst,
@@ -53,26 +123,44 @@ enum Order {
 fn main() {
     let cpus = list(arg("--cpus").map(|p| p.to_str().unwrap().to_string()).as_deref().unwrap_or("49-71,73-95"));
     let n = num("--n", 3);
-    let (nw, nc) = (num("--warm", 9), num("--cold", 7));
+    // rows an item (64: 128 KB of codes; the served gate/up pair is ~544 KB, 256 rows)
+    let rows = num("--rows", 64);
+    let (nw0, nc) = (num("--warm", 9), num("--cold", 7));
+    // `--warm-spread s`: core i gets nw ± s warm items (spread evenly over the cores, the mean kept) — the served run's
+    // own deques are uneven (each core took what it claimed during the prefetch), which staggers when cores reach their
+    // cold items
+    let spread = num("--warm-spread", 0);
+    // `--cold-hint nta|t0` with `--dist` bytes: the cold items' reads prefetched non-temporally (or ordinarily) ahead
+    let hint: u8 = match arg("--cold-hint").map(|v| v.to_str().unwrap().to_string()).as_deref() { Some("nta") => 1, Some("t0") => 2, _ => 0 };
+    let dist = num("--dist", 2048);
     let pool_mb = num("--pool-mb", 96);
     let iters = num("--iters", 200);
     let orders = [Order::WarmFirst, Order::ColdFirst, Order::Interleave, Order::WarmOnly, Order::ColdOnly];
     let t = cpus.len();
-    // per iteration, per thread: the run's time (ns)
+    // per iteration, per thread: the run's time (ns); per order: the warm and cold items' summed times and counts
     let times: Arc<Mutex<Vec<Vec<Vec<u64>>>>> = Arc::new(Mutex::new(vec![vec![vec![0; t]; iters]; orders.len()]));
+    let class: Arc<Mutex<Vec<[u64; 4]>>> = Arc::new(Mutex::new(vec![[0; 4]; orders.len()]));
+    // the fill counters (common::pmc::FILLS, the node's): per order and class (warm, cold), each item's six counts
+    let fills: Arc<Mutex<Vec<[[u64; 6]; 2]>>> = Arc::new(Mutex::new(vec![[[0; 6]; 2]; orders.len()]));
+    let pmc_ok = {
+        let _ = std::fs::write("/proc/sys/kernel/nmi_watchdog", "0");
+        let ok = cpus.iter().all(|&c| common::pmc::Pmc::open(c).is_some_and(|p| p.program(&common::pmc::FILLS)));
+        ok && common::pmc::allow_rdpmc()
+    };
     let start = Arc::new(Barrier::new(t));
     let handles: Vec<_> = cpus
         .iter()
         .enumerate()
         .map(|(ti, &cpu)| {
-            let (start, times) = (start.clone(), times.clone());
+            let (start, times, class, fills) = (start.clone(), times.clone(), class.clone(), fills.clone());
+            let nw = if spread == 0 { nw0 } else { (nw0 + spread).saturating_sub((ti * (2 * spread + 1)) / t.max(1)).max(1) };
             std::thread::spawn(move || {
                 use common::q4::{pack, Act, QAct, GROUP};
                 harness::bench::pin(cpu);
                 let mut rng = common::testing::Rng::new(77 + ti as u64);
-                let w: Vec<i8> = (0..ROWS * K).map(|_| rng.i4()).collect();
-                let sc: Vec<f32> = vec![0.01; ROWS * K / GROUP];
-                let (pw1, ps1) = pack(ROWS, K, &w, &sc);
+                let w: Vec<i8> = (0..rows * K).map(|_| rng.i4()).collect();
+                let sc: Vec<f32> = vec![0.01; rows * K / GROUP];
+                let (pw1, ps1) = pack(rows, K, &w, &sc);
                 let (ib, sb) = (pw1.len(), ps1.len());
                 let mk = |count: usize| -> (Vec<u8>, Vec<f32>) {
                     ((0..count).flat_map(|i| pw1.iter().map(move |&b| b ^ (i as u8 & 0x11))).collect(), (0..count).flat_map(|_| ps1.iter().copied()).collect())
@@ -86,10 +174,34 @@ fn main() {
                     QAct { q: &mut q[i * K..(i + 1) * K], scale: &mut s[i * K / GROUP..(i + 1) * K / GROUP], gsum: &mut g[i * K / GROUP..(i + 1) * K / GROUP] }.quantize(&x);
                 }
                 let act = |i: usize| Act { q: &q[i * K..(i + 1) * K], scale: &s[i * K / GROUP..(i + 1) * K / GROUP], gsum: &g[i * K / GROUP..(i + 1) * K / GROUP] };
-                let mut out = vec![0f32; n * ROWS];
+                let mut out = vec![0f32; n * rows];
                 let op = out.as_mut_ptr() as usize;
                 let item = |wp: &[u8], sp: &[f32], k: usize| unsafe {
-                    common::q4::avx2::gemm::<K>(ROWS, wp.as_ptr().add(k * ib), sp.as_ptr().add(k * sb), n, act, |i| (op as *mut f32).add(i * ROWS));
+                    if n == 1 {
+                        common::q4::avx2::gemv::<K>(rows, wp.as_ptr().add(k * ib), sp.as_ptr().add(k * sb), &act(0), op as *mut f32);
+                    } else {
+                        common::q4::avx2::gemm::<K>(rows, wp.as_ptr().add(k * ib), sp.as_ptr().add(k * sb), n, act, |i| (op as *mut f32).add(i * rows));
+                    }
+                };
+                // each item timed by its class: what interleaving does to the warm and to the cold items
+                let (wsum, csum) = (std::cell::Cell::new([0u64; 2]), std::cell::Cell::new([0u64; 2]));
+                let (wfill, cfill) = (std::cell::Cell::new([0u64; 6]), std::cell::Cell::new([0u64; 6]));
+                let read6 = || -> [u64; 6] { if pmc_ok { std::array::from_fn(|i| common::pmc::rdpmc(i as u32)) } else { [0; 6] } };
+                let timed = |cell: &std::cell::Cell<[u64; 2]>, fc: &std::cell::Cell<[u64; 6]>, f: &dyn Fn()| {
+                    let p0 = read6();
+                    let t = std::time::Instant::now();
+                    f();
+                    let dt = t.elapsed().as_nanos() as u64;
+                    let p1 = read6();
+                    let mut c = cell.get();
+                    c[0] += dt;
+                    c[1] += 1;
+                    cell.set(c);
+                    let mut x = fc.get();
+                    for i in 0..6 {
+                        x[i] += p1[i].wrapping_sub(p0[i]) & ((1 << 48) - 1);
+                    }
+                    fc.set(x);
                 };
                 let mut cursor = 0usize;
                 let mut sink = 0u64;
@@ -102,8 +214,21 @@ fn main() {
                         cursor = (cursor + nc) % pool_items;
                         start.wait();
                         let t0 = std::time::Instant::now();
-                        let warm = |k: usize| item(&warm_w, &warm_s, k);
-                        let cold_run = |k: usize| item(&pool_w, &pool_s, cold[k]);
+                        let warm = |k: usize| timed(&wsum, &wfill, &|| item(&warm_w, &warm_s, k));
+                        let cold_item = |k: usize| unsafe {
+                            if n == 1 && hint != 0 {
+                                gemv_hint::<K>(rows, pool_w.as_ptr().add(cold[k] * ib), pool_s.as_ptr().add(cold[k] * sb), &act(0), op as *mut f32, hint, dist);
+                            } else {
+                                item(&pool_w, &pool_s, cold[k]);
+                            }
+                        };
+                        let cold_run = |k: usize| timed(&csum, &cfill, &|| cold_item(k));
+                        if it == 1 {
+                            wsum.set([0; 2]);
+                            csum.set([0; 2]);
+                            wfill.set([0; 6]);
+                            cfill.set([0; 6]);
+                        }
                         match order {
                             Order::WarmFirst => {
                                 (0..nw).for_each(warm);
@@ -134,6 +259,24 @@ fn main() {
                         }
                         start.wait();
                     }
+                    let (w2, c2) = (wsum.get(), csum.get());
+                    let mut cl = class.lock().unwrap();
+                    cl[oi][0] += w2[0];
+                    cl[oi][1] += w2[1];
+                    cl[oi][2] += c2[0];
+                    cl[oi][3] += c2[1];
+                    drop(cl);
+                    let mut fl = fills.lock().unwrap();
+                    let (wf, cf) = (wfill.get(), cfill.get());
+                    for i in 0..6 {
+                        fl[oi][0][i] += wf[i];
+                        fl[oi][1][i] += cf[i];
+                    }
+                    drop(fl);
+                    wsum.set([0; 2]);
+                    csum.set([0; 2]);
+                    wfill.set([0; 6]);
+                    cfill.set([0; 6]);
                 }
                 std::hint::black_box((sink, out));
             })
@@ -143,14 +286,31 @@ fn main() {
         h.join().unwrap();
     }
     let times = times.lock().unwrap();
-    let mb = |items: usize| (items * (ROWS * K / 2 + ROWS * K / 128 * 4)) as f64 / 1e6;
-    println!("bench-order: {t} cores, {n} tokens, {nw} warm items ({:.2} MB) + {nc} cold ({:.2} MB) a core, {iters} iterations", mb(nw), mb(nc));
-    println!("{:<12} {:>12} {:>12} {:>12} {:>16}", "order", "p50 µs", "p10 µs", "p90 µs", "cold GB/s (all)");
+    let mb = |items: usize| (items * (rows * K / 2 + rows * K / 128 * 4)) as f64 / 1e6;
+    let cl = class.lock().unwrap();
+    println!("bench-order: {t} cores, {n} tokens, items of {rows} rows, {nw0} ± {spread} warm ({:.2} MB) + {nc} cold ({:.2} MB) a core, {iters} iterations, cold hint {} at {dist} B", mb(nw0), mb(nc), ["none", "nta", "t0"][hint as usize]);
+    println!("{:<12} {:>9} {:>9} {:>9} {:>15} {:>14} {:>14}", "order", "p50 µs", "p10 µs", "p90 µs", "cold GB/s (all)", "warm item µs", "cold item µs");
+    let fl = fills.lock().unwrap();
+    let lines = (rows * K / 2 + rows * K / 128 * 4) as f64 / 64.0;
+    if pmc_ok {
+        println!("lines an item from each source (an item is {lines:.0} lines): {}", common::pmc::FILL_NAMES.join(" / "));
+        for (oi, o) in orders.iter().enumerate() {
+            for (c, name) in [(0, "warm"), (1, "cold")] {
+                let items = if c == 0 { cl[oi][1] } else { cl[oi][3] };
+                if items == 0 {
+                    continue;
+                }
+                let v: Vec<String> = (0..6).map(|i| format!("{:.0}", fl[oi][c][i] as f64 / items as f64)).collect();
+                println!("  {:<12} {name}: {}", format!("{o:?}"), v.join(" / "));
+            }
+        }
+    }
     for (oi, o) in orders.iter().enumerate() {
         let mut span: Vec<u64> = times[oi].iter().map(|v| *v.iter().max().unwrap()).collect();
         span.sort();
         let p = |q: f64| span[((span.len() - 1) as f64 * q) as usize] as f64 / 1e3;
         let cold = if matches!(o, Order::WarmOnly) { 0.0 } else { mb(nc) * t as f64 / (p(0.5) * 1e-6) / 1e3 };
-        println!("{:<12} {:>12.1} {:>12.1} {:>12.1} {:>16.1}", format!("{o:?}"), p(0.5), p(0.1), p(0.9), cold);
+        let per = |a: u64, b: u64| if b == 0 { 0.0 } else { a as f64 / b as f64 / 1e3 };
+        println!("{:<12} {:>9.1} {:>9.1} {:>9.1} {:>15.1} {:>14.2} {:>14.2}", format!("{o:?}"), p(0.5), p(0.1), p(0.9), cold, per(cl[oi][0], cl[oi][1]), per(cl[oi][2], cl[oi][3]));
     }
 }
