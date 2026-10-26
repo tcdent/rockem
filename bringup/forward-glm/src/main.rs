@@ -494,27 +494,10 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
         let mut f = std::io::BufWriter::new(std::fs::File::create(&out).unwrap());
         let mut logits = vec![0f32; E];
         let (mut ahead, mut ahead_n) = (0usize, 0usize);
-        // the analog's first margin off the cards (098) against the same picks, where the next layer is KDA
-        let mut an_logits = vec![0f32; E];
-        let (mut an_hit, mut an_n, mut ra_kda) = (0usize, 0usize, 0usize);
         let t0 = std::time::Instant::now();
         for t in FIRST_POS..ids.len() {
             let mut tc = Collect::default();
             model.step(&w, ids[t] as u32, t, None, &mut tc, true);
-            for l in 0..NUM_HIDDEN_LAYERS - 1 {
-                if let (Ffn::Moe(next), Some((_, actual))) = (&w.layers[l + 1].ffn, tc.topk.iter().find(|(l2, _)| *l2 == l + 1)) {
-                    if model.placed.as_mut().unwrap().analog_first(l, 1, &mut an_logits) {
-                        let pred = glm_5_3_flash::ffn::picks(next, &mut an_logits);
-                        an_hit += actual.iter().filter(|e| pred.contains(e)).count();
-                        an_n += 1;
-                        if let Some((_, _, xn)) = tc.edges.iter().find(|(l2, name, _)| *l2 == l && name == "ffn_in") {
-                            common::gemv::bf16_par::<E, H>(next.router, xn, &mut logits, &pool);
-                            let pred = glm_5_3_flash::ffn::picks(next, &mut logits);
-                            ra_kda += actual.iter().filter(|e| pred.contains(e)).count();
-                        }
-                    }
-                }
-            }
             for (l, idx) in &tc.topk {
                 writeln!(f, "{t} {l} {}", idx.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(" ")).unwrap();
             }
@@ -535,9 +518,6 @@ fn cpu_gate(bundle: &std::path::Path, ck: &Checkpoint, experts_mode: &str, posit
         }
         let p = &model.profile;
         println!("routing trace: {} positions to {}; layer-ahead predictor names {:.2} of {TOP_K} picks (layer l+1's router over layer l's FFN input); today's names {:.2} (layer l's router over the attention input); {:.1} s", ids.len() - FIRST_POS, out.display(), ahead as f64 / ahead_n.max(1) as f64, p.pre_agree as f64 / p.moe_layers.max(1) as f64, t0.elapsed().as_secs_f32());
-        if an_n > 0 {
-            println!("routing trace: the analog's first margin (098) names {:.2} of {TOP_K} picks over {an_n} KDA-next layer positions; the route-ahead names {:.2} on the same", an_hit as f64 / an_n as f64, ra_kda as f64 / an_n as f64);
-        }
     }
     std::process::exit(if report.failures() > 0 || !step_gate { 1 } else { 0 });
 }

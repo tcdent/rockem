@@ -39,7 +39,6 @@ use glm_5_3_flash::construct::Placed;
 use glm_5_3_flash::ffn::gfx11_consts::{DENSE_GU_ROWS, SHARED_GU_ROWS};
 use glm_5_3_flash::hc::gfx11_consts::{ACT_SLOTS, CHANNEL_GRID, MIX as HC_MIX, PRE_COUNTS, PRE_GRID, PRE_LDS, PRE_STRIDE, ROUTE_ROWS};
 use glm_5_3_flash::kda::gfx11_consts as g;
-use glm_5_3_flash::analog as an;
 use common::gemv::ROWS;
 use glm_5_3_flash::ffn::gfx11_consts::ROWS_GU;
 use glm_5_3_flash::layout::{KDA_MEMORY, KDA_WINDOW};
@@ -205,31 +204,6 @@ struct Card {
     pred_rows: crate::kfd::Kernel,
     pred_learn: crate::kfd::Kernel,
     pred_input: crate::kfd::Kernel,
-    /// The expert predictor's analog of the next layer (098, `analog.rs`): its kernels and this card's scratch for a
-    /// verify step — the stood-in streams and the no-attention streams `[SPEC_TOKENS][HC][H]`, the two collapses
-    /// `[SPEC_TOKENS][H]`, c and k `[SPEC_TOKENS]`, `an_pre`'s coefficient scratch and barrier words, the chosen
-    /// heads' rows `[SPEC_TOKENS][M_SMALL]` and gates `[SPEC_TOKENS][2 · PART_QKV]`, their readouts
-    /// `[SPEC_TOKENS][PART_QKV]`, this card's partial logits `[SPEC_TOKENS][E]`, the leader's first-margin scores
-    /// `[SPEC_TOKENS][ROUTE_ROWS]` (the analog's at `E`), `an_out`'s arrival count.
-    an_pre: crate::kfd::Kernel,
-    an_rows_sel: crate::kfd::Kernel,
-    an_fg_sel: crate::kfd::Kernel,
-    an_step: crate::kfd::Kernel,
-    an_out: crate::kfd::Kernel,
-    an_streams: Mem,
-    an_streams2: Mem,
-    an_x: Mem,
-    an_x0: Mem,
-    an_c: Mem,
-    an_k: Mem,
-    an_scratch: Mem,
-    an_count: Mem,
-    an_smix: Mem,
-    an_fg: Mem,
-    an_normed: Mem,
-    an_part: Mem,
-    an_scores: Mem,
-    an_ocount: Mem,
     /// The rows pass's input from `hc_post`: `[STEP][H]` f32 (a long step's rows kernel), the same normed as bf16 with
     /// the waves' partial sums of squares (a decode step's `pred_rows`) (093).
     pred_x: Mem,
@@ -361,11 +335,7 @@ const W_XQ: usize = 9;
 const W_PLAN: usize = 10;
 /// The rows-based plan (093): the predictor's second pass behind `hc_post`, over the whole FFN output.
 const W_PLAN2: usize = 11;
-/// The analog's handoffs (098): the leader's shared-expert output is in the peer's receiving buffer; the peer's
-/// partial logits are in the leader's.
-const W_AN_FYV: usize = 12;
-const W_AN_PART: usize = 13;
-const W_KINDS: usize = 14;
+const W_KINDS: usize = 12;
 /// The resident experts' completion line (`Kfd::fence_line`): a prefill chunk's residents are waited for after the
 /// other chunk's card half has posted and waited for its own fences (037).
 const XPT_LINE: usize = 1;
@@ -421,20 +391,6 @@ struct FfnOn {
     /// The prefetch predictor's pair (this layer → the next MoE layer) on this card: its state (`plan::STATE` f32) and
     /// its tokens' two margins `[STEP][E]` f32 each, kept from its prediction for its update.
     pred: Option<(Mem, Mem, Mem)>,
-    /// The pair's analog of the next layer (098) where that layer is KDA: a part a card.
-    analog: Option<Vec<AnalogPart>>,
-}
-
-/// One card's share of a pair's analog (098): the part of layer l + 1 it holds, the `an::NSEL` heads of that part the
-/// analog runs (`[NSEL]` u32, the part's indices, by the composed rows' norm), the router composed into those heads'
-/// output columns (`[E][an::SEL_W]` bf16: R·diag(post_ln)·O over them), and layer l + 1's post-norm (bf16) on the
-/// leader's card for its router rows.
-struct AnalogPart {
-    card: usize,
-    part: usize,
-    heads: Mem,
-    crows: Mem,
-    ln: Mem,
 }
 
 /// An MLA layer's projections on a card: q_a and kv_a (FP8, over the input-normed
@@ -489,10 +445,6 @@ struct Peer {
     axq: Mem,
     axs: Mem,
     axg: Mem,
-    /// The analog's handoffs (098): the leader's shared-expert output for this card's chain (`[SPEC_TOKENS][H]` f32),
-    /// and the peer's partial logits for this card's `pred_step` when this card leads (`[SPEC_TOKENS][E]` f32).
-    an_fyv: Mem,
-    an_part_peer: Mem,
     words: Mem,   // `word()` offsets, a cache line each
 }
 
@@ -554,50 +506,6 @@ fn raw<T>(v: &[T]) -> &[u8] {
 /// A bf16-stored norm, widened at load, back to its bf16 bits (exact: the low half is zero).
 fn bf16_of(v: &[f32]) -> Vec<u16> {
     v.iter().map(|&v| (v.to_bits() >> 16) as u16).collect()
-}
-
-/// The analog's rows for part `i` of a KDA layer (098): `C = R·diag(ln)·O` over the part's output columns
-/// (`[E][PART_QKV]`, f32, the rows over the threads), the `NSEL` heads whose columns carry the most of it (by the
-/// squared norm of their blocks), and `C`'s columns of those heads in that order as bf16 (`[E][SEL_W]`).
-fn analog_rows(kw: &glm_5_3_flash::weights::Kda, router: &[u16], ln: &[f32], i: usize) -> (Vec<u32>, Vec<u16>) {
-    use common::gemv::widen;
-    const E: usize = glm_5_3_flash::E;
-    let (c0, w) = (i * g::PART_QKV, g::PART_QKV);
-    let threads = std::thread::available_parallelism().map_or(8, |t| t.get()).min(E);
-    let per = E.div_ceil(threads);
-    let rows: Vec<Vec<f32>> = std::thread::scope(|sc| {
-        let hs: Vec<_> = (0..threads)
-            .map(|t| {
-                sc.spawn(move || {
-                    let mut out = Vec::with_capacity(per * w);
-                    for e in t * per..((t + 1) * per).min(E) {
-                        let mut acc = vec![0f32; w];
-                        for d in 0..H {
-                            let v = widen(router[e * H + d]) * ln[d];
-                            let orow = &kw.o[d * KDA_QKV + c0..d * KDA_QKV + c0 + w];
-                            for (a, &o) in acc.iter_mut().zip(orow) {
-                                *a += v * widen(o);
-                            }
-                        }
-                        out.extend_from_slice(&acc);
-                    }
-                    out
-                })
-            })
-            .collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    let c: Vec<f32> = rows.concat();
-    let mut imp: Vec<(f32, usize)> = (0..g::PART_HEADS).map(|h| ((0..E).map(|e| c[e * w + h * KDA_DIM..e * w + (h + 1) * KDA_DIM].iter().map(|v| v * v).sum::<f32>()).sum(), h)).collect();
-    imp.sort_by(|a, b| b.0.total_cmp(&a.0));
-    let heads: Vec<u32> = imp[..an::NSEL].iter().map(|x| x.1 as u32).collect();
-    let mut crows = Vec::with_capacity(E * an::SEL_W);
-    for e in 0..E {
-        for &h in &heads {
-            crows.extend(c[e * w + h as usize * KDA_DIM..e * w + (h as usize + 1) * KDA_DIM].iter().map(|&v| (v.to_bits() >> 16) as u16));
-        }
-    }
-    (heads, crows)
 }
 
 impl Cards {
@@ -668,33 +576,6 @@ impl Cards {
                     pred_rows: k.kernel("pred_rows"),
                     pred_learn: k.kernel("pred_learn"),
                     pred_input: k.kernel("pred_input"),
-                    an_pre: k.kernel("an_pre"),
-                    an_rows_sel: k.kernel("an_rows_sel"),
-                    an_fg_sel: k.kernel("an_fg_sel"),
-                    an_step: k.kernel("kda_step_ro"),
-                    an_out: k.kernel("an_out"),
-                    an_streams: k.vram(SPEC_TOKENS * HC * H * 4),
-                    an_streams2: k.vram(SPEC_TOKENS * HC * H * 4),
-                    an_x: k.vram(SPEC_TOKENS * H * 4),
-                    an_x0: k.vram(SPEC_TOKENS * H * 4),
-                    an_c: k.vram(64),
-                    an_k: k.vram(64),
-                    an_scratch: k.vram(SPEC_TOKENS * an::PRE_SCRATCH * 4),
-                    an_count: {
-                        let m = k.vram_visible(an::PRE_COUNTS * 4);
-                        k.upload(&m, 0, &vec![0u8; an::PRE_COUNTS * 4]);
-                        m
-                    },
-                    an_smix: k.vram(SPEC_TOKENS * (SMALL_ROWS + 3 * g::PART_QKV) * 4),
-                    an_fg: k.vram(SPEC_TOKENS * 2 * g::PART_QKV * 4),
-                    an_normed: k.vram(SPEC_TOKENS * g::PART_QKV * 4),
-                    an_part: k.vram(SPEC_TOKENS * glm_5_3_flash::E * 4),
-                    an_scores: k.vram(SPEC_TOKENS * ROUTE_ROWS * 4),
-                    an_ocount: {
-                        let m = k.vram_visible(64);
-                        k.upload(&m, 0, &[0u8; 64]);
-                        m
-                    },
                     pred_x: k.vram(STEP * H * 4),
                     pred_xn: k.vram(STEP * H * 2),
                     pred_ss: k.vram(STEP * glm_5_3_flash::plan::PRED_SS * 4),
@@ -791,7 +672,7 @@ impl Cards {
                 let buf = || k.vram_shared(STEP * H * 4, &others);
                 let words = k.vram_shared(CHUNKS * WORD_SET, &others);
                 unsafe { std::ptr::write_bytes(words.ptr() as *mut u8, 0, words.size) };
-                Peer { ys: [buf(), buf()], fy: [buf(), buf()], my: [buf(), buf()], rows: k.vram_shared(STEP * TOP_K * H * 4, &others), yr: [buf(), buf()], psel: k.vram_shared(STEP * DENSE_BELOW * 4, &others), psel_n: k.vram_shared(STEP * 4, &others), pmqa: k.vram_shared(STEP * Q_LORA_RANK * 4, &others), phd: k.vram_shared(STEP * O_IN * 4, &others), pml: k.vram_shared(STEP * MLA_HEADS * 2 * 4, &others), axq: k.vram_shared(STEP * H, &others), axs: k.vram_shared(STEP * HG * 4, &others), axg: k.vram_shared(STEP * HG * 4, &others), an_fyv: k.vram_shared(SPEC_TOKENS * H * 4, &others), an_part_peer: k.vram_shared(SPEC_TOKENS * glm_5_3_flash::E * 4, &others), words }
+                Peer { ys: [buf(), buf()], fy: [buf(), buf()], my: [buf(), buf()], rows: k.vram_shared(STEP * TOP_K * H * 4, &others), yr: [buf(), buf()], psel: k.vram_shared(STEP * DENSE_BELOW * 4, &others), psel_n: k.vram_shared(STEP * 4, &others), pmqa: k.vram_shared(STEP * Q_LORA_RANK * 4, &others), phd: k.vram_shared(STEP * O_IN * 4, &others), pml: k.vram_shared(STEP * MLA_HEADS * 2 * 4, &others), axq: k.vram_shared(STEP * H, &others), axs: k.vram_shared(STEP * HG * 4, &others), axg: k.vram_shared(STEP * HG * 4, &others), words }
             })
             .collect();
         // the host's handoffs: host memory card 0 allocates and every other card maps too
@@ -895,7 +776,6 @@ impl Cards {
         // every layer's FFN half but the routed experts
         let mut ffns: Vec<Option<FfnOn>> = Vec::with_capacity(NUM_HIDDEN_LAYERS);
         let (mut dense, mut shared_n) = (0, 0);
-        let mut analog_bytes = 0usize;
         for l in 0..NUM_HIDDEN_LAYERS {
             let card = card_of(l);
             let k = &cards[card].k;
@@ -984,29 +864,7 @@ impl Cards {
                 }
                 _ => None,
             };
-            // the analog (098) where this layer and the next are MoE and the next is KDA: a part a card
-            let analog = match (&w.layers[l].ffn, w.layers.get(l + 1)) {
-                (Ffn::Moe(_), Some(lw1)) if matches!(lw1.ffn, Ffn::Moe(_)) && LINEAR_ATTENTION[l + 1] => {
-                    let (Attn::Kda(kw1), Ffn::Moe(m1)) = (&lw1.attn, &lw1.ffn) else { unreachable!() };
-                    let mut parts = Vec::with_capacity(g::PARTS);
-                    for i in 0..g::PARTS {
-                        let pc = layers[l + 1].as_ref().unwrap().parts[i].card;
-                        let k = &cards[pc].k;
-                        let (heads, crows) = analog_rows(kw1, m1.router, lw1.post_ln, i);
-                        let hm = k.vram_visible(an::NSEL * 4);
-                        k.upload(&hm, 0, raw(&heads));
-                        let cm = k.vram_visible(crows.len() * 2);
-                        k.upload(&cm, 0, raw(&crows));
-                        let lnm = k.vram_visible(H * 2);
-                        k.upload(&lnm, 0, raw(&bf16_of(lw1.post_ln)));
-                        analog_bytes += hm.size + cm.size + lnm.size;
-                        parts.push(AnalogPart { card: pc, part: i, heads: hm, crows: cm, ln: lnm });
-                    }
-                    Some(parts)
-                }
-                _ => None,
-            };
-            ffns.push(Some(FfnOn { card, dense: is_dense, ln, hc, gu_w, gu_s, down_w, down_s, router, act, pred, analog }));
+            ffns.push(Some(FfnOn { card, dense: is_dense, ln, hc, gu_w, gu_s, down_w, down_s, router, act, pred }));
         }
         // the MLA layers' projections
         let mut mlas: Vec<Option<MlaOn>> = (0..NUM_HIDDEN_LAYERS).map(|_| None).collect();
@@ -1054,8 +912,6 @@ impl Cards {
                 (norm, lm)
             })
             .collect();
-        bytes += analog_bytes;
-        println!("gpu      : the expert predictor's analog (098): {} pairs' composed rows and head tables, {:.0} MB over the cards", ffns.iter().flatten().filter(|f| f.analog.is_some()).count(), analog_bytes as f64 / 1e6);
         prow::row!("track-boot", "boot", { "what" => "cards", "s" => t0.elapsed().as_secs_f64(), "gb" => bytes as f64 / 1e9 });
         println!("gpu      : {} KDA layers, {mla_n} MLA layers (their latents to {max_ctx} positions), {dense} dense FFNs, {shared_n} shared experts, the hyper-connections, the streams and the head on {} card{} ({:.1} GB with their state) in {:.1}s", kda_layers.len(), n, if n == 1 { "" } else { "s" }, bytes as f64 / 1e9, t0.elapsed().as_secs_f32());
         // the draft layer: its MLA attention as layer MTP_LAYER on the head's card (the shared lm_head is
@@ -2266,36 +2122,6 @@ impl Placed for Cards {
             *k = f32::from_bits(b);
         }
     }
-    fn analog_first(&mut self, l: usize, n: usize, out: &mut [f32]) -> bool {
-        const E: usize = glm_5_3_flash::E;
-        let f = self.ffns[l].as_ref().unwrap();
-        if f.analog.is_none() || n > SPEC_TOKENS {
-            return false;
-        }
-        // the plan's word: `pred_step` is done, so the chain before it is; the pieces out through host memory (a copy
-        // launch each into the card's snapshot buffer), then combined as `pred_step`'s first margin does
-        crate::kfd::wait_word(self.word_ptr(W_PLAN, f.card), self.half_seq[l][self.ch][1]);
-        let c = &self.cards[f.card];
-        let copy = |src: usize, dst_off: usize, floats: usize| {
-            let mut a = Args::new();
-            a.ptr(src).ptr(c.snap.at(dst_off * 4)).u32(floats as u32);
-            c.k.launch(&c.copy, floats.div_ceil(g::COPY_WG_WORDS) as u32, g::WG, 0, &a);
-        };
-        let (o_s, o_a, o_b, o_k) = (0, n * ROUTE_ROWS, n * ROUTE_ROWS + n * E, n * ROUTE_ROWS + 2 * n * E);
-        copy(c.an_scores.va, o_s, n * ROUTE_ROWS);
-        copy(c.an_part.va, o_a, n * E);
-        copy(self.peers[f.card].an_part_peer.va, o_b, n * E);
-        copy(c.an_k.va, o_k, n);
-        c.k.sync();
-        let mut v = vec![0f32; o_k + n];
-        read(&c.snap, 0, &mut v);
-        for i in 0..n {
-            for e in 0..E {
-                out[i * E + e] = v[o_s + i * ROUTE_ROWS + E + e] + v[o_k + i] * (v[o_a + i * E + e] + v[o_b + i * E + e]);
-            }
-        }
-        true
-    }
     fn ffn_logits(&mut self, l: usize, n: usize, x: &mut [f32], logits: &mut [f32]) {
         let f = self.ffns[l].as_ref().unwrap();
         crate::kfd::wait_word(self.word_ptr(W_X, f.card), self.half_seq[l][self.ch][1]);
@@ -2463,57 +2289,6 @@ impl Placed for Cards {
 const _: () = assert!(CONV_DIM == 3 * KDA_QKV && CONV_TAPS == 4);
 
 impl Cards {
-    /// The analog of layer l + 1 for pair l's first margin (098, `analog.rs`), a verify step of `n` tokens, on both
-    /// cards ahead of their `hc_post`: each card's chain over the part of layer l + 1 it holds. The leader (layer l's FFN
-    /// card) starts by copying its shared-expert output to the peer and posting the peer's word; the peer's chain waits
-    /// for it first; the peer's `an_out` writes its partial into the leader's receiving buffer and posts the leader's
-    /// word, which the leader's queue waits for ahead of its own `an_out`. No cycle: the leader's post precedes every
-    /// wait in its queue, the peer posts only after its own wait, and neither chain is behind a `hc_post`.
-    fn analog(&self, l: usize, n: usize) {
-        let f = self.ffns[l].as_ref().unwrap();
-        let parts = f.analog.as_ref().unwrap();
-        let f1 = self.ffns[l + 1].as_ref().unwrap();
-        let lay1 = self.layers[l + 1].as_ref().unwrap();
-        let value = self.half_seq[l][self.ch][1];
-        let leader = f.card;
-        let peer = (0..self.cards.len()).find(|&j| j != leader).expect("the analog's handoffs need a peer card");
-        const M_SMALL: usize = SMALL_ROWS + 3 * g::PART_QKV;
-        for ap in parts {
-            let c = &self.cards[ap.card];
-            let p = &lay1.parts[ap.part];
-            let me = c.k.index;
-            let lead = me == leader;
-            let hc1 = &f1.hc[me];
-            if !lead {
-                self.hold_word(c, W_AN_FYV, leader, value);
-            }
-            let (fyv, fyv_dst, fyv_word) = if lead { (self.tok(&c.fyv, H), self.peers[peer].an_fyv.va, self.peers[peer].words.at(self.wd(W_AN_FYV, leader))) } else { (self.peers[me].an_fyv.va, 0, 0) };
-            let mut a = Args::new();
-            a.ptr(self.tok(&c.streams, HC * H)).ptr(self.tok(&c.mix, HC_MIX)).ptr(fyv).ptr(fyv_dst).ptr(fyv_word);
-            a.ptr(hc1[0].0.va).ptr(hc1[0].1.va).ptr(hc1[0].2.va).ptr(hc1[1].0.va).ptr(hc1[1].1.va).ptr(hc1[1].2.va);
-            a.ptr(c.an_streams.va).ptr(c.an_streams2.va).ptr(c.an_x.va).ptr(c.an_x0.va).ptr(c.an_c.va).ptr(c.an_scratch.va).ptr(c.an_count.va).u32(value).u32(n as u32);
-            c.k.launch(&c.an_pre, an::PRE_GRID, g::WG, an::PRE_LDS, &a);
-            let mut a = Args::new();
-            a.ptr(c.an_x.va).ptr(p.input_ln.va).ptr(p.sq.va).ptr(c.an_smix.va).ptr(ap.heads.va).u32(n as u32);
-            c.k.launch(&c.an_rows_sel, an::SEL_ROWS.div_ceil(g::E4_WAVES * g::E4_ROWS) as u32, 32 * g::E4_WAVES as u32, 0, &a);
-            let mut a = Args::new();
-            a.ptr(c.an_smix.va).ptr(p.fg.va).ptr(c.an_fg.va).ptr(ap.heads.va).u32(n as u32);
-            c.k.launch(&c.an_fg_sel, an::SEL_FG_ROWS.div_ceil(g::E4_WAVES * g::E4_ROWS) as u32, 32 * g::E4_WAVES as u32, 0, &a);
-            let mut a = Args::new();
-            a.ptr(c.an_smix.at(SMALL_ROWS * 4)).ptr(p.taps.va).ptr(p.window.va).ptr(c.an_fg.va).ptr(p.dt_bias.va).ptr(p.a_log.va).ptr(c.an_smix.at(2 * KDA_DIM * 4)).ptr(c.an_fg.at(g::PART_QKV * 4)).ptr(p.mem.va).ptr(p.o_norm.va).ptr(c.an_normed.va).u32(p.head0 as u32).u32(n as u32).u32(M_SMALL as u32).u32(2 * g::PART_QKV as u32).u32(M_SMALL as u32).ptr(ap.heads.va);
-            c.k.launch(&c.an_step, an::NSEL as u32, g::WG, g::STEP_LDS as u32, &a);
-            if lead {
-                self.hold_word(c, W_AN_PART, peer, value);
-            }
-            let (part, part_word) = if lead { (c.an_part.va, 0) } else { (self.peers[leader].an_part_peer.va, self.peers[leader].words.at(self.wd(W_AN_PART, me))) };
-            let router = f.router.as_ref().unwrap().va;
-            let mut a = Args::new();
-            a.ptr(c.an_normed.va).ptr(ap.heads.va).ptr(ap.crows.va).ptr(part).ptr(part_word).ptr(c.an_ocount.va);
-            a.ptr(if lead { c.an_x0.va } else { 0 }).ptr(ap.ln.va).ptr(router).ptr(c.an_scores.va).ptr(c.an_c.va).ptr(c.an_k.va).u32(value).u32(n as u32);
-            c.k.launch(&c.an_out, if lead { 2 * an::OUT_WGS } else { an::OUT_WGS }, g::WG, an::OUT_LDS, &a);
-        }
-    }
-
     /// One pass of pair l's predictor on the FFN card: the second margin's input (the FFN input plus the shared output,
     /// plus the weighted routed rows when `rows`), the next layer's router over it, `pred_step` — a decode step's plan
     /// into `plan` (early) or `plan2` (rows) with its word; a long step's into the margins only.
@@ -2529,24 +2304,14 @@ impl Cards {
         // the routed rows: the host's experts' rows as the leader holds them once its word is in (this pass runs behind
         // `hc_post`, which waited for it), weighted in pick order (093); null for the early pass
         let router = f.router.as_ref().unwrap().va;
-        // the first margin: the analog's scores and partials where the next layer is KDA (098, a decode step), else
-        // the route-ahead in `scores_v`
-        let peer = (0..self.cards.len()).find(|&j| j != f.card);
-        let (first, pa, pb, pk) = match (f.analog.as_ref(), decode, peer) {
-            (Some(_), true, Some(_)) => (c.an_scores.va, c.an_part.va, self.peers[f.card].an_part_peer.va, c.an_k.va),
-            _ => (self.tok(&c.scores_v, ROUTE_ROWS), 0, 0, 0),
-        };
         if rows && decode {
             // `hc_post` wrote the input (x + the whole FFN output); the next layer's router, the margins and the plan in
             // one launch (`pred_rows`: three launches were ~60 µs on the card's chain behind `hc_post`, 2026-10-22)
             let mut a = Args::new();
-            a.ptr(pxn).ptr(pss).ptr(router).ptr(ps2).ptr(st.va).ptr(first).ptr(d.at(self.t0 * E * 4)).ptr(d2.at(self.t0 * E * 4)).ptr(c.pred_aux.va);
-            a.ptr(self.shared.plan2.va).ptr(self.shared.words.at(self.wd(W_PLAN2, f.card))).u32(self.half_seq[l][self.ch][1]).u32(n as u32).ptr(c.pred_keys.va).ptr(c.pred_count.va).ptr(pa).ptr(pb).ptr(pk);
+            a.ptr(pxn).ptr(pss).ptr(router).ptr(ps2).ptr(st.va).ptr(self.tok(&c.scores_v, ROUTE_ROWS)).ptr(d.at(self.t0 * E * 4)).ptr(d2.at(self.t0 * E * 4)).ptr(c.pred_aux.va);
+            a.ptr(self.shared.plan2.va).ptr(self.shared.words.at(self.wd(W_PLAN2, f.card))).u32(self.half_seq[l][self.ch][1]).u32(n as u32).ptr(c.pred_keys.va).ptr(c.pred_count.va);
             c.k.launch(&c.pred_rows, glm_5_3_flash::plan::PRED_ROWS_BLOCKS, PLAN_WG, PLAN_LDS, &a);
             return;
-        }
-        if !rows && decode && f.analog.is_some() {
-            self.analog(l, n);
         }
         if rows {
             // a long step's rows pass: the stacked router through the matrix path, the margins for the learning
@@ -2571,7 +2336,7 @@ impl Cards {
             }
         }
         let mut a = Args::new();
-        a.ptr(st.va).ptr(first).ptr(ps2).ptr(d.at(self.t0 * E * 4)).ptr(d2.at(self.t0 * E * 4)).ptr(slot(l));
+        a.ptr(st.va).ptr(self.tok(&c.scores_v, ROUTE_ROWS)).ptr(ps2).ptr(d.at(self.t0 * E * 4)).ptr(d2.at(self.t0 * E * 4)).ptr(slot(l));
         if decode {
             let (plan, word) = if rows { (self.shared.plan2.va, self.shared.words.at(self.wd(W_PLAN2, f.card))) } else { (self.shared.plan.va, self.shared.words.at(self.wd(W_PLAN, f.card))) };
             a.ptr(plan).ptr(word);
@@ -2579,7 +2344,7 @@ impl Cards {
             a.ptr(0).ptr(0);
         }
         // the early decode pass leaves its thresholds and co-routing sums for the rows pass; a long step's does not
-        a.u32(self.half_seq[l][self.ch][1]).u32(n as u32).ptr(c.pred_keys.va).ptr(c.pred_count.va).ptr(if decode && !rows { c.pred_aux.va } else { 0 }).ptr(pa).ptr(pb).ptr(pk);
+        a.u32(self.half_seq[l][self.ch][1]).u32(n as u32).ptr(c.pred_keys.va).ptr(c.pred_count.va).ptr(if decode && !rows { c.pred_aux.va } else { 0 });
         c.k.launch(&c.pred_step, if decode { n as u32 } else { PLAN_PRED_WGS as u32 }, PLAN_WG, PLAN_LDS, &a);
     }
 }

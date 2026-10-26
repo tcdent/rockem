@@ -501,30 +501,10 @@ pub mod gfx11 {
     #[no_mangle]
     pub extern "gpu-kernel" fn kda_step(mixed: *const f32, taps: *const u16, window: *mut f32, f: *const f32, dt_bias: *const f32, a_log: *const f32, beta: *const f32, gate: *const f32, mem: *mut f32, o_norm: *const f32, normed: *mut f32, head0: u32, n: u32, ms: u32, fs: u32, bs: u32, ring: *mut f32, ring_w: *mut f32) {
         unsafe {
-            let hl = workgroup_id_x() as usize; // the head within the part: its buffers' index
-            step_head::<true>(mixed, taps, window, f, dt_bias, a_log, beta, gate, mem, o_norm, normed, head0 as usize + hl, hl, n, ms, fs, bs, ring, ring_w);
-        }
-    }
-
-    /// `kda_step` read-only, over the part's heads a table names (098, the expert predictor's analog of the next
-    /// layer): workgroup w steps head `heads[w]` of the part (its index within the part) from the state as it stands,
-    /// carrying it in registers across the step's tokens and storing none of it back — the layer's own step runs
-    /// later on the same state. Grid: the table's length; LDS: STEP_LDS.
-    #[no_mangle]
-    pub extern "gpu-kernel" fn kda_step_ro(mixed: *const f32, taps: *const u16, window: *const f32, f: *const f32, dt_bias: *const f32, a_log: *const f32, beta: *const f32, gate: *const f32, mem: *const f32, o_norm: *const f32, normed: *mut f32, head0: u32, n: u32, ms: u32, fs: u32, bs: u32, heads: *const u32) {
-        unsafe {
-            let hl = *heads.add(workgroup_id_x() as usize) as usize;
-            step_head::<false>(mixed, taps, window as *mut f32, f, dt_bias, a_log, beta, gate, mem as *mut f32, o_norm, normed, head0 as usize + hl, hl, n, ms, fs, bs, core::ptr::null_mut(), core::ptr::null_mut());
-        }
-    }
-
-    /// One head through the step's tokens (`kda_step`'s body): head `h` of the layer, `hl` of the part. `WRITE`: the
-    /// advanced window and memory stored back (and to the ring when given); else the state is read only.
-    #[inline(always)]
-    unsafe fn step_head<const WRITE: bool>(mixed: *const f32, taps: *const u16, window: *mut f32, f: *const f32, dt_bias: *const f32, a_log: *const f32, beta: *const f32, gate: *const f32, mem: *mut f32, o_norm: *const f32, normed: *mut f32, h: usize, hl: usize, n: u32, ms: u32, fs: u32, bs: u32, ring: *mut f32, ring_w: *mut f32) {
-        {
             // token i's inputs: `mixed[i · ms]`, `f[i · fs]`, `gate[i · fs]`, `beta[i · bs]` — the strides of the launches that made them
             let (ms, fs, bs) = (ms as usize, fs as usize, bs as usize);
+            let hl = workgroup_id_x() as usize; // the head within the part: its buffers' index
+            let h = head0 as usize + hl; // the head within the layer: the state's and the small tensors' index
             let tid = workitem_id_x();
             let t = tid as usize;
             let lane = tid % 32;
@@ -543,9 +523,6 @@ pub mod gfx11 {
                 s[r] = *mem.add(h * D * D + (kk0 + r) * D + vv);
                 r += 1;
             }
-            // the read-only step's window advanced in registers (an array across the barriers went to scratch): the
-            // thread's two channels' last three inputs as scalars, the second channel's for `t < D / 2`
-            let (mut wa0, mut wa1, mut wa2, mut wb0, mut wb1, mut wb2) = (0f32, 0f32, 0f32, 0f32, 0f32, 0f32);
             let mut i = 0;
             while i < n as usize {
                 // the convolution for this head's 3·D channels (two per thread), the window advanced
@@ -554,26 +531,13 @@ pub mod gfx11 {
                     let part = c / D;
                     let g = part * KDA_QKV + h * D + c % D;
                     let tp = taps.add((part * KDA_QKV + h * D + c % D) * CONV_TAPS);
-                    let second = c >= 256;
-                    let (w0, w1, w2) = if WRITE || i == 0 {
-                        (*window.add(g), *window.add(CONV_DIM + g), *window.add(2 * CONV_DIM + g))
-                    } else if second {
-                        (wb0, wb1, wb2)
-                    } else {
-                        (wa0, wa1, wa2)
-                    };
+                    let (w0, w1, w2) = (*window.add(g), *window.add(CONV_DIM + g), *window.add(2 * CONV_DIM + g));
                     let x = *mixed.add(i * ms + part * PART_QKV + hl * D + c % D);
                     let acc = widen(*tp) * w0 + widen(*tp.add(1)) * w1 + widen(*tp.add(2)) * w2 + widen(*tp.add(3)) * x;
                     *conv.add(c) = silu(acc);
-                    if WRITE {
-                        *window.add(g) = w1;
-                        *window.add(CONV_DIM + g) = w2;
-                        *window.add(2 * CONV_DIM + g) = x;
-                    } else if second {
-                        (wb0, wb1, wb2) = (w1, w2, x);
-                    } else {
-                        (wa0, wa1, wa2) = (w1, w2, x);
-                    }
+                    *window.add(g) = w1;
+                    *window.add(CONV_DIM + g) = w2;
+                    *window.add(2 * CONV_DIM + g) = x;
                     if !ring_w.is_null() {
                         let rw = ring_w.add(i * (CONV_TAPS - 1) * CONV_DIM);
                         *rw.add(g) = w1;
@@ -655,12 +619,10 @@ pub mod gfx11 {
                 }
                 i += 1;
             }
-            if WRITE {
-                let mut r = 0;
-                while r < HALF {
-                    *mem.add(h * D * D + (kk0 + r) * D + vv) = s[r];
-                    r += 1;
-                }
+            let mut r = 0;
+            while r < HALF {
+                *mem.add(h * D * D + (kk0 + r) * D + vv) = s[r];
+                r += 1;
             }
         }
     }
