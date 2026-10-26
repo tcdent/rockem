@@ -40,7 +40,15 @@
 //!
 //! `--stagger-ns x`: worker w (by its rank in its CCD) starts each phase w·x ns after the release.
 //!
-//!   bench-run [--stagger-ns 0] [--notouch 0] [--front 0] [--one-phase 0] [--regions 0] [--notime 0] [--plain 0] [--private 0] [--pages 2m] [--fixed 0] [--smt 0] [--multi 0] [--cpus 49-71,73-95] [--steal any] [--plan 45] [--cold 28] [--window-us 440] [--rounds 60] [--pool-mb 600]
+//! `--hold kb`: each worker keeps its L3-hit rate up through the window and its waits — `kb` KB of its own 1 MB ring every
+//! 50 µs between touches (metatron-cpu §3.7: ~5 GB/s of L3 hits holds a core's L3 read rate; a run after a window of
+//! DRAM touching reads its warm lines up to 4× slower otherwise).
+//!
+//! `--ring-kb n`: the hold ring's size (default 1024; must exceed the L2's 512 KB for its reads to be L3 hits).
+//! `--retouch 1`: each worker re-reads every slice it touched once 512 KB of touching later (the node lab's re-touch,
+//! construct.rs `RETOUCH_LAG`): L3 hits on the planned lines themselves — the hold with no footprint, promoting them too.
+//!
+//!   bench-run [--retouch 0] [--ring-kb 1024] [--hold 0] [--stagger-ns 0] [--notouch 0] [--front 0] [--one-phase 0] [--regions 0] [--notime 0] [--plain 0] [--private 0] [--pages 2m] [--fixed 0] [--smt 0] [--multi 0] [--cpus 49-71,73-95] [--steal any] [--plan 45] [--cold 28] [--window-us 440] [--rounds 60] [--pool-mb 600]
 use harness::arg;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -158,6 +166,9 @@ fn main() {
     let one_phase = num("--one-phase", 0) == 1;
     let regions = num("--regions", 0) == 1;
     let stagger_ns = num("--stagger-ns", 0) as u64;
+    let hold_kb = num("--hold", 0);
+    let ring_kb = num("--ring-kb", 1024);
+    let retouch = num("--retouch", 0) == 1;
     let pages_huge = !arg("--pages").is_some_and(|v| v.to_str() == Some("4k"));
     // `--share cores`: a CCD's planned slices and cold items in proportion to its workers (the node gives every CCD the
     // same bytes of every expert, whatever its count of workers)
@@ -310,6 +321,19 @@ fn main() {
                 // this worker's per-class counts, its own (shared atomics across 92 cores bounced between the sockets
                 // inside the phase), added to the totals once at the end
                 let local = std::cell::RefCell::new([[0u64; 5]; 6]);
+                // the hold: `hold_kb` KB of this ring (1 MB, L3-resident after the first pass) when 50 µs have passed
+                let ring: Vec<u8> = (0..(ring_kb << 10)).map(|i| i as u8).collect();
+                let ring_at = std::cell::Cell::new(0usize);
+                let last_hold = std::cell::Cell::new(std::time::Instant::now());
+                let hold = || {
+                    if hold_kb > 0 && last_hold.get().elapsed() >= std::time::Duration::from_micros(50) {
+                        let at = ring_at.get();
+                        let end = (at + (hold_kb << 10)).min(ring.len());
+                        unsafe { touch_node::touch(ring.as_ptr().add(at), end - at, None) };
+                        ring_at.set(if end >= ring.len() { 0 } else { end });
+                        last_hold.set(std::time::Instant::now());
+                    }
+                };
                 // (demand fills from L3, L2-prefetch hits in L3, lines from DRAM)
                 let read3 = || if pmc_ok { (common::pmc::rdpmc(0), common::pmc::rdpmc(4), common::pmc::rdpmc(1).wrapping_add(common::pmc::rdpmc(2)).wrapping_add(common::pmc::rdpmc(5))) } else { (0, 0, 0) };
                 loop {
@@ -324,17 +348,42 @@ fn main() {
                         return;
                     }
                     let snap = planq[my_ccd].items.lock().unwrap().clone();
+                    let (mut rt_queue, mut rt_bytes): (std::collections::VecDeque<(usize, usize)>, usize) = (Default::default(), 0);
                     let until = std::time::Instant::now() + std::time::Duration::from_micros(window);
                     while !notouch && std::time::Instant::now() < until {
                         let Some(sl) = planq[my_ccd].claim(&snap) else { break };
                         takers[my_ccd][sl & 0xffff].store(wi, Ordering::Relaxed);
                         let id = sl >> 16;
-                        let ok = unsafe { touch_node::touch(wptr(id), 2 * ib, Some(until)) } && unsafe { touch_node::touch(sptr(id) as *const u8, 2 * sb * 4, Some(until)) };
+                        if retouch {
+                            rt_queue.push_back((id, rt_bytes + 2 * ib));
+                            rt_bytes += 2 * ib;
+                            // the slices touched ≥ 512 KB ago, read again
+                            while let Some(&(rid, at)) = rt_queue.front() {
+                                if at + (512 << 10) > rt_bytes {
+                                    break;
+                                }
+                                rt_queue.pop_front();
+                                if !unsafe { touch_node::touch(wptr(rid), 2 * ib, Some(until)) } {
+                                    break;
+                                }
+                            }
+                        }
+                        // a slice touched in 64 KB pieces with the hold between them
+                        let mut ok = true;
+                        let mut off = 0;
+                        while ok && off < 2 * ib {
+                            let n = (64 << 10).min(2 * ib - off);
+                            ok = unsafe { touch_node::touch(wptr(id).add(off), n, Some(until)) };
+                            off += n;
+                            hold();
+                        }
+                        ok = ok && unsafe { touch_node::touch(sptr(id) as *const u8, 2 * sb * 4, Some(until)) };
                         if !ok {
                             break;
                         }
                     }
                     while std::time::Instant::now() < until {
+                        hold();
                         std::hint::spin_loop();
                     }
                     bar.wait(); // the main thread builds the run's queues

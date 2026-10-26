@@ -445,8 +445,19 @@ milliseconds, that sets the rate at which L3 hits are delivered to that core, in
 separated: the L2 prefetcher's adaptive throttle, a per-core request-credit allocation, a power state of the core's L3
 interface.
 
-**The prediction before any node change** (`bench-run --hold kb`: each worker reads `kb` KB of its own L3 ring every 50 µs
-through the window's touches and its waits): `bringup/box/logs/bench-run-hold.txt`.
+**The prediction before any node change** (`bench-run`, the node's width-3 shape on both sockets, two repeats each):
+
+| hold | gate/up + down wall | own item | stolen item |
+|---|---|---|---|
+| none | 232 + 129 µs | 15.2 µs, 6.5 % DRAM | 18.8 µs, 15.5 % DRAM |
+| a 1 MB ring a core, 256 KB every 50 µs through the window | **258 + 135** | 17.8, **14.6 %** | 19.6, **34.6 %** |
+
+The ring holds the state (one CCD, all warm, fixed: 15.5 → 9.0 µs an item, the wall 182 → 95) but at the node's shape it
+costs more than it returns: its lines are L3 hits, so protected, and 8 MB of them a CCD displace the window's
+once-referenced planned lines (the bytes model) — the warm items lose twice the DRAM share. The instrument with no
+footprint is the planned lines themselves: re-reading slices touched 512 KB earlier is L3 hits (the hold), promotes them
+(the protection) and adds no lines — the re-touch of 1g, whose lab gain (warm items 11.3 → 9.7 µs) has this second
+mechanism behind it. Its price is first touches: `bench-run --retouch 1` against none, `bringup/box/logs/bench-run-retouch.txt`.
 
 **Why it matters here:** every one of the node's expert runs follows a ~440 µs window of DRAM touching and `mwaitx`
 waits — no L3 hits for the core — so the node's warm items run in the decayed state on every layer; `bench-run`'s
