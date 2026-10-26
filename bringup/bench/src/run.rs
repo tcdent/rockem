@@ -48,7 +48,11 @@
 //! `--retouch 1`: each worker re-reads every slice it touched once 512 KB of touching later (the node lab's re-touch,
 //! construct.rs `RETOUCH_LAG`): L3 hits on the planned lines themselves — the hold with no footprint, promoting them too.
 //!
-//!   bench-run [--retouch 0] [--ring-kb 1024] [--hold 0] [--stagger-ns 0] [--notouch 0] [--front 0] [--one-phase 0] [--regions 0] [--notime 0] [--plain 0] [--private 0] [--pages 2m] [--fixed 0] [--smt 0] [--multi 0] [--cpus 49-71,73-95] [--steal any] [--plan 45] [--cold 28] [--window-us 440] [--rounds 60] [--pool-mb 600]
+//! `--ccd-barrier 1`: in each phase a CCD's workers finish every warm item (own, mates') before any of them claims a cold
+//! one (a spin barrier a CCD): the warm reads with the CCD's DRAM path quiet, then the cold ones at full rate — the CCD
+//! delivers the sum either way (099), so the overlap is worth nothing and the interference is.
+//!
+//!   bench-run [--ccd-barrier 0] [--retouch 0] [--ring-kb 1024] [--hold 0] [--stagger-ns 0] [--notouch 0] [--front 0] [--one-phase 0] [--regions 0] [--notime 0] [--plain 0] [--private 0] [--pages 2m] [--fixed 0] [--smt 0] [--multi 0] [--cpus 49-71,73-95] [--steal any] [--plan 45] [--cold 28] [--window-us 440] [--rounds 60] [--pool-mb 600]
 use harness::arg;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -169,6 +173,8 @@ fn main() {
     let hold_kb = num("--hold", 0);
     let ring_kb = num("--ring-kb", 1024);
     let retouch = num("--retouch", 0) == 1;
+    let ccd_barrier = num("--ccd-barrier", 0) == 1;
+    let ccd_bars: Arc<Vec<Spin>> = Arc::new((0..nccd).map(|k| Spin { n: mates[k].len(), arrived: Line(AtomicUsize::new(0)), gen: Line(AtomicUsize::new(0)) }).collect());
     let pages_huge = !arg("--pages").is_some_and(|v| v.to_str() == Some("4k"));
     // `--share cores`: a CCD's planned slices and cold items in proportion to its workers (the node gives every CCD the
     // same bytes of every expert, whatever its count of workers)
@@ -271,6 +277,7 @@ fn main() {
     let hs: Vec<_> = (0..t)
         .map(|wi| {
             let (ccdq, planq, deques, takers, bar, done, cls, measuring, round_end, t0s, phase_data) = (ccdq.clone(), planq.clone(), deques.clone(), takers.clone(), bar.clone(), done.clone(), cls.clone(), measuring.clone(), round_end.clone(), t0s.clone(), phase_data.clone());
+            let ccd_bars = ccd_bars.clone();
             let (cpu, my_ccd, my_node) = (cpus[wi], ccd[wi], ccd_node[ccd[wi]]);
             let mates_w: Vec<usize> = mates[my_ccd].iter().copied().filter(|&m| m != wi).collect();
             let node_ccds: Vec<usize> = (0..nccd).filter(|&k| k != my_ccd && ccd_node[k] == my_node).collect();
@@ -466,6 +473,9 @@ fn main() {
                                     return got;
                                 }
                                 stage += 1;
+                                if ccd_barrier && stage == n_m + 1 {
+                                    ccd_bars[my_ccd].wait();
+                                }
                             }
                         };
                         if smt {

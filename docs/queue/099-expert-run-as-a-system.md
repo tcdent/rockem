@@ -457,7 +457,20 @@ costs more than it returns: its lines are L3 hits, so protected, and 8 MB of the
 once-referenced planned lines (the bytes model) — the warm items lose twice the DRAM share. The instrument with no
 footprint is the planned lines themselves: re-reading slices touched 512 KB earlier is L3 hits (the hold), promotes them
 (the protection) and adds no lines — the re-touch of 1g, whose lab gain (warm items 11.3 → 9.7 µs) has this second
-mechanism behind it. Its price is first touches: `bench-run --retouch 1` against none, `bringup/box/logs/bench-run-retouch.txt`.
+mechanism behind it. Measured at the node's shape (two repeats each):
+
+| | wall | own item | stolen item |
+|---|---|---|---|
+| none | 232 + 131 µs | 15.3 µs, 7.3 % DRAM | 18.8, 16.0 % |
+| re-touch | 237–241 + 127 | 16.0–16.2, 7.0 % | 18.3, **5.0 %** |
+| a 576 KB ring held at 256 KB / 50 µs | 257 + 132 | 17.9, 10.4 % | 19.1, 26.3 % |
+
+The re-touch protects the stolen lines and returns nothing on the wall, as in the node lab. **So at the node's shape the
+warm item's cost is not the decay** (holding the state through the window changes nothing) **but the interference**: in
+every phase a CCD's cold items stream DRAM beside its warm ones, and an L3-fed core slows 2–5× while its mates stream
+(the interference section). The CCD delivers the sum of its sources, not the maximum (measured above), so that overlap
+is worth nothing: the prediction to test is the warm items first with the CCD's DRAM path quiet, then the cold ones
+(`--ccd-barrier 1`), with the re-touch to carry the L3 state across the window: `bringup/box/logs/bench-run-ccdbarrier.txt`.
 
 **Why it matters here:** every one of the node's expert runs follows a ~440 µs window of DRAM touching and `mwaitx`
 waits — no L3 hits for the core — so the node's warm items run in the decayed state on every layer; `bench-run`'s
