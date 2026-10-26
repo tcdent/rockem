@@ -276,6 +276,30 @@ and their time (µs an item): 7.8–9.8 at young ages past the run's first MB, 1
 - **The re-touch arm** (same boot): touched items 11.3 → 9.7 µs (width 3), their DRAM 13.3 → 9.1 %; per item over the
   whole run −1.4 to −4 %; the arms' item mixes differ (steps alternate), so the step-level difference is within noise.
 
+## Ordering and hints do not reduce the loss; they move it (2026-10-26)
+- **Oldest first** (lab-fifo: the owner claims its deque from the front on alternate steps, re-touch off, the same loss
+  map): own items lose more (8.8 → 12.4 % at width 2, 10.2 → 13.4 % at 3, 11.0 → 15.0 % at 4) and stolen ones less (17.4 →
+  10.3 %, 22.2 → 12.0 %, 24.4 → 14.2 %); the newest slices, safe in their toucher's L2 under newest-first, now wait out the
+  run once evicted. Within a layer the loss is set by the bytes a CCD inserts; the order picks which lines pay. Not
+  taken.
+- **Cold reads non-temporal** (`bench-window --cold-nta 1`, the items nobody touched read with `prefetchnta`): the
+  touched lines' loss rises (4.2 → 8.4–9.3 %; with 8 cold items 3.3 → 5.7 %), the run unchanged. The cold lines in the L3
+  are the cheapest victims the next window's fresh lines find; without them the fresh lines displace each other. (The
+  fill counters under `prefetchnta` are not comparable for the hinted reads themselves.) Not taken.
+
+## The run as quantified (2026-10-26)
+- **A touched line's survival** is the CCD's fresh bytes after it (the window's touches and the run's own reads), the
+  once-referenced class replaced oldest first, the previous layer's read lines protected (metatron-cpu §3).
+- **The leak's ceiling** is ~8–11 % of `experts` (inference, the loss map's budget); every way of buying it back measured
+  so far costs about what it returns: a re-touch costs window time (first touches), a flush 12.4 ns a line, the
+  non-temporal warm read ~35 % of the gemv, ordering only moves it, non-temporal cold reads make it worse.
+- **A warm item that loses nothing** costs ~7.8 µs in the node against 4.6 alone in the bench: the socket's power cap
+  (3.04 vs 3.44 GHz under the gemm, metatron-cpu §4: → ~5.2 µs) and the CCD's streaming beside it (~2.6 µs; the
+  interference section above).
+- **The cold items are the run:** ~half its core time at width 3, two thirds at width 4, at 30–36 µs an item, the CCD's
+  DRAM path. The levers on them are fewer cold bytes (the predictor, 098; residency; formats) and the clock (power
+  per MAC).
+
 ## How the bench and the node differ (to quantify, one at a time)
 1. **The shared CCD queue and stealing.** The node's cold items are claimed from one queue by the CCD's 8 cores and its
    warm items can be stolen by mates; the bench's cores own private sets. The queue is the node's load balancer.
@@ -307,7 +331,7 @@ and their time (µs an item): 7.8–9.8 at young ages past the run's first MB, 1
 1f. Done: the leak reproduced in the bench (fresh sets) and a second touch removes it (above).
 1g. Done: the re-touch in the node (lab) and the window model — the leak falls, the step does not (above).
 1h. Done: the node's loss map by age, run churn, claim and plan (above).
-1i. Next: the owner reads its own deque oldest first (the most-at-risk lines before more bytes land on them), A/B.
+1i. Done: oldest first (moves the loss) and non-temporal cold reads (raise it) — above.
 1e. The node's fill counters by item, with its class (own / CCD / stolen) and its slice's touch time (lab): where a
     complete expert's 14–18 % DRAM lines come from — evicted (own items) or a mate's L2 (stolen).
 2. The node's warm item at its best: a lab run with the prefetch posted but no cold traffic (the run's misses forced to

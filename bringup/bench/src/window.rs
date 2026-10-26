@@ -8,9 +8,14 @@
 //!
 //! `--oldest-first 1`: the run takes its touched items oldest first (the most bytes inserted after them: the most at risk).
 //!
-//!   bench-window [--oldest-first 0] [--cpus 49-71,73-95] [--plan 16] [--cold 4] [--window-us 440] [--retouch-kb 0] [--iters 100]
+//! `--cold-nta 1`: the items nobody touched (read once, from DRAM) read with `prefetchnta` `--dist` bytes ahead: their
+//! lines kept out of the L3 they would otherwise churn.
+//!
+//!   bench-window [--cold-nta 0] [--dist 2048] [--oldest-first 0] [--cpus 49-71,73-95] [--plan 16] [--cold 4] [--window-us 440] [--retouch-kb 0] [--iters 100]
 use harness::arg;
 use std::sync::{Arc, Barrier, Mutex};
+#[path = "gemv_hint.rs"]
+mod gemv_hint;
 
 const K: usize = 4096;
 const ROWS: usize = 64;
@@ -52,6 +57,8 @@ fn main() {
     let lag = num("--retouch-kb", 0) << 10;
     let iters = num("--iters", 100);
     let oldest = num("--oldest-first", 0) == 1;
+    let cold_nta = num("--cold-nta", 0) == 1;
+    let dist = num("--dist", 2048);
     let pool_mb = num("--pool-mb", 160);
     let t = cpus.len();
     let pmc_ok = {
@@ -125,7 +132,11 @@ fn main() {
                     let mut run_dram = 0u64;
                     let mut item = |k: usize, warm: bool| {
                         let c0 = read2();
-                        unsafe { common::q4::avx2::gemv::<K>(ROWS, pool_w.as_ptr().add(k * ib), pool_s.as_ptr().add(k * sb), &a, out.as_mut_ptr()) };
+                        if !warm && cold_nta {
+                            unsafe { gemv_hint::gemv_hint::<K>(ROWS, pool_w.as_ptr().add(k * ib), pool_s.as_ptr().add(k * sb), &a, out.as_mut_ptr(), 1, dist) };
+                        } else {
+                            unsafe { common::q4::avx2::gemv::<K>(ROWS, pool_w.as_ptr().add(k * ib), pool_s.as_ptr().add(k * sb), &a, out.as_mut_ptr()) };
+                        }
                         let c1 = read2();
                         let (h, m) = ((c1.0.wrapping_sub(c0.0)) & ((1 << 48) - 1), (c1.1.wrapping_sub(c0.1)) & ((1 << 48) - 1));
                         run_dram += m;
@@ -171,9 +182,10 @@ fn main() {
     let a = acc.lock().unwrap();
     let n = a[4] as f64;
     println!(
-        "bench-window: {t} cores, plan {plan} + cold {nc} items (136 KB) a core, window {window} µs, {} first, re-touch {} | run p50 {:.1} µs p90 {:.1} | touched {:.2} items a core | touched lines from DRAM {:.1} % | run DRAM lines a core {:.0}",
+        "bench-window: {t} cores, plan {plan} + cold {nc} items (136 KB) a core, window {window} µs, {} first, re-touch {}, cold reads {} | run p50 {:.1} µs p90 {:.1} | touched {:.2} items a core | touched lines from DRAM {:.1} % | run DRAM lines a core {:.0}",
         if oldest { "oldest" } else { "newest" },
         if lag == 0 { "off".to_string() } else { format!("{} KB behind", lag >> 10) },
+        if cold_nta { "nta" } else { "plain" },
         span[span.len() / 2] as f64 / 1e3,
         span[span.len() * 9 / 10] as f64 / 1e3,
         a[0] as f64 / n,
