@@ -872,6 +872,23 @@ faster with a sibling block on the CU (latency hiding by whatever is co-resident
 supply deliberately); every other wave 1.5–1.8 (the copy and idle). The occupancy reading's first branch: an24
 boots to the full gates against an22.
 
+**an24's boot (rockem.lead, 2026-10-27; run affc1bc6): the chain moved as the model said — an_chain 97.3 / 98.9
+(an22 105.0 / 105.8), slot wait 2.81 / 1.45 / 0.89, decode-identical, SCORE bit-identical — but coverage .765 /
+picked .847 against .776 / .860 held to the digit since an18.** Not the join's arithmetic and not a race (every
+`s_barrier` in the object follows an `s_waitcnt lgkmcnt(0)` after its stores; ulps never moved coverage): **the LDS
+size.** Build 24 grew the chain's LDS by the join's 8 KB (`CHAIN_LDS` 17,440 → 25,632), and `CHAIN_LDS` is a
+compile-time constant of the model crate that the node passes as the dispatch's dynamic LDS; the node was not
+rebuilt ("the arguments are unchanged"), so an24 launched with 17,440 bytes, the join region at 17,408..25,600 was
+past the allocation — dropped on store, zero on read — and the quarter-0 wave summed zeros for its siblings'
+partials: the rows carried about a quarter of K, deterministically. The kernarg assert catches the arguments;
+nothing checked this. **Build 25 (staged: `kernels-an25` 184ee96f, `-an25s` 358b6348, `-an25t` 7fab0ac7; the node rebuilt from
+the same source):** the kernel code is an24's to the instruction (`kernel_diff`: identical), plus the durable gate —
+the chain's launch constants exported from the object as `ROCKEM_AN_ABI` (`[CHAIN_LDS, CHAIN_GRID, TAB_LEN,
+ACT_TOTAL]`, `an::abi()`), read by the node at load (`Kfd::constants`) and asserted against its own; an object
+without the symbol prints a warning. Rule: a kernel's dynamic LDS size, grid and table length are node constants
+like its kernarg — a change to any of them is a node rebuild, and from build 25 the node refuses the mismatch at
+boot.
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back

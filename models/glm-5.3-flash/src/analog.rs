@@ -79,6 +79,18 @@ const _: () = assert!(SEL_ROWS % common::q4::TILE == 0 && R_TILES <= CHAIN_GRID 
 pub const OUT_WGS: usize = E / 8;
 /// The width of a part's chosen heads' readouts, the composed rows' width.
 pub const SEL_W: usize = NSEL * KDA_DIM;
+/// The chain's constants the node bakes into its launches and tables, exported from the code object for the node to
+/// check at load (`ROCKEM_AN_ABI`): the LDS size, the grid, the table's length, the activation buffer's size. An
+/// object whose LDS grew (build 24: the join's 8 KB) launched by a node built before it ran with the old size —
+/// LDS past the allocation is dropped on store and zero on read, the join summed zeros, coverage .776 → .765,
+/// deterministic; the kernarg check caught the arguments but nothing checked these (2026-10-27).
+pub const ABI_LEN: usize = 4;
+pub const fn abi() -> [u32; ABI_LEN] {
+    [CHAIN_LDS, CHAIN_GRID, TAB_LEN as u32, ACT_TOTAL as u32]
+}
+#[cfg(target_arch = "amdgpu")]
+#[no_mangle]
+pub static ROCKEM_AN_ABI: [u32; ABI_LEN] = abi();
 /// `an_chain`'s table of device addresses (one a card a pair, built at boot): `TAB_*` index it.
 pub const TAB_STREAMS: usize = 0;
 pub const TAB_MIX_L: usize = 1;
