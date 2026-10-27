@@ -865,6 +865,13 @@ quarter-0 wave summing its three siblings' after one sync and emitting. The per-
 32 with ~9 waves a SIMD to interleave them. The group arithmetic and the flush are an23's (coverage held there to
 the digit). Not booted until an23t says the chain is the cost.
 
+**an23t (rockem.lead, 2026-10-27; run e8434bec): the block waves are the long pole.** R mean 5.2 / slowest
+workgroup 31.2; the per-wave rows (card0, median / p90 / max): the single-block workgroups' wave 0 (wg 44–167)
+25.9 / 30.1 / 32.1; the two-block workgroups' (wg 0–43) wave 0 20.8 / 22.3 / 24.6 and wave 1 19.9 / 20.9 / 24.0 —
+faster with a sibling block on the CU (latency hiding by whatever is co-resident, which an24's four waves a block
+supply deliberately); every other wave 1.5–1.8 (the copy and idle). The occupancy reading's first branch: an24
+boots to the full gates against an22.
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back
