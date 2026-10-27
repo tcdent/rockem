@@ -449,7 +449,7 @@ until a long run. So the fix is the chain's length, not the dependency: once the
 lag cannot lock in. Build 5 (branch 098-analog): phase A's wide loads; no `hc_route_ahead` launch on analog pairs
 (nothing reads it; −25 µs on the leader's queue ahead of its shared expert); **16 heads (8 a part, `NSEL` 8)**, the
 size that fits the ~170–200 µs run at width 2 — measured offline (the first-margin shape, used experts a layer over
-today's posts, cody / survey): 32 heads +0.44 / +0.31, 24 +0.35 / +0.22, **16 +0.27 / +0.16**, 8 +0.14 / +0.07; at
+today's posts, cody / survey): 32 heads +0.44 / +0.31, 24 +0.35 / +0.22, **16 +0.27 / +0.16**, 12 +0.21 / +0.12, 8 +0.14 / +0.07; at
 rank 13 the early plan .593 / .651 offline against h32's .617 / .674 and today's .549 / .622, so the served .711
 should come back as ~.68. Predicted chain at width 2: A/B/C ~12, rows ~40 (22 MB), F/S/O ~25, the launch ~15 → ~90
 µs, the plan ~130 µs after the run starts, 40–70 µs of slack. Gates (rockem.lead): the slot wait by width back to
