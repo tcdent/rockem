@@ -50,7 +50,11 @@
 //! lines holding the index of the next (a random cycle), 2,176 dependent loads an item — so a gap's effect on L3-hit
 //! LATENCY is measured apart from bandwidth (prefetchers cannot help a dependent chain; docs/l3-literature.md §5 B2).
 //!
-//!   bench-order [--chase 0] [--warmup 0] [--ballast-mb 0] [--pretouch 1] [--gap-mode pause] [--spin 0] [--shared none] [--fresh] [--gap-us 0] [--cpus 49-71,73-95] [--n 3] [--rows 64] [--warm 9] [--cold 7] [--pool-mb 96] [--iters 200]
+//! `--pmc fills2`: the second counter set (common::pmc::FILLS2: L2 fill latency and fills pending; l3-literature §5 B3) in
+//! place of the fill sources — the printed six columns follow. `--pf-off bits`: Prefetch Control bits set on every
+//! listed core for the run (0x08 = L2 stream off, 0x20 = up/down, 0x07 = the L1 prefetchers; §5 B4), restored at exit.
+//!
+//!   bench-order [--pmc fills] [--pf-off 0] [--chase 0] [--warmup 0] [--ballast-mb 0] [--pretouch 1] [--gap-mode pause] [--spin 0] [--shared none] [--fresh] [--gap-us 0] [--cpus 49-71,73-95] [--n 3] [--rows 64] [--warm 9] [--cold 7] [--pool-mb 96] [--iters 200]
 use harness::arg;
 use std::sync::{Arc, Barrier, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -156,9 +160,12 @@ fn main() {
     let class: Arc<Mutex<Vec<[u64; 4]>>> = Arc::new(Mutex::new(vec![[0; 4]; orders.len()]));
     // the fill counters (common::pmc::FILLS, the node's): per order and class (warm, cold), each item's six counts
     let fills: Arc<Mutex<Vec<[[u64; 6]; 2]>>> = Arc::new(Mutex::new(vec![[[0; 6]; 2]; orders.len()]));
+    let fills2 = arg("--pmc").is_some_and(|v| v.to_str() == Some("fills2"));
+    let pf_off = u64::from_str_radix(arg("--pf-off").map(|v| v.to_str().unwrap().trim_start_matches("0x").to_string()).as_deref().unwrap_or("0"), 16).unwrap();
     let pmc_ok = {
         let _ = std::fs::write("/proc/sys/kernel/nmi_watchdog", "0");
-        let ok = cpus.iter().all(|&c| common::pmc::Pmc::open(c).is_some_and(|p| p.program(&common::pmc::FILLS)));
+        let set = if fills2 { &common::pmc::FILLS2 } else { &common::pmc::FILLS };
+        let ok = cpus.iter().all(|&c| common::pmc::Pmc::open(c).is_some_and(|p| p.program(set)));
         ok && common::pmc::allow_rdpmc()
     };
     let (ibytes, sbytes) = (rows * K / 2, rows * K / 128 * 4);
@@ -196,6 +203,11 @@ fn main() {
     // clocks: [gap aperf, gap mperf, run aperf, run mperf]; items by position: [ns, n] × 3
     let clocks: Arc<Mutex<[u64; 4]>> = Arc::new(Mutex::new([0; 4]));
     let bypos: Arc<Mutex<[[u64; 2]; 3]>> = Arc::new(Mutex::new([[0; 2]; 3]));
+    // --pf-off: the prefetchers' control bits on the bench cores, restored at the end
+    let pf_old: Vec<(usize, u64)> = if pf_off != 0 { cpus.iter().filter_map(|&c| common::pmc::prefetch_control(c, pf_off).map(|o| (c, o))).collect() } else { Vec::new() };
+    if pf_off != 0 {
+        println!("prefetch control: bits {pf_off:#x} set on {} of {} cores (previous value {:#x})", pf_old.len(), cpus.len(), pf_old.first().map_or(0, |x| x.1));
+    }
     let start = Arc::new(Bar::new(t, spin));
     let handles: Vec<_> = cpus
         .iter()
@@ -613,7 +625,7 @@ fn main() {
     let fl = fills.lock().unwrap();
     let lines = (rows * K / 2 + rows * K / 128 * 4) as f64 / 64.0;
     if pmc_ok {
-        println!("lines an item from each source (an item is {lines:.0} lines): {}", common::pmc::FILL_NAMES.join(" / "));
+        println!("lines an item from each source (an item is {lines:.0} lines): {}", if fills2 { common::pmc::FILL2_NAMES.join(" / ") } else { common::pmc::FILL_NAMES.join(" / ") });
         for (oi, o) in orders.iter().enumerate() {
             for (c, name) in [(0, "warm"), (1, "cold")] {
                 let items = if c == 0 { cl[oi][1] } else { cl[oi][3] };
@@ -632,5 +644,8 @@ fn main() {
         let cold = if matches!(o, Order::WarmOnly) { 0.0 } else { mb(nc) * t as f64 / (p(0.5) * 1e-6) / 1e3 };
         let per = |a: u64, b: u64| if b == 0 { 0.0 } else { a as f64 / b as f64 / 1e3 };
         println!("{:<12} {:>9.1} {:>9.1} {:>9.1} {:>15.1} {:>14.2} {:>14.2}", format!("{o:?}"), p(0.5), p(0.1), p(0.9), cold, per(cl[oi][0], cl[oi][1]), per(cl[oi][2], cl[oi][3]));
+    }
+    for (c, old) in pf_old {
+        common::pmc::prefetch_control(c, old);
     }
 }
