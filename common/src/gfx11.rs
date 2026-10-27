@@ -212,6 +212,12 @@ pub unsafe fn row_sum16(v: f32) -> f32 {
     let v = v + dpp_xmask::<XMASK4>(v);
     v + dpp_xmask::<XMASK8>(v)
 }
+/// A compiler fence: no memory operation moves across it (an empty `asm!` with a memory clobber, no instruction
+/// emitted). For a hand-pipelined body whose loads the scheduler would otherwise hoist to the register bound.
+#[inline(always)]
+pub unsafe fn compiler_fence() {
+    core::arch::asm!("", options(nostack, preserves_flags));
+}
 /// The max over the lane's row of 16, on every lane of the row.
 #[inline(always)]
 pub unsafe fn row_max16(v: f32) -> f32 {

@@ -761,6 +761,68 @@ prologue ~20.8 → the copy (~1–2), R ~30 → ~15–17, the chain ~111 → ~96
 an18 and vs an13s: `an_chain` only. (The norms' partials every lane loading all sixteen held 64 loads live and
 spilled 8 bytes — one a lane with a row sum instead.)
 
+**an19's boot (rockem.lead, 2026-10-27; run 046022b2): WORSE than an18** — an_chain 115.3 / 115.6 (an18
+110.9 / 110.8), slot wait 3.25 / 1.68 / 1.02 (3.09 / 1.49 / 0.98), coverage .776, decode-identical, SCORE
+bit-identical. Halving the prologue's dependent depth cost ~4.5 µs: the same 160 dynamic permutes in a two-token
+lockstep body ran slower than four single-token trips, so neither the static count nor the depth priced that loop
+(a reading, not a finding: with all 1,344 waves in the prologue at once the LDS crossbar is the shared resource,
+and eight permutes in flight a wave congest it where four did not — the chain's price was throughput, not
+latency). an18 stays the mark; an19t not booted; an20, which deletes the prologue, boots to the full gates.
+
+**an20's boot (rockem.lead, 2026-10-27; run 2de7f619; node rebuilt, `TAB_LEN` 42) — VALID, the new mark, serving.**
+an_chain **106.0 / 105.8** (an18 110.9 / 110.8; predicted ~96), p90 192 / 193, slow 0 / 0.1 %; slot wait
+2.98 / 1.48 / 0.94 ms at widths 2–4 (an18 3.09 / 1.49 / 0.98; production 1.3 / 0.87 / 0.8); step
+47.1 / 59.2 / 68.8; experts 11.79 / 19.09 / 27.22; coverage .776 to the digit; decode-identical; SCORE
+bit-identical. The prologue's removal bought 5 of the ~15 the table put in it, so R did not reach ~15–17: an20t's
+table (R alone, the per-workgroup rows, the no-tile band's reading of the copy + sync by itself) before any cut.
+
+**an20t (rockem.lead, 2026-10-27; run 6be05ecb): R mean 18.1 / slowest 27.4 (an18t 29.9 / 36.2); b3 + F + b4
+17.5 / 34.5 (the idle workgroups waiting out R — off the critical path); S 16.9 / 18.9; O 2.3 / 9.3. The
+per-workgroup rows: the no-tile band reads 2.5 / 2.4 (was 20.8) — the copy + sync is 2.5, the prologue gone as
+designed; the working bands flat at 26.7 / 27.1, slowest five 26.9–27.5, ordinary ids.** A working wave's tile is
+~24 µs against the bytes' 11.6 (8 KB of weights a wave at 640 GB/s): flat everywhere, so the tile's own dependent
+chain — sixteen steps each waiting on its activation words before its dots, 55 `lgkmcnt(0)` a wave ≈ 3.4 a step
+at ~400 ns ≈ 22. Next by size after R: S at 17 (the step's own code: 36 LDS waits, 24 `v_div`), then A's slowest
+workgroup 12.2 against the mean 5.6.
+
+**Build 21 (staged: `kernels-an21` 482f4d46, `-an21s` c3064c45, `-an21t` 7040b2d5; node as an20's; kernarg 200; 158 VGPRs,
+no scratch, 30 barriers).** The tile's chain: a step's activation words of every token read from LDS one step ahead
+of their dots, the room for it made by holding the weights as a rolling window of eight steps' loads issued seven
+steps ahead (`WD`; all sixteen at once was 64 registers — the lookahead at that bound spilled in build 19). The R
+region: 2,949 instructions, **10 full LDS waits (55)**, 5 drains, 512 `v_dot4`, no permute, no scratch. By the
+table: the chain's waits halved, the tile ~24 → ~13–15, R ~27 → ~16, the chain ~106 → ~95. `kernel_diff` vs an20
+and vs an13s: `an_chain` only.
+
+**an21's boot (rockem.lead, 2026-10-27; run 0e33476d): a NULL** — 106.1 / 106.5 (an20 106.0 / 105.8), slot wait
+2.97 / 1.47 / 0.94, coverage .776, gates clean. R's waits 55 → 10 moved nothing: the tile's ~24 is not bytes, not
+the prologue, not the LDS waits. The object says what it is (rockem.lead): the sixteen steps are fully unrolled
+(~2,950 straight-line instructions a wave; one back-edge, the copy loop) and the grid is 1,344 waves on 96 SIMDs
+= 14 a SIMD — **issue throughput**: ~2,200 issued slots a wave × 1,344 / 96 ≈ 31k cycles ≈ 13 µs at 2.4 GHz, plus
+the LDS traffic (82 KB a wave, 110 MB over the grid at 128 B/clk/CU over 48 CUs ≈ 7.5) ≈ 20 against the measured
+24, flat across every wave because all waves share the SIMDs and finish together. The rule for a candidate: count
+its R body's issued slots × 1,344 / 96 + the LDS bytes / (48 × 128); under ~12 µs or no boot.
+
+**Build 22 (staged, a minor by that rule: `kernels-an22` 58c2a28c, `-an22s` 1c6fbfbb, `-an22t` b89aecf0; THE NODE
+REBUILT — the rows, scales and activations as kernel arguments, kernarg 224; 155 VGPRs, no scratch, 30 barriers).**
+Through the table they were generic pointers (flat loads, on the LDS counter) and every read re-derived its
+address (348 adds a wave): one base a lane with the step and token as immediate offsets, the activation reads as
+16-byte `ds_load_b128` (a 16-aligned type; as two 8-byte reads the compiler paired them into `ds_load_2addr_b64`,
+whose 8-bit offsets forced an add a read). The R region: issued 2,209 → **2,037** (11.9 µs by the rule), adds
+348 → 175, no flat loads, full LDS waits 55 → 8, drains 3. What did NOT work, each measured in the object: every
+lane accumulating (the quad's sum is on all four lanes — the guard on lane 4r is an exec-masked region a token a
+step) put the kernel at 192 VGPRs with ~100 scratch ops — the guard's branches are what keep the scheduler from
+flattening the sixteen steps into one region; a compiler fence a step made it worse (400 bytes); the norms before
+the steps were the long-lived values the body spilled (computed after them now). The 4-step window and the
+one-step lookahead are moot at this bound and were left out.
+
+**Next, build 23 — WMMA iu8 (the lead's lever d):** `v_wmma_i32_16x16x16_iu8` is one instruction for 4,096 MACs
+against `v_dot4`'s 4 (the experts' prefill path has the form, `expert.rs`: A the q4 nibbles widened to unsigned
+bytes, B the a8 activations signed, the `WBIAS · Σq` correction at the flush — exactly `word_dot`'s rule). Sixteen
+rows a wave (212 working waves instead of 848; the tokens padded 4 → 16 waste MACs, not issue): ~256 WMMA + 256
+activation loads + ~400 unpack ops + a flush a group a wave — the grid's issued slots fall ~4×, the LDS bytes ~8×;
+R's tile ~24 → ~5–6 by the rule. The q4 copy's layout at boot is the analog's own, so it can be laid out as the
+B... the A fragment wants it (a lane's 16 bytes = one row's sixteen k).
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back

@@ -582,7 +582,7 @@ pub mod gfx11 {
     /// layer l's post-norm) into `s2` — what `pred_input` + `hc_route_ahead` made. `tab`: `TAB_LEN` device addresses.
     /// LDS CHAIN_LDS.
     #[no_mangle]
-    pub extern "gpu-kernel" fn an_chain(tab: *const u64, streams: *const f32, fyv: *const f32, a_fn: *const u16, f_fn: *const u16, sq: *const u8, fg_w: *const u8, crows: *const u16, router: *const u16, x: *mut f32, smix: *mut f32, fg: *mut f32, normed: *mut f32, mem: *const f32, mix_l: *const f32, scratch: *mut f32, c: *mut f32, count: *mut u32, x0: *mut f32, a_base: *const f32, a_scale: *const f32, f_base: *const f32, f_scale: *const f32, head0: u32, value: u32, n: u32, layer: u32) {
+    pub extern "gpu-kernel" fn an_chain(tab: *const u64, streams: *const f32, fyv: *const f32, a_fn: *const u16, f_fn: *const u16, sq: *const u8, fg_w: *const u8, crows: *const u16, router: *const u16, x: *mut f32, smix: *mut f32, fg: *mut f32, normed: *mut f32, mem: *const f32, mix_l: *const f32, scratch: *mut f32, c: *mut f32, count: *mut u32, x0: *mut f32, a_base: *const f32, a_scale: *const f32, f_base: *const f32, f_scale: *const f32, head0: u32, value: u32, n: u32, layer: u32, qrows: *const u8, qscales: *const f32, act_g: *const u8) {
         unsafe {
             // the streamed operands and phase B's are arguments (a kernel argument's loads are global; an address read
             // from the table is generic — flat loads, which count on the scalar counter too, so every LDS wait drained
@@ -688,7 +688,7 @@ pub mod gfx11 {
                     {
                         use common::q4::GROUP;
                         let ln = at(TAB_INPUT_LN) as *const u16;
-                        let act = at(TAB_ACT) as *mut u8;
+                        let act = act_g as *mut u8;
                         let lv: [u16; 8] = core::ptr::read(ln.add(d8) as *const [u16; 8]);
                         let mut v = [0f32; 8];
                         let (mut amax, mut ss) = (0f32, 0f32);
@@ -749,74 +749,102 @@ pub mod gfx11 {
             // once (a lane's 16 bytes of each), then per step and token the lane's two word dots against the group in
             // LDS, the quad's sum and the row's two group parities by DPP — no LDS reduction, no permute.
             {
-                use common::q4::gfx11::{word_act, word_dot_act};
+                use common::q4::gfx11::word_dot_act;
                 use common::q4::{GROUP, TILE, WBIAS};
                 const NG: usize = H / GROUP;
                 const NSTEP: usize = H / 256;
                 const CHUNKS: usize = SPEC_TOKENS * ACT_BYTES / 16;
                 let act = l as *mut u8;
-                let src = at(TAB_ACT) as *const u8;
+                let src = act_g;
                 let mut c = t;
                 while c < CHUNKS {
                     *(act.add(c * 16) as *mut [u32; 4]) = core::ptr::read((src.add(c * 16)) as *const [u32; 4]);
                     c += 256;
                 }
-                // the norms: the sixteen partials of a token one a lane of each row, summed across the row (every
-                // lane loading all sixteen held sixty-four loads live and spilled)
-                const { assert!(ACT_SS == 16) };
-                let ps = (src.add(SPEC_TOKENS * ACT_BYTES) as *const f32).add(lane as usize % 16);
-                let rr: [f32; SPEC_TOKENS] = core::array::from_fn(|i| {
-                    let ss = common::gfx11::row_sum16(*ps.add(i * ACT_SS));
-                    common::gfx11::rsq(ss * (1.0 / H as f32) + RMS_NORM_EPS)
-                });
                 workgroup_sync();
                 let tile = wg * CHAIN_WAVES + wave;
                 if tile < R_TILES {
                     let lu = lane as usize;
                     let (r, i0, gpar) = ((lu % 16) / 4, (lu % 4) * 2, lu / 16);
-                    let wt = (at(TAB_QROWS) as *const u8).add(tile * TILE * H / 2);
-                    let ws = (at(TAB_QSCALES) as *const f32).add(tile * NG * TILE);
-                    // the tile's bytes, this lane's of every step, as one batch
-                    let w: [(u64, u64); NSTEP] = core::array::from_fn(|st| {
-                        let p = wt.add(st * 512 + lu * 16);
+                    // (the rows, scales and activations are kernel arguments: through the table they were generic
+                    // pointers — flat loads on the LDS counter — and every read re-derived its address, 348 adds a
+                    // wave; one base a lane, the step and token as immediate offsets)
+                    let wt = qrows.add(tile * TILE * H / 2 + lu * 16);
+                    let ws = qscales.add(tile * NG * TILE);
+                    // the tile's bytes, this lane's 16 of each step: a rolling window of `WD` steps' loads (all
+                    // sixteen at once held 64 registers; the window is issued `WD - 1` steps ahead of its use), and
+                    // the step's activation words of every token read from LDS one step ahead of their dots — the
+                    // tile was ~24 µs a wave against 11.6 of bytes, 55 LDS waits a wave, ~3.4 a step (an20t,
+                    // 2026-10-27); the lookahead halves that chain by arithmetic. Written out: a loop left the
+                    // batches a stack object in scratch.
+                    const WD: usize = 4;
+                    let wload = |st: usize| -> (u64, u64) {
+                        let p = wt.add(st * 512);
                         (core::ptr::read_unaligned(p as *const u64), core::ptr::read_unaligned(p.add(8) as *const u64))
-                    });
-                    // the lane's groups' scales (group 2 st + gpar, row r): a batch too — indexed by the lane's parity
-                    // at runtime they were a stack object in scratch
+                    };
+                    let mut w: [(u64, u64); WD] = core::array::from_fn(|st| wload(st));
                     let wsv: [f32; NSTEP] = core::array::from_fn(|st| *ws.add((2 * st + gpar) * TILE + r));
-                    // the steps written out (a loop over them left the batches a stack object in scratch)
-                    let mut y = [0f32; SPEC_TOKENS];
-                    // a step's activation words of every token and the groups' scale and Σq read first, one wait for
-                    // all (reading them a step ahead of their dots held two steps' worth live and spilled, 2026-10-27)
+                    // the lane's activation words: word i0 of its parity's group at k_lo = (i0 / 4) · 64 + (i0 % 4) · 8
+                    // and +32, word i0 + 1 at +8 (`q4::gfx11::word_dot`'s rule, `word_act`); the step and token are
+                    // constant offsets from one base
+                    /// Sixteen activation bytes, 16-aligned: one `ds_load_b128` with the offset in the instruction
+                    /// (as two 8-byte reads the compiler paired them into `ds_load_2addr_b64`, whose 8-bit offsets
+                    /// made an add a read and held the addresses live; 2026-10-27).
+                    #[repr(C, align(16))]
+                    #[derive(Clone, Copy)]
+                    struct Q16([u64; 2]);
+                    let qb = (act as *const u8).add(gpar * GROUP + (i0 / 4) * 64 + (i0 % 4) * 8);
+                    let sb = (act as *const u8).add(H + gpar * 4);
                     let read = |st: usize| -> ([[(u64, u64); 2]; SPEC_TOKENS], [(f32, f32); SPEC_TOKENS]) {
-                        let g = 2 * st + gpar;
                         (
                             core::array::from_fn(|i| {
-                                let qg = (act.add(i * ACT_BYTES) as *const i8).add(g * GROUP);
-                                [word_act(qg, i0), word_act(qg, i0 + 1)]
+                                // the two words' low halves are 16 contiguous bytes, their high halves the 16 at +32:
+                                // two 16-byte LDS loads with the step and token in the offset field (two 8-byte loads
+                                // a pair were paired into `ds_load_2addr_b64`, whose 8-bit offsets forced an add
+                                // a read, 2026-10-27)
+                                let q = qb.add(i * ACT_BYTES + st * 2 * GROUP);
+                                let lo = core::ptr::read(q as *const Q16).0;
+                                let hi = core::ptr::read(q.add(32) as *const Q16).0;
+                                [(lo[0], hi[0]), (lo[1], hi[1])]
                             }),
                             core::array::from_fn(|i| {
-                                let tok = act.add(i * ACT_BYTES);
-                                (*(tok.add(H + 4 * NG) as *const i32).add(g) as f32, *(tok.add(H) as *const f32).add(g))
+                                let sp = sb.add(i * ACT_BYTES + st * 8);
+                                (*(sp.add(4 * NG) as *const i32) as f32, *(sp as *const f32))
                             }),
                         )
                     };
+                    let mut y = [0f32; SPEC_TOKENS];
+                    // one step of lookahead exactly: the next step's words are read before this step's dots, and a
+                    // compiler fence at the step's end keeps the scheduler from hoisting further (with the addresses
+                    // folded into the loads it hoisted every step's reads to the register bound and spilled)
+                    let (mut qa, mut gss) = read(0);
                     macro_rules! step {
                         ($st:expr) => {{
-                            let (qa, gss) = read($st);
+                            let next = if $st + 1 < NSTEP { read($st + 1) } else { (qa, gss) };
+                            let wst = w[$st % WD];
                             let mut i = 0;
                             while i < SPEC_TOKENS {
-                                let part = word_dot_act(w[$st].0, qa[i][0].0, qa[i][0].1) + word_dot_act(w[$st].1, qa[i][1].0, qa[i][1].1);
+                                let part = word_dot_act(wst.0, qa[i][0].0, qa[i][0].1) + word_dot_act(wst.1, qa[i][1].0, qa[i][1].1);
                                 // the quad's four lanes hold the cell's quarters: the group's exact integer sum
                                 let p = part as f32;
                                 let p = p + dpp_xmask::<XMASK1>(p);
                                 let sum = p + dpp_xmask::<XMASK2>(p);
+                                // every lane of the quad holds the quad's sum: all accumulate (a guard on lane 4r
+                                // was an exec-masked region a token a step, ~200 scalar ops a wave)
+                                // lane 4r's accumulate: the guard is what keeps the scheduler from flattening the
+                                // sixteen steps into one region at the register bound (every lane accumulating —
+                                // the same value across the quad — put 192 registers and 99 scratch ops in the body,
+                                // 2026-10-27)
                                 let term = (sum - WBIAS as f32 * gss[i].0) * wsv[$st] * gss[i].1;
                                 if lu % 4 == 0 {
                                     y[i] += term;
                                 }
                                 i += 1;
                             }
+                            if $st + WD < NSTEP {
+                                w[$st % WD] = wload($st + WD);
+                            }
+                            (qa, gss) = next;
                         }};
                     }
                     const { assert!(NSTEP == 16) };
@@ -836,6 +864,16 @@ pub mod gfx11 {
                     step!(13);
                     step!(14);
                     step!(15);
+                    // the norms, after the steps: the sixteen partials of a token one a lane of each row, summed
+                    // across the row (every lane loading all sixteen held sixty-four loads live; computed before the
+                    // steps the four values lived across the whole body and were what the body's register pressure
+                    // spilled — 42 stores, 51 loads a wave, 2026-10-27)
+                    const { assert!(ACT_SS == 16) };
+                    let ps = (src.add(SPEC_TOKENS * ACT_BYTES) as *const f32).add(lane as usize % 16);
+                    let rr: [f32; SPEC_TOKENS] = core::array::from_fn(|i| {
+                        let ss = common::gfx11::row_sum16(*ps.add(i * ACT_SS));
+                        common::gfx11::rsq(ss * (1.0 / H as f32) + RMS_NORM_EPS)
+                    });
                     // the row's two parities (lanes 4r and 16 + 4r) summed, lane 4r emits
                     let mut i = 0;
                     while i < SPEC_TOKENS {
