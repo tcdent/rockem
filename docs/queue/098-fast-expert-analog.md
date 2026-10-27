@@ -527,6 +527,9 @@ bit-identical kernels). The B region: **1,819 instructions, 2 drains (the two do
 172 `row_xmask` adds, 4 permlane, 84 `v_rcp`, 2 `v_rsq`, 28 `v_readlane`, 79 depctr waits, 377 `s_delay_alu`. The
 line predicts 19.7; what it cannot say is how much of its 12.6 intercept was the fifteen LDS waits and the five drains
 now gone — an12s's point decides (rockem.lead booting an12s first for that reason, 2026-10-27), then this object.
+Cut (2) priced on the same object (committed on the branch, not staged): phase B's products through `gfx11::fma`
+(`v_fma_f32` / `v_fmac`; rustc never contracts the pair — the bit-identical kernels keep theirs): the B region
+1,819 → **1,670** (142 fma, −0.6 µs on the line). The Sinkhorns' 640 remain the floor of the count.
 
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the

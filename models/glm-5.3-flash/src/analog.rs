@@ -146,7 +146,7 @@ pub mod gfx11 {
         fence(Ordering::Acquire);
     }
 
-    use common::gfx11::{dpp_xmask, other_row, wave_sum_dpp, XMASK1, XMASK2, XMASK4, XMASK8};
+    use common::gfx11::{dpp_xmask, fma, other_row, wave_sum_dpp, XMASK1, XMASK2, XMASK4, XMASK8};
     /// The sum over a lane's quad (lanes `4q..4q + 4`): the Sinkhorn matrix's row, an entry a lane.
     #[inline(always)]
     unsafe fn quad_sum(v: f32) -> f32 {
@@ -204,12 +204,12 @@ pub mod gfx11 {
     #[inline(always)]
     unsafe fn mix_token(coef: f32, m: MixIn, lu: usize, mix: *mut f32) -> (f32, f32) {
         let c_pp = other_row(coef);
-        let pre = sigmoid_rcp(c_pp * m.s0 + m.b) + HC_EPS;
-        let post = 2.0 * sigmoid_rcp(c_pp * m.s1 + m.b);
+        let pre = sigmoid_rcp(fma(c_pp, m.s0, m.b)) + HC_EPS;
+        let post = 2.0 * sigmoid_rcp(fma(c_pp, m.s1, m.b));
         let pp = if lu < HC { pre } else { post };
         // the softmax of the row, then Sinkhorn: the columns first, then rows and columns `HC_SINKHORN_ITERS - 1`
         // times (`hc::pre`'s order)
-        let e = coef * m.s2 + m.b8;
+        let e = fma(coef, m.s2, m.b8);
         let e = exp(e - quad_max(e));
         let mut cb = e * rcp(quad_sum(e)) + HC_EPS;
         let mut it = 0;
@@ -451,7 +451,7 @@ pub mod gfx11 {
             let mut term = 0f32;
             let mut j = 0;
             while j < HC {
-                term += pick(&al[j], ga) * pick(&al[j], gb);
+                term = fma(pick(&al[j], ga), pick(&al[j], gb), term);
                 j += 1;
             }
             let ss = wave_sum_dpp(if lu < BASE * BASE { term * g } else { 0.0 });
@@ -460,7 +460,7 @@ pub mod gfx11 {
             while j < HC {
                 let mut a = 0;
                 while a < BASE {
-                    acc += al[j][a] * dots[j * BASE + a];
+                    acc = fma(al[j][a], dots[j * BASE + a], acc);
                     a += 1;
                 }
                 j += 1;
@@ -490,7 +490,7 @@ pub mod gfx11 {
                 let mut v = 0f32;
                 let mut k = 0;
                 while k < HC {
-                    v += comb[k][j] * alpha[k][a];
+                    v = fma(comb[k][j], alpha[k][a], v);
                     k += 1;
                 }
                 alpha2[j][a] = v;
@@ -521,8 +521,8 @@ pub mod gfx11 {
                 if lu == a {
                     let mut j = 0;
                     while j < HC {
-                        beta += pre_a[j] * alpha[j][a];
-                        beta0 += pre_f[j] * alpha2[j][a];
+                        beta = fma(pre_a[j], alpha[j][a], beta);
+                        beta0 = fma(pre_f[j], alpha2[j][a], beta0);
                         j += 1;
                     }
                 }
@@ -535,7 +535,7 @@ pub mod gfx11 {
             let mut cc = 0f32;
             let mut j = 0;
             while j < HC {
-                cc += pre_f[j] * post_a[j];
+                cc = fma(pre_f[j], post_a[j], cc);
                 j += 1;
             }
             *c.add(i) = cc;

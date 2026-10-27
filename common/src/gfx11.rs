@@ -180,6 +180,12 @@ pub unsafe fn rcp(x: f32) -> f32 {
 pub unsafe fn rsq(x: f32) -> f32 {
     amdgcn_rsq(x)
 }
+/// `a * b + c` as one `v_fma_f32` (rustc never contracts the pair; the bit-identical kernels keep their pairs —
+/// this is for arithmetic no forward output depends on, the analog's phase B first).
+#[inline(always)]
+pub unsafe fn fma(a: f32, b: f32, c: f32) -> f32 {
+    core::intrinsics::fmaf32(a, b, c)
+}
 
 /// The value lane `src` holds, to every lane of the wave.
 #[inline(always)]
