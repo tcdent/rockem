@@ -63,15 +63,17 @@ pub const SEL_FG_ROWS: usize = 2 * NSEL * KDA_DIM;
 pub const R_TILES: usize = SEL_ROWS / common::q4::TILE;
 /// A token's staged activation in LDS: `H` bytes of i8, then a scale and a Σq a group.
 pub const ACT_BYTES: usize = H + 8 * (H / common::q4::GROUP);
-/// Phase R's LDS: the `SPEC_TOKENS` staged activations, copied from `TAB_ACT`.
-pub const R_LDS: usize = SPEC_TOKENS * ACT_BYTES;
+/// Phase R's LDS: the `SPEC_TOKENS` staged activations, copied from `TAB_ACT`, then the K-quarters' partial
+/// sums `[8 waves][32 lanes][8]` f32 for the join.
+pub const R_KSPLIT: usize = 4;
+pub const R_LDS: usize = SPEC_TOKENS * ACT_BYTES + CHAIN_WAVES * 32 * 8 * 4;
 /// `TAB_ACT`, VRAM: the activations quantized once by phase C's workgroups (`[SPEC_TOKENS][ACT_BYTES]`), then the
 /// norms' partial sums of squares `[SPEC_TOKENS][ACT_SS]` (a value a wave of phase C's `H / 2048` workgroups).
 /// Every one of phase R's 168 workgroups quantizing the four tokens itself was ~20.8 µs on the critical path
 /// before its first dot — the pass's larger half once the bytes were cut (an18t, 2026-10-27).
 pub const ACT_SS: usize = (H / 2048) * 8;
 pub const ACT_TOTAL: usize = SPEC_TOKENS * ACT_BYTES + SPEC_TOKENS * ACT_SS * 4;
-const _: () = assert!(SEL_ROWS % common::q4::TILE == 0 && R_TILES <= CHAIN_GRID as usize * CHAIN_WAVES && H % 256 == 0 && SEL_FG_ROWS <= crate::kda::gfx11_consts::E4_ROWS * CHAIN_GRID as usize * CHAIN_WAVES);
+const _: () = assert!(SEL_ROWS % common::q4::TILE == 0 && R_TILES <= CHAIN_GRID as usize * CHAIN_WAVES && H % 256 == 0 && SEL_FG_ROWS <= crate::kda::gfx11_consts::E4_ROWS * CHAIN_GRID as usize * CHAIN_WAVES && (SEL_ROWS / 16) * R_KSPLIT % CHAIN_WAVES == 0 && (H / common::q4::GROUP) % R_KSPLIT == 0);
 /// The output phase: a composed row a wave, eight a workgroup; the leader's workgroups past them take the router's
 /// rows over the no-attention input, then over the second margin's input.
 pub const OUT_WGS: usize = E / 8;
@@ -769,9 +771,13 @@ pub mod gfx11 {
                 // r of lane l is (row 2r + l / 16, token l % 16). 212 working waves against 848 four-row tiles:
                 // the grid's issued slots ~4× fewer, its LDS bytes ~4× fewer — the tile was issue throughput
                 // (an21 null, 2026-10-27).
-                // the 212 row blocks spread over the grid wave-major (wave 0 of every workgroup, then wave 1 of
-                // the first 44): every CU's matrix pipes carry ~2 blocks instead of 27 workgroups' carrying 8
-                let wb = wave * CHAIN_GRID as usize + wg;
+                // a block's K split across four waves of its workgroup (eight groups each; 848 waves active, the
+                // `v_dot4` form's depth — one wave a block was 212 waves, ~2 a SIMD, and the group loop's loads,
+                // unpack, eight 16-cycle WMMAs and flush ran as a serial chain with nothing to interleave: an23
+                // +5 µs where the slot arithmetic said −18, 2026-10-27); the four partial sums joined through LDS,
+                // the first wave emitting
+                let gwave = wg * CHAIN_WAVES + wave;
+                let (wb, kq) = (gwave / R_KSPLIT, gwave % R_KSPLIT);
                 if wb * 16 < SEL_ROWS {
                     use common::gemv::gfx11::{v4i32, v8i32, wmma_u8i8, ZERO_I32};
                     let lu = lane as usize;
@@ -787,8 +793,8 @@ pub mod gfx11 {
                     // were 24 64-bit ops a group)
                     let wsb = qscales.add((row0 / TILE) * (NG * TILE) + lu / 16);
                     let mut y = [0f32; 8];
-                    let mut g = 0;
-                    while g < NG {
+                    let mut g = kq * (NG / R_KSPLIT);
+                    while g < (kq + 1) * (NG / R_KSPLIT) {
                         let mut acc: v8i32 = ZERO_I32;
                         let ab = a_row.add(g * TILE * (GROUP / 2));
                         let bb = b.add(g * GROUP);
@@ -828,6 +834,29 @@ pub mod gfx11 {
                         }
                         g += 1;
                     }
+                    // the join: each wave's eight partials a lane into LDS, the quarter-0 wave of the block sums
+                    // its three siblings' (waves 4b'..4b' + 3 of this workgroup)
+                    let part = (act.add(SPEC_TOKENS * ACT_BYTES) as *mut f32).add((wave * 32 + lu) * 8);
+                    if kq != 0 {
+                        let mut r = 0;
+                        while r < 8 {
+                            *part.add(r) = y[r];
+                            r += 1;
+                        }
+                    }
+                    workgroup_sync();
+                    if kq == 0 {
+                        let mut q = 1;
+                        while q < R_KSPLIT {
+                            let sib = part.add(q * 32 * 8);
+                            let mut r = 0;
+                            while r < 8 {
+                                y[r] += *sib.add(r);
+                                r += 1;
+                            }
+                            q += 1;
+                        }
+                    }
                     // the norms after the steps: the sixteen partials of a token one a lane of each row, summed
                     // across the row; this lane's token's
                     const { assert!(ACT_SS == 16) };
@@ -845,7 +874,7 @@ pub mod gfx11 {
                         i += 1;
                     }
                     // lanes with a token of the step emit their eight rows at the rows' places
-                    if lr < SPEC_TOKENS && lr < n {
+                    if kq == 0 && lr < SPEC_TOKENS && lr < n {
                         let mut r = 0;
                         while r < 8 {
                             let row = row0 + 2 * r + lu / 16;

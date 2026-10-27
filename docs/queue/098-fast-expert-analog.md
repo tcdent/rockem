@@ -848,6 +848,23 @@ the 224 node validated on its own (a node merged ahead of its object panicked th
 an21s stats boot — the check did its job; an21s's section rows are lost, A's per-workgroup read comes from an22s or
 an23s). an23 boots against 105.0 / 105.8 with the prediction on record: tile ~4–6, R ~7–9, chain ~87.
 
+**an23's boot (rockem.lead, 2026-10-27; run 24c9c541): WORSE** — an_chain 110.3 / 110.8 (an22 105.0 / 105.8), slot
+wait 3.08 / 1.57 / 0.94, coverage .776 to the digit (the integer sums and the flush held exactly), decode-identical,
+SCORE bit-identical. The matrix form added ~5 where the throughput arithmetic said −18 — the fourth model of R to
+miss (bytes, prologue, waits, issue). From the object (rockem.lead): the R region is a 32-trip loop of ~200
+instructions with eight WMMAs a trip on ONE wave a block — 212 waves active of 1,344, ~2.2 a SIMD where the
+`v_dot4` form had 14 — so the matrix pipe's ~16-cycle WMMA latency and the trip's LDS / VMEM round trips run as a
+serial chain on each active wave (the B / R lesson in a new place), hidden before by fourteen waves of interleave.
+an23t boots for the table (the per-wave rows: block waves against idle), an22 redeploys as the mark.
+
+**Build 24 (staged, behind an23t's table: `kernels-an24` eacfd1b7, `-an24s` 48fd8756, `-an24t` fd7f7328; the node as an22's,
+kernarg 224; 155 VGPRs, no scratch, 31 barriers = 30 + the join's sync).** Depth: a block's K split across four
+waves of its workgroup (`R_KSPLIT`: eight groups each, 848 waves active — the `v_dot4` form's occupancy with the
+WMMA form's slot count), each wave's eight partial sums a lane into LDS (`R_LDS` grows by 8 KB), the block's
+quarter-0 wave summing its three siblings' after one sync and emitting. The per-wave chain is 8 trips instead of
+32 with ~9 waves a SIMD to interleave them. The group arithmetic and the flush are an23's (coverage held there to
+the digit). Not booted until an23t says the chain is the cost.
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back
