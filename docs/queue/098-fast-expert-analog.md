@@ -718,6 +718,16 @@ wave: a bandwidth-bound pass with the saturated queue's tail; the 20.8 MB / 640 
 the lever. Side facts: card1 runs R ~1.5–2 µs slower than card0 throughout (its chain 124 vs 121: its memory
 system, not the code); 26 workgroups (208 waves, 15 % of the grid) idle in R at `R_ROWS` 3.
 
+**an18's boot (rockem.lead, 2026-10-27; run fc78c879; node rebuilt, `TAB_LEN` 41) — VALID, the new mark.**
+Coverage **.776** (an17 .767: the a8 activations cost nothing), @13 .860; an_chain **110.9 / 110.8** (an17
+120.4 / 121.6; the cards now equal — card1's lag was its bytes), p90 198 / 200, slow 0 / 0.1 %; slot wait
+3.09 / 1.49 / 0.98 ms at widths 2–4 (an17 3.27 / 1.62 / 0.97; production 1.3 / 0.87 / 0.8); step 47.3 / 59.5 / 68.9;
+experts 12.03 / 19.51 / 27.53; decode-identical post-SCORE; SCORE bit-identical. The chain fell 10, not the 23 the
+bytes predicted: R did not reach ~12 — an18t's table (R alone) says where it sits before anything is cut. The
+candidates, by the object: the staging prologue (a wave's four tokens quantized one after another, each a lockstep
+`wave_max` and `wave_sum_i32` of five `ds_bpermute` round trips — forty a wave before its tile starts), the tile's
+LDS waits (61 full `lgkmcnt(0)` a wave, a step's activation words read then used), and the bytes' 11.5.
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back
