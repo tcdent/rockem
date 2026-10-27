@@ -27,6 +27,7 @@ bringup/*.log
 os/initramfs/dl/
 models/glm-5.3-flash/gpu/target/
 models/glm-5.3-flash/gpu/target-stats/
+models/glm-5.3-flash/gpu/target-stats-tail/
 
 # expert-cache experiment data (dumps, traces, exported rows): kept in the repo tree, out of git
 bringup/expert-cache/data/
