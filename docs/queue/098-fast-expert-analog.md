@@ -963,6 +963,10 @@ two blocks' scales (one 4 KB span of `q4::pack`'s tile-major layout) copied into
 wait of its own (the batch's eight weight loads at the batch's top, nine LDS loads a group). If the round trip was
 the trip, a block wave ~12–15 → ~5–7 and the chain ~97 → ~89; if an26t's rows show the block waves already at
 ~6 with the chain unmoved, the join or the barriers hold it and 27 is a minor.
+an26t (rockem.lead, 2026-10-27; run 87b90e60): the block waves UNCHANGED — wg 0–43 14.0–15.5, wg 44–167
+10.6–11.3 against an24t's 13.6–15.1 / 12.2–12.8; R 10.4 / 19.0 (an24t 10.3 / 18.0). The weight batching did not
+touch the trip; the flush's scale loads stand as its reading, and an27 boots as the fix for that number (the node
+rebuilt with 29,728; prediction on record: block wave ~5–7, chain ~89).
 
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
