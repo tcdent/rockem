@@ -644,7 +644,7 @@ change bits**; the fault is in an14 → an16's own changes. Bisection from the m
 staged here — `kernels-an16a` 419959ce (an15 + the rows variant's DPP reductions only), `-an16b` 54c3019f (an15 +
 phase O's reads past n, the fyv 0 / 1 weighting, O's fma), `-an14a` 2b32e578 (an13f + phase O's DPP wave sums
 only), `-an14b` 07965542 (an13f + the router rows' `v_rsq` only); an15's own two (the Gram workgroups, phase A's
-DPP sums) split next if needed. Built in a worktree at the ladder's commits (`~/Work/rockem-bis`).
+DPP sums) split as `-an15a` bf7e9ba9 (the Gram workgroups without A's DPP sums) and `-an15b` f23b8e10 (A's DPP sums with the Gram on rows 0..n). Built in a worktree at the ladder's commits (`~/Work/rockem-bis`).
 
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
