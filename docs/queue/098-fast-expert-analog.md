@@ -456,6 +456,20 @@ should come back as ~.68. Predicted chain at width 2: A/B/C ~12, rows ~40 (22 MB
 production's 1.3 / 0.9 / 0.8 ms at widths 2–4, rank 13 early ≥ ~.68, the per-layer slow share near zero; width 1
 stays tcdent's fork.
 
+**Build 5's boot (rockem.lead, 2026-10-27, run 47003b43) and the phase splits.** Accuracy held at 16 heads (the posted 13
+cover .772 against 32 heads' .776, production .658); the cascade down to 1–2 % of chains; an_chain p50 143 / 149
+(predicted 90); slot wait 4.3 / 3.7 / 2.1 / 1.1 ms a step at widths 1–4 (production 1.45 / 1.3 / 0.87 / 0.8), the step
++1.9 / +1.3 / +0.5 at 2–4. The hyper-connection phases measured 48 µs for the third time: neither the barriers (build
+3) nor phase A's loads (build 5; the ISA carries the wide form) were it. Split into A / barrier / B / rest (an5s2, run
+df0bc7df): A 21.8 for the workgroups that do it (the mean over the grid, 5.6, counts the 120 idle ones), the barrier's
+wait 19 for them, **B 18.6 on one wave a token** (the Sinkhorn mixes with their terms re-read from memory inside the
+loops), barrier + C + barrier 22.5 waiting B out. **Build 6** (53e0035): B's mix terms, Gram and alpha'' once into the
+wave's LDS, the lane's dots in registers. **Build 7** (64a1e45; `kernels-an7`, `-an7s`): phase A over two workgroups a
+row (96 of the 168), a 2048-channel chunk each, the chunks' dots and Gram summed in B — one row a workgroup was a
+chain of round trips over both chunks. Predicted A ~10, B ~8, C and barriers ~6: the phase ~24, the chain ~120, the
+plan ~155 µs after the run starts at width 2 — borderline on the ≤ 150; 12 heads (+0.21 / +0.12 offline, ~17 MB of
+rows) is the next cut if the served numbers need it.
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back
