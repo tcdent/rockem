@@ -227,6 +227,18 @@ the same work buy nothing, and a cut that changes the shape must be measured, no
 the previous shape's line. The register pressure that moved loads into loops, the ALU chain
 that grew when they came back out, and the shape change that halved B left no trace in the
 slab; all three were in the object.
+A count is static; a cost is dynamic. Before pricing a region's instructions, find its
+back-edges (`s_branch`/`s_cbranch` with a negative offset — printed as a 16-bit two's complement, > 32767)
+and multiply each loop body by its trips: build an19's staging loop doubled its static permutes (40 → 80)
+while halving its trips (4 → 2) and its dependent depth — the same 160 dynamic permutes, half the waits.
+The straight-line rule above (one wave, every instruction serial) applies to a body once per trip.
+And a phase whose time is flat across every wave of an oversubscribed grid, and unmoved by cutting its
+waits or its bytes, is issue-bound: the grid's total issued slots (VALU + SALU + LDS a wave × waves) over the
+SIMDs, plus its LDS bytes over the CUs' LDS bandwidth, is the time; latency models (round trips, drains, waits)
+do not enter. 098's rows pass on q4 rows: 1,344 waves on 96 SIMDs, ~2,200 issued slots a wave ≈ 13 µs, 110 MB
+of LDS reads ≈ 7.5 µs, measured ~24 flat — after the bytes, the prologue and the LDS waits had each been cut
+and the last of them moved nothing. The lever there is instructions and LDS bytes a tile, checked by the same
+arithmetic before a build.
 
 **The rule that makes observation a property rather than a session.** Every launch site
 declares the bytes its kernel moves, the ceiling is measured on the box at startup, and
