@@ -631,6 +631,21 @@ an13f changes the histogram, the plan changes bits and the join / slot path is w
 the ladder an14 (c48f22f5: + phase O's DPP sums, `v_rsq` on the router rows) → an15 (384efd20: + the Gram
 workgroups, phase A's DPP sums) → an16 bisects the rest in at most two boots.
 
+**The control, the fingerprint and an13f (rockem.lead, 2026-10-27).** The gate is now the `spec_step` path (pos, made,
+verified, accepted) against an13's run 4a6ba8f4, all 54 steps (`decode_identical.sh`; the step histogram's
+1,370 vs 1,380 was a run boundary). an13 restored (1d4f3cd4): identical across boots. an16 (17ef4a57) departs at the
+FIRST speculative step, pos 18121 — made 2 / verified 1 against 3 / 2 in every request: the draft of that step takes
+the model's hidden state from the plain width-1 decode step at 18120, the first step on which the analog runs, so
+an16 changed the width-1 forward's bits — a changed computation, not a near-tie. (In every run, request #1 follows
+its own path and #2–25 another: the cold prompt against its cache hits, the known cold-vs-hit difference; not
+today's fault.) **an13f (83cc8bb2): decode-identical to an13** — so two rounding-level changes of the analog's
+margins (an12 → an13's `v_rcp` / `v_rsq`, an13 → an13f's fma) left the output untouched: **the plan path does not
+change bits**; the fault is in an14 → an16's own changes. Bisection from the midpoint: an15 booting; then the splits
+staged here — `kernels-an16a` 419959ce (an15 + the rows variant's DPP reductions only), `-an16b` 54c3019f (an15 +
+phase O's reads past n, the fyv 0 / 1 weighting, O's fma), `-an14a` 2b32e578 (an13f + phase O's DPP wave sums
+only), `-an14b` 07965542 (an13f + the router rows' `v_rsq` only); an15's own two (the Gram workgroups, phase A's
+DPP sums) split next if needed. Built in a worktree at the ladder's commits (`~/Work/rockem-bis`).
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back
