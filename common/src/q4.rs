@@ -1139,10 +1139,19 @@ pub mod gfx11 {
     /// against q[k..k+4] and q[k+4..k+8], then the high nibbles against the
     /// +32 activations.
     #[inline(always)]
-    unsafe fn word_dot(packed: u64, qg: *const i8, i: usize) -> i32 {
+    pub unsafe fn word_dot(packed: u64, qg: *const i8, i: usize) -> i32 {
+        let (qlo, qhi) = word_act(qg, i);
+        word_dot_act(packed, qlo, qhi)
+    }
+    /// Word `i`'s activations of a group: the eight at its low nibbles' k and the eight at +32.
+    #[inline(always)]
+    pub unsafe fn word_act(qg: *const i8, i: usize) -> (u64, u64) {
         let k_lo = (i / 4) * 64 + (i % 4) * 8;
-        let qlo = core::ptr::read_unaligned(qg.add(k_lo) as *const u64);
-        let qhi = core::ptr::read_unaligned(qg.add(k_lo + 32) as *const u64);
+        (core::ptr::read_unaligned(qg.add(k_lo) as *const u64), core::ptr::read_unaligned(qg.add(k_lo + 32) as *const u64))
+    }
+    /// `word_dot` on activations already read (`word_act`): a caller batching its LDS reads ahead of its dots.
+    #[inline(always)]
+    pub unsafe fn word_dot_act(packed: u64, qlo: u64, qhi: u64) -> i32 {
         const M: u32 = 0x0F0F_0F0F;
         let (w0, w1) = (packed as u32, (packed >> 32) as u32);
         let (q0, q1) = (qlo as u32, (qlo >> 32) as u32);
