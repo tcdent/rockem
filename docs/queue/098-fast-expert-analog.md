@@ -470,6 +470,30 @@ chain of round trips over both chunks. Predicted A ~10, B ~8, C and barriers ~6:
 plan ~155 µs after the run starts at width 2 — borderline on the ≤ 150; 12 heads (+0.21 / +0.12 offline, ~17 MB of
 rows) is the next cut if the served numbers need it.
 
+**Build 7's boot (rockem.lead, 2026-10-27, run d020207d) and build 8.** The chain did not move (p50 140 / 144 against
+an5's 143 / 149; slot wait 3.7 / 1.9 / 1.2 ms): the fourth fix with no change in the total. Both phases are
+**cross-lane latency chains**, not bytes or barriers: phase A's reduction summed its 65 values one `wave_sum` at a time —
+325 dependent `ds_bpermute` steps a wave, ~20 µs, the same with narrow or wide loads and with one or two workgroups a
+row; phase B's mix was `hc_pre`'s wave form, ~6 permutes an iteration over 20 Sinkhorn iterations and two halves on
+one wave, ~15 µs (864 `ds_bpermute` in an5's `an_chain`). **Build 8** (e6c49f4; `kernels-an8`, `-an8s`): the sums in
+lockstep (`common::gfx11::wave_sum_f32::<N>`: every value's permute issued per step, five round trips for all), the
+Sinkhorn in registers on every lane alike (no permute: a 4 × 4 for a few tokens); static report clean after two spilled
+forms. Held for an7s's table; the prediction: A ~4, B ~3, the phase ~12, the chain ~105 µs. Rule: for a few tokens a
+cross-lane reduction is latency, not throughput — count the dependent permutes before the bytes.
+
+**Builds 8–11 (2026-10-27), the single-wave phase read from the objects.** an8 (lockstep sums, register Sinkhorn with
+`/`): the chain +20 µs — a `/` lowers to the ~10-instruction IEEE sequence, 1,280 of them a token on one wave
+(308 `v_div_scale`); the lockstep sums did win (A's slowest workgroup 17 → 12.6). an9 (`v_rcp_f32`): back to an7's
+141 — B 26.6 against an7's 19.9, with the dots loaded one at a time inside the loops (a drain a value: rockem.lead's
+cut of the B region between the clocks, 19 `vmcnt(0)` drains, "flat_load → wait → FMA → store → flat_load"). an10
+(the dots as one batch): the object's B region unchanged, held unbooted — the stretch was the stored mix re-read
+through the scratch pointer, not the dots. **Build 11** (529cfb2; `kernels-an11`, `-an11s`; the node rebuilt, kernarg
+200): `mix_token` returns (pre, post, comb) and the caller keeps the registers; the base and scale, alpha, the Gram and
+a half's dots each one batch of loads; phase B's and the barriers' pointers as kernel arguments (generic loads were
+drained at every LDS wait). The B region cut at the clocks: **6 drains against 19** (three a token), 52 global loads,
+1 flat. Rule kept from here (rockem.lead): cut the stats object at its clock stamps and count the region's drains
+before handing an object over; ≤ ~5 is the shape that predicts B ~6. Prediction: B ~6, the phase ~24, chain ~120.
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back
