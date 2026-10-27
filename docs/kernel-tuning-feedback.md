@@ -151,12 +151,17 @@ fails on the three rows kernels, an15 passes); *on the box* — `bringup/box/dec
 path of the cody-decode hits (`spec_step`'s (pos, made, verified, accepted) sequence) against the reference
 `bringup/gates/cody-decode.fingerprint` taken from an13; deterministic across builds, boots and PCIe error bursts
 (an12, an13, an13s, an13f, an15, two restores — 54 steps, 96/54/41 a request), so a build that moves it has changed
-the computation. deploy.sh runs it after its prow reads (three extra hits give the steady-state path); the
-`an*_gates.sh` workloads run it over 24. The step-width histogram is not the fingerprint (its count moves with the
-run boundary). Residency cannot move the path by rounding — the card expert path is bit-identical to the host's
-and the join is in pick order (002, 003), and an12 → an13 → an13f (rounding-level changes to the analog's margins)
-left it untouched — yet in every run the cold request, the first hit and the second hit each follow their own path
-and hits 3+ another, same prompt; unexplained, consistent across builds.
+the computation. deploy.sh runs it on three hits sent AFTER the long SCORE; the `an*_gates.sh` workloads run it over 24. The
+step-width histogram is not the fingerprint (its count moves with the run boundary). **The state matters as much
+as the build.** On every build the request sequence has the same structure: the cold request its own path, the
+first hit its own, hits before SCORE a 45-step path, the first hit after SCORE its own, every later hit the
+reference's 54-step path. So running SCORE changes the bits of a later decode of an unrelated prompt — the
+"cold and hit differ at a near-tie" record (029, the rare-divergence notes) localized to a state SCORE perturbs
+(the draft's prompt cache, the KDA mirror restore, the pools; residency cannot: the card expert path is
+bit-identical to the host's and the join is in pick order, 002/003, and an12 → an13 → an13f's rounding-level
+changes to the analog's margins left the path untouched). The decode sits at a near-tie that any ulp flips — an16's
+post-SCORE path was the pre-SCORE one — which is what makes the fingerprint a sharp bit-identity gate, provided the
+reference and the sample are taken in the same state (post-SCORE, steady). The state dependence itself is open.
 
 ## Observation: four channels, none inside a kernel
 
