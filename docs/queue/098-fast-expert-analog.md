@@ -657,9 +657,10 @@ and SCORE cannot see those kernels — past SPEC_TOKENS the rows passes are the 
 reduction is load-bearing: it replays the staged pass's exactly, which is what makes a decode step bit-identical
 to a prefill step.) **Fix (the branch's head):** `exp4_rows_direct_rows` takes a `DPP: bool` const generic — the
 analog's call sites `true`, `exp4_rows_direct_map` `false` with the original reduction verbatim — and the gate that
-would have caught it is static: `bringup/expert-cache/analog/kdiff.py <new.elf> <served.elf>` disassembles every
-kernel symbol of both objects and fails on any symbol outside `an_chain` / `an_send` that differs (it reproduces the
-an16a finding: the three rows kernels). rockem.lead's `bringup/gates/kernel_diff.sh` makes it a build gate. With
+would have caught it is static: `bringup/gates/kernel_diff.sh <new.elf> <served.elf>` (rockem.lead's; deploy runs
+it) disassembles every kernel symbol of both objects — the count and an md5 of the instructions, the comments with
+the addresses stripped — and fails on any symbol outside the `an_` prefix that differs (it reproduces the an16a
+finding: the three rows kernels). With
 the fix, the plain / stats / tail objects differ from an13 / an13s in `an_chain` only. **an17 re-staged on the fix:
 `kernels-an17` c842df31, `-an17s` 8ded64ea, `-an17t` 3f9c3a9b** (171 VGPRs, no scratch, 29 barriers, kernarg
 200; `an_chain` 12,349 instructions — the same count as the held an17: the analog's own code is unchanged, only the

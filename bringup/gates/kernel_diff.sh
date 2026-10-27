@@ -8,7 +8,9 @@
 set -u
 NEW=$1; OLD=$2; shift 2; ALLOW=${*:-an_}
 OD=$(ls ~/.rustup/toolchains/*/lib/rustlib/*/bin/llvm-objdump | head -1)
-streams() { "$OD" -d --triple=amdgcn-amd-amdhsa --mcpu=gfx1100 "$1" 2>/dev/null | awk '/^[0-9a-f]+ <[^>]+>:/{name=$2; gsub(/[<>:]/,"",name); next} name!=""{sub(/\/\/.*/,""); gsub(/[ \t]+/," "); print name "\t" $0}' | awk -F'\t' '{n[$1]++; h[$1]=h[$1] $2} END{for(k in n) print k, n[k], length(h[k])}' | sort; }
+# a symbol's stream: its instruction count and the md5 of the instructions themselves (the comments carry the absolute
+# addresses — stripped; a count and a text length let a same-length change through, 2026-10-27)
+streams() { "$OD" -d --triple=amdgcn-amd-amdhsa --mcpu=gfx1100 "$1" 2>/dev/null | awk '/^[0-9a-f]+ <[^>]+>:/{name=$2; gsub(/[<>:]/,"",name); next} name!=""{sub(/\/\/.*/,""); gsub(/[ \t]+/," "); print name "\t" $0}' | sort -s -k1,1 | awk -F'\t' '$1!=k{if(k!="")print k "\t" n "\t" h; k=$1; n=0; h=""} {n++; h=h "|" $2} END{print k "\t" n "\t" h}' | while IFS=$'\t' read -r k n h; do echo "$k $n $(printf %s "$h" | md5sum | cut -c1-12)"; done | sort; }
 join -a1 -a2 -e MISSING -o 0,1.2,1.3,2.2,2.3 <(streams "$OLD") <(streams "$NEW") > /tmp/claude-1000/kernel_diff.txt
 fail=0
 while read -r k o1 o2 n1 n2; do
