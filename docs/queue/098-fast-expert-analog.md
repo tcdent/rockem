@@ -1032,6 +1032,31 @@ stale baseline. No boots until this is understood; the offline sim re-run at the
 sets of 24 / 48 / 96 a layer against the sim's 0 / 3 / 6 — at R = 6 the sim had 19.2 non-resident picks a layer
 where production has 14.4) is the first read: today's plan, 16 heads, 32 heads, both texts.
 
+**The baseline resolved as two workloads (rockem.lead).** 50bbd219 (.658 / .692) was 36 requests: the 25
+cody-decode hits plus ten real conversations at 377k–392k tokens of context generating 1,600–2,476 tokens each
+(7,500 of its 9,928 generated tokens) — production's predictor on real long-context sessions. 77d23b03 (.769 / .800)
+and every analog run (an1 → an27) were the 18k cody prompt × 25, 96 tokens — the repetitive benchmark, where the
+route-ahead already covers .769 and the analog adds +.007. The analog has never been measured on the workload the
+baseline came from, which is where production is weakest and the offline sim predicted the gain. One boot of an25
+under a long-context workload against production on the same requests decides it (rockem.lead finding or building
+the workload; the long sessions were live traffic).
+
+**The sim at the served operating points (cody; the survey text pending).** The sim's coverage — picked among the
+first 13 posts over the non-resident picks a layer-step, `plan_eval`'s number — at the resident size reproducing
+each workload's non-resident count: **R = 48 (14.25 non-resident a layer; the benchmark's 14.4): early today .590,
+16 heads .615 (+.025), 32 heads .632 (+.042); rows .643 / .667 / .684. R = 24 (16.86; the long sessions' 16.0
+between): early .551 / .574 (+.023) / .589 (+.038); rows .597 / .619 / .634.** The sim predicts +.02 (16 heads) to
++.04 (32) at either residency — residency is not what lost the served gain. What is: the sim's today-plan reads
+.59 where served production reads .769 on the same benchmark, an underestimate of .18 — the benchmark is one
+18k prompt 25 times, so production's learned predictor state has seen the text it is scored on, while the sim
+learns in one pass (`--warm 0`). On that reading the sim's +.025 is the prediction for an unrepeated workload (the
+long sessions) and the served +.007 the repeated benchmark's number, where today's plan is already warmed on the
+text. Testable in the lab: the sim with two warm passes (`--warm 2`) on cody, today against 16 heads — running.
+The sim has no long text (cody and the survey are 12k; a 380k reference forward is not feasible on the host), and
+`plan_eval` on a 1,600–2,476-token generation is dominated by model-generated tokens at decode widths and a state
+matured over 380k, which the sim never scored (teacher-forced prompt text; the day-one caveat): its prediction
+transfers in the residency and repetition dimensions, not in those.
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back
