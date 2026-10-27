@@ -842,6 +842,11 @@ flush as the `v_dot4` form (exact i32 either way), the f32 accumulation in group
 hold to the digit.
 an21t (rockem.lead, 2026-10-27; run 308e0112): R 17.8 / 27.3 against an20t's 18.1 / 27.4 — the lookahead left
 R unchanged to the tenth: the waits were never on R's clock, the throughput reading confirmed from the table side.
+an22 (rockem.lead, 2026-10-27; run f1d0cc8c; the kernarg-224 node): an_chain 105.0 / 105.8 (an20 / an21 106.0 /
+105.8) — the minor as priced; slot wait 3.02 / 1.58 / 0.92; coverage .776; decode-identical; SCORE bit-identical;
+the 224 node validated on its own (a node merged ahead of its object panicked the kernarg assert twice under the
+an21s stats boot — the check did its job; an21s's section rows are lost, A's per-workgroup read comes from an22s or
+an23s). an23 boots against 105.0 / 105.8 with the prediction on record: tile ~4–6, R ~7–9, chain ~87.
 
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
