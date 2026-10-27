@@ -1019,6 +1019,19 @@ accuracy is tcdent's criterion. The chain's remaining pieces are tcdent's two fo
 the second queue for the slope) and the barriers; rockem.lead brings him the state; this work holds until he
 answers.
 
+**BASELINE CORRECTION (rockem.lead, 2026-10-27).** Every coverage comparison in this series was made against run
+50bbd219 (.658 early / .692 rows) — a 193,028-layer-run session with 16.0 non-resident picks a layer, a colder
+residency. The production run deployed against, 77d23b03 (the re-touch build, no analog), has the same workload
+shape as every analog run (~56k layer runs, 14.4 non-resident picks a layer) and reads **.769 early / .800 rows**
+under the same `plan_eval` (unchanged since 2026-10-25). an25 reads .776 / .807: **the analog's served accuracy
+gain over production is +.007 / +.007**, the experts phase agrees (11.55 vs 11.74 / 18.76 vs 18.74 / 26.73 vs
+26.38 ms a step), and the step is slower at every width (46.88 vs 45.27, 59.58 vs 58.51, 68.15 vs 67.48). an1 at
+32 heads (1f8f79f2) reads .776 / .809 under the same tool — the same as 16 heads: the head count was never the
+limit either. So at 16 heads the analog has no served accuracy case, and the latency series was spent against a
+stale baseline. No boots until this is understood; the offline sim re-run at the served operating point (resident
+sets of 24 / 48 / 96 a layer against the sim's 0 / 3 / 6 — at R = 6 the sim had 19.2 non-resident picks a layer
+where production has 14.4) is the first read: today's plan, 16 heads, 32 heads, both texts.
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back
