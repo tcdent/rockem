@@ -761,6 +761,14 @@ prologue ~20.8 → the copy (~1–2), R ~30 → ~15–17, the chain ~111 → ~96
 an18 and vs an13s: `an_chain` only. (The norms' partials every lane loading all sixteen held 64 loads live and
 spilled 8 bytes — one a lane with a row sum instead.)
 
+**an19's boot (rockem.lead, 2026-10-27; run 046022b2): WORSE than an18** — an_chain 115.3 / 115.6 (an18
+110.9 / 110.8), slot wait 3.25 / 1.68 / 1.02 (3.09 / 1.49 / 0.98), coverage .776, decode-identical, SCORE
+bit-identical. Halving the prologue's dependent depth cost ~4.5 µs: the same 160 dynamic permutes in a two-token
+lockstep body ran slower than four single-token trips, so neither the static count nor the depth priced that loop
+(a reading, not a finding: with all 1,344 waves in the prologue at once the LDS crossbar is the shared resource,
+and eight permutes in flight a wave congest it where four did not — the chain's price was throughput, not
+latency). an18 stays the mark; an19t not booted; an20, which deletes the prologue, boots to the full gates.
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back
