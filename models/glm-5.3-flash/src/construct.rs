@@ -2045,12 +2045,6 @@ pub trait Placed {
     /// Bring-up: a MoE layer's FFN input (`x: [n][H]`) and its router's logits (`[n][ROUTE_ROWS]`) as the card
     /// made them, for forced picks and the traces' edges; serving reads `ffn_input`'s quantized form instead.
     fn ffn_logits(&mut self, l: usize, n: usize, x: &mut [f32], logits: &mut [f32]);
-    /// Bring-up: the predictor's first margin for the layer after `l` as the cards made it (`[n][E]` logits of
-    /// layer l + 1's router) — the analog's composed form where that layer is KDA (098), once the step's plan is in.
-    /// False where the pair has no analog.
-    fn analog_first(&mut self, _l: usize, _n: usize, _out: &mut [f32]) -> bool {
-        false
-    }
     /// Lab (`dump-pred`): a MoE layer's shared expert output (`[n][H]`) and its routed experts' rows (`[n][TOP_K][H]`,
     /// pick order) as the leader card holds them, once the layer's output half is done.
     fn ffn_parts(&mut self, l: usize, n: usize, shared: &mut [f32], rows: &mut [f32]);

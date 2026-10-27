@@ -7,8 +7,6 @@ description = "GLM-5.3-Flash: the pinned config, its constants, and the f32 tran
 [features]
 std = ["common/std", "dep:prow"]
 stats = ["common/stats"]
-stats_tail = ["stats", "common/stats_tail"]
-stats_r = ["stats", "common/stats_r"]
 # prow categories (host only: prow comes with `std`; the GPU build of this crate never links it).
 # The step's phases as zones on the main thread, each layer's lap from its start to its end, with
 # the routed experts, the pool's runs and the host's join for the cards' experts nested inside by time.

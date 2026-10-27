@@ -1,0 +1,50 @@
+thread 'rustc' panicked at /rustc-dev/4429659e4745016bd3f26a4a421843edc7fbc422/compiler/rustc_mir_transform/src/validate.rs:82:25:
+Box<dyn Any>
+stack backtrace:
+   0:     0x7f331f401a7b - <std[3d46086344a7ae7a]::backtrace::Backtrace>::create
+   1:     0x7f331f4019c5 - <std[3d46086344a7ae7a]::backtrace::Backtrace>::force_capture
+   2:     0x7f331e470ddd - std[3d46086344a7ae7a]::panicking::update_hook::<alloc[b6e8defdd65683e4]::boxed::Box<rustc_driver_impl[e98da4d991f149da]::install_ice_hook::{closure#1}>>::{closure#0}
+   3:     0x7f331f4155f2 - std[3d46086344a7ae7a]::panicking::panic_with_hook
+   4:     0x7f331e49dd21 - std[3d46086344a7ae7a]::panicking::begin_panic::<rustc_errors[531e07b59293fb60]::ExplicitBug>::{closure#0}
+   5:     0x7f331e496a96 - std[3d46086344a7ae7a]::sys::backtrace::__rust_end_short_backtrace::<std[3d46086344a7ae7a]::panicking::begin_panic<rustc_errors[531e07b59293fb60]::ExplicitBug>::{closure#0}, !>
+   6:     0x7f331e496a7b - std[3d46086344a7ae7a]::panicking::begin_panic::<rustc_errors[531e07b59293fb60]::ExplicitBug>
+   7:     0x7f331e4a8eb1 - <rustc_errors[531e07b59293fb60]::diagnostic::BugAbort as rustc_errors[531e07b59293fb60]::diagnostic::EmissionGuarantee>::emit_producing_guarantee
+   8:     0x7f331e9bfdec - <rustc_errors[531e07b59293fb60]::DiagCtxtHandle>::span_bug::<rustc_span[c0fd46f789e8d999]::span_encoding::Span, alloc[b6e8defdd65683e4]::string::String>
+   9:     0x7f331e9eb7a6 - rustc_middle[cff461d045763160]::util::bug::opt_span_bug_fmt::<rustc_span[c0fd46f789e8d999]::span_encoding::Span>::{closure#0}
+  10:     0x7f331e9eb932 - rustc_middle[cff461d045763160]::ty::context::tls::with_opt::<rustc_middle[cff461d045763160]::util::bug::opt_span_bug_fmt<rustc_span[c0fd46f789e8d999]::span_encoding::Span>::{closure#0}, !>::{closure#0}
+  11:     0x7f331e9da7cb - rustc_middle[cff461d045763160]::ty::context::tls::with_context_opt::<rustc_middle[cff461d045763160]::ty::context::tls::with_opt<rustc_middle[cff461d045763160]::util::bug::opt_span_bug_fmt<rustc_span[c0fd46f789e8d999]::span_encoding::Span>::{closure#0}, !>::{closure#0}, !>
+  12:     0x7f331c41d858 - rustc_middle[cff461d045763160]::util::bug::span_bug_fmt::<rustc_span[c0fd46f789e8d999]::span_encoding::Span>
+  13:     0x7f331bf69185 - <rustc_mir_transform[1c887b8c32adcf5f]::validate::CfgChecker>::fail::<alloc[b6e8defdd65683e4]::string::String>
+  14:     0x7f33203820ff - <rustc_mir_transform[1c887b8c32adcf5f]::validate::Validator as rustc_mir_transform[1c887b8c32adcf5f]::pass_manager::MirPass>::run_pass
+  15:     0x7f331fa08c4f - rustc_mir_transform[1c887b8c32adcf5f]::run_optimization_passes
+  16:     0x7f331fef4742 - rustc_mir_transform[1c887b8c32adcf5f]::optimized_mir
+  17:     0x7f331fef43a5 - rustc_query_impl[f15f39df5e5f8d31]::query_impl::optimized_mir::invoke_provider_fn::__rust_begin_short_backtrace
+  18:     0x7f331fa2a70d - rustc_query_impl[f15f39df5e5f8d31]::execution::try_execute_query::<rustc_middle[cff461d045763160]::query::caches::DefIdCache<rustc_middle[cff461d045763160]::query::erase::ErasedData<[u8; 8usize]>>, false>
+  19:     0x7f331fa29cce - rustc_query_impl[f15f39df5e5f8d31]::query_impl::optimized_mir::execute_query_non_incr::__rust_end_short_backtrace
+  20:     0x7f331d503182 - rustc_mir_transform[1c887b8c32adcf5f]::deduce_param_attrs::deduced_param_attrs
+  21:     0x7f331fcc3374 - rustc_query_impl[f15f39df5e5f8d31]::query_impl::deduced_param_attrs::invoke_provider_fn::__rust_begin_short_backtrace
+  22:     0x7f331fcc86c5 - rustc_query_impl[f15f39df5e5f8d31]::execution::try_execute_query::<rustc_middle[cff461d045763160]::query::caches::DefIdCache<rustc_middle[cff461d045763160]::query::erase::ErasedData<[u8; 16usize]>>, false>
+  23:     0x7f331fcc7e4d - rustc_query_impl[f15f39df5e5f8d31]::query_impl::deduced_param_attrs::execute_query_non_incr::__rust_end_short_backtrace
+  24:     0x7f33202c00e5 - <rustc_metadata[1d8b41272dc0a1dc]::rmeta::encoder::EncodeContext>::encode_crate_root
+  25:     0x7f33209296d5 - rustc_metadata[1d8b41272dc0a1dc]::rmeta::encoder::encode_metadata::{closure#3}
+  26:     0x7f3320926ea1 - rustc_metadata[1d8b41272dc0a1dc]::rmeta::encoder::encode_metadata
+  27:     0x7f3320931005 - rustc_metadata[1d8b41272dc0a1dc]::fs::encode_and_write_metadata
+  28:     0x7f3320b6247b - <rustc_interface[3222c6a6230bc2a3]::queries::Linker>::codegen_and_build_linker
+  29:     0x7f3320b5d1fd - rustc_interface[3222c6a6230bc2a3]::interface::run_compiler::<(), rustc_driver_impl[e98da4d991f149da]::run_compiler::{closure#0}>::{closure#1}
+  30:     0x7f3320b18b7a - std[3d46086344a7ae7a]::sys::backtrace::__rust_begin_short_backtrace::<rustc_interface[3222c6a6230bc2a3]::util::run_in_thread_with_globals<rustc_interface[3222c6a6230bc2a3]::util::run_in_thread_pool_with_globals<rustc_interface[3222c6a6230bc2a3]::interface::run_compiler<(), rustc_driver_impl[e98da4d991f149da]::run_compiler::{closure#0}>::{closure#1}, ()>::{closure#0}, ()>::{closure#0}::{closure#0}, ()>
+  31:     0x7f3320b1892d - <std[3d46086344a7ae7a]::thread::lifecycle::spawn_unchecked<rustc_interface[3222c6a6230bc2a3]::util::run_in_thread_with_globals<rustc_interface[3222c6a6230bc2a3]::util::run_in_thread_pool_with_globals<rustc_interface[3222c6a6230bc2a3]::interface::run_compiler<(), rustc_driver_impl[e98da4d991f149da]::run_compiler::{closure#0}>::{closure#1}, ()>::{closure#0}, ()>::{closure#0}::{closure#0}, ()>::{closure#1} as core[1e5dff68517d21c3]::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+  32:     0x7f3320b1cc92 - <std[3d46086344a7ae7a]::sys::thread::unix::Thread>::new::thread_start
+  33:     0x7f331a8a71f5 - start_thread
+                               at ./nptl/pthread_create.c:442:8
+  34:     0x7f331a9278dc - clone3
+                               at ./misc/../sysdeps/unix/sysv/linux/x86_64/clone3.S:81:0
+  35:                0x0 - <unknown>
+
+
+rustc version: 1.98.0-nightly (4429659e4 2026-06-22)
+platform: x86_64-unknown-linux-gnu
+
+query stack during panic:
+#0 [optimized_mir] optimizing MIR for `expert::gfx11::tile16`
+#1 [deduced_param_attrs] deducing parameter attributes for expert::gfx11::tile16
+end of query stack

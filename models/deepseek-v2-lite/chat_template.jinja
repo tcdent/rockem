@@ -1,0 +1,25 @@
+{%- if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif -%}
+{#- DeepSeek-V2-Lite's own template (tokenizer_config.json at the pinned revision), extended
+    by rockem with a tool-call format the checkpoint was never trained on: tools are listed
+    as JSON, a call is <tool_call>{"name": …, "arguments": {…}}</tool_call>, a result is a
+    Tool: turn. Without tools and tool messages it renders exactly what the original does. -#}
+{{- bos_token -}}
+{%- if tools -%}
+{{- '# Tools\n\nYou may call one or more functions to assist with the user query. The functions are listed as JSON within <tools></tools> tags:\n<tools>\n' -}}
+{%- for tool in tools -%}{{- (tool.function if tool.function is defined else tool) | tojson -}}{{- '\n' -}}{%- endfor -%}
+{{- '</tools>\n\nTo call a function, write its name and arguments as a JSON object within <tool_call></tool_call> tags, one call per tag:\n<tool_call>{"name": "<function-name>", "arguments": {<arguments>}}</tool_call>\n\n' -}}
+{%- endif -%}
+{%- for message in messages -%}
+{%- if message['role'] == 'user' -%}{{- 'User: ' + message['content'] + '\n\n' -}}
+{%- elif message['role'] == 'assistant' -%}
+{{- 'Assistant: ' + (message['content'] or '') -}}
+{%- for tc in message['tool_calls'] or [] -%}
+{%- set f = tc.function if tc.function is defined else tc -%}
+{{- '<tool_call>{"name": ' + (f.name | tojson) + ', "arguments": ' + (f.arguments if f.arguments is string else (f.arguments | tojson)) + '}</tool_call>' -}}
+{%- endfor -%}
+{{- eos_token -}}
+{%- elif message['role'] == 'tool' -%}{{- 'Tool: <tool_response>' + message['content'] + '</tool_response>\n\n' -}}
+{%- elif message['role'] == 'system' -%}{{- message['content'] + '\n\n' -}}
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}{{- 'Assistant:' -}}{%- endif -%}

@@ -659,10 +659,6 @@ impl Kfd {
             println!("gpu      : kernel statistics on ({} MB slab)", slab.size >> 20);
         }
     }
-    /// A code object's exported constants (`[u32; N]` at symbol `name`), read from the loaded image, if it has them.
-    pub fn constants<const N: usize>(&self, name: &str) -> Option<[u32; N]> {
-        self.symbol(name).map(|va| unsafe { core::ptr::read_unaligned(self.code.at(va) as *const [u32; N]) })
-    }
     /// A symbol's address in the code object, if it has one.
     fn symbol(&self, want: &str) -> Option<usize> {
         let e = &self.elf;

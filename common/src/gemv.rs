@@ -966,44 +966,19 @@ pub mod gfx11 {
     /// workgroup is only the unit the card places): grid `m.div_ceil(WAVES · R)`, no LDS.
     #[inline(always)]
     pub unsafe fn exp4_rows_direct<const K: usize, const NORM: bool, const A: usize, const A1: usize, const R: usize, const WAVES: usize, const NP: usize>(tid: u32, w: Exp4<A, A1>, ln: *const u16, m: usize, n: usize, eps: f32, x: impl Fn(usize, usize) -> *const f32, emit: impl Fn(usize, usize, f32)) {
-        exp4_rows_direct_map::<K, NORM, A, A1, R, WAVES, NP>(tid, w, ln, m, n, eps, |r| r, x, emit)
-    }
-    /// `exp4_rows_direct` over a selection of the matrix's rows: the launch covers `m` rows `0..m` of which row `r`
-    /// is the matrix's row `map(r)` (the analog's rows of its chosen heads, 098); `x` and `emit` see the matrix's row.
-    #[inline(always)]
-    pub unsafe fn exp4_rows_direct_map<const K: usize, const NORM: bool, const A: usize, const A1: usize, const R: usize, const WAVES: usize, const NP: usize>(tid: u32, w: Exp4<A, A1>, ln: *const u16, m: usize, n: usize, eps: f32, map: impl Fn(usize) -> usize, x: impl Fn(usize, usize) -> *const f32, emit: impl Fn(usize, usize, f32)) {
-        let wave = (tid / 32) as usize;
+        const { assert!(NP <= PASS) };
+        let (lane, wave) = (tid % 32, (tid / 32) as usize);
+        let l = lane as usize;
         let row = (core::arch::amdgpu::workgroup_id_x() as usize * WAVES + wave) * R;
         if row >= m {
             return; // no barrier follows: a wave past the matrix simply ends
         }
-        exp4_rows_direct_rows::<K, NORM, A, A1, R, NP, false>(tid, w, ln, m, n, eps, row, map, x, emit)
-    }
-    /// `exp4_rows_direct_map` for the wave's `R` rows from `row` (under `m`), given: a kernel that loops its waves
-    /// over a matrix larger than its grid (the analog's fused chain, 098). `DPP`: the reductions as VALU butterflies
-    /// instead of the staged pass's replayed `ds_bpermute` form — the analog's chain only (a wave's dependent round
-    /// trips are its price); the production passes (`exp4_rows_direct_map`, `false`) keep the form that is
-    /// bit-identical to the staged pass — changing it here changed the decode-width rows kernels and the decode's
-    /// tokens (an16, 2026-10-27).
-    #[inline(always)]
-    pub unsafe fn exp4_rows_direct_rows<const K: usize, const NORM: bool, const A: usize, const A1: usize, const R: usize, const NP: usize, const DPP: bool>(tid: u32, w: Exp4<A, A1>, ln: *const u16, m: usize, n: usize, eps: f32, row: usize, map: impl Fn(usize) -> usize, x: impl Fn(usize, usize) -> *const f32, emit: impl Fn(usize, usize, f32)) {
-        const { assert!(NP <= PASS) };
-        let lane = tid % 32;
-        let l = lane as usize;
-        // the wave's R rows of the matrix: the selection's consecutive rows, the last repeated past `m`
-        let mut rows = [map(row); R];
+        let mut wr = [<Exp4<A, A1> as Rows<K>>::row(w, row); R];
         let mut k = 1;
         while k < R {
-            rows[k] = map(if row + k < m { row + k } else { m - 1 });
+            wr[k] = <Exp4<A, A1> as Rows<K>>::row(w, if row + k < m { row + k } else { m - 1 });
             k += 1;
         }
-        let mut wr = [<Exp4<A, A1> as Rows<K>>::row(w, rows[0]); R];
-        let mut k = 1;
-        while k < R {
-            wr[k] = <Exp4<A, A1> as Rows<K>>::row(w, rows[k]);
-            k += 1;
-        }
-        let (vrow, row) = (row, rows[0]);
         let steps = K.div_ceil(256);
         let mut acc = [[0f32; PASS]; R];
         let mut ss = [[0f32; 8]; NP];
@@ -1060,44 +1035,33 @@ pub mod gfx11 {
         if NORM {
             let mut i = 0;
             while i < NP {
-                if DPP {
-                    let mut t = 0f32;
+                let mut v = ss[i];
+                let mut mb = 1;
+                while mb < 8 {
+                    let old = v;
                     let mut j = 0;
                     while j < 8 {
-                        t += ss[i][j];
+                        v[j] = old[j] + old[j ^ mb];
                         j += 1;
                     }
-                    let total = crate::gfx11::wave_sum_dpp(t);
-                    rr[i] = crate::gfx11::rsq(total * (1.0 / K as f32) + eps);
-                } else {
-                    let mut v = ss[i];
-                    let mut mb = 1;
-                    while mb < 8 {
-                        let old = v;
-                        let mut j = 0;
-                        while j < 8 {
-                            v[j] = old[j] + old[j ^ mb];
-                            j += 1;
-                        }
-                        mb <<= 1;
-                    }
-                    let mut ml = 1u32;
-                    while ml < 4 {
-                        let mut j = 0;
-                        while j < 8 {
-                            v[j] += f32::from_bits(core::arch::amdgpu::ds_bpermute((lane ^ ml) * 4, v[j].to_bits()));
-                            j += 1;
-                        }
-                        ml <<= 1;
-                    }
-                    let mut total = 0f32;
-                    let mut w8 = 0u32;
-                    while w8 < 8 {
-                        total += f32::from_bits(core::arch::amdgpu::ds_bpermute(w8 * 4 * 4, v[0].to_bits()));
-                        w8 += 1;
-                    }
-                    rr[i] = crate::math::rsqrt(total / K as f32 + eps);
+                    mb <<= 1;
                 }
+                let mut ml = 1u32;
+                while ml < 4 {
+                    let mut j = 0;
+                    while j < 8 {
+                        v[j] += f32::from_bits(core::arch::amdgpu::ds_bpermute((lane ^ ml) * 4, v[j].to_bits()));
+                        j += 1;
+                    }
+                    ml <<= 1;
+                }
+                let mut total = 0f32;
+                let mut w8 = 0u32;
+                while w8 < 8 {
+                    total += f32::from_bits(core::arch::amdgpu::ds_bpermute(w8 * 4 * 4, v[0].to_bits()));
+                    w8 += 1;
+                }
+                rr[i] = crate::math::rsqrt(total / K as f32 + eps);
                 i += 1;
             }
         }
@@ -1105,9 +1069,9 @@ pub mod gfx11 {
         while k < R {
             let mut i = 0;
             while i < NP {
-                let y = if DPP { crate::gfx11::wave_sum_dpp(acc[k][i]) } else { wave_sum(lane, acc[k][i]) };
-                if lane == 0 && vrow + k < m && i < n {
-                    emit(rows[k], i, if NORM { y * rr[i] } else { y });
+                let y = wave_sum(lane, acc[k][i]);
+                if lane == 0 && row + k < m && i < n {
+                    emit(row + k, i, if NORM { y * rr[i] } else { y });
                 }
                 i += 1;
             }
