@@ -1052,37 +1052,20 @@ pub mod gfx11 {
             }
             s0 += A;
         }
+        // the reductions on the VALU (DPP butterflies; `exp4_rows_direct_map` keeps its `ds_bpermute` form — this
+        // variant serves the analog's chain, where a wave's dependent round trips are the price, 2026-10-27)
         let mut rr = [1f32; PASS];
         if NORM {
             let mut i = 0;
             while i < NP {
-                let mut v = ss[i];
-                let mut mb = 1;
-                while mb < 8 {
-                    let old = v;
-                    let mut j = 0;
-                    while j < 8 {
-                        v[j] = old[j] + old[j ^ mb];
-                        j += 1;
-                    }
-                    mb <<= 1;
+                let mut t = 0f32;
+                let mut j = 0;
+                while j < 8 {
+                    t += ss[i][j];
+                    j += 1;
                 }
-                let mut ml = 1u32;
-                while ml < 4 {
-                    let mut j = 0;
-                    while j < 8 {
-                        v[j] += f32::from_bits(core::arch::amdgpu::ds_bpermute((lane ^ ml) * 4, v[j].to_bits()));
-                        j += 1;
-                    }
-                    ml <<= 1;
-                }
-                let mut total = 0f32;
-                let mut w8 = 0u32;
-                while w8 < 8 {
-                    total += f32::from_bits(core::arch::amdgpu::ds_bpermute(w8 * 4 * 4, v[0].to_bits()));
-                    w8 += 1;
-                }
-                rr[i] = crate::math::rsqrt(total / K as f32 + eps);
+                let total = crate::gfx11::wave_sum_dpp(t);
+                rr[i] = crate::gfx11::rsq(total * (1.0 / K as f32) + eps);
                 i += 1;
             }
         }
@@ -1090,7 +1073,7 @@ pub mod gfx11 {
         while k < R {
             let mut i = 0;
             while i < NP {
-                let y = wave_sum(lane, acc[k][i]);
+                let y = crate::gfx11::wave_sum_dpp(acc[k][i]);
                 if lane == 0 && vrow + k < m && i < n {
                     emit(rows[k], i, if NORM { y * rr[i] } else { y });
                 }

@@ -749,6 +749,9 @@ pub mod gfx11 {
                 let part = at(TAB_PART) as *mut f32;
                 let row = wg * 8 + wave;
                 let wr = crows.add(row * SEL_W);
+                // every token's row read whether or not it is in the step (the buffers hold SPEC_TOKENS rows; a
+                // load under `i < n` is a branch arm the compiler sinks it into — a round trip a step, 39 drains in
+                // the phase, 2026-10-27); the stores keep `i < n`
                 let mut acc = [0f32; 4];
                 let mut s = 0;
                 while s < SEL_W / 256 {
@@ -757,13 +760,11 @@ pub mod gfx11 {
                     let src = *heads.add(col / D) as usize * D + col % D;
                     let mut i = 0;
                     while i < 4 {
-                        if i < n {
-                            let xv: [f32; 8] = core::ptr::read(normed.add(i * PART_QKV + src) as *const [f32; 8]);
-                            let mut j = 0;
-                            while j < 8 {
-                                acc[i] += wv[j] * xv[j];
-                                j += 1;
-                            }
+                        let xv: [f32; 8] = core::ptr::read(normed.add(i * PART_QKV + src) as *const [f32; 8]);
+                        let mut j = 0;
+                        while j < 8 {
+                            acc[i] = fma(wv[j], xv[j], acc[i]);
+                            j += 1;
                         }
                         i += 1;
                     }
@@ -794,7 +795,10 @@ pub mod gfx11 {
                 let row = E + (wg - if second { 2 * OUT_WGS } else { OUT_WGS }) * 8 + wave;
                 let wr = router.add(row * H);
                 let ln = at(if second { TAB_LN_L } else { TAB_LN1 }) as *const u16;
-                let (xl, xr) = (at(TAB_XL) as *const f32, x0 as *const f32);
+                let xs = if second { at(TAB_XL) as *const f32 } else { x0 as *const f32 };
+                // the shared output added for the second margin's rows: loaded for both (the same SPEC_TOKENS rows)
+                // and weighted by a uniform 0 or 1 — no branch for the loads to sink into (see the partial rows)
+                let fw = if second { 1.0 } else { 0.0 };
                 let mut acc = [0f32; 4];
                 let mut ss = [0f32; 4];
                 let mut s = 0;
@@ -804,22 +808,14 @@ pub mod gfx11 {
                     let lv = widen8_at(ln.add(col));
                     let mut i = 0;
                     while i < 4 {
-                        if i < n {
-                            let mut xv: [f32; 8] = core::ptr::read((if second { xl } else { xr }).add(i * H + col) as *const [f32; 8]);
-                            if second {
-                                let fv: [f32; 8] = core::ptr::read(fyv.add(i * H + col) as *const [f32; 8]);
-                                let mut j = 0;
-                                while j < 8 {
-                                    xv[j] += fv[j];
-                                    j += 1;
-                                }
-                            }
-                            let mut j = 0;
-                            while j < 8 {
-                                acc[i] += xv[j] * lv[j] * wv[j];
-                                ss[i] += xv[j] * xv[j];
-                                j += 1;
-                            }
+                        let xv: [f32; 8] = core::ptr::read(xs.add(i * H + col) as *const [f32; 8]);
+                        let fv: [f32; 8] = core::ptr::read(fyv.add(i * H + col) as *const [f32; 8]);
+                        let mut j = 0;
+                        while j < 8 {
+                            let v = fma(fv[j], fw, xv[j]);
+                            acc[i] = fma(v * lv[j], wv[j], acc[i]);
+                            ss[i] = fma(v, v, ss[i]);
+                            j += 1;
                         }
                         i += 1;
                     }

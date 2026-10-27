@@ -564,6 +564,25 @@ every value's five-step DPP chain, interleaved; no LDS round trip). The A region
 rows passes' and the step's own remain). Barriers 27 → 29: the Gram workgroup's two syncs. Predicted: A's slowest
 workgroup ~6 (the mean), the first barrier's wait falls with it, chain ~124.
 
+**Build 16 (staged, not booted: `kernels-an16` c1b03831, `-an16s` c814f7ec, `-an16t` 75f88f8f; node unchanged,
+kernarg 200; 178 VGPRs, no scratch, 29 barriers).** The tail's permutes and sunk loads, read from the an15t object
+(rockem.lead's cut agreed: R 3,921 instructions with 120 `ds_bpermute` and 28 drains, F 1,429 with 90, O 1,472 with
+41 drains — R and F held 210 of the kernel's 230 remaining permutes, the class that priced A and B). The analog's rows
+variant `exp4_rows_direct_rows` (its own copy; `exp4_rows_direct_map` and the production passes untouched) reduces
+on the VALU: the norm's sum one `wave_sum_dpp` a token and `v_rsq`, each row's dot a `wave_sum_dpp`. Phase O's loads
+read every one of the SPEC_TOKENS rows whether or not the token is in the step (`if i < n` around a load is a branch
+arm the compiler sinks the load into: a round trip a step), the second margin's shared output weighted by a uniform
+0 / 1 instead of branched, the products through `fma`. Per phase in the an16t object (instructions / `vmcnt(0)`
+drains / `lgkmcnt(0)` waits / `ds_bpermute`): A 2,168 / 10 / 10 / 0; B 1,637 / 2 / 1 / 0; C 325 / 9 / 5 / 0;
+**R 3,463 / 33 / 16 / 0** (was 3,889 / 27 / 124 / 120); **F 886 / 12 / 9 / 0** (1,459 / 15 / 104 / 90); S 1,595 / 10 /
+36 / 10 (the step's own, shared code, untouched; its 24 `v_div` likewise); **O 954 / 12 / 10 / 0** (1,413 / 39 / 32 /
+10). Kernel-wide `ds_bpermute` 440 → 10, `v_div` 64 → 24. Left by class: R's 33 drains (the rows pass's own load
+pipeline — the next read), S's form, the six grid barriers, the launch.
+
+A stats object's clock reads sit on the critical path (~1 µs a `MSG_RTN_GET_REALTIME`; the -s/-t objects carry 9–10
+against the an9s–an12s 6): chains compare only between production objects — an12's 130.8 / 134.7 is the mark; the
+-s/-t objects are for their tables alone (rockem.lead, 2026-10-27).
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back
