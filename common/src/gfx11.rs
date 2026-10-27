@@ -137,6 +137,30 @@ pub unsafe fn wave_sum_i32<const N: usize>(lane: u32, v: [i32; N]) -> [i32; N] {
     v
 }
 
+/// Sum of `N` f32 a lane across the wave, the `N` butterflies in lockstep: each step's `N` permutes issued together, so
+/// the wave waits ~5 round trips for all of them, not 5 a value (`wave_sum` a value at a time was 325 dependent
+/// permutes for 65 values, ~20 µs, the analog's phase A, 2026-10-27).
+#[inline(always)]
+pub unsafe fn wave_sum_f32<const N: usize>(lane: u32, v: [f32; N]) -> [f32; N] {
+    let mut v = v;
+    let mut m = 1;
+    while m < 32 {
+        let mut o = [0u32; N];
+        let mut i = 0;
+        while i < N {
+            o[i] = ds_bpermute((lane ^ m) * 4, v[i].to_bits());
+            i += 1;
+        }
+        let mut i = 0;
+        while i < N {
+            v[i] += f32::from_bits(o[i]);
+            i += 1;
+        }
+        m <<= 1;
+    }
+    v
+}
+
 /// The value lane `src` holds, to every lane of the wave.
 #[inline(always)]
 pub unsafe fn lane_read(src: u32, v: f32) -> f32 {
