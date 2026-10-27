@@ -531,6 +531,17 @@ Cut (2) priced on the same object (committed on the branch, not staged): phase B
 (`v_fma_f32` / `v_fmac`; rustc never contracts the pair — the bit-identical kernels keep theirs): the B region
 1,819 → **1,670** (142 fma, −0.6 µs on the line). The Sinkhorns' 640 remain the floor of the count.
 
+**Build 14 (staged, not booted: `kernels-an14` c48f22f5, `-an14s` 9f675163, `-an14t` e931cb38; node unchanged,
+kernarg 200).** Build 13 with cut (2), and the same latency chain taken out of phase O: the partial rows' and the
+leader's router rows' four `wave_sum`s a wave (five dependent `ds_bpermute` round trips each, eight chains a wave on
+the leader) are `wave_sum_dpp`, the router rows' `1 / sqrt` is `v_rsq`. 191 VGPRs, no scratch, 27 barriers. The
+`-an14t` object is a **`stats_tail`** build (feature `stats_tail` in common, the model crate and the gpu crate: the
+same kernel, the stamps placed on the tail): slot 0 phase R with the fourth barrier, 1 F with the fifth, 2 S with the
+sixth, 3 O to the end — the first table of the chain's other ~80 µs, which only the an1 lanes ever priced (rows 75 at
+32 heads, fg 11, step 19, out 16). Still in the whole kernel: 440 `ds_bpermute` and 64 `v_div` — phase A's lockstep
+sums (five round trips for all 65 values), the rows passes' and the step's own (`exp4_rows_direct_rows`, `step_head`:
+shared, bit-identical code; not touched).
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back

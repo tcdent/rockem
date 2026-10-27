@@ -576,7 +576,9 @@ pub mod gfx11 {
             // stats (a stats code object only), ticks of the 100 MHz clock as every wave sees them — the hyper-connection
             // phases apart, after three builds left their sum at 42–48 µs (2026-10-27): slot 0 phase A (after the peer's
             // wait), 1 the first grid barrier's wait, 2 phase B (workgroup 0's waves; 0 elsewhere), 3 the second barrier,
-            // phase C and the third barrier
+            // phase C and the third barrier. A `stats_tail` object stamps the tail instead: slot 0 phase R (with the
+            // fourth barrier), 1 F (with the fifth), 2 S (with the sixth), 3 O to the end.
+            const TAIL: bool = cfg!(feature = "stats_tail");
             let kt_w = common::stat_clock!();
             // the peer: the leader's shared output must be in (its word in this card's copy)
             let fyv_word = at(TAB_FYV_WORD) as *const u32;
@@ -604,16 +606,22 @@ pub mod gfx11 {
                 }
             }
             let kta = common::stat_clock!();
-            common::stat!(0, kta.wrapping_sub(kt0) & common::stats::CLOCK_MASK);
+            if !TAIL {
+                common::stat!(0, kta.wrapping_sub(kt0) & common::stats::CLOCK_MASK);
+            }
             barrier(count, 0, t, wg, value);
             let ktb0 = common::stat_clock!();
-            common::stat!(1, ktb0.wrapping_sub(kta) & common::stats::CLOCK_MASK);
+            if !TAIL {
+                common::stat!(1, ktb0.wrapping_sub(kta) & common::stats::CLOCK_MASK);
+            }
             // phase B: workgroup 0, a wave a token
             if wg == 0 && wave < n {
                 phase_b(wave, mix_l, a_base, a_scale, f_base, f_scale, c, scratch, lane);
             }
             let ktb1 = common::stat_clock!();
-            common::stat!(2, ktb1.wrapping_sub(ktb0) & common::stats::CLOCK_MASK);
+            if !TAIL {
+                common::stat!(2, ktb1.wrapping_sub(ktb0) & common::stats::CLOCK_MASK);
+            }
             barrier(count, 1, t, wg, value);
             // phase C: the collapses, a thread eight channels (workgroups under H / 2048), every token
             if wg < H / 2048 {
@@ -647,7 +655,9 @@ pub mod gfx11 {
             }
             barrier(count, 2, t, wg, value);
             let kt1 = common::stat_clock!();
-            common::stat!(3, kt1.wrapping_sub(ktb1) & common::stats::CLOCK_MASK);
+            if !TAIL {
+                common::stat!(3, kt1.wrapping_sub(ktb1) & common::stats::CLOCK_MASK);
+            }
             // phase R: the small rows and the chosen heads' q, k, v rows of `sq` over `x` normed with the input norm,
             // into `smix` at the rows' own places (the step reads it as `kda_step` reads `sq`'s output); every wave
             // loops the selection E4_ROWS rows at a time
@@ -677,7 +687,10 @@ pub mod gfx11 {
                 }
             }
             barrier(count, 3, t, wg, value);
-            let _ = kt1;
+            let ktr = common::stat_clock!();
+            if TAIL {
+                common::stat!(0, ktr.wrapping_sub(kt1) & common::stats::CLOCK_MASK);
+            }
             // phase F: the chosen heads' f_b and g_b rows of `fg` over the gates' first halves in `smix`
             {
                 let smix = smix as *const f32;
@@ -700,6 +713,10 @@ pub mod gfx11 {
                 }
             }
             barrier(count, 4, t, wg, value);
+            let ktf = common::stat_clock!();
+            if TAIL {
+                common::stat!(1, ktf.wrapping_sub(ktr) & common::stats::CLOCK_MASK);
+            }
             // phase S: the chosen heads' step from the state as it stands, nothing stored back
             if wg < NSEL {
                 let (smix, fg) = (smix as *const f32, fg as *const f32);
@@ -707,6 +724,10 @@ pub mod gfx11 {
                 crate::kda::gfx11::step_head::<false>(smix.add(SMALL_ROWS), at(TAB_TAPS) as *const u16, at(TAB_WINDOW) as *mut f32, fg, at(TAB_DT_BIAS) as *const f32, at(TAB_A_LOG) as *const f32, smix.add(2 * KDA_DIM), fg.add(PART_QKV), mem as *mut f32, at(TAB_O_NORM) as *const f32, normed, head0 as usize + hl, hl, n as u32, M_SMALL as u32, 2 * PART_QKV as u32, M_SMALL as u32, core::ptr::null_mut(), core::ptr::null_mut());
             }
             barrier(count, 5, t, wg, value);
+            let kts = common::stat_clock!();
+            if TAIL {
+                common::stat!(2, kts.wrapping_sub(ktf) & common::stats::CLOCK_MASK);
+            }
             // phase O
             let normed = normed as *const f32;
             if wg < OUT_WGS {
@@ -737,7 +758,7 @@ pub mod gfx11 {
                 }
                 let mut i = 0;
                 while i < 4 {
-                    let y = wave_sum(lane, acc[i]);
+                    let y = wave_sum_dpp(acc[i]);
                     if lane == 0 && i < n {
                         *part.add(i * E + row) = y;
                     }
@@ -794,8 +815,8 @@ pub mod gfx11 {
                 let out = at(if second { TAB_S2 } else { TAB_SCORES }) as *mut f32;
                 let mut i = 0;
                 while i < 4 {
-                    let y = wave_sum(lane, acc[i]);
-                    let rr = 1.0 / sqrt(wave_sum(lane, ss[i]) / H as f32 + RMS_NORM_EPS);
+                    let y = wave_sum_dpp(acc[i]);
+                    let rr = common::gfx11::rsq(wave_sum_dpp(ss[i]) * (1.0 / H as f32) + RMS_NORM_EPS);
                     if lane == 0 && i < n {
                         *out.add(i * RR + row) = y * rr;
                         if !second && row == E {
@@ -804,6 +825,9 @@ pub mod gfx11 {
                     }
                     i += 1;
                 }
+            }
+            if TAIL {
+                common::stat!(3, common::stat_clock!().wrapping_sub(kts) & common::stats::CLOCK_MASK);
             }
             let _ = layer;
         }

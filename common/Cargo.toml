@@ -10,3 +10,4 @@ description = "Primitives with no model in them: math, byte formats, GEMV inner 
 std = []
 # statistics from inside kernels (`stat!`); expands to nothing without it
 stats = []
+stats_tail = ["stats"]
