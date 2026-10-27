@@ -735,6 +735,10 @@ of four — all four tokens at once, and a one-step lookahead on the activation 
 192 VGPRs into scratch and were dropped: the LDS-wait lever waits for the table). R region 4,823 instructions,
 9 drains, 58 full LDS waits, 80 `ds_bpermute` static (the two lockstep chains, 20 round trips a wave against 40).
 `kernel_diff` vs an18 and vs an13s: `an_chain` only.
+Reading rule (2026-10-27): the staging is a loop over tokens in both objects (the back-edge is the `s_branch` with
+the negative offset after the quantizer), so an18's 40 static `ds_bpermute` are 160 dynamic in four dependent
+chains and an19's 80 are 160 in two — a loop body's static count is multiplied by its trips before it is priced;
+the B rule (12.6 µs + 3.9 ns an instruction) was for straight-line bodies.
 
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
