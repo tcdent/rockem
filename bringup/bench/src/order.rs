@@ -46,7 +46,11 @@
 //! milliseconds of hits, metatron-cpu §3.8; the orders run in sequence, so without this WarmFirst — first — is measured
 //! in the recovery and WarmOnly — fourth — in the steady state).
 //!
-//!   bench-order [--warmup 0] [--ballast-mb 0] [--pretouch 1] [--gap-mode pause] [--spin 0] [--shared none] [--fresh] [--gap-us 0] [--cpus 49-71,73-95] [--n 3] [--rows 64] [--warm 9] [--cold 7] [--pool-mb 96] [--iters 200]
+//! `--chase 1`: the warm items are dependent-load pointer chases instead of gemvs — each core a fixed 2 MB buffer of
+//! lines holding the index of the next (a random cycle), 2,176 dependent loads an item — so a gap's effect on L3-hit
+//! LATENCY is measured apart from bandwidth (prefetchers cannot help a dependent chain; docs/l3-literature.md §5 B2).
+//!
+//!   bench-order [--chase 0] [--warmup 0] [--ballast-mb 0] [--pretouch 1] [--gap-mode pause] [--spin 0] [--shared none] [--fresh] [--gap-us 0] [--cpus 49-71,73-95] [--n 3] [--rows 64] [--warm 9] [--cold 7] [--pool-mb 96] [--iters 200]
 use harness::arg;
 use std::sync::{Arc, Barrier, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -168,6 +172,7 @@ fn main() {
     let spin = num("--spin", 0) == 1;
     let ballast_mb = num("--ballast-mb", 0);
     let warmup_iters = num("--warmup", 0);
+    let chase = num("--chase", 0) == 1;
     if ballast_mb > 0 {
         let hugep = !arg("--ballast-pages").is_some_and(|v| v.to_str() == Some("4k"));
         let core0 = cpus[0];
@@ -243,6 +248,7 @@ fn main() {
                 // each item timed by its class: what interleaving does to the warm and to the cold items
                 let (wsum, csum) = (std::cell::Cell::new([0u64; 2]), std::cell::Cell::new([0u64; 2]));
                 let (wfill, cfill) = (std::cell::Cell::new([0u64; 6]), std::cell::Cell::new([0u64; 6]));
+                let sink_chase = std::cell::Cell::new(0u64);
                 let read6 = || -> [u64; 6] { if pmc_ok { std::array::from_fn(|i| common::pmc::rdpmc(i as u32)) } else { [0; 6] } };
                 let timed = |cell: &std::cell::Cell<[u64; 2]>, fc: &std::cell::Cell<[u64; 6]>, f: &dyn Fn()| {
                     let p0 = read6();
@@ -262,6 +268,31 @@ fn main() {
                 };
                 let mut cursor = 0usize;
                 let mut sink = 0u64;
+                // --chase: a 2 MB buffer of u32 line indices forming one random cycle (64 B a line, 32768 lines), its
+                // chase of 2,176 lines starting at line k·2176 of the cycle order
+                let chase_lines = (2usize << 20) / 64;
+                let chase_buf: Vec<u64> = if chase {
+                    let mut order: Vec<u32> = (0..chase_lines as u32).collect();
+                    let mut r = common::testing::Rng::new(1234 + ti as u64);
+                    for i in (1..order.len()).rev() {
+                        let j = (r.i4() as i64 + 8) as usize * 7919 % (i + 1);
+                        order.swap(i, j);
+                    }
+                    let mut b = vec![0u64; chase_lines * 8];
+                    for i in 0..chase_lines {
+                        b[order[i] as usize * 8] = order[(i + 1) % chase_lines] as u64;
+                    }
+                    b
+                } else {
+                    Vec::new()
+                };
+                let chase_item = |k: usize| -> u64 {
+                    let mut at = (k * 2176 % chase_lines) as u64;
+                    for _ in 0..2176 {
+                        at = unsafe { std::ptr::read_volatile(chase_buf.as_ptr().add(at as usize * 8)) };
+                    }
+                    at
+                };
                 let gapbuf: Vec<u8> = (0..(1usize << 20)).map(|i| i as u8).collect();
                 let gap_cursor = std::cell::Cell::new(pool_items / 2);
                 let ring_at = std::cell::Cell::new(0usize);
@@ -446,6 +477,11 @@ fn main() {
                         let (ra0, rm0) = if timed_run { (msr(0xE8), msr(0xE7)) } else { (0, 0) };
                         let t0 = std::time::Instant::now();
                         let warm = |k: usize| {
+                            if chase {
+                                return timed(&wsum, &wfill, &|| {
+                                    sink_chase.set(sink_chase.get().wrapping_add(chase_item(k)));
+                                });
+                            }
                             timed(&wsum, &wfill, &|| {
                                 let (wp, sp, kk) = if fresh { (&pool_w, &pool_s, wsel[k]) } else { (&warm_w, &warm_s, k) };
                                 if n == 1 && whint != 0 {
@@ -565,6 +601,9 @@ fn main() {
         let ghz = |a: u64, m: u64| 2.65 * a as f64 / m.max(1) as f64;
         let us = |x: [u64; 2]| x[0] as f64 / x[1].max(1) as f64 / 1e3;
         println!("gap {gap_us} µs as {gap_mode}: clock over the gap {:.2} GHz, over the WarmOnly run {:.2} GHz; warm item µs by position: first third {:.2}, middle {:.2}, last third {:.2}", ghz(c[0], c[1]), ghz(c[2], c[3]), us(b[0]), us(b[1]), us(b[2]));
+    }
+    if chase {
+        println!("warm items: dependent-load pointer chases, 2,176 lines each over a fixed 2 MB cycle a core (latency, not bandwidth)");
     }
     println!("release: {}", if spin { "spin barrier" } else { "std (futex) barrier" });
     println!("warm memory: {}", match shared.as_str() { "4k" => "one shared allocation, 4 KiB pages", "2m" => "one shared allocation, 2 MiB pages", _ => "a private Vec a core" });
