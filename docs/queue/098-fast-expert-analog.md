@@ -583,6 +583,17 @@ A stats object's clock reads sit on the critical path (~1 µs a `MSG_RTN_GET_REA
 against the an9s–an12s 6): chains compare only between production objects — an12's 130.8 / 134.7 is the mark; the
 -s/-t objects are for their tables alone (rockem.lead, 2026-10-27).
 
+**Build 17 (staged, not booted: `kernels-an17` 6f43bf99, `-an17s` 4fb083d8, `-an17t` a84ca335; node unchanged,
+kernarg 200; 171 VGPRs, no scratch, 29 barriers).** Phase R's depth. The selection is 3,392 rows (the 320 small rows
+and 16 heads × 3 × 128) over the grid's 1,344 waves at `E4_ROWS` = 2 rows a wave: the first 704 waves went round
+twice — the rows pass loads two 256-column steps a batch over H's twenty, ten drains a round, so those waves ran
+twenty serial batches with the rest of the grid idle. The phase is one wave's round trips (8.7 MB is ~14 µs of
+bandwidth; the an1 lanes priced the rows at 75 for 32 heads). At widths 1–2 the pass takes `R_ROWS` = 3 rows a wave
+(one round; three rows at four tokens put 12 bytes in scratch, so widths 3–4 keep two — their host run is the
+longer). Predicted at width 2: R's serial depth halved, ~10–15 µs off the chain. Left in R: the batch width itself
+(`A` = 2 steps; four would hold NP ≤ 2's activations but not the fetches at this register bound) and the bytes (12
+heads, FP8 rows).
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back

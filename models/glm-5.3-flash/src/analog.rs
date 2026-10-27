@@ -55,6 +55,9 @@ pub const CHAIN_LDS: u32 = {
 pub const SEL_ROWS: usize = 2 * KDA_DIM + KDA_HEADS + 3 * NSEL * KDA_DIM;
 /// The rows of `fg` the selection covers: f_b then g_b of the chosen heads.
 pub const SEL_FG_ROWS: usize = 2 * NSEL * KDA_DIM;
+/// Phase R's rows a wave: enough that the grid's waves take the selection in one round.
+pub const R_ROWS: usize = SEL_ROWS.div_ceil(CHAIN_GRID as usize * CHAIN_WAVES);
+const _: () = assert!(R_ROWS * CHAIN_GRID as usize * CHAIN_WAVES >= SEL_ROWS && SEL_FG_ROWS <= crate::kda::gfx11_consts::E4_ROWS * CHAIN_GRID as usize * CHAIN_WAVES);
 /// The output phase: a composed row a wave, eight a workgroup; the leader's workgroups past them take the router's
 /// rows over the no-attention input, then over the second margin's input.
 pub const OUT_WGS: usize = E / 8;
@@ -687,16 +690,25 @@ pub mod gfx11 {
                 };
                 let emit = |row: usize, i: usize, y: f32| *smix.add(i * M_SMALL + row) = y;
                 let xs = |_: usize, i: usize| x.add(i * H) as *const f32;
+                // the rows a wave: the selection in one round of the grid's waves at widths 1–2 (`R_ROWS` = 3; at
+                // `E4_ROWS` = 2 the first 704 waves went round twice — twenty serial batches of loads instead of
+                // ten, with the rest of the grid idle: the phase is one wave's round trips, not bytes; 2026-10-27);
+                // widths 3–4 keep two (three rows at four tokens spill), their host run being the longer
                 let e4 = Exp4::<2, 8>::at::<H>(sq, M_SMALL);
-                let mut vrow = (wg * CHAIN_WAVES + wave) * E4_ROWS;
-                while vrow < SEL_ROWS {
-                    match n {
-                        1 => exp4_rows_direct_rows::<H, true, 2, 8, E4_ROWS, 1>(t as u32, e4, ln, SEL_ROWS, n, RMS_NORM_EPS, vrow, &map, &xs, &emit),
-                        2 => exp4_rows_direct_rows::<H, true, 2, 8, E4_ROWS, 2>(t as u32, e4, ln, SEL_ROWS, n, RMS_NORM_EPS, vrow, &map, &xs, &emit),
-                        3 => exp4_rows_direct_rows::<H, true, 2, 8, E4_ROWS, 3>(t as u32, e4, ln, SEL_ROWS, n, RMS_NORM_EPS, vrow, &map, &xs, &emit),
-                        _ => exp4_rows_direct_rows::<H, true, 2, 8, E4_ROWS, { common::gemv::FEW }>(t as u32, e4, ln, SEL_ROWS, n, RMS_NORM_EPS, vrow, &map, &xs, &emit),
-                    }
-                    vrow += CHAIN_GRID as usize * CHAIN_WAVES * E4_ROWS;
+                macro_rules! rows_pass {
+                    ($np:expr, $r:expr) => {{
+                        let mut vrow = (wg * CHAIN_WAVES + wave) * $r;
+                        while vrow < SEL_ROWS {
+                            exp4_rows_direct_rows::<H, true, 2, 8, $r, $np>(t as u32, e4, ln, SEL_ROWS, n, RMS_NORM_EPS, vrow, &map, &xs, &emit);
+                            vrow += CHAIN_GRID as usize * CHAIN_WAVES * $r;
+                        }
+                    }};
+                }
+                match n {
+                    1 => rows_pass!(1, R_ROWS),
+                    2 => rows_pass!(2, R_ROWS),
+                    3 => rows_pass!(3, E4_ROWS),
+                    _ => rows_pass!({ common::gemv::FEW }, E4_ROWS),
                 }
             }
             barrier(count, 3, t, wg, value);
