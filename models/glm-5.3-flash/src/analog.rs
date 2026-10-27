@@ -20,8 +20,11 @@
 
 use crate::*;
 
-/// Heads of a part the analog runs (half of the part's `PART_HEADS`).
-pub const NSEL: usize = 16;
+/// Heads of a part the analog runs: 8 of its 32 (16 of the layer's 64). Measured offline (the first-margin shape, used
+/// experts a layer over today's posts, cody / survey): 32 heads +0.44 / +0.31, 24 +0.35 / +0.22, **16 +0.27 / +0.16**,
+/// 8 +0.14 / +0.07; the rows read scales with them (~42 MB a card at 32, ~22 at 16), and the host's run the chain
+/// must fit is ~170–200 µs at width 2 (2026-10-27): 16 heads is the size that fits.
+pub const NSEL: usize = 8;
 /// `an_chain`'s grid: two workgroups a CU of the 7900 XT's 84, all resident (its grid barriers); its waves loop over
 /// the rows. `bringup/kernel_report.py` holds its registers to what keeps the grid resident.
 pub const CHAIN_GRID: u32 = 168;
