@@ -63,15 +63,17 @@ pub const SEL_FG_ROWS: usize = 2 * NSEL * KDA_DIM;
 pub const R_TILES: usize = SEL_ROWS / common::q4::TILE;
 /// A token's staged activation in LDS: `H` bytes of i8, then a scale and a Σq a group.
 pub const ACT_BYTES: usize = H + 8 * (H / common::q4::GROUP);
-/// Phase R's LDS: the `SPEC_TOKENS` staged activations, copied from `TAB_ACT`.
-pub const R_LDS: usize = SPEC_TOKENS * ACT_BYTES;
+/// Phase R's LDS: the `SPEC_TOKENS` staged activations, copied from `TAB_ACT`, then the K-quarters' partial
+/// sums `[8 waves][32 lanes][8]` f32 for the join.
+pub const R_KSPLIT: usize = 4;
+pub const R_LDS: usize = SPEC_TOKENS * ACT_BYTES + CHAIN_WAVES * 32 * 8 * 4;
 /// `TAB_ACT`, VRAM: the activations quantized once by phase C's workgroups (`[SPEC_TOKENS][ACT_BYTES]`), then the
 /// norms' partial sums of squares `[SPEC_TOKENS][ACT_SS]` (a value a wave of phase C's `H / 2048` workgroups).
 /// Every one of phase R's 168 workgroups quantizing the four tokens itself was ~20.8 µs on the critical path
 /// before its first dot — the pass's larger half once the bytes were cut (an18t, 2026-10-27).
 pub const ACT_SS: usize = (H / 2048) * 8;
 pub const ACT_TOTAL: usize = SPEC_TOKENS * ACT_BYTES + SPEC_TOKENS * ACT_SS * 4;
-const _: () = assert!(SEL_ROWS % common::q4::TILE == 0 && R_TILES <= CHAIN_GRID as usize * CHAIN_WAVES && H % 256 == 0 && SEL_FG_ROWS <= crate::kda::gfx11_consts::E4_ROWS * CHAIN_GRID as usize * CHAIN_WAVES);
+const _: () = assert!(SEL_ROWS % common::q4::TILE == 0 && R_TILES <= CHAIN_GRID as usize * CHAIN_WAVES && H % 256 == 0 && SEL_FG_ROWS <= crate::kda::gfx11_consts::E4_ROWS * CHAIN_GRID as usize * CHAIN_WAVES && (SEL_ROWS / 16) * R_KSPLIT % CHAIN_WAVES == 0 && (H / common::q4::GROUP) % R_KSPLIT == 0);
 /// The output phase: a composed row a wave, eight a workgroup; the leader's workgroups past them take the router's
 /// rows over the no-attention input, then over the second margin's input.
 pub const OUT_WGS: usize = E / 8;
@@ -749,7 +751,6 @@ pub mod gfx11 {
             // once (a lane's 16 bytes of each), then per step and token the lane's two word dots against the group in
             // LDS, the quad's sum and the row's two group parities by DPP — no LDS reduction, no permute.
             {
-                use common::q4::gfx11::word_dot_act;
                 use common::q4::{GROUP, TILE, WBIAS};
                 const NG: usize = H / GROUP;
                 const NSTEP: usize = H / 256;
@@ -762,136 +763,131 @@ pub mod gfx11 {
                     c += 256;
                 }
                 workgroup_sync();
-                let tile = wg * CHAIN_WAVES + wave;
-                if tile < R_TILES {
+                // sixteen rows a wave on the matrix unit (the experts' prefill form, `expert::tile16`): A the rows'
+                // q4 nibbles widened to unsigned bytes (lane l supplies row l % 16's sixteen k a step), B the a8
+                // activations signed (lane l supplies token l % 4's — tokens 4..15 of the fragment carry a repeat
+                // whose columns are never read), one `v_wmma_i32_16x16x16_iu8` for 4,096 MACs against `v_dot4`'s 4;
+                // the `WBIAS · Σq` correction and the scales at each group's flush (`word_dot`'s rule). D's register
+                // r of lane l is (row 2r + l / 16, token l % 16). 212 working waves against 848 four-row tiles:
+                // the grid's issued slots ~4× fewer, its LDS bytes ~4× fewer — the tile was issue throughput
+                // (an21 null, 2026-10-27).
+                // a block's K split across four waves of its workgroup (eight groups each; 848 waves active, the
+                // `v_dot4` form's depth — one wave a block was 212 waves, ~2 a SIMD, and the group loop's loads,
+                // unpack, eight 16-cycle WMMAs and flush ran as a serial chain with nothing to interleave: an23
+                // +5 µs where the slot arithmetic said −18, 2026-10-27); the four partial sums joined through LDS,
+                // the first wave emitting
+                let gwave = wg * CHAIN_WAVES + wave;
+                let (wb, kq) = (gwave / R_KSPLIT, gwave % R_KSPLIT);
+                if wb * 16 < SEL_ROWS {
+                    use common::gemv::gfx11::{v4i32, v8i32, wmma_u8i8, ZERO_I32};
                     let lu = lane as usize;
-                    let (r, i0, gpar) = ((lu % 16) / 4, (lu % 4) * 2, lu / 16);
-                    // (the rows, scales and activations are kernel arguments: through the table they were generic
-                    // pointers — flat loads on the LDS counter — and every read re-derived its address, 348 adds a
-                    // wave; one base a lane, the step and token as immediate offsets)
-                    let wt = qrows.add(tile * TILE * H / 2 + lu * 16);
-                    let ws = qscales.add(tile * NG * TILE);
-                    // the tile's bytes, this lane's 16 of each step: a rolling window of `WD` steps' loads (all
-                    // sixteen at once held 64 registers; the window is issued `WD - 1` steps ahead of its use), and
-                    // the step's activation words of every token read from LDS one step ahead of their dots — the
-                    // tile was ~24 µs a wave against 11.6 of bytes, 55 LDS waits a wave, ~3.4 a step (an20t,
-                    // 2026-10-27); the lookahead halves that chain by arithmetic. Written out: a loop left the
-                    // batches a stack object in scratch.
-                    const WD: usize = 4;
-                    let wload = |st: usize| -> (u64, u64) {
-                        let p = wt.add(st * 512);
-                        (core::ptr::read_unaligned(p as *const u64), core::ptr::read_unaligned(p.add(8) as *const u64))
-                    };
-                    let mut w: [(u64, u64); WD] = core::array::from_fn(|st| wload(st));
-                    let wsv: [f32; NSTEP] = core::array::from_fn(|st| *ws.add((2 * st + gpar) * TILE + r));
-                    // the lane's activation words: word i0 of its parity's group at k_lo = (i0 / 4) · 64 + (i0 % 4) · 8
-                    // and +32, word i0 + 1 at +8 (`q4::gfx11::word_dot`'s rule, `word_act`); the step and token are
-                    // constant offsets from one base
-                    /// Sixteen activation bytes, 16-aligned: one `ds_load_b128` with the offset in the instruction
-                    /// (as two 8-byte reads the compiler paired them into `ds_load_2addr_b64`, whose 8-bit offsets
-                    /// made an add a read and held the addresses live; 2026-10-27).
-                    #[repr(C, align(16))]
-                    #[derive(Clone, Copy)]
-                    struct Q16([u64; 2]);
-                    let qb = (act as *const u8).add(gpar * GROUP + (i0 / 4) * 64 + (i0 % 4) * 8);
-                    let sb = (act as *const u8).add(H + gpar * 4);
-                    let read = |st: usize| -> ([[(u64, u64); 2]; SPEC_TOKENS], [(f32, f32); SPEC_TOKENS]) {
-                        (
-                            core::array::from_fn(|i| {
-                                // the two words' low halves are 16 contiguous bytes, their high halves the 16 at +32:
-                                // two 16-byte LDS loads with the step and token in the offset field (two 8-byte loads
-                                // a pair were paired into `ds_load_2addr_b64`, whose 8-bit offsets forced an add
-                                // a read, 2026-10-27)
-                                let q = qb.add(i * ACT_BYTES + st * 2 * GROUP);
-                                let lo = core::ptr::read(q as *const Q16).0;
-                                let hi = core::ptr::read(q.add(32) as *const Q16).0;
-                                [(lo[0], hi[0]), (lo[1], hi[1])]
-                            }),
-                            core::array::from_fn(|i| {
-                                let sp = sb.add(i * ACT_BYTES + st * 8);
-                                (*(sp.add(4 * NG) as *const i32) as f32, *(sp as *const f32))
-                            }),
-                        )
-                    };
-                    let mut y = [0f32; SPEC_TOKENS];
-                    // one step of lookahead exactly: the next step's words are read before this step's dots, and a
-                    // compiler fence at the step's end keeps the scheduler from hoisting further (with the addresses
-                    // folded into the loads it hoisted every step's reads to the register bound and spilled)
-                    let (mut qa, mut gss) = read(0);
-                    macro_rules! step {
-                        ($st:expr) => {{
-                            let next = if $st + 1 < NSTEP { read($st + 1) } else { (qa, gss) };
-                            let wst = w[$st % WD];
-                            let mut i = 0;
-                            while i < SPEC_TOKENS {
-                                let part = word_dot_act(wst.0, qa[i][0].0, qa[i][0].1) + word_dot_act(wst.1, qa[i][1].0, qa[i][1].1);
-                                // the quad's four lanes hold the cell's quarters: the group's exact integer sum
-                                let p = part as f32;
-                                let p = p + dpp_xmask::<XMASK1>(p);
-                                let sum = p + dpp_xmask::<XMASK2>(p);
-                                // every lane of the quad holds the quad's sum: all accumulate (a guard on lane 4r
-                                // was an exec-masked region a token a step, ~200 scalar ops a wave)
-                                // lane 4r's accumulate: the guard is what keeps the scheduler from flattening the
-                                // sixteen steps into one region at the register bound (every lane accumulating —
-                                // the same value across the quad — put 192 registers and 99 scratch ops in the body,
-                                // 2026-10-27)
-                                let term = (sum - WBIAS as f32 * gss[i].0) * wsv[$st] * gss[i].1;
-                                if lu % 4 == 0 {
-                                    y[i] += term;
-                                }
-                                i += 1;
+                    let lr = lu % 16;
+                    let row0 = wb * 16;
+                    let a_row = qrows.add((row0 + lr) / TILE * (TILE * H / 2) + ((row0 + lr) % TILE) * (GROUP / 2));
+                    let tok = lr % SPEC_TOKENS;
+                    let b = (act as *const i8).add(tok * ACT_BYTES);
+                    let bs = act.add(tok * ACT_BYTES + H) as *const f32;
+                    let bg = act.add(tok * ACT_BYTES + H + 4 * NG) as *const i32;
+                    // the lane's eight rows' scales from one base: row 2r + h (h = l / 16) is tile r / 2 of the
+                    // wave's four, row-in-tile 2 (r % 2) + h — constant offsets (eight pointers advanced a group
+                    // were 24 64-bit ops a group)
+                    let wsb = qscales.add((row0 / TILE) * (NG * TILE) + lu / 16);
+                    let mut y = [0f32; 8];
+                    let mut g = kq * (NG / R_KSPLIT);
+                    while g < (kq + 1) * (NG / R_KSPLIT) {
+                        let mut acc: v8i32 = ZERO_I32;
+                        let ab = a_row.add(g * TILE * (GROUP / 2));
+                        let bb = b.add(g * GROUP);
+                        // the group's eight k-steps in two halves of four, each half's loads before its WMMAs:
+                        // bytes c·32 + q·16.. of the row hold k c·64 + q·16.. in their low nibbles, k + 32 in the high
+                        let mut c = 0;
+                        while c < 2 {
+                            let raw0: [u32; 4] = core::ptr::read_unaligned(ab.add(c * 32) as *const [u32; 4]);
+                            let raw1: [u32; 4] = core::ptr::read_unaligned(ab.add(c * 32 + 16) as *const [u32; 4]);
+                            let b0: [i32; 4] = core::ptr::read_unaligned(bb.add(c * 64) as *const [i32; 4]);
+                            let b1: [i32; 4] = core::ptr::read_unaligned(bb.add(c * 64 + 16) as *const [i32; 4]);
+                            let b2: [i32; 4] = core::ptr::read_unaligned(bb.add(c * 64 + 32) as *const [i32; 4]);
+                            let b3: [i32; 4] = core::ptr::read_unaligned(bb.add(c * 64 + 48) as *const [i32; 4]);
+                            let (mut lo0, mut lo1, mut hi0, mut hi1) = ([0i32; 4], [0i32; 4], [0i32; 4], [0i32; 4]);
+                            let mut q = 0;
+                            while q < 4 {
+                                lo0[q] = (raw0[q] & 0x0F0F_0F0F) as i32;
+                                lo1[q] = (raw1[q] & 0x0F0F_0F0F) as i32;
+                                hi0[q] = ((raw0[q] >> 4) & 0x0F0F_0F0F) as i32;
+                                hi1[q] = ((raw1[q] >> 4) & 0x0F0F_0F0F) as i32;
+                                q += 1;
                             }
-                            if $st + WD < NSTEP {
-                                w[$st % WD] = wload($st + WD);
-                            }
-                            (qa, gss) = next;
-                        }};
+                            acc = wmma_u8i8(v4i32(lo0), v4i32(b0), acc);
+                            acc = wmma_u8i8(v4i32(lo1), v4i32(b1), acc);
+                            acc = wmma_u8i8(v4i32(hi0), v4i32(b2), acc);
+                            acc = wmma_u8i8(v4i32(hi1), v4i32(b3), acc);
+                            c += 1;
+                        }
+                        let (xs, xg) = (*bs.add(g), *bg.add(g));
+                        let d: [i32; 8] = core::mem::transmute(acc);
+                        let mut r = 0;
+                        while r < 8 {
+                            let sum = d[r] - WBIAS * xg;
+                            let ws = *wsb.add(g * TILE + (r / 2) * (NG * TILE) + 2 * (r % 2));
+                            y[r] = fma(sum as f32, ws * xs, y[r]);
+                            r += 1;
+                        }
+                        g += 1;
                     }
-                    const { assert!(NSTEP == 16) };
-                    step!(0);
-                    step!(1);
-                    step!(2);
-                    step!(3);
-                    step!(4);
-                    step!(5);
-                    step!(6);
-                    step!(7);
-                    step!(8);
-                    step!(9);
-                    step!(10);
-                    step!(11);
-                    step!(12);
-                    step!(13);
-                    step!(14);
-                    step!(15);
-                    // the norms, after the steps: the sixteen partials of a token one a lane of each row, summed
-                    // across the row (every lane loading all sixteen held sixty-four loads live; computed before the
-                    // steps the four values lived across the whole body and were what the body's register pressure
-                    // spilled — 42 stores, 51 loads a wave, 2026-10-27)
+                    // the join: each wave's eight partials a lane into LDS, the quarter-0 wave of the block sums
+                    // its three siblings' (waves 4b'..4b' + 3 of this workgroup)
+                    let part = (act.add(SPEC_TOKENS * ACT_BYTES) as *mut f32).add((wave * 32 + lu) * 8);
+                    if kq != 0 {
+                        let mut r = 0;
+                        while r < 8 {
+                            *part.add(r) = y[r];
+                            r += 1;
+                        }
+                    }
+                    workgroup_sync();
+                    if kq == 0 {
+                        let mut q = 1;
+                        while q < R_KSPLIT {
+                            let sib = part.add(q * 32 * 8);
+                            let mut r = 0;
+                            while r < 8 {
+                                y[r] += *sib.add(r);
+                                r += 1;
+                            }
+                            q += 1;
+                        }
+                    }
+                    // the norms after the steps: the sixteen partials of a token one a lane of each row, summed
+                    // across the row; this lane's token's
                     const { assert!(ACT_SS == 16) };
                     let ps = (src.add(SPEC_TOKENS * ACT_BYTES) as *const f32).add(lane as usize % 16);
                     let rr: [f32; SPEC_TOKENS] = core::array::from_fn(|i| {
                         let ss = common::gfx11::row_sum16(*ps.add(i * ACT_SS));
                         common::gfx11::rsq(ss * (1.0 / H as f32) + RMS_NORM_EPS)
                     });
-                    // the row's two parities (lanes 4r and 16 + 4r) summed, lane 4r emits
-                    let mut i = 0;
+                    let mut rt = rr[0];
+                    let mut i = 1;
                     while i < SPEC_TOKENS {
-                        let yt = y[i] + other_row(y[i]);
-                        if lu < 16 && lu % 4 == 0 {
-                            if i < n {
-                                let row = tile * TILE + r;
-                                let mrow = if row < SMALL_ROWS {
-                                    row
-                                } else {
-                                    let j = row - SMALL_ROWS;
-                                    let (part, rem) = (j / (NSEL * D), j % (NSEL * D));
-                                    SMALL_ROWS + part * PART_QKV + *heads.add(rem / D) as usize * D + rem % D
-                                };
-                                *smix.add(i * M_SMALL + mrow) = yt * rr[i];
-                            }
+                        if tok == i {
+                            rt = rr[i];
                         }
                         i += 1;
+                    }
+                    // lanes with a token of the step emit their eight rows at the rows' places
+                    if kq == 0 && lr < SPEC_TOKENS && lr < n {
+                        let mut r = 0;
+                        while r < 8 {
+                            let row = row0 + 2 * r + lu / 16;
+                            let mrow = if row < SMALL_ROWS {
+                                row
+                            } else {
+                                let j = row - SMALL_ROWS;
+                                let (part, rem) = (j / (NSEL * D), j % (NSEL * D));
+                                SMALL_ROWS + part * PART_QKV + *heads.add(rem / D) as usize * D + rem % D
+                            };
+                            *smix.add(lr * M_SMALL + mrow) = y[r] * rt;
+                            r += 1;
+                        }
                     }
                 }
             }

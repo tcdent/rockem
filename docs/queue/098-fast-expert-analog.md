@@ -821,7 +821,56 @@ bytes, B the a8 activations signed, the `WBIAS · Σq` correction at the flush �
 rows a wave (212 working waves instead of 848; the tokens padded 4 → 16 waste MACs, not issue): ~256 WMMA + 256
 activation loads + ~400 unpack ops + a flush a group a wave — the grid's issued slots fall ~4×, the LDS bytes ~8×;
 R's tile ~24 → ~5–6 by the rule. The q4 copy's layout at boot is the analog's own, so it can be laid out as the
-B... the A fragment wants it (a lane's 16 bytes = one row's sixteen k).
+B the A fragment wants it (a lane's 16 bytes = one row's sixteen k).
+
+**Build 23 (staged: `kernels-an23` 0701dde8, `-an23s` ef909852, `-an23t` dd7ca4a0; the node as an22's — kernarg 224, the same
+arguments; 155 VGPRs, no scratch, 30 barriers).** Phase R's tile on the matrix unit, the experts' prefill form
+(`expert::tile16`): sixteen rows a wave; A the rows' q4 nibbles widened to unsigned bytes (lane l supplies row
+l % 16's sixteen k a step: the q4 cell's low nibbles are k, its high k + 32, so a 16-byte read serves two steps),
+B the a8 activations signed (lane l supplies token l % 4's bytes from LDS; tokens 4..15 of the fragment carry a
+repeat whose D columns are never read); a group is eight `v_wmma_i32_16x16x16_iu8` on an i32 accumulator, the
+flush `(Σ − WBIAS · Σq) · ws[row][g] · as[tok][g]` — `word_dot`'s rule — into eight f32 a lane (D's register r is
+row 2r + l / 16, token l % 16; the eight rows' scales from one base with constant offsets). Lanes with a token of
+the step emit their eight rows at the rows' places, scaled by the norm. The 212 row blocks spread wave-major over
+the grid (wave 0 of every workgroup, then wave 1 of the first 44) so every CU's matrix pipes carry ~2 blocks. The
+object: the R region 552 static instructions, the group loop's body ~79 issued × 32 ≈ 2,900 a wave — **212
+working waves against 848: the grid's issued slots ~2,900 × 212 / 96 ≈ 2.6 µs**, the matrix pipe 256 WMMA a wave
+× ~2.2 a SIMD × ~16 cycles ≈ 3.8, the LDS bytes 27 MB ≈ 1.8 (110 MB before); the tile ~24 → ~4–6, R ~27 → ~7–9
+with the copy, the chain ~106 → ~87 by the arithmetic — the first shape that would move the slot wait by whole
+milliseconds. `kernel_diff` vs an22 and vs an13s: `an_chain` only. Numerics: the same integer sums and the same
+flush as the `v_dot4` form (exact i32 either way), the f32 accumulation in group order as before — coverage should
+hold to the digit.
+an21t (rockem.lead, 2026-10-27; run 308e0112): R 17.8 / 27.3 against an20t's 18.1 / 27.4 — the lookahead left
+R unchanged to the tenth: the waits were never on R's clock, the throughput reading confirmed from the table side.
+an22 (rockem.lead, 2026-10-27; run f1d0cc8c; the kernarg-224 node): an_chain 105.0 / 105.8 (an20 / an21 106.0 /
+105.8) — the minor as priced; slot wait 3.02 / 1.58 / 0.92; coverage .776; decode-identical; SCORE bit-identical;
+the 224 node validated on its own (a node merged ahead of its object panicked the kernarg assert twice under the
+an21s stats boot — the check did its job; an21s's section rows are lost, A's per-workgroup read comes from an22s or
+an23s). an23 boots against 105.0 / 105.8 with the prediction on record: tile ~4–6, R ~7–9, chain ~87.
+
+**an23's boot (rockem.lead, 2026-10-27; run 24c9c541): WORSE** — an_chain 110.3 / 110.8 (an22 105.0 / 105.8), slot
+wait 3.08 / 1.57 / 0.94, coverage .776 to the digit (the integer sums and the flush held exactly), decode-identical,
+SCORE bit-identical. The matrix form added ~5 where the throughput arithmetic said −18 — the fourth model of R to
+miss (bytes, prologue, waits, issue). From the object (rockem.lead): the R region is a 32-trip loop of ~200
+instructions with eight WMMAs a trip on ONE wave a block — 212 waves active of 1,344, ~2.2 a SIMD where the
+`v_dot4` form had 14 — so the matrix pipe's ~16-cycle WMMA latency and the trip's LDS / VMEM round trips run as a
+serial chain on each active wave (the B / R lesson in a new place), hidden before by fourteen waves of interleave.
+an23t boots for the table (the per-wave rows: block waves against idle), an22 redeploys as the mark.
+
+**Build 24 (staged, behind an23t's table: `kernels-an24` eacfd1b7, `-an24s` 48fd8756, `-an24t` fd7f7328; the node as an22's,
+kernarg 224; 155 VGPRs, no scratch, 31 barriers = 30 + the join's sync).** Depth: a block's K split across four
+waves of its workgroup (`R_KSPLIT`: eight groups each, 848 waves active — the `v_dot4` form's occupancy with the
+WMMA form's slot count), each wave's eight partial sums a lane into LDS (`R_LDS` grows by 8 KB), the block's
+quarter-0 wave summing its three siblings' after one sync and emitting. The per-wave chain is 8 trips instead of
+32 with ~9 waves a SIMD to interleave them. The group arithmetic and the flush are an23's (coverage held there to
+the digit). Not booted until an23t says the chain is the cost.
+
+**an23t (rockem.lead, 2026-10-27; run e8434bec): the block waves are the long pole.** R mean 5.2 / slowest
+workgroup 31.2; the per-wave rows (card0, median / p90 / max): the single-block workgroups' wave 0 (wg 44–167)
+25.9 / 30.1 / 32.1; the two-block workgroups' (wg 0–43) wave 0 20.8 / 22.3 / 24.6 and wave 1 19.9 / 20.9 / 24.0 —
+faster with a sibling block on the CU (latency hiding by whatever is co-resident, which an24's four waves a block
+supply deliberately); every other wave 1.5–1.8 (the copy and idle). The occupancy reading's first branch: an24
+boots to the full gates against an22.
 
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
