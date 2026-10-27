@@ -1056,6 +1056,10 @@ The sim has no long text (cody and the survey are 12k; a 380k reference forward 
 `plan_eval` on a 1,600–2,476-token generation is dominated by model-generated tokens at decode widths and a state
 matured over 380k, which the sim never scored (teacher-forced prompt text; the day-one caveat): its prediction
 transfers in the residency and repetition dimensions, not in those.
+The survey text (d12), the same read: R = 24 (15.54 non-resident): early today .622, 16 heads .638 (+.016),
+32 heads .651 (+.029); rows .663 / .680 / .694. R = 48 (12.46): early .673 / .691 (+.018) / .705 (+.033); rows
+.722 / .740 / .757. Both texts, either residency: **+.02 at 16 heads, +.03–.04 at 32**, against the benchmark's
+served +.007.
 
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
