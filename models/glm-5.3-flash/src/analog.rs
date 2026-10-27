@@ -26,16 +26,23 @@ pub const NSEL: usize = 16;
 /// the rows. `bringup/kernel_report.py` holds its registers to what keeps the grid resident.
 pub const CHAIN_GRID: u32 = 168;
 pub const CHAIN_WAVES: usize = 8;
-/// `an_chain`'s grid barriers: an arrival count and a done word each (`CHAIN_COUNTS` words, 0 between launches).
+/// `an_chain`'s grid barriers: each `BARRIER_WORDS` words — the top count, a count a group of `BARRIER_GROUP`
+/// workgroups, the done word (`CHAIN_COUNTS` words in all, 0 between launches). Arrivals count on a group's word
+/// first, the groups' last on the top word: 168 arrivals serialized on one word cost ~8 µs a barrier (the stats boot
+/// of 2026-10-27: the hyper-connection phases 42 µs against 18 predicted).
 pub const CHAIN_BARRIERS: usize = 6;
-pub const CHAIN_COUNTS: usize = 2 * CHAIN_BARRIERS;
+pub const BARRIER_GROUP: usize = 8;
+pub const BARRIER_GROUPS: usize = CHAIN_GRID as usize / BARRIER_GROUP;
+pub const BARRIER_WORDS: usize = 32;
+pub const CHAIN_COUNTS: usize = CHAIN_BARRIERS * BARRIER_WORDS;
+const _: () = assert!(CHAIN_GRID as usize % BARRIER_GROUP == 0 && 2 + BARRIER_GROUPS <= BARRIER_WORDS);
 /// `an_chain`'s scratch a token, f32 (`gfx11::SCRATCH` lays it out).
 pub const PRE_SCRATCH: usize = 1152;
 /// `an_chain`'s LDS: phase A's wave partials `[8][4 · DOTS + BASE²]`, or the step's (`kda::STEP_LDS`), the larger.
 pub const CHAIN_LDS: u32 = {
     let a = 4 * 8 * (4 * 20 + 25);
     let b = crate::kda::gfx11_consts::STEP_LDS;
-    (if a > b { a } else { b }) as u32
+    (if a > b { a } else { b }) as u32 + 4 * NSEL as u32
 };
 /// The rows of `sq` the selection covers: the small rows, then q, k, v of the chosen heads.
 pub const SEL_ROWS: usize = 2 * KDA_DIM + KDA_HEADS + 3 * NSEL * KDA_DIM;
@@ -109,17 +116,22 @@ pub mod gfx11 {
         1.0 / (1.0 + exp(-x))
     }
 
-    /// A grid barrier over `CHAIN_GRID` workgroups on its (count, done) pair: thread 0 counts in, the last resets the
-    /// count and publishes `value` in `done`; every workgroup waits for it. Uniform: every thread of every workgroup.
+    /// A grid barrier over `CHAIN_GRID` workgroups on its words: thread 0 counts in on its group's word; the group's
+    /// last counts on the top word; the last group's publishes `value` in the done word, which every workgroup waits
+    /// for. Counts back at 0 when the barrier leaves. Uniform: every thread of every workgroup.
     #[inline(always)]
-    unsafe fn barrier(count: *mut u32, b: usize, t: usize, value: u32) {
+    unsafe fn barrier(count: *mut u32, b: usize, t: usize, wg: usize, value: u32) {
         fence(Ordering::Release);
         workgroup_sync();
-        let (cnt, done) = (count.add(2 * b), count.add(2 * b + 1));
+        let base = count.add(b * BARRIER_WORDS);
+        let (top, group, done) = (base, base.add(1 + wg / BARRIER_GROUP), base.add(1 + BARRIER_GROUPS));
         if t == 0 {
-            if AtomicU32::from_ptr(cnt).fetch_add(1, Ordering::AcqRel) == CHAIN_GRID - 1 {
-                AtomicU32::from_ptr(cnt).store(0, Ordering::Relaxed);
-                AtomicU32::from_ptr(done).store(value, Ordering::Release);
+            if AtomicU32::from_ptr(group).fetch_add(1, Ordering::AcqRel) == BARRIER_GROUP as u32 - 1 {
+                AtomicU32::from_ptr(group).store(0, Ordering::Relaxed);
+                if AtomicU32::from_ptr(top).fetch_add(1, Ordering::AcqRel) == BARRIER_GROUPS as u32 - 1 {
+                    AtomicU32::from_ptr(top).store(0, Ordering::Relaxed);
+                    AtomicU32::from_ptr(done).store(value, Ordering::Release);
+                }
             }
             await_word(done, value);
         }
@@ -388,7 +400,7 @@ pub mod gfx11 {
     /// layer l's post-norm) into `s2` — what `pred_input` + `hc_route_ahead` made. `tab`: `TAB_LEN` device addresses.
     /// LDS CHAIN_LDS.
     #[no_mangle]
-    pub extern "gpu-kernel" fn an_chain(tab: *const u64, streams: *const f32, fyv: *const f32, a_fn: *const u16, f_fn: *const u16, sq: *const u8, fg_w: *const u8, crows: *const u16, router: *const u16, x: *mut f32, smix: *mut f32, fg: *mut f32, normed: *mut f32, mem: *const f32, head0: u32, value: u32, n: u32) {
+    pub extern "gpu-kernel" fn an_chain(tab: *const u64, streams: *const f32, fyv: *const f32, a_fn: *const u16, f_fn: *const u16, sq: *const u8, fg_w: *const u8, crows: *const u16, router: *const u16, x: *mut f32, smix: *mut f32, fg: *mut f32, normed: *mut f32, mem: *const f32, head0: u32, value: u32, n: u32, layer: u32) {
         unsafe {
             // the streamed operands are arguments (a kernel argument's loads are global; an address read from the
             // table is generic — flat loads, which count on the scalar counter too, 2026-10-25); the rest in `tab`
@@ -401,11 +413,17 @@ pub mod gfx11 {
             let at = |k: usize| *tab.add(k) as usize;
             let mix_l = at(TAB_MIX_L) as *const f32;
             let (x0, c, scratch, count) = (at(TAB_X0) as *mut f32, at(TAB_C) as *mut f32, at(TAB_SCRATCH) as *mut f32, at(TAB_COUNT) as *mut u32);
-            let heads = at(TAB_HEADS) as *const u32;
+            // the head table in LDS (its reads through a generic pointer were a round trip a wave a row group)
+            let heads = l.add((CHAIN_LDS as usize - 4 * NSEL) / 4) as *mut u32;
+            if t < NSEL {
+                *heads.add(t) = *(at(TAB_HEADS) as *const u32).add(t);
+            }
+            workgroup_sync();
+            let heads = heads as *const u32;
             let lead = at(TAB_PART_WORD) == 0;
             // stats (a stats code object only), ticks of the 100 MHz clock as every wave sees them: slot 0 the peer's
             // wait for the leader's shared output (0 on the leader), 1 the hyper-connection phases A, B, C to the third
-            // barrier, 2 the rows phase R to the fourth, 3 the gates, the step and the output phase to the end
+            // barrier, 2 the rows phase R to the fourth, 3 the layer (to name the late ones)
             let kt_w = common::stat_clock!();
             // the peer: the leader's shared output must be in (its word in this card's copy)
             let fyv_word = at(TAB_FYV_WORD) as *const u32;
@@ -431,12 +449,12 @@ pub mod gfx11 {
                     i0 += 2;
                 }
             }
-            barrier(count, 0, t, value);
+            barrier(count, 0, t, wg, value);
             // phase B: workgroup 0, a wave a token
             if wg == 0 && wave < n {
                 phase_b(wave, mix_l, at(TAB_A_BASE) as *const f32, at(TAB_A_SCALE) as *const f32, at(TAB_F_BASE) as *const f32, at(TAB_F_SCALE) as *const f32, c, scratch, lane, l.add(wave * 64));
             }
-            barrier(count, 1, t, value);
+            barrier(count, 1, t, wg, value);
             // phase C: the collapses, a thread a channel, every token
             let d = wg * 256 + t;
             if d < H {
@@ -456,7 +474,7 @@ pub mod gfx11 {
                     i += 1;
                 }
             }
-            barrier(count, 2, t, value);
+            barrier(count, 2, t, wg, value);
             let kt1 = common::stat_clock!();
             common::stat!(1, kt1.wrapping_sub(kt0) & common::stats::CLOCK_MASK);
             // phase R: the small rows and the chosen heads' q, k, v rows of `sq` over `x` normed with the input norm,
@@ -487,7 +505,7 @@ pub mod gfx11 {
                     vrow += CHAIN_GRID as usize * CHAIN_WAVES * E4_ROWS;
                 }
             }
-            barrier(count, 3, t, value);
+            barrier(count, 3, t, wg, value);
             let kt2 = common::stat_clock!();
             common::stat!(2, kt2.wrapping_sub(kt1) & common::stats::CLOCK_MASK);
             // phase F: the chosen heads' f_b and g_b rows of `fg` over the gates' first halves in `smix`
@@ -511,14 +529,14 @@ pub mod gfx11 {
                     vrow += CHAIN_GRID as usize * CHAIN_WAVES * E4_ROWS;
                 }
             }
-            barrier(count, 4, t, value);
+            barrier(count, 4, t, wg, value);
             // phase S: the chosen heads' step from the state as it stands, nothing stored back
             if wg < NSEL {
                 let (smix, fg) = (smix as *const f32, fg as *const f32);
                 let hl = *heads.add(wg) as usize;
                 crate::kda::gfx11::step_head::<false>(smix.add(SMALL_ROWS), at(TAB_TAPS) as *const u16, at(TAB_WINDOW) as *mut f32, fg, at(TAB_DT_BIAS) as *const f32, at(TAB_A_LOG) as *const f32, smix.add(2 * KDA_DIM), fg.add(PART_QKV), mem as *mut f32, at(TAB_O_NORM) as *const f32, normed, head0 as usize + hl, hl, n as u32, M_SMALL as u32, 2 * PART_QKV as u32, M_SMALL as u32, core::ptr::null_mut(), core::ptr::null_mut());
             }
-            barrier(count, 5, t, value);
+            barrier(count, 5, t, wg, value);
             // phase O
             let normed = normed as *const f32;
             if wg < OUT_WGS {
@@ -617,8 +635,7 @@ pub mod gfx11 {
                     i += 1;
                 }
             }
-            let kt3 = common::stat_clock!();
-            common::stat!(3, kt3.wrapping_sub(kt2) & common::stats::CLOCK_MASK);
+            common::stat!(3, layer);
         }
     }
 

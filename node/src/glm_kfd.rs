@@ -2541,7 +2541,7 @@ impl Cards {
             let fyv = if ap.card == f.card { c.fyv.va } else { self.peers[ap.card].an_fyv.va };
             let mut a = Args::new();
             a.ptr(ap.tab.va).ptr(c.streams.va).ptr(fyv).ptr(hc1[0].0.va).ptr(hc1[1].0.va).ptr(p.sq.va).ptr(p.fg.va).ptr(ap.crows.va).ptr(f.router.as_ref().unwrap().va).ptr(c.an_x.va).ptr(c.an_smix.va).ptr(c.an_fg.va).ptr(c.an_normed.va).ptr(p.mem.va);
-            a.u32(p.head0 as u32).u32(value).u32(n as u32);
+            a.u32(p.head0 as u32).u32(value).u32(n as u32).u32(l as u32);
             c.k.launch(&c.an_chain, an::CHAIN_GRID, g::WG, an::CHAIN_LDS, &a);
         }
     }
