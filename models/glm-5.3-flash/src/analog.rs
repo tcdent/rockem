@@ -776,18 +776,19 @@ pub mod gfx11 {
                     let (r, i0, gpar) = ((lu % 16) / 4, (lu % 4) * 2, lu / 16);
                     let wt = (at(TAB_QROWS) as *const u8).add(tile * TILE * H / 2);
                     let ws = (at(TAB_QSCALES) as *const f32).add(tile * NG * TILE);
-                    // the tile's bytes, this lane's of every step, as one batch
-                    let w: [(u64, u64); NSTEP] = core::array::from_fn(|st| {
+                    // the tile's bytes, this lane's 16 of each step: a rolling window of `WD` steps' loads (all
+                    // sixteen at once held 64 registers; the window is issued `WD - 1` steps ahead of its use), and
+                    // the step's activation words of every token read from LDS one step ahead of their dots — the
+                    // tile was ~24 µs a wave against 11.6 of bytes, 55 LDS waits a wave, ~3.4 a step (an20t,
+                    // 2026-10-27); the lookahead halves that chain by arithmetic. Written out: a loop left the
+                    // batches a stack object in scratch.
+                    const WD: usize = 8;
+                    let wload = |st: usize| -> (u64, u64) {
                         let p = wt.add(st * 512 + lu * 16);
                         (core::ptr::read_unaligned(p as *const u64), core::ptr::read_unaligned(p.add(8) as *const u64))
-                    });
-                    // the lane's groups' scales (group 2 st + gpar, row r): a batch too — indexed by the lane's parity
-                    // at runtime they were a stack object in scratch
+                    };
+                    let mut w: [(u64, u64); WD] = core::array::from_fn(|st| wload(st));
                     let wsv: [f32; NSTEP] = core::array::from_fn(|st| *ws.add((2 * st + gpar) * TILE + r));
-                    // the steps written out (a loop over them left the batches a stack object in scratch)
-                    let mut y = [0f32; SPEC_TOKENS];
-                    // a step's activation words of every token and the groups' scale and Σq read first, one wait for
-                    // all (reading them a step ahead of their dots held two steps' worth live and spilled, 2026-10-27)
                     let read = |st: usize| -> ([[(u64, u64); 2]; SPEC_TOKENS], [(f32, f32); SPEC_TOKENS]) {
                         let g = 2 * st + gpar;
                         (
@@ -801,12 +802,15 @@ pub mod gfx11 {
                             }),
                         )
                     };
+                    let mut y = [0f32; SPEC_TOKENS];
+                    let (mut qa, mut gss) = read(0);
                     macro_rules! step {
                         ($st:expr) => {{
-                            let (qa, gss) = read($st);
+                            let next = if $st + 1 < NSTEP { read($st + 1) } else { (qa, gss) };
+                            let wst = w[$st % WD];
                             let mut i = 0;
                             while i < SPEC_TOKENS {
-                                let part = word_dot_act(w[$st].0, qa[i][0].0, qa[i][0].1) + word_dot_act(w[$st].1, qa[i][1].0, qa[i][1].1);
+                                let part = word_dot_act(wst.0, qa[i][0].0, qa[i][0].1) + word_dot_act(wst.1, qa[i][1].0, qa[i][1].1);
                                 // the quad's four lanes hold the cell's quarters: the group's exact integer sum
                                 let p = part as f32;
                                 let p = p + dpp_xmask::<XMASK1>(p);
@@ -817,6 +821,10 @@ pub mod gfx11 {
                                 }
                                 i += 1;
                             }
+                            if $st + WD < NSTEP {
+                                w[$st % WD] = wload($st + WD);
+                            }
+                            (qa, gss) = next;
                         }};
                     }
                     const { assert!(NSTEP == 16) };

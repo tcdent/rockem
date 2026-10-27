@@ -776,6 +776,23 @@ an_chain **106.0 / 105.8** (an18 110.9 / 110.8; predicted ~96), p90 192 / 193, s
 bit-identical. The prologue's removal bought 5 of the ~15 the table put in it, so R did not reach ~15–17: an20t's
 table (R alone, the per-workgroup rows, the no-tile band's reading of the copy + sync by itself) before any cut.
 
+**an20t (rockem.lead, 2026-10-27; run 6be05ecb): R mean 18.1 / slowest 27.4 (an18t 29.9 / 36.2); b3 + F + b4
+17.5 / 34.5 (the idle workgroups waiting out R — off the critical path); S 16.9 / 18.9; O 2.3 / 9.3. The
+per-workgroup rows: the no-tile band reads 2.5 / 2.4 (was 20.8) — the copy + sync is 2.5, the prologue gone as
+designed; the working bands flat at 26.7 / 27.1, slowest five 26.9–27.5, ordinary ids.** A working wave's tile is
+~24 µs against the bytes' 11.6 (8 KB of weights a wave at 640 GB/s): flat everywhere, so the tile's own dependent
+chain — sixteen steps each waiting on its activation words before its dots, 55 `lgkmcnt(0)` a wave ≈ 3.4 a step
+at ~400 ns ≈ 22. Next by size after R: S at 17 (the step's own code: 36 LDS waits, 24 `v_div`), then A's slowest
+workgroup 12.2 against the mean 5.6.
+
+**Build 21 (staged: `kernels-an21` 482f4d46, `-an21s` c3064c45, `-an21t` 7040b2d5; node as an20's; kernarg 200; 158 VGPRs,
+no scratch, 30 barriers).** The tile's chain: a step's activation words of every token read from LDS one step ahead
+of their dots, the room for it made by holding the weights as a rolling window of eight steps' loads issued seven
+steps ahead (`WD`; all sixteen at once was 64 registers — the lookahead at that bound spilled in build 19). The R
+region: 2,949 instructions, **10 full LDS waits (55)**, 5 drains, 512 `v_dot4`, no permute, no scratch. By the
+table: the chain's waits halved, the tile ~24 → ~13–15, R ~27 → ~16, the chain ~106 → ~95. `kernel_diff` vs an20
+and vs an13s: `an_chain` only.
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back
