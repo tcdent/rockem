@@ -897,6 +897,15 @@ deterministic, the LDS truncation confirmed on a second reading. The block waves
 wave's 20–26 is the occupancy gain; what remains (R_max 18 against the bytes' ~3 a block-quarter) is the 8-trip
 chain on nine waves a SIMD — the next R lever, if any, is depth or slots, with the per-wave instrument to price it.
 
+**an25's boot (rockem.lead, 2026-10-27; run 0b595dbf; the merged node 53595aa) — VALID, the new mark, serving.**
+an_chain **97.3 / 99.3** (an22 105.0 / 105.8), p90 185 / 187, slow 0.1 / 0.2 %; slot wait **2.83 / 1.44 / 0.88** ms
+at widths 2–4 (an22 3.02 / 1.58 / 0.92; production 1.3 / 0.87 / 0.8); step 46.9 / 59.6 / 68.2; experts
+11.56 / 18.85 / 26.73; coverage **.776** / picked .859 — back to the digit; decode-identical; SCORE bit-identical.
+The occupancy prediction held for the chain and the numerics held once `CHAIN_LDS` matched. Ledger (slot wait
+2–4 · chain): production 1.3 / 0.87 / 0.8 · an18 3.09 / 1.49 / 0.98 · 111 · an22 3.02 / 1.58 / 0.92 · 105 · an25
+2.83 / 1.44 / 0.88 · 97 / 99; coverage .776 throughout. an25s boots for the section's per-workgroup rows (A by band:
+wg 0–95 the rows, 96–103 the Gram, 104–167 idle; B by workgroup 0).
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back
