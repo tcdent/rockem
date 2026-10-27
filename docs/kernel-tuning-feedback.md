@@ -177,6 +177,25 @@ body is a store; it never branches on what it wrote. What it answered first: the
 22 µs is rows 12.7, quantize 6.8, softmax 3.9, pick 2.4 — the rows latency-bound on one
 workgroup, the quantize a candidate to move into the expert kernels' prologue.
 
+**The stamps cut the object too.** A stats build's clock reads are instructions
+(`s_sendmsg_rtn_b64 … MSG_RTN_GET_REALTIME` for the real-time clock, `s_getreg` for cycles),
+so the disassembly of a kernel splits at them into exactly the phases the slab times:
+`llvm-objdump -d --triple=amdgcn-amd-amdhsa --mcpu=gfx1100` from the rustup toolchain, cut
+the kernel's listing at each clock read, and count instruction classes a region — VALU,
+`v_rcp`/`v_div_scale`, `ds_bpermute`, `s_waitcnt vmcnt(0)` (a full drain of the memory
+queue, one dependent round trip), `flat_` against `global_` (a pointer that came out of a
+device-address table is generic, and a generic load is also charged to `lgkmcnt`, so every
+LDS wait drains it too), `scratch_` and `.vgpr_spill_count` from `llvm-readobj --notes`.
+Read before the next build, not after: a measured phase that a rewrite did not move is a
+class the rewrite did not touch, and the counts say which. What it answered in 098
+(2026-10-27): the analog chain's phase B held at 20–27 µs through three rewrites of its
+Sinkhorn (wave form, registers with `/`, registers with `v_rcp_f32`) because the Sinkhorn was
+~4 µs of it — the region's `vmcnt(0)` drains were 14 in one build and 19 in the next, against
+19.9 and 26.6 µs measured: ~1.2 µs a drain plus ~5 µs of ALU, the loads of a few floats
+issued one at a time behind a wait. The counts also showed the next object unchanged in
+that class before it was booted, which saved the boot. The register pressure that moved
+the loads into the loop left no trace in the slab; it was in the object.
+
 **The rule that makes observation a property rather than a session.** Every launch site
 declares the bytes its kernel moves, the ceiling is measured on the box at startup, and
 the timeline reports each kernel as a fraction of that ceiling — the bench harness's rule
