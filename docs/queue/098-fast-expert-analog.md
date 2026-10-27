@@ -889,6 +889,14 @@ without the symbol prints a warning. Rule: a kernel's dynamic LDS size, grid and
 like its kernarg — a change to any of them is a node rebuild, and from build 25 the node refuses the mismatch at
 boot.
 
+**an24t (rockem.lead, 2026-10-27; run f1050fbd; the 17,440 node — timing valid, sums not): R mean 10.3 / slowest
+18.0 (an23t 5.2 / 31.2; the `v_dot4` passes 18 / 27); b3 + F + b4 16.0 / 25.6; S 16.6 / 18.6; O 2.3 / 9.2.** The
+per-wave rows: wg 0–43 waves 0–7 all 13.6–15.1, wg 44–167 all 12.2–12.8 (max ~20) — the four K-quarter waves of a
+block run alike, and the idle waves read ~12 because they wait at the join's sync. Coverage .765 / .847 again:
+deterministic, the LDS truncation confirmed on a second reading. The block waves' 12–15 against an23's single
+wave's 20–26 is the occupancy gain; what remains (R_max 18 against the bytes' ~3 a block-quarter) is the 8-trip
+chain on nine waves a SIMD — the next R lever, if any, is depth or slots, with the per-wave instrument to price it.
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back
