@@ -470,6 +470,17 @@ chain of round trips over both chunks. Predicted A ~10, B ~8, C and barriers ~6:
 plan ~155 µs after the run starts at width 2 — borderline on the ≤ 150; 12 heads (+0.21 / +0.12 offline, ~17 MB of
 rows) is the next cut if the served numbers need it.
 
+**Build 7's boot (rockem.lead, 2026-10-27, run d020207d) and build 8.** The chain did not move (p50 140 / 144 against
+an5's 143 / 149; slot wait 3.7 / 1.9 / 1.2 ms): the fourth fix with no change in the total. Both phases are
+**cross-lane latency chains**, not bytes or barriers: phase A's reduction summed its 65 values one `wave_sum` at a time —
+325 dependent `ds_bpermute` steps a wave, ~20 µs, the same with narrow or wide loads and with one or two workgroups a
+row; phase B's mix was `hc_pre`'s wave form, ~6 permutes an iteration over 20 Sinkhorn iterations and two halves on
+one wave, ~15 µs (864 `ds_bpermute` in an5's `an_chain`). **Build 8** (e6c49f4; `kernels-an8`, `-an8s`): the sums in
+lockstep (`common::gfx11::wave_sum_f32::<N>`: every value's permute issued per step, five round trips for all), the
+Sinkhorn in registers on every lane alike (no permute: a 4 × 4 for a few tokens); static report clean after two spilled
+forms. Held for an7s's table; the prediction: A ~4, B ~3, the phase ~12, the chain ~105 µs. Rule: for a few tokens a
+cross-lane reduction is latency, not throughput — count the dependent permutes before the bytes.
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back
