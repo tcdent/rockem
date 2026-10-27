@@ -161,6 +161,18 @@ pub unsafe fn wave_sum_f32<const N: usize>(lane: u32, v: [f32; N]) -> [f32; N] {
     v
 }
 
+unsafe extern "C" {
+    #[link_name = "llvm.amdgcn.rcp.f32"]
+    fn amdgcn_rcp(x: f32) -> f32;
+}
+/// `v_rcp_f32`: the hardware reciprocal (1 ulp), one instruction — a `/` lowers to the IEEE division sequence of ~10
+/// (`v_div_scale` … `v_div_fixup`), a dependent chain where a few divisions sit on one wave's critical path (the
+/// analog's register Sinkhorn ran 1,280 of them a token: +20 µs over the permute chain it replaced, 2026-10-27).
+#[inline(always)]
+pub unsafe fn rcp(x: f32) -> f32 {
+    amdgcn_rcp(x)
+}
+
 /// The value lane `src` holds, to every lane of the wave.
 #[inline(always)]
 pub unsafe fn lane_read(src: u32, v: f32) -> f32 {

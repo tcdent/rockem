@@ -122,6 +122,7 @@ pub mod gfx11 {
     fn sigmoid(x: f32) -> f32 {
         1.0 / (1.0 + exp(-x))
     }
+    use common::gfx11::rcp;
 
     /// A grid barrier over `CHAIN_GRID` workgroups on its words: thread 0 counts in on its group's word; the group's
     /// last counts on the top word; the last group's publishes `value` in the done word, which every workgroup waits
@@ -178,9 +179,10 @@ pub mod gfx11 {
                 sum += cb[i][j];
                 j += 1;
             }
+            let rs = rcp(sum);
             let mut j = 0;
             while j < HC {
-                cb[i][j] = cb[i][j] / sum + HC_EPS;
+                cb[i][j] = cb[i][j] * rs + HC_EPS;
                 j += 1;
             }
             i += 1;
@@ -197,9 +199,10 @@ pub mod gfx11 {
                         rs += cb[i][j];
                         j += 1;
                     }
+                    let rr = rcp(rs);
                     let mut j = 0;
                     while j < HC {
-                        cb[i][j] /= rs;
+                        cb[i][j] *= rr;
                         j += 1;
                     }
                     i += 1;
@@ -213,9 +216,10 @@ pub mod gfx11 {
                     cs += cb[i][j];
                     i += 1;
                 }
+                let rc = rcp(cs);
                 let mut i = 0;
                 while i < HC {
-                    cb[i][j] /= cs;
+                    cb[i][j] *= rc;
                     i += 1;
                 }
                 j += 1;
