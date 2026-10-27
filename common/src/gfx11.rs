@@ -212,6 +212,18 @@ pub unsafe fn row_sum16(v: f32) -> f32 {
     let v = v + dpp_xmask::<XMASK4>(v);
     v + dpp_xmask::<XMASK8>(v)
 }
+/// The max over the lane's row of 16, on every lane of the row.
+#[inline(always)]
+pub unsafe fn row_max16(v: f32) -> f32 {
+    let o = dpp_xmask::<XMASK1>(v);
+    let v = if o > v { o } else { v };
+    let o = dpp_xmask::<XMASK2>(v);
+    let v = if o > v { o } else { v };
+    let o = dpp_xmask::<XMASK4>(v);
+    let v = if o > v { o } else { v };
+    let o = dpp_xmask::<XMASK8>(v);
+    if o > v { o } else { v }
+}
 /// The value the same-numbered lane of the other row of 16 holds (`v_permlanex16`, a VALU op).
 #[inline(always)]
 pub unsafe fn other_row(v: f32) -> f32 {
