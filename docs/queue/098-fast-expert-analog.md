@@ -438,6 +438,24 @@ slot 3 to name the late chains. Expected: A+B+C ~20, the rows ~72, chain ~150 wi
 budget: the rows are the floor, and the fit needs 16 heads (8 a part, ~22 MB a card, ~40 µs) if the offline gain
 holds (hb24 / hb16 / hb8 columns computing on both texts).
 
+**Build 3's boot (rockem.lead, 2026-10-27, run 0247bbf0) and build 5.** The grouped barriers and the LDS head table
+moved nothing (A+B+C 46, the rows 77–79): the barrier theory of the hyper-connection phase was wrong — the cost was
+phase A's loads, ~700 single strided 4-byte loads a thread a pass, a round trip a batch; rewritten as 16- and 32-byte
+loads, a thread eight channels, the row's weights held across the five vectors (~30 loads a thread). The tail named
+by layer is a **cascade, not the MLA pairs**: card1 waits for card0's shared output on layers 15–21 in 76–93 % of
+chains, card0 for card1's on 23–43 in 13–31 % — the chain exceeding the run adds (chain + pred_step + pred_rows − run)
+of lag to the leader's queue each layer, the other card inherits it through fyv at the next, and nothing drains it
+until a long run. So the fix is the chain's length, not the dependency: once the chain is shorter than the run the
+lag cannot lock in. Build 5 (branch 098-analog): phase A's wide loads; no `hc_route_ahead` launch on analog pairs
+(nothing reads it; −25 µs on the leader's queue ahead of its shared expert); **16 heads (8 a part, `NSEL` 8)**, the
+size that fits the ~170–200 µs run at width 2 — measured offline (the first-margin shape, used experts a layer over
+today's posts, cody / survey): 32 heads +0.44 / +0.31, 24 +0.35 / +0.22, **16 +0.27 / +0.16**, 8 +0.14 / +0.07; at
+rank 13 the early plan .593 / .651 offline against h32's .617 / .674 and today's .549 / .622, so the served .711
+should come back as ~.68. Predicted chain at width 2: A/B/C ~12, rows ~40 (22 MB), F/S/O ~25, the launch ~15 → ~90
+µs, the plan ~130 µs after the run starts, 40–70 µs of slack. Gates (rockem.lead): the slot wait by width back to
+production's 1.3 / 0.9 / 0.8 ms at widths 2–4, rank 13 early ≥ ~.68, the per-layer slow share near zero; width 1
+stays tcdent's fork.
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back

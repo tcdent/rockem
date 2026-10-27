@@ -1258,7 +1258,7 @@ impl Cards {
     /// `act`: a MoE layer's act table on its FFN card — the FFN input's norm, quantize and router picks done in
     /// the launch's tail once the scores are in (queue 001), the host's word at its end.
     #[allow(clippy::too_many_arguments)]
-    fn hc_pre(&self, c: &Card, hc: &(Mem, Mem, Mem), value: u32, router: Option<(usize, usize, usize, usize)>, act: Option<usize>, n: usize) {
+    fn hc_pre(&self, c: &Card, hc: &(Mem, Mem, Mem), value: u32, router: Option<(usize, usize, usize, usize)>, act: Option<usize>, n: usize, route_ahead: bool) {
         // the chunk's rows (037); the act phase's table rows from its first token, and its word in the chunk's set
         let act_word = if act.is_some() { self.shared.words.at(self.wd(W_ACT, c.k.index)) } else { 0 };
         let (ln, rw, sc, wd) = router.unwrap_or((0, 0, 0, 0));
@@ -1269,7 +1269,9 @@ impl Cards {
         // a long step's router takes the next layer's rows too (the matrix path, the same launch): the prefetch
         // predictor's labels from every prompt position (phase 4)
         let rows = if router.is_none() { 0 } else if n > SPEC_TOKENS { ROUTE_ROWS } else { glm_5_3_flash::E };
-        let ahead = router.is_some() && n <= SPEC_TOKENS;
+        // the route-ahead's launch: a decode step's, unless the analog makes the pair's margins (098) — then nothing
+        // reads it and the leader's queue is shorter ahead of its shared expert
+        let ahead = router.is_some() && n <= SPEC_TOKENS && route_ahead;
         let mut a = Args::new();
         a.ptr(self.tok(&c.streams, HC * H)).ptr(hc.0.va).ptr(self.tok(&c.part, PRE_STRIDE)).ptr(hc.1.va).ptr(hc.2.va).ptr(self.tok(&c.mix, HC_MIX)).ptr(self.tok(&c.x, H)).ptr(c.count.va).u32(value).ptr(ln).ptr(rw).ptr(sc).ptr(self.tok(&c.scores_v, ROUTE_ROWS)).ptr(if ahead { 0 } else { wd }).ptr(act.unwrap_or(0)).ptr(act_word).u32(self.t0 as u32).u32(rows as u32).u32(n as u32);
         c.k.launch(&c.hc_pre, PRE_GRID, g::WG, PRE_LDS, &a);
@@ -1729,7 +1731,7 @@ impl Placed for Cards {
         self.half_seq[l][self.ch][0] = value;
         let f = self.ffns[l].as_ref().unwrap();
         for c in &self.cards {
-            self.hc_pre(c, &f.hc[c.k.index][0], value, None, None, n);
+            self.hc_pre(c, &f.hc[c.k.index][0], value, None, None, n, false);
         }
         let lay = self.layers[l].as_ref().unwrap();
         let parity = l % 2;
@@ -1789,7 +1791,7 @@ impl Placed for Cards {
         self.half_seq[l][self.ch][0] = value;
         let f = self.ffns[l].as_ref().unwrap();
         for c in &self.cards {
-            self.hc_pre(c, &f.hc[c.k.index][0], value, None, None, n);
+            self.hc_pre(c, &f.hc[c.k.index][0], value, None, None, n, false);
         }
         self.mla_value = value;
         let m = self.mlas[l].as_ref().unwrap();
@@ -2215,7 +2217,7 @@ impl Placed for Cards {
             // the FFN card's collapse goes to the host too when the routed experts need it, with the router's logits and the word
             let router = self.ffn_router(l, c);
             let act = f.act.as_ref().filter(|_| c.k.index == f.card).map(|(_, _, tab)| tab.va);
-            self.hc_pre(c, &f.hc[c.k.index][1], value, router, act, n);
+            self.hc_pre(c, &f.hc[c.k.index][1], value, router, act, n, f.analog.is_none());
         }
         let c = &self.cards[f.card];
         let (rows, down, k_width) = if f.dense { (DENSE_GU_ROWS, &c.ffn_down_dense, INTERMEDIATE_SIZE) } else { (SHARED_GU_ROWS, &c.ffn_down_shared, N_SHARED_EXPERTS * D_FF) };
