@@ -14,4 +14,4 @@ done
 echo "-- the five slowest workgroups (wave 0 median), per lane"
 q "WITH w AS (SELECT lane, wg, median(s$S)/100 v FROM kernel_stats_wave WHERE run LIKE '$RUN%' AND kernel='$K' AND wave=0 GROUP BY lane, wg), r AS (SELECT *, row_number() OVER (PARTITION BY lane ORDER BY v DESC) rk FROM w) SELECT lane, wg, round(v,1) us FROM r WHERE rk <= 5 ORDER BY lane, rk"
 echo "-- inside the slowest five: the per-wave spread (median a wave, µs), card0"
-q "WITH w AS (SELECT wg, median(s$S)/100 v FROM kernel_stats_wave WHERE run LIKE '$RUN%' AND kernel='$K' AND wave=0 AND lane='card0' GROUP BY wg ORDER BY v DESC LIMIT 5) SELECT k.wg, k.wave, round(median(k.s$S)/100,1) us FROM kernel_stats_wave k JOIN w ON w.wg=k.wg WHERE k.run LIKE '$RUN%' AND k.kernel='$K' AND k.lane='card0' GROUP BY k.wg, k.wave ORDER BY k.wg, k.wave"
+q "SELECT wg, wave, round(median(s$S)/100,1) us FROM kernel_stats_wave WHERE run LIKE '$RUN%' AND kernel='$K' AND lane='card0' AND wg IN (SELECT wg FROM kernel_stats_wave WHERE run LIKE '$RUN%' AND kernel='$K' AND wave=0 AND lane='card0' GROUP BY wg ORDER BY median(s$S) DESC LIMIT 5) GROUP BY wg, wave ORDER BY wg, wave"
