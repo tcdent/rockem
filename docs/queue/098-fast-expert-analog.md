@@ -986,6 +986,11 @@ trips. **`kernels-an27r`** (1cc4c9cd; a `stats_r` object on an27's code, the pla
 the block wave — slot 0 the copy prologue, 1 the batches' loads landed (a drain at each batch's top, summed), 2 the
 groups' WMMA chain and flushes (summed), 3 the wave's hardware placement (`stat_hwid!`: SE / SA / WGP) — the rows
 then price the trip on the nine-wave SIMD directly, and slot 3 sorts them by CU load.
+an27t (rockem.lead, 2026-10-27; run 0e1cf9ea): R 10.9 / 19.0; the block waves (card0, med / p90 / max): the
+two-block workgroups (0–43) 15.2–16.4 / 17–18 / 19–21, the single-block (44–167) 8.9–9.7 / 17.4–18.3 / 20–22 — the
+two-block band ~6 µs slower a wave at the median with the same p90: placement, as the matrix-pipe reading predicts
+and the trip readings do not (a block wave on a unit with another working workgroup takes the pipe's time twice).
+an27r boots; the read groups its slot 2 by the number of working workgroups sharing a hardware id.
 
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
