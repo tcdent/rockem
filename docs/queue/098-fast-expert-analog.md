@@ -646,6 +646,25 @@ phase O's reads past n, the fyv 0 / 1 weighting, O's fma), `-an14a` 2b32e578 (an
 only), `-an14b` 07965542 (an13f + the router rows' `v_rsq` only); an15's own two (the Gram workgroups, phase A's
 DPP sums) split as `-an15a` bf7e9ba9 (the Gram workgroups without A's DPP sums) and `-an15b` f23b8e10 (A's DPP sums with the Gram on rows 0..n). Built in a worktree at the ladder's commits (`~/Work/rockem-bis`).
 
+**an15 decode-identical; an16a DIFFERS with an16's signature — the fault and its mechanism (rockem.lead,
+2026-10-27).** an15 (373dee1c) held, so an14's and an15's changes are clear; an16a (1525ea8a; an15 + the rows
+variant's DPP reductions only) departs exactly as an16 did. The object says how: a per-symbol diff of an15 → an16a
+shows `an_chain` 12,605 → 12,068 **and three production kernels changed** — `rows_d2_e4` 1,582 → 1,466,
+`rows_h_e4` 4,312 → 3,748, `rows_part_e4` 2,994 → 2,876 — while an13 → an15 and an16a → an16 touch `an_chain`
+alone. `exp4_rows_direct_rows` was not the analog's own copy: `exp4_rows_direct_map` (the production decode-width
+rows passes) is implemented by calling it, so the reduction change reached the forward's decode-width rows kernels,
+and SCORE cannot see those kernels — past SPEC_TOKENS the rows passes are the WMMA twins. (The pass's `ds_bpermute`
+reduction is load-bearing: it replays the staged pass's exactly, which is what makes a decode step bit-identical
+to a prefill step.) **Fix (the branch's head):** `exp4_rows_direct_rows` takes a `DPP: bool` const generic — the
+analog's call sites `true`, `exp4_rows_direct_map` `false` with the original reduction verbatim — and the gate that
+would have caught it is static: `bringup/expert-cache/analog/kdiff.py <new.elf> <served.elf>` disassembles every
+kernel symbol of both objects and fails on any symbol outside `an_chain` / `an_send` that differs (it reproduces the
+an16a finding: the three rows kernels). rockem.lead's `bringup/gates/kernel_diff.sh` makes it a build gate. With
+the fix, the plain / stats / tail objects differ from an13 / an13s in `an_chain` only. **an17 re-staged on the fix:
+`kernels-an17` c842df31, `-an17s` 8ded64ea, `-an17t` 3f9c3a9b** (171 VGPRs, no scratch, 29 barriers, kernarg
+200; `an_chain` 12,349 instructions — the same count as the held an17: the analog's own code is unchanged, only the
+production kernels were). an16b was not needed; an16's phase O changes are `an_chain`-only and ride in an17.
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back

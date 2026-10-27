@@ -699,7 +699,7 @@ pub mod gfx11 {
                     ($np:expr, $r:expr) => {{
                         let mut vrow = (wg * CHAIN_WAVES + wave) * $r;
                         while vrow < SEL_ROWS {
-                            exp4_rows_direct_rows::<H, true, 2, 8, $r, $np>(t as u32, e4, ln, SEL_ROWS, n, RMS_NORM_EPS, vrow, &map, &xs, &emit);
+                            exp4_rows_direct_rows::<H, true, 2, 8, $r, $np, true>(t as u32, e4, ln, SEL_ROWS, n, RMS_NORM_EPS, vrow, &map, &xs, &emit);
                             vrow += CHAIN_GRID as usize * CHAIN_WAVES * $r;
                         }
                     }};
@@ -729,10 +729,10 @@ pub mod gfx11 {
                 let mut vrow = (wg * CHAIN_WAVES + wave) * E4_ROWS;
                 while vrow < SEL_FG_ROWS {
                     match n {
-                        1 => exp4_rows_direct_rows::<KDA_DIM, false, 2, 8, E4_ROWS, 1>(t as u32, e4, core::ptr::null(), SEL_FG_ROWS, n, 0.0, vrow, &map, &xs, &emit),
-                        2 => exp4_rows_direct_rows::<KDA_DIM, false, 2, 8, E4_ROWS, 2>(t as u32, e4, core::ptr::null(), SEL_FG_ROWS, n, 0.0, vrow, &map, &xs, &emit),
-                        3 => exp4_rows_direct_rows::<KDA_DIM, false, 2, 8, E4_ROWS, 3>(t as u32, e4, core::ptr::null(), SEL_FG_ROWS, n, 0.0, vrow, &map, &xs, &emit),
-                        _ => exp4_rows_direct_rows::<KDA_DIM, false, 2, 8, E4_ROWS, { common::gemv::FEW }>(t as u32, e4, core::ptr::null(), SEL_FG_ROWS, n, 0.0, vrow, &map, &xs, &emit),
+                        1 => exp4_rows_direct_rows::<KDA_DIM, false, 2, 8, E4_ROWS, 1, true>(t as u32, e4, core::ptr::null(), SEL_FG_ROWS, n, 0.0, vrow, &map, &xs, &emit),
+                        2 => exp4_rows_direct_rows::<KDA_DIM, false, 2, 8, E4_ROWS, 2, true>(t as u32, e4, core::ptr::null(), SEL_FG_ROWS, n, 0.0, vrow, &map, &xs, &emit),
+                        3 => exp4_rows_direct_rows::<KDA_DIM, false, 2, 8, E4_ROWS, 3, true>(t as u32, e4, core::ptr::null(), SEL_FG_ROWS, n, 0.0, vrow, &map, &xs, &emit),
+                        _ => exp4_rows_direct_rows::<KDA_DIM, false, 2, 8, E4_ROWS, { common::gemv::FEW }, true>(t as u32, e4, core::ptr::null(), SEL_FG_ROWS, n, 0.0, vrow, &map, &xs, &emit),
                     }
                     vrow += CHAIN_GRID as usize * CHAIN_WAVES * E4_ROWS;
                 }
