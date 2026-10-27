@@ -968,6 +968,25 @@ an26t (rockem.lead, 2026-10-27; run 87b90e60): the block waves UNCHANGED — wg 
 touch the trip; the flush's scale loads stand as its reading, and an27 boots as the fix for that number (the node
 rebuilt with 29,728; prediction on record: block wave ~5–7, chain ~89).
 
+**an27's boot (rockem.lead, 2026-10-27; run 16829838; the 29,728 node): WORSE** — 100.3 / 101.2 (an25 97.3 /
+99.3), slot wait 2.84 / 1.45 / 0.91, coverage .776, gates clean. The scales in LDS added ~3 µs: the per-group scale
+load was not the trip either — the second static-object reading of R to miss on the box since an25 (the weights'
+trips, then the scales'). an27 serves as the matched object on the 29,728 node (the ABI gate refused an25's
+redeploy on it, as designed); an25 stays the mark by numbers.
+
+**The reading that fits all of it (rockem.predictor, 2026-10-27): the matrix pipe's throughput per SIMD.** The
+WMMA fragment pads the step's 4 tokens to 16, so the matrix form does 4× the MACs the `v_dot4` form did; at ~32
+cycles a `v_wmma_i32_16x16x16_iu8` (4,096 MACs at 128 a cycle a SIMD), 212 blocks × 256 WMMAs over 96 SIMDs is
+~7.5 µs even perfectly balanced — and the an26t bands differ (wg 0–43's block waves 14–15, wg 44–167's 10.6–11.3)
+because workgroup placement puts three working workgroups on some CUs and two on others: the slow band is the
+loaded CUs. It is consistent with every R result since an24: removing round trips (an26) changed nothing, and more
+LDS traffic (an27) hurt, both landing on the same per-CU resources. If so, R's floor in this form is ~8–10 and the
+`v_dot4` form's ~24 was issue; the lever would be the padding (the fragment's twelve dead token columns), not the
+trips. **`kernels-an27r`** (1cc4c9cd; a `stats_r` object on an27's code, the plain object unchanged): stamps inside
+the block wave — slot 0 the copy prologue, 1 the batches' loads landed (a drain at each batch's top, summed), 2 the
+groups' WMMA chain and flushes (summed), 3 the wave's hardware placement (`stat_hwid!`: SE / SA / WGP) — the rows
+then price the trip on the nine-wave SIMD directly, and slot 3 sorts them by CU load.
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back
