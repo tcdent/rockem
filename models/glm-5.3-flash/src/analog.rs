@@ -418,16 +418,32 @@ pub mod gfx11 {
         }
         common::gfx11::wave_lds_sync();
         let row = if lu < HC_COEFS { lu } else { 0 };
-        // the lane's row's dots, the chunks' partials summed, loaded where used (held in registers they spilled)
-        let dots = |h: usize, k: usize| {
-            let mut v = 0f32;
+        // the lane's row's dots of a half, the chunks' partials: forty independent loads issued together, then summed
+        // (loaded where used, one at a time inside the loops, they were a chain of L2 round trips: B 26.6 µs on an9)
+        let load_dots = |h: usize| -> [f32; DOTS] {
+            let mut p = [[0f32; DOTS]; A_CHUNKS];
             let mut ch = 0;
             while ch < A_CHUNKS {
-                v += *sc.add(SCR_DOTS + (ch * A_ROWS + h * HC_COEFS + row) * DOTS + k);
+                let mut k = 0;
+                while k < DOTS {
+                    p[ch][k] = *sc.add(SCR_DOTS + (ch * A_ROWS + h * HC_COEFS + row) * DOTS + k);
+                    k += 1;
+                }
                 ch += 1;
             }
-            v
+            let mut d = [0f32; DOTS];
+            let mut k = 0;
+            while k < DOTS {
+                let mut ch = 0;
+                while ch < A_CHUNKS {
+                    d[k] += p[ch][k];
+                    ch += 1;
+                }
+                k += 1;
+            }
+            d
         };
+        let dots = load_dots(0);
         // the stood-in streams' sum of squares from the Gram, then lane r's attention coefficient
         let mut ss = 0f32;
         let mut acc = 0f32;
@@ -436,7 +452,7 @@ pub mod gfx11 {
             let mut a = 0;
             while a < BASE {
                 let al = *alpha.add(j * BASE + a);
-                acc += al * dots(0, j * BASE + a);
+                acc += al * dots[j * BASE + a];
                 let mut b = 0;
                 while b < BASE {
                     ss += al * *alpha.add(j * BASE + b) * *gram.add(a * BASE + b);
@@ -465,6 +481,7 @@ pub mod gfx11 {
             *alpha2.add(lu) = v;
         }
         common::gfx11::wave_lds_sync();
+        let dots = load_dots(1);
         let mut ss = 0f32;
         let mut acc = 0f32;
         let mut j = 0;
@@ -472,7 +489,7 @@ pub mod gfx11 {
             let mut a = 0;
             while a < BASE {
                 let al = *alpha2.add(j * BASE + a);
-                acc += al * dots(1, j * BASE + a);
+                acc += al * dots[j * BASE + a];
                 let mut b = 0;
                 while b < BASE {
                     ss += al * *alpha2.add(j * BASE + b) * *gram.add(a * BASE + b);
