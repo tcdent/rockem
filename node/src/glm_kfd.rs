@@ -322,6 +322,8 @@ struct Shared {
 /// 2026-10-24) run through `rows_pass`, whose slots are its phases: 0 the activation staging
 /// rounds, 1 the weight rounds (the FP8 decode and dot), 2 the tail (the norm's reduction, the
 /// ready, the emits) — shader cycles a wave, wave 0 of each workgroup the clean read.
+/// A stats code object: every this-many-th stamped launch of a kernel also writes its slab, an entry a row (`kernel_stats_wave`).
+const STAT_SAMPLE_EVERY: u64 = 256;
 const STAT_KERNELS: &[&str] = &["hc_pre", "pred_rows", "mla_o", "an_chain"];
 /// `Shared::xact`'s regions, in bytes.
 const HG: usize = H / common::q4::GROUP;
@@ -1227,6 +1229,17 @@ impl Cards {
                     "s0_w0" => w0(0), "s0_mean" => mean(0), "s0_max" => max(0), "s1_w0" => w0(1), "s1_mean" => mean(1), "s1_max" => max(1),
                     "s2_w0" => w0(2), "s2_mean" => mean(2), "s2_max" => max(2), "s3_w0" => w0(3), "s3_mean" => mean(3), "s3_max" => max(3),
                     "s0_wgmin" => wgmin(0), "s0_wgmax" => wgmax(0), "s1_wgmin" => wgmin(1), "s1_wgmax" => wgmax(1), "s2_wgmin" => wgmin(2), "s2_wgmax" => wgmax(2), "s2_wgdistinct" => wgdistinct(2) });
+                // every STAT_SAMPLE_EVERY-th stamped launch: the slab itself, a row an entry (workgroup, wave, the four
+                // slots), so a phase's distribution over the grid can be read after the fact — which workgroups are
+                // slow, and whether a slow workgroup is one wave or all of them (098: R's slowest wave vs its mean)
+                if idx % STAT_SAMPLE_EVERY == 0 {
+                    for w in 0..slots[0].len() {
+                        let v = |k: usize| slots[k].get(w).copied().unwrap_or(0.0) as f64;
+                        prow::row!("track-launches", "kernel_stats_wave", { "lane" => lane.as_str(), "kernel" => name, "launch" => idx,
+                            "wg" => w as u32 / common::stats::STAT_WAVES_PER_WG, "wave" => w as u32 % common::stats::STAT_WAVES_PER_WG,
+                            "s0" => v(0), "s1" => v(1), "s2" => v(2), "s3" => v(3) });
+                    }
+                }
             }
         }
     }
