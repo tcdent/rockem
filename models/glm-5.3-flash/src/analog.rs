@@ -589,8 +589,8 @@ pub mod gfx11 {
             // stats (a stats code object only), ticks of the 100 MHz clock as every wave sees them — the hyper-connection
             // phases apart, after three builds left their sum at 42–48 µs (2026-10-27): slot 0 phase A (after the peer's
             // wait), 1 the first grid barrier's wait, 2 phase B (workgroup 0's waves; 0 elsewhere), 3 the second barrier,
-            // phase C and the third barrier. A `stats_tail` object stamps the tail instead: slot 0 phase R (with the
-            // fourth barrier), 1 F (with the fifth), 2 S (with the sixth), 3 O to the end.
+            // phase C and the third barrier. A `stats_tail` object stamps the tail instead: slot 0 phase R alone, 1 the
+            // fourth barrier, F and the fifth, 2 S (with the sixth), 3 O to the end.
             const TAIL: bool = cfg!(feature = "stats_tail");
             let kt_w = common::stat_clock!();
             // the peer: the leader's shared output must be in (its word in this card's copy)
