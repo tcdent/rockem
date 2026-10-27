@@ -711,7 +711,14 @@ impl Cards {
                     pred_rows: k.kernel("pred_rows"),
                     pred_learn: k.kernel("pred_learn"),
                     pred_input: k.kernel("pred_input"),
-                    an_chain: k.kernel("an_chain"),
+                    an_chain: {
+                        // the object's constants against this node's (`an::abi`): a mismatch is the an24 fault class
+                        match k.constants::<{ an::ABI_LEN }>("ROCKEM_AN_ABI") {
+                            Some(got) => assert_eq!(got, an::abi(), "an_chain's constants (LDS, grid, table length, activation bytes) differ between the code object and the node"),
+                            None => println!("gpu      : the code object exports no ROCKEM_AN_ABI (older than build 25): the analog's constants unchecked"),
+                        }
+                        k.kernel("an_chain")
+                    },
                     an_send: k.kernel("an_send"),
                     an_x: k.vram(SPEC_TOKENS * H * 4),
                     an_x0: k.vram(SPEC_TOKENS * H * 4),
