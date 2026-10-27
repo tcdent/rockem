@@ -606,6 +606,31 @@ B **10.6** (an12s 11.4: the fifteen LDS waits and five drains were 0.8 µs), A 5
 step 46.9 / 59.8 / 68.4; coverage .773; both SCOREs bit-identical; hardware clean. So B is done at ~11 (the
 Sinkhorns' dependent chain), and the section's remaining 12 is A's slowest workgroup (build 15's Gram fix, in an16).
 
+**an16's boot (rockem.lead, 2026-10-27): the chain moved — and the decode changed.** an16: an_chain 121.8 / 125.5
+(an13 129.0 / 133.3), slot wait 2.92 / 1.80 / 0.90; the tail table (an16t, run 19360abb, mean / slowest workgroup):
+**R 45.1 / 45.7, F 6.4 / 6.9, S 17.0 / 18.9, O 2.5 / 9.5**. But the 24 cody-decode requests' step-width histogram —
+26 / 822 / 378 / 154 (1,380 steps) on an12, an13, an13s, identical, the generation deterministic — is
+25 / 600 / 241 / 295 (1,161 steps) on an16t and an16 alike: deterministic, different tokens. Both SCOREs were
+bit-identical (the analog runs only at decode widths; SCORE cannot see it). an16 came off the box (an13 restored,
+the histogram as the control); an17 held. **New gate for every build (rockem.lead): `bringup/box/decode_identical.sh`
+— the histogram must equal 26 / 822 / 378 / 154 / 1,380.**
+
+The audit of an13 → an16 (e0ccda3 against 0be775d; the diff is `gemv.rs`'s `exp4_rows_direct_rows` reductions,
+`gfx11.rs` additions, `analog.rs`, the Cargo features): every store in `an_chain` and `an_send` targets an analog or
+plan buffer — `an_scratch` (mix, dots, Gram, beta), the workgroup's LDS, `an_c`, `an_x` / `an_x0`, `an_smix`,
+`an_fg`, `an_part` / the peer's, `an_scores` / `pred_s2`, `an_k`, the barrier words, the peer's `an_fyv` — and the
+diff adds no store: the Gram's lands where it did (`SCR_GRAM`), the dots' guard is `t < NP · DOTS` as before, phase
+O's stores keep `i < n`. The new reads (phase O over every SPEC_TOKENS row of `an_normed`, `an_x0`, `x`, `fyv`) are
+in bounds — the buffers hold four rows (`x` holds STEP). So by the code the forward's path is untouched, and what
+the box sees has to come through the plan: a rounding-level change of the analog's margins (fma, DPP sum orders)
+flips near-tie picks, a different residency, and — if the join is not bit-identical across residencies after all —
+different bits. an12 → an13 was the same class of change (`v_rcp`, `v_rsq`) with the histogram unchanged, which fits
+either reading (near-tie flips are rare). The discriminator, staged: **`kernels-an13f`** (b5d15c78, from 7480af9 =
+build 13 + the fma contraction in phase B and nothing else; 192 VGPRs, no scratch, 27 barriers, kernarg 200). If
+an13f changes the histogram, the plan changes bits and the join / slot path is where to look, not the analog; if not,
+the ladder an14 (c48f22f5: + phase O's DPP sums, `v_rsq` on the router rows) → an15 (384efd20: + the Gram
+workgroups, phase A's DPP sums) → an16 bisects the rest in at most two boots.
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back
