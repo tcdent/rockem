@@ -110,7 +110,7 @@ pub mod gfx11 {
     use crate::kda::gfx11_consts::{E4_ROWS, PART_QKV};
     use common::gemv::gfx11::{exp4_rows_direct_rows, widen8_at, Exp4};
     use common::gemv::widen;
-    use common::gfx11::{await_word, lds, wave_sum, wave_sum_f32, workgroup_sync};
+    use common::gfx11::{await_word, lds, rcp, wave_sum, wave_sum_f32, workgroup_sync};
     use common::math::{exp, rsqrt, sqrt};
     use core::arch::amdgpu::{workgroup_id_x, workitem_id_x};
     use core::sync::atomic::{fence, AtomicU32, Ordering};
@@ -122,7 +122,6 @@ pub mod gfx11 {
     fn sigmoid(x: f32) -> f32 {
         1.0 / (1.0 + exp(-x))
     }
-    use common::gfx11::rcp;
 
     /// A grid barrier over `CHAIN_GRID` workgroups on its words: thread 0 counts in on its group's word; the group's
     /// last counts on the top word; the last group's publishes `value` in the done word, which every workgroup waits
@@ -148,27 +147,32 @@ pub mod gfx11 {
     }
 
     /// One token's hyper-connection mix from its coefficients (`hc::pre`'s arithmetic: the sigmoids, the softmax rows
-    /// and Sinkhorn), into `mix[MIX]` (pre | post | comb). Every lane computes the whole 4 × 4 in registers alike and
-    /// lanes under `MIX` write — no cross-lane operation: `hc_pre`'s wave form (a lane an entry, group sums and a
-    /// transpose through LDS a Sinkhorn iteration, ~6 permutes each over 20 iterations) was a latency chain of ~15 µs
-    /// on one wave for a few tokens (2026-10-27).
+    /// and Sinkhorn): every lane computes the whole 4 × 4 in registers alike and returns it (pre, post, comb) — the
+    /// caller keeps using the registers; lanes under `MIX` store a copy to `mix` for the later phases. No cross-lane
+    /// operation and no re-read: `hc_pre`'s wave form was a permute chain (~15 µs on one wave for a few tokens), and
+    /// reading the stored mix back through the scratch pointer was a memory round trip a value (the an9s ISA cut,
+    /// 2026-10-27). The row and column scalings through `v_rcp_f32`.
     #[inline(always)]
-    unsafe fn mix_token(c: impl Fn(usize) -> f32, base: *const f32, scale: *const f32, lane: u32, mix: *mut f32) {
+    unsafe fn mix_token(c: impl Fn(usize) -> f32, base: *const f32, scale: *const f32, lane: u32, mix: *mut f32) -> ([f32; HC], [f32; HC], [[f32; HC]; HC]) {
+        // the base and scale once, as one batch of loads (read where used, each was a drain inside the loops)
         let (s0, s1, s2) = (*scale, *scale.add(1), *scale.add(2));
-        let lu = lane as usize;
-        // pre and post: a lane an entry, straight out
-        if lu < HC {
-            *mix.add(lu) = sigmoid(c(lu) * s0 + *base.add(lu)) + HC_EPS;
-            *mix.add(HC + lu) = 2.0 * sigmoid(c(HC + lu) * s1 + *base.add(HC + lu));
+        let mut bs = [0f32; MIX];
+        let mut k = 0;
+        while k < MIX {
+            bs[k] = *base.add(k);
+            k += 1;
         }
-        // comb: the softmax rows in place
+        let mut pre = [0f32; HC];
+        let mut post = [0f32; HC];
         let mut cb = [[0f32; HC]; HC];
         let mut i = 0;
         while i < HC {
+            pre[i] = sigmoid(c(i) * s0 + bs[i]) + HC_EPS;
+            post[i] = 2.0 * sigmoid(c(HC + i) * s1 + bs[HC + i]);
             let mut mx = f32::NEG_INFINITY;
             let mut j = 0;
             while j < HC {
-                cb[i][j] = c(2 * HC + i * HC + j) * s2 + *base.add(2 * HC + i * HC + j);
+                cb[i][j] = c(2 * HC + i * HC + j) * s2 + bs[2 * HC + i * HC + j];
                 mx = if cb[i][j] > mx { cb[i][j] } else { mx };
                 j += 1;
             }
@@ -226,22 +230,30 @@ pub mod gfx11 {
             }
             it += 1;
         }
-        // comb a lane an entry: a constant-indexed select over the sixteen (an array indexed by the lane goes to scratch)
-        if lu < HC * HC {
-            let mut v = 0f32;
-            let mut i = 0;
-            while i < HC {
-                let mut j = 0;
-                while j < HC {
-                    if lu == i * HC + j {
-                        v = cb[i][j];
-                    }
-                    j += 1;
-                }
-                i += 1;
+        // a lane an entry of the stored copy: constant-indexed selects (an array indexed by the lane goes to scratch)
+        let lu = lane as usize;
+        let mut v = 0f32;
+        let mut i = 0;
+        while i < HC {
+            if lu == i {
+                v = pre[i];
             }
-            *mix.add(2 * HC + lu) = v;
+            if lu == HC + i {
+                v = post[i];
+            }
+            let mut j = 0;
+            while j < HC {
+                if lu == 2 * HC + i * HC + j {
+                    v = cb[i][j];
+                }
+                j += 1;
+            }
+            i += 1;
         }
+        if lu < MIX {
+            *mix.add(lu) = v;
+        }
+        (pre, post, cb)
     }
 
     /// The stood-in and no-attention streams are linear in five base vectors a token — layer l's four FFN-input streams
@@ -390,36 +402,46 @@ pub mod gfx11 {
 
     /// Phase B on one wave for token `i`: the attention half's coefficients from its dots and layer l's FFN mix
     /// (`alpha[j][a]`: how the stood-in stream j is made of the base vectors), its mix; the no-attention streams'
-    /// weights, the FFN half's coefficients, its mix; c and the collapses' weights. `lds`: `B_LDS` floats of this
-    /// wave's — the mix terms, the Gram and alpha'' are read or made once into it (read inside the loops from memory
-    /// they were a few hundred dependent loads a lane); the lane's own row's dots are twenty registers a half.
+    /// weights, the FFN half's coefficients, its mix; c and the collapses' weights. Every term is loaded once as a
+    /// batch into registers (alpha and the Gram on every lane alike, the lane's own row's dots a half); the mixes stay
+    /// in registers between the halves; the coefficients cross the lanes through `lds` (`B_LDS` floats of this
+    /// wave's). Memory round trips: three.
     #[inline(always)]
     unsafe fn phase_b(i: usize, mix_l: *const f32, a_base: *const f32, a_scale: *const f32, f_base: *const f32, f_scale: *const f32, c: *mut f32, scratch: *mut f32, lane: u32, lds: *mut f32) {
         let lu = lane as usize;
         let sc = scratch.add(i * PRE_SCRATCH);
         let ml = mix_l.add(i * MIX);
         let coefs = lds; // [HC_COEFS]
-        let gram = lds.add(48); // [BASE·BASE]
-        let alpha = lds.add(80); // [HC][BASE]
-        let alpha2 = lds.add(100); // [HC][BASE]
-        // alpha[j][a]: stood-in stream j = Σ_a alpha[j][a] · v_a — comb_kj over the streams, post_j over fyv; a lane an entry
-        if lu < HC * BASE {
-            let (j, a) = (lu / BASE, lu % BASE);
-            *alpha.add(lu) = if a < HC { *ml.add(2 * HC + a * HC + j) } else { *ml.add(HC + j) };
-        }
-        if lu < BASE * BASE {
-            let mut g = 0f32;
-            let mut ch = 0;
-            while ch < A_CHUNKS {
-                g += *sc.add(SCR_GRAM + ch * BASE * BASE + lu);
-                ch += 1;
-            }
-            *gram.add(lu) = g;
-        }
-        common::gfx11::wave_lds_sync();
         let row = if lu < HC_COEFS { lu } else { 0 };
+        // alpha[j][a]: stood-in stream j = Σ_a alpha[j][a] · v_a — comb_kj over the streams, post_j over fyv
+        let mut alpha = [[0f32; BASE]; HC];
+        let mut j = 0;
+        while j < HC {
+            let mut a = 0;
+            while a < HC {
+                alpha[j][a] = *ml.add(2 * HC + a * HC + j);
+                a += 1;
+            }
+            alpha[j][HC] = *ml.add(HC + j);
+            j += 1;
+        }
+        let mut gram = [[0f32; BASE]; BASE];
+        let mut a = 0;
+        while a < BASE {
+            let mut b = 0;
+            while b < BASE {
+                let mut g = 0f32;
+                let mut ch = 0;
+                while ch < A_CHUNKS {
+                    g += *sc.add(SCR_GRAM + ch * BASE * BASE + a * BASE + b);
+                    ch += 1;
+                }
+                gram[a][b] = g;
+                b += 1;
+            }
+            a += 1;
+        }
         // the lane's row's dots of a half, the chunks' partials: forty independent loads issued together, then summed
-        // (loaded where used, one at a time inside the loops, they were a chain of L2 round trips: B 26.6 µs on an9)
         let load_dots = |h: usize| -> [f32; DOTS] {
             let mut p = [[0f32; DOTS]; A_CHUNKS];
             let mut ch = 0;
@@ -443,78 +465,73 @@ pub mod gfx11 {
             }
             d
         };
-        let dots = load_dots(0);
-        // the stood-in streams' sum of squares from the Gram, then lane r's attention coefficient
-        let mut ss = 0f32;
-        let mut acc = 0f32;
-        let mut j = 0;
-        while j < HC {
-            let mut a = 0;
-            while a < BASE {
-                let al = *alpha.add(j * BASE + a);
-                acc += al * dots[j * BASE + a];
-                let mut b = 0;
-                while b < BASE {
-                    ss += al * *alpha.add(j * BASE + b) * *gram.add(a * BASE + b);
-                    b += 1;
-                }
-                a += 1;
-            }
-            j += 1;
-        }
-        if lu < HC_COEFS {
-            *coefs.add(lu) = acc * rsqrt(ss / (HC * H) as f32 + RMS_NORM_EPS);
-        }
-        common::gfx11::wave_lds_sync();
-        let mix_a = sc.add(SCR_MIX);
-        mix_token(|k| *coefs.add(k), a_base, a_scale, lane, mix_a);
-        common::gfx11::wave_lds_sync();
-        // the no-attention streams: s''_j = Σ_k comb_a[k][j] · s'_k, so alpha''[j][a] = Σ_k comb_a[k][j] · alpha[k][a]; a lane an entry
-        if lu < HC * BASE {
-            let (j, a) = (lu / BASE, lu % BASE);
-            let mut v = 0f32;
-            let mut k = 0;
-            while k < HC {
-                v += *mix_a.add(2 * HC + k * HC + j) * *alpha.add(k * BASE + a);
-                k += 1;
-            }
-            *alpha2.add(lu) = v;
-        }
-        common::gfx11::wave_lds_sync();
-        let dots = load_dots(1);
-        let mut ss = 0f32;
-        let mut acc = 0f32;
-        let mut j = 0;
-        while j < HC {
-            let mut a = 0;
-            while a < BASE {
-                let al = *alpha2.add(j * BASE + a);
-                acc += al * dots[j * BASE + a];
-                let mut b = 0;
-                while b < BASE {
-                    ss += al * *alpha2.add(j * BASE + b) * *gram.add(a * BASE + b);
-                    b += 1;
-                }
-                a += 1;
-            }
-            j += 1;
-        }
-        if lu < HC_COEFS {
-            *coefs.add(lu) = acc * rsqrt(ss / (HC * H) as f32 + RMS_NORM_EPS);
-        }
-        common::gfx11::wave_lds_sync();
-        let mix_f = sc.add(SCR_MIX + MIX);
-        mix_token(|k| *coefs.add(k), f_base, f_scale, lane, mix_f);
-        common::gfx11::wave_lds_sync();
-        // c = Σ_j pre_f[j] · post_a[j]; the collapses' weights over the base vectors: beta_a = Σ_j pre_a[j] alpha[j][a],
-        // beta0_a = Σ_j pre_f[j] alpha''[j][a]
-        if lu < BASE {
-            let (mut beta, mut beta0) = (0f32, 0f32);
+        // a half's coefficient on lane r: its row's dots against the streams' weights `al`, over the Gram's norm
+        let coef = |al: &[[f32; BASE]; HC], dots: &[f32; DOTS]| -> f32 {
+            let mut ss = 0f32;
+            let mut acc = 0f32;
             let mut j = 0;
             while j < HC {
-                beta += *mix_a.add(j) * *alpha.add(j * BASE + lu);
-                beta0 += *mix_f.add(j) * *alpha2.add(j * BASE + lu);
+                let mut a = 0;
+                while a < BASE {
+                    acc += al[j][a] * dots[j * BASE + a];
+                    let mut b = 0;
+                    while b < BASE {
+                        ss += al[j][a] * al[j][b] * gram[a][b];
+                        b += 1;
+                    }
+                    a += 1;
+                }
                 j += 1;
+            }
+            acc * rsqrt(ss / (HC * H) as f32 + RMS_NORM_EPS)
+        };
+        let dots = load_dots(0);
+        let ca = coef(&alpha, &dots);
+        if lu < HC_COEFS {
+            *coefs.add(lu) = ca;
+        }
+        common::gfx11::wave_lds_sync();
+        let (pre_a, post_a, comb_a) = mix_token(|k| *coefs.add(k), a_base, a_scale, lane, sc.add(SCR_MIX));
+        common::gfx11::wave_lds_sync();
+        // the no-attention streams: s''_j = Σ_k comb_a[k][j] · s'_k, so alpha''[j][a] = Σ_k comb_a[k][j] · alpha[k][a]
+        let mut alpha2 = [[0f32; BASE]; HC];
+        let mut j = 0;
+        while j < HC {
+            let mut a = 0;
+            while a < BASE {
+                let mut v = 0f32;
+                let mut k = 0;
+                while k < HC {
+                    v += comb_a[k][j] * alpha[k][a];
+                    k += 1;
+                }
+                alpha2[j][a] = v;
+                a += 1;
+            }
+            j += 1;
+        }
+        let dots = load_dots(1);
+        let cf = coef(&alpha2, &dots);
+        if lu < HC_COEFS {
+            *coefs.add(lu) = cf;
+        }
+        common::gfx11::wave_lds_sync();
+        let (pre_f, _post_f, _comb_f) = mix_token(|k| *coefs.add(k), f_base, f_scale, lane, sc.add(SCR_MIX + MIX));
+        // c = Σ_j pre_f[j] · post_a[j]; the collapses' weights over the base vectors: beta_a = Σ_j pre_a[j] alpha[j][a],
+        // beta0_a = Σ_j pre_f[j] alpha''[j][a] — a lane an entry, constant-indexed selects
+        if lu < BASE {
+            let (mut beta, mut beta0) = (0f32, 0f32);
+            let mut a = 0;
+            while a < BASE {
+                if lu == a {
+                    let mut j = 0;
+                    while j < HC {
+                        beta += pre_a[j] * alpha[j][a];
+                        beta0 += pre_f[j] * alpha2[j][a];
+                        j += 1;
+                    }
+                }
+                a += 1;
             }
             *sc.add(SCR_BETA + lu) = beta;
             *sc.add(SCR_BETA + BASE + lu) = beta0;
@@ -523,7 +540,7 @@ pub mod gfx11 {
             let mut cc = 0f32;
             let mut j = 0;
             while j < HC {
-                cc += *mix_f.add(j) * *mix_a.add(HC + j);
+                cc += pre_f[j] * post_a[j];
                 j += 1;
             }
             *c.add(i) = cc;
@@ -541,10 +558,11 @@ pub mod gfx11 {
     /// layer l's post-norm) into `s2` — what `pred_input` + `hc_route_ahead` made. `tab`: `TAB_LEN` device addresses.
     /// LDS CHAIN_LDS.
     #[no_mangle]
-    pub extern "gpu-kernel" fn an_chain(tab: *const u64, streams: *const f32, fyv: *const f32, a_fn: *const u16, f_fn: *const u16, sq: *const u8, fg_w: *const u8, crows: *const u16, router: *const u16, x: *mut f32, smix: *mut f32, fg: *mut f32, normed: *mut f32, mem: *const f32, head0: u32, value: u32, n: u32, layer: u32) {
+    pub extern "gpu-kernel" fn an_chain(tab: *const u64, streams: *const f32, fyv: *const f32, a_fn: *const u16, f_fn: *const u16, sq: *const u8, fg_w: *const u8, crows: *const u16, router: *const u16, x: *mut f32, smix: *mut f32, fg: *mut f32, normed: *mut f32, mem: *const f32, mix_l: *const f32, scratch: *mut f32, c: *mut f32, count: *mut u32, x0: *mut f32, a_base: *const f32, a_scale: *const f32, f_base: *const f32, f_scale: *const f32, head0: u32, value: u32, n: u32, layer: u32) {
         unsafe {
-            // the streamed operands are arguments (a kernel argument's loads are global; an address read from the
-            // table is generic — flat loads, which count on the scalar counter too, 2026-10-25); the rest in `tab`
+            // the streamed operands and phase B's are arguments (a kernel argument's loads are global; an address read
+            // from the table is generic — flat loads, which count on the scalar counter too, so every LDS wait drained
+            // them: the an9s ISA cut, 2026-10-27); the rest in `tab`
             const RR: usize = crate::hc::gfx11_consts::ROUTE_ROWS;
             let n = n as usize;
             let t = workitem_id_x() as usize;
@@ -552,8 +570,6 @@ pub mod gfx11 {
             let wg = workgroup_id_x() as usize;
             let l = lds::<f32>();
             let at = |k: usize| *tab.add(k) as usize;
-            let mix_l = at(TAB_MIX_L) as *const f32;
-            let (x0, c, scratch, count) = (at(TAB_X0) as *mut f32, at(TAB_C) as *mut f32, at(TAB_SCRATCH) as *mut f32, at(TAB_COUNT) as *mut u32);
             // the head table in LDS (its reads through a generic pointer were a round trip a wave a row group)
             let heads = l.add((CHAIN_LDS as usize - 4 * NSEL) / 4) as *mut u32;
             if t < NSEL {
@@ -599,7 +615,7 @@ pub mod gfx11 {
             common::stat!(1, ktb0.wrapping_sub(kta) & common::stats::CLOCK_MASK);
             // phase B: workgroup 0, a wave a token
             if wg == 0 && wave < n {
-                phase_b(wave, mix_l, at(TAB_A_BASE) as *const f32, at(TAB_A_SCALE) as *const f32, at(TAB_F_BASE) as *const f32, at(TAB_F_SCALE) as *const f32, c, scratch, lane, l.add(wave * B_LDS));
+                phase_b(wave, mix_l, a_base, a_scale, f_base, f_scale, c, scratch, lane, l.add(wave * B_LDS));
             }
             let ktb1 = common::stat_clock!();
             common::stat!(2, ktb1.wrapping_sub(ktb0) & common::stats::CLOCK_MASK);
