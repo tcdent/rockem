@@ -728,6 +728,14 @@ candidates, by the object: the staging prologue (a wave's four tokens quantized 
 `wave_max` and `wave_sum_i32` of five `ds_bpermute` round trips — forty a wave before its tile starts), the tile's
 LDS waits (61 full `lgkmcnt(0)` a wave, a step's activation words read then used), and the bytes' 11.5.
 
+**Build 19 (staged, not booted: `kernels-an19` 07d95eb3, `-an19s` 06254f4b, `-an19t` 9dd9c994; node as an18's;
+kernarg 200; 166 VGPRs, no scratch, 30 barriers).** The staging prologue's chains halved: the wave's (token, group)
+pairs quantized two tokens a lockstep (`quantize_groups::<8>`: two chains of a `wave_max` and a `wave_sum` instead
+of four — all four tokens at once, and a one-step lookahead on the activation words, each put the kernel past
+192 VGPRs into scratch and were dropped: the LDS-wait lever waits for the table). R region 4,823 instructions,
+9 drains, 58 full LDS waits, 80 `ds_bpermute` static (the two lockstep chains, 20 round trips a wave against 40).
+`kernel_diff` vs an18 and vs an13s: `an_chain` only.
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back

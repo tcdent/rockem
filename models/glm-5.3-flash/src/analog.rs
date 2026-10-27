@@ -719,35 +719,35 @@ pub mod gfx11 {
                     }
                     i += 1;
                 }
-                // the activations: a wave takes groups wave, wave + 8, wave + 16, wave + 24 of each token, in lockstep
-                let mut i = 0;
-                while i < SPEC_TOKENS {
-                    let mut v = [[0f32; 4]; NG / 8];
-                    let mut q = 0;
-                    while q < NG / 8 {
+                // the activations: a wave takes groups wave, wave + 8, wave + 16, wave + 24 of every token — all
+                // sixteen (token, group) pairs in one lockstep quantization (a token at a time was four chains of a
+                // `wave_max` and a `wave_sum` each, forty permute round trips a wave before its tile; 2026-10-27)
+                // (two tokens a lockstep: all four at once spilled at the register bound)
+                const TPL: usize = 2;
+                const NQ: usize = TPL * (NG / 8);
+                let mut i0t = 0;
+                while i0t < SPEC_TOKENS {
+                    let v: [[f32; 4]; NQ] = core::array::from_fn(|p| {
+                        let (i, q) = (i0t + p / (NG / 8), p % (NG / 8));
                         let c0 = (wave + 8 * q) * GROUP + lane as usize * 4;
                         let xv: [f32; 4] = core::ptr::read(xr.add(i * H + c0) as *const [f32; 4]);
                         let lv: [u16; 4] = core::ptr::read(ln.add(c0) as *const [u16; 4]);
-                        let mut k = 0;
-                        while k < 4 {
-                            v[q][k] = xv[k] * f32::from_bits((lv[k] as u32) << 16);
-                            k += 1;
-                        }
-                        q += 1;
-                    }
-                    let (packed, scale, sum) = quantize_groups::<{ NG / 8 }>(lane, v);
-                    let tok = act.add(i * ACT_BYTES);
-                    let mut q = 0;
-                    while q < NG / 8 {
+                        core::array::from_fn(|k| xv[k] * f32::from_bits((lv[k] as u32) << 16))
+                    });
+                    let (packed, scale, sum) = quantize_groups::<NQ>(lane, v);
+                    let mut pq = 0;
+                    while pq < NQ {
+                        let (i, q) = (i0t + pq / (NG / 8), pq % (NG / 8));
+                        let tok = act.add(i * ACT_BYTES);
                         let g = wave + 8 * q;
-                        *(tok.add(g * GROUP + lane as usize * 4) as *mut u32) = packed[q];
+                        *(tok.add(g * GROUP + lane as usize * 4) as *mut u32) = packed[pq];
                         if lane == 0 {
-                            *(tok.add(H) as *mut f32).add(g) = scale[q];
-                            *(tok.add(H + 4 * NG) as *mut i32).add(g) = sum[q];
+                            *(tok.add(H) as *mut f32).add(g) = scale[pq];
+                            *(tok.add(H + 4 * NG) as *mut i32).add(g) = sum[pq];
                         }
-                        q += 1;
+                        pq += 1;
                     }
-                    i += 1;
+                    i0t += TPL;
                 }
                 workgroup_sync();
                 let mut rr = [0f32; SPEC_TOKENS];
@@ -778,19 +778,24 @@ pub mod gfx11 {
                     let wsv: [f32; NSTEP] = core::array::from_fn(|st| *ws.add((2 * st + gpar) * TILE + r));
                     // the steps written out (a loop over them left the batches a stack object in scratch)
                     let mut y = [0f32; SPEC_TOKENS];
-                    macro_rules! step {
-                        ($st:expr) => {{
-                            let g = 2 * $st + gpar;
-                            // every token's activation words of the step read first, one wait for all (a read a dot
-                            // was an LDS wait a token a step)
-                            let qa: [[(u64, u64); 2]; SPEC_TOKENS] = core::array::from_fn(|i| {
+                    // a step's activation words of every token and the groups' scale and Σq read first, one wait for
+                    // all (reading them a step ahead of their dots held two steps' worth live and spilled, 2026-10-27)
+                    let read = |st: usize| -> ([[(u64, u64); 2]; SPEC_TOKENS], [(f32, f32); SPEC_TOKENS]) {
+                        let g = 2 * st + gpar;
+                        (
+                            core::array::from_fn(|i| {
                                 let qg = (act.add(i * ACT_BYTES) as *const i8).add(g * GROUP);
                                 [word_act(qg, i0), word_act(qg, i0 + 1)]
-                            });
-                            let gss: [(f32, f32); SPEC_TOKENS] = core::array::from_fn(|i| {
+                            }),
+                            core::array::from_fn(|i| {
                                 let tok = act.add(i * ACT_BYTES);
                                 (*(tok.add(H + 4 * NG) as *const i32).add(g) as f32, *(tok.add(H) as *const f32).add(g))
-                            });
+                            }),
+                        )
+                    };
+                    macro_rules! step {
+                        ($st:expr) => {{
+                            let (qa, gss) = read($st);
                             let mut i = 0;
                             while i < SPEC_TOKENS {
                                 let part = word_dot_act(w[$st].0, qa[i][0].0, qa[i][0].1) + word_dot_act(w[$st].1, qa[i][1].0, qa[i][1].1);
