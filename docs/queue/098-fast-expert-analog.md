@@ -666,6 +666,19 @@ the fix, the plain / stats / tail objects differ from an13 / an13s in `an_chain`
 200; `an_chain` 12,349 instructions — the same count as the held an17: the analog's own code is unchanged, only the
 production kernels were). an16b was not needed; an16's phase O changes are `an_chain`-only and ride in an17.
 
+**an17's boot (rockem.lead, 2026-10-27; run efd9a8cd) — VALID and SERVING, the new mark.** an_chain **120.4 /
+121.6** (an13 129.0 / 133.3; an16 121.8 / 125.5), p90 206 / 210, slow 0.1 / 0.3 %; slot wait 3.27 / 1.62 / 0.97 ms
+at widths 2–4 (an13 3.40 / 1.72 / 1.00; production 1.3 / 0.87 / 0.8); step 46.95 / 59.55 / 68.24; coverage .767
+(29 requests); SCORE bit-identical; decode-identical in the post-SCORE steady state. R's one round bought ~1.5 / 4
+against an16, not the 10–15 its wave depth said: the pass is not one wave's serial batches alone — an17t's R
+against an16t's 45.1 / 45.7 is the number to read before the next R cut (an18t stamps R without its barrier).
+A finding for the model of the slot (rockem.lead): on every build the request sequence is cold → own path, hit 1 →
+own, hits before SCORE → a 45-step path, the first hit after SCORE → own, later hits → the reference's 54 — SCORE
+changes a later decode's bits (the open cold-vs-hit near-tie, now localized to a state SCORE perturbs: the draft's
+prompt cache / KDA mirror restore / pools — not residency, not the plan); the decode sits at a near-tie any ulp
+flips, so the gate samples post-SCORE (deploy.sh). Remaining to "fits" at width 2: chain ≤ ~115 and the slot wait
+toward 1.3; the section ~27 and R ~45 of the 120.
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back
