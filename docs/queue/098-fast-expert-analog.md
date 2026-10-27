@@ -599,6 +599,13 @@ loop's two rounds cost fewer), so the loop stays. The step (S) is `step_head`'s 
 workgroup syncs, two `wave_sum`s and three division sequences a token — shared with `kda_step`; a DPP/`v_rsq` form for
 the read-only instantiation would be a fork inside shared code, flagged, not built.
 
+**an13's boot (rockem.lead, 2026-10-27; an13s run fd213e01, an13 run 4a6ba8f4, serving — the new mark).** an13s:
+B **10.6** (an12s 11.4: the fifteen LDS waits and five drains were 0.8 µs), A 5.6 / 12.1, the first barrier
+10.9 / 21.2, the rest 14.8. an13 served: an_chain **129.0 / 133.3** (an12 130.8 / 134.7), p90 209 / 213, slow
+0.2 / 0.6 %; slot wait 3.40 / 1.72 / 1.00 ms at widths 2–4 (an12 3.47 / 1.82 / 1.08; production 1.3 / 0.87 / 0.8);
+step 46.9 / 59.8 / 68.4; coverage .773; both SCOREs bit-identical; hardware clean. So B is done at ~11 (the
+Sinkhorns' dependent chain), and the section's remaining 12 is A's slowest workgroup (build 15's Gram fix, in an16).
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back
