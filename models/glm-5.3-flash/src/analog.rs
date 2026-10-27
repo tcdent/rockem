@@ -63,8 +63,14 @@ pub const SEL_FG_ROWS: usize = 2 * NSEL * KDA_DIM;
 pub const R_TILES: usize = SEL_ROWS / common::q4::TILE;
 /// A token's staged activation in LDS: `H` bytes of i8, then a scale and a Σq a group.
 pub const ACT_BYTES: usize = H + 8 * (H / common::q4::GROUP);
-/// Phase R's LDS: the `SPEC_TOKENS` activations, then the norms' wave partials `[SPEC_TOKENS][8]`.
-pub const R_LDS: usize = SPEC_TOKENS * ACT_BYTES + SPEC_TOKENS * 8 * 4;
+/// Phase R's LDS: the `SPEC_TOKENS` staged activations, copied from `TAB_ACT`.
+pub const R_LDS: usize = SPEC_TOKENS * ACT_BYTES;
+/// `TAB_ACT`, VRAM: the activations quantized once by phase C's workgroups (`[SPEC_TOKENS][ACT_BYTES]`), then the
+/// norms' partial sums of squares `[SPEC_TOKENS][ACT_SS]` (a value a wave of phase C's `H / 2048` workgroups).
+/// Every one of phase R's 168 workgroups quantizing the four tokens itself was ~20.8 µs on the critical path
+/// before its first dot — the pass's larger half once the bytes were cut (an18t, 2026-10-27).
+pub const ACT_SS: usize = (H / 2048) * 8;
+pub const ACT_TOTAL: usize = SPEC_TOKENS * ACT_BYTES + SPEC_TOKENS * ACT_SS * 4;
 const _: () = assert!(SEL_ROWS % common::q4::TILE == 0 && R_TILES <= CHAIN_GRID as usize * CHAIN_WAVES && H % 256 == 0 && SEL_FG_ROWS <= crate::kda::gfx11_consts::E4_ROWS * CHAIN_GRID as usize * CHAIN_WAVES);
 /// The output phase: a composed row a wave, eight a workgroup; the leader's workgroups past them take the router's
 /// rows over the no-attention input, then over the second margin's input.
@@ -113,7 +119,8 @@ pub const TAB_XL: usize = 37;
 pub const TAB_LN_L: usize = 38;
 pub const TAB_QROWS: usize = 39;
 pub const TAB_QSCALES: usize = 40;
-pub const TAB_LEN: usize = 41;
+pub const TAB_ACT: usize = 41;
+pub const TAB_LEN: usize = 42;
 const _: () = assert!(E % 8 == 0 && SEL_W % 256 == 0 && H % 256 == 0 && HC == 4 && (HC * H) % 256 == 0 && CHAIN_GRID as usize >= OUT_WGS * 3 && CHAIN_GRID as usize >= 2 * HC_COEFS);
 
 #[cfg(target_arch = "amdgpu")]
@@ -675,6 +682,57 @@ pub mod gfx11 {
                     }
                     core::ptr::write(x.add(i * H + d8) as *mut [f32; 8], xa);
                     core::ptr::write(x0.add(i * H + d8) as *mut [f32; 8], x0a);
+                    // phase R's activation of this token: x · ln as a8 per group of 128 — a lane's eight channels,
+                    // a row of 16 lanes a group, so the group's absmax and Σq are DPP row reductions (`QAct`'s
+                    // rule: absmax / 127, round half away, clamped); the norm's Σx² a wave into `ACT_SS`
+                    {
+                        use common::q4::GROUP;
+                        let ln = at(TAB_INPUT_LN) as *const u16;
+                        let act = at(TAB_ACT) as *mut u8;
+                        let lv: [u16; 8] = core::ptr::read(ln.add(d8) as *const [u16; 8]);
+                        let mut v = [0f32; 8];
+                        let (mut amax, mut ss) = (0f32, 0f32);
+                        let mut k = 0;
+                        while k < 8 {
+                            v[k] = xa[k] * f32::from_bits((lv[k] as u32) << 16);
+                            let a = if v[k] < 0.0 { -v[k] } else { v[k] };
+                            if a > amax {
+                                amax = a;
+                            }
+                            ss = fma(xa[k], xa[k], ss);
+                            k += 1;
+                        }
+                        let amax = common::gfx11::row_max16(amax);
+                        let sc = amax / 127.0;
+                        let inv = if sc > 0.0 { 1.0 / sc } else { 0.0 };
+                        let (mut p0, mut p1, mut sum) = (0u32, 0u32, 0i32);
+                        let mut k = 0;
+                        while k < 8 {
+                            let r = common::math::round(v[k] * inv);
+                            let r = if r > 127.0 { 127.0 } else if r < -127.0 { -127.0 } else { r };
+                            let q = r as i8;
+                            if k < 4 {
+                                p0 |= ((q as u8) as u32) << (8 * k);
+                            } else {
+                                p1 |= ((q as u8) as u32) << (8 * (k - 4));
+                            }
+                            sum += q as i32;
+                            k += 1;
+                        }
+                        let sum = common::gfx11::row_sum16(sum as f32) as i32;
+                        let tok = act.add(i * ACT_BYTES);
+                        *(tok.add(d8) as *mut u32) = p0;
+                        *(tok.add(d8 + 4) as *mut u32) = p1;
+                        if lane % 16 == 0 {
+                            let g = d8 / GROUP;
+                            *(tok.add(H) as *mut f32).add(g) = sc;
+                            *(tok.add(H + 4 * (H / GROUP)) as *mut i32).add(g) = sum;
+                        }
+                        let ss = wave_sum_dpp(ss);
+                        if lane == 0 {
+                            *(act.add(SPEC_TOKENS * ACT_BYTES) as *mut f32).add(i * ACT_SS + wg * 8 + wave) = ss;
+                        }
+                    }
                     i += 1;
                 }
             }
@@ -685,83 +743,33 @@ pub mod gfx11 {
             }
             // phase R: the small rows and the chosen heads' q, k, v rows over `x` normed with the input norm, into
             // `smix` at the rows' own places (the step reads it as `kda_step` reads `sq`'s output). The rows in q4g128
-            // (`R_TILES` tiles of four, a wave each), the activations a8 per group in LDS — every workgroup stages its
-            // own copy: token i's x · ln quantized as the experts' activations are (`q4::gfx11::quantize_groups`), its
-            // norm's sum of squares beside it. A wave's tile: all sixteen 512-byte steps loaded at once (a lane's
-            // 16 bytes of each), then per step and token the lane's two word dots against the group in LDS, the
-            // quad's sum and the row's two group parities by DPP — no LDS reduction, no permute.
+            // (`R_TILES` tiles of four, a wave each); the activations a8 per group, quantized once by phase C's
+            // workgroups into `TAB_ACT` and copied into every workgroup's LDS here (each quantizing the four tokens
+            // itself was ~20.8 µs before its first dot, an18t). A wave's tile: all sixteen 512-byte steps loaded at
+            // once (a lane's 16 bytes of each), then per step and token the lane's two word dots against the group in
+            // LDS, the quad's sum and the row's two group parities by DPP — no LDS reduction, no permute.
             {
-                use common::q4::gfx11::{quantize_groups, word_act, word_dot_act};
+                use common::q4::gfx11::{word_act, word_dot_act};
                 use common::q4::{GROUP, TILE, WBIAS};
                 const NG: usize = H / GROUP;
                 const NSTEP: usize = H / 256;
+                const CHUNKS: usize = SPEC_TOKENS * ACT_BYTES / 16;
                 let act = l as *mut u8;
-                let red = l.add(SPEC_TOKENS * ACT_BYTES / 4);
-                let ln = at(TAB_INPUT_LN) as *const u16;
-                let xr = x as *const f32;
-                // the norms: thread t takes sixteen channels of each token
-                let mut i = 0;
-                while i < SPEC_TOKENS {
-                    let mut ss = 0f32;
-                    let mut j = 0;
-                    while j < 2 {
-                        let v: [f32; 8] = core::ptr::read(xr.add(i * H + (t * 2 + j) * 8) as *const [f32; 8]);
-                        let mut k = 0;
-                        while k < 8 {
-                            ss = fma(v[k], v[k], ss);
-                            k += 1;
-                        }
-                        j += 1;
-                    }
-                    let ss = wave_sum_dpp(ss);
-                    if lane == 0 {
-                        *red.add(i * 8 + wave) = ss;
-                    }
-                    i += 1;
+                let src = at(TAB_ACT) as *const u8;
+                let mut c = t;
+                while c < CHUNKS {
+                    *(act.add(c * 16) as *mut [u32; 4]) = core::ptr::read((src.add(c * 16)) as *const [u32; 4]);
+                    c += 256;
                 }
-                // the activations: a wave takes groups wave, wave + 8, wave + 16, wave + 24 of every token — all
-                // sixteen (token, group) pairs in one lockstep quantization (a token at a time was four chains of a
-                // `wave_max` and a `wave_sum` each, forty permute round trips a wave before its tile; 2026-10-27)
-                // (two tokens a lockstep: all four at once spilled at the register bound)
-                const TPL: usize = 2;
-                const NQ: usize = TPL * (NG / 8);
-                let mut i0t = 0;
-                while i0t < SPEC_TOKENS {
-                    let v: [[f32; 4]; NQ] = core::array::from_fn(|p| {
-                        let (i, q) = (i0t + p / (NG / 8), p % (NG / 8));
-                        let c0 = (wave + 8 * q) * GROUP + lane as usize * 4;
-                        let xv: [f32; 4] = core::ptr::read(xr.add(i * H + c0) as *const [f32; 4]);
-                        let lv: [u16; 4] = core::ptr::read(ln.add(c0) as *const [u16; 4]);
-                        core::array::from_fn(|k| xv[k] * f32::from_bits((lv[k] as u32) << 16))
-                    });
-                    let (packed, scale, sum) = quantize_groups::<NQ>(lane, v);
-                    let mut pq = 0;
-                    while pq < NQ {
-                        let (i, q) = (i0t + pq / (NG / 8), pq % (NG / 8));
-                        let tok = act.add(i * ACT_BYTES);
-                        let g = wave + 8 * q;
-                        *(tok.add(g * GROUP + lane as usize * 4) as *mut u32) = packed[pq];
-                        if lane == 0 {
-                            *(tok.add(H) as *mut f32).add(g) = scale[pq];
-                            *(tok.add(H + 4 * NG) as *mut i32).add(g) = sum[pq];
-                        }
-                        pq += 1;
-                    }
-                    i0t += TPL;
-                }
+                // the norms: the sixteen partials of a token one a lane of each row, summed across the row (every
+                // lane loading all sixteen held sixty-four loads live and spilled)
+                const { assert!(ACT_SS == 16) };
+                let ps = (src.add(SPEC_TOKENS * ACT_BYTES) as *const f32).add(lane as usize % 16);
+                let rr: [f32; SPEC_TOKENS] = core::array::from_fn(|i| {
+                    let ss = common::gfx11::row_sum16(*ps.add(i * ACT_SS));
+                    common::gfx11::rsq(ss * (1.0 / H as f32) + RMS_NORM_EPS)
+                });
                 workgroup_sync();
-                let mut rr = [0f32; SPEC_TOKENS];
-                let mut i = 0;
-                while i < SPEC_TOKENS {
-                    let mut ss = 0f32;
-                    let mut w = 0;
-                    while w < 8 {
-                        ss += *red.add(i * 8 + w);
-                        w += 1;
-                    }
-                    rr[i] = common::gfx11::rsq(ss * (1.0 / H as f32) + RMS_NORM_EPS);
-                    i += 1;
-                }
                 let tile = wg * CHAIN_WAVES + wave;
                 if tile < R_TILES {
                     let lu = lane as usize;

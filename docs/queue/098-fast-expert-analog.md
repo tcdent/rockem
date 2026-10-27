@@ -740,6 +740,27 @@ the negative offset after the quantizer), so an18's 40 static `ds_bpermute` are 
 chains and an19's 80 are 160 in two — a loop body's static count is multiplied by its trips before it is priced;
 the B rule (12.6 µs + 3.9 ns an instruction) was for straight-line bodies.
 
+**an18t on the q4 pass (rockem.lead, 2026-10-27; run 19818516): R mean 29.9 / slowest 36.2 (the an17 instrument
+30.7 / 42.8), b3 + F + b4 14.3 / 26 (was 21.4 / 49), S 17.0 / 18.8, O 2.5 / 9.2; the per-workgroup rows name it:
+the no-tile band (wg 142–167) reads 20.8 / 21.0 where it read ~1.0 on an17, the working bands flat at
+35.5 / 35.8.** So R = **the staging prologue ~20.8 that every workgroup pays before its first dot** (the 160 dynamic
+permutes of the quantizer, four tokens one after another) + ~15 of tile work (the bytes' 11.5 and the waits). The
+bytes cut did its job on the tile; the prologue was hidden under the old pass's 31 and is now the pass. 168
+workgroups quantizing the same four tokens is 168× the same work on the critical path.
+
+**Build 20 (staged: `kernels-an20` 4fb4fa7d, `-an20s` e8314275, `-an20t` f6698159; THE NODE REBUILT — `TAB_LEN`
+42, `an_act`; kernarg 200; 155 VGPRs, no scratch, 30 barriers).** The activations quantized once, by phase C: its
+threads hold x eight consecutive channels a lane, so a row of 16 lanes is exactly one group of 128 — the group's
+absmax is a DPP row max (`gfx11::row_max16`), its Σq a row sum; `QAct`'s rule (absmax / 127, round half away,
+clamped) lane by lane, the bytes to `TAB_ACT` in VRAM (`[SPEC_TOKENS][ACT_BYTES]`, then the norms' partial sums of
+squares `[SPEC_TOKENS][16]`, a value a wave). Phase R's prologue is a copy: each workgroup's 256 threads bring the
+17.4 KB into LDS in 16-byte chunks, the norm's sixteen partials one a lane summed across the row, one sync. The
+object: C 721 instructions (12 `row_xmask`, 8 `v_div` — the `1 / scale` a token, `QAct`'s own), R 3,102 with
+**0 `ds_bpermute`** (an19 80 static / 160 dynamic), 8 drains, 55 LDS waits, 512 `v_dot4`. By an18t's table: the
+prologue ~20.8 → the copy (~1–2), R ~30 → ~15–17, the chain ~111 → ~96 (an19's half-step ~100). `kernel_diff` vs
+an18 and vs an13s: `an_chain` only. (The norms' partials every lane loading all sixteen held 64 loads live and
+spilled 8 bytes — one a lane with a row sum instead.)
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back

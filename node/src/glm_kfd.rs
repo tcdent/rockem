@@ -222,6 +222,8 @@ struct Card {
     an_smix: Mem,
     an_fg: Mem,
     an_normed: Mem,
+    /// The analog's a8 activations and norm partials, quantized once by the chain's phase C (`an::TAB_ACT`).
+    an_act: Mem,
     an_part: Mem,
     an_scores: Mem,
     an_ocount: Mem,
@@ -724,6 +726,11 @@ impl Cards {
                     an_smix: k.vram(SPEC_TOKENS * (SMALL_ROWS + 3 * g::PART_QKV) * 4),
                     an_fg: k.vram(SPEC_TOKENS * 2 * g::PART_QKV * 4),
                     an_normed: k.vram(SPEC_TOKENS * g::PART_QKV * 4),
+                    an_act: {
+                        let m = k.vram_visible(an::ACT_TOTAL);
+                        k.upload(&m, 0, &vec![0u8; an::ACT_TOTAL]);
+                        m
+                    },
                     an_part: k.vram(SPEC_TOKENS * glm_5_3_flash::E * 4),
                     an_scores: k.vram(SPEC_TOKENS * ROUTE_ROWS * 4),
                     an_ocount: {
@@ -1199,6 +1206,7 @@ impl Cards {
                 t[an::TAB_LN_L] = f.ln.va as u64;
                 t[an::TAB_QROWS] = ap.qrows.va as u64;
                 t[an::TAB_QSCALES] = ap.qscales.va as u64;
+                t[an::TAB_ACT] = c.an_act.va as u64;
                 c.k.upload(&ap.tab, 0, raw(&t));
             }
         }
