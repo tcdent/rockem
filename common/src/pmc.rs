@@ -17,6 +17,24 @@ pub const fn evsel(event: u16, umask: u8) -> u64 {
 pub const FILLS: [u64; 6] = [evsel(0x43, 0x02), evsel(0x43, 0x08), evsel(0x43, 0x50), evsel(0x70, 0xff), evsel(0x71, 0xff), evsel(0x72, 0xff)];
 pub const FILL_NAMES: [&str; 6] = ["dfill_l3", "dfill_dram", "dfill_far", "pf_hit_l2", "pf_hit_l3", "pf_miss_l3"];
 
+/// The L2 fill path's latency and occupancy (docs/l3-literature.md §7.1; Linux's amdzen3 table, not the Milan PPR):
+/// `l2_latency` sums fill cycles ÷ 4 (0x62/0x01), `fills_pending` counts fill-pending cycles (0x6D/0x01), demand L2
+/// misses (0x64/0x08), L2-prefetch hits in L3 and misses with the documented L2-prefetcher umask (0x71, 0x72 / 0x1F),
+/// L2-prefetch hits in L2 (0x70/0x1F). Latency a fill = 4 · l2_latency / (demand misses + pf hits in L3 + pf misses).
+pub const FILLS2: [u64; 6] = [evsel(0x62, 0x01), evsel(0x6D, 0x01), evsel(0x64, 0x08), evsel(0x71, 0x1f), evsel(0x72, 0x1f), evsel(0x70, 0x1f)];
+pub const FILL2_NAMES: [&str; 6] = ["l2_lat_q", "fills_pend", "dmiss_l2", "pf_hit_l3", "pf_miss_l3", "pf_hit_l2"];
+
+/// Prefetch Control, MSR C000_0108 (one instance a physical core; 1 disables): bit 0 L1 stream, 1 L1 stride, 2 L1
+/// region, 3 L2 stream, 5 up/down (docs/l3-literature.md §7.3; PPR Milan). Returns the previous value.
+pub fn prefetch_control(cpu: usize, bits: u64) -> Option<u64> {
+    let f = std::fs::OpenOptions::new().read(true).write(true).open(std::format!("/dev/cpu/{cpu}/msr")).ok()?;
+    let mut b = [0u8; 8];
+    f.read_exact_at(&mut b, 0xC000_0108).ok()?;
+    let old = u64::from_le_bytes(b);
+    f.write_at(&bits.to_le_bytes(), 0xC000_0108).ok()?;
+    Some(old)
+}
+
 /// One core's counters.
 pub struct Pmc(std::fs::File);
 
