@@ -146,56 +146,70 @@ pub mod gfx11 {
         fence(Ordering::Acquire);
     }
 
-    /// `v_mov_b32_dpp row_xmask:M`: the value lane `l ^ M` holds within its row of 16 — a butterfly step with no LDS
-    /// and no wait (a `ds_bpermute` is a round trip through LDS; `hc_pre`'s wave mix paid ~6 of them an iteration).
-    #[inline(always)]
-    unsafe fn xmask<const CTRL: u32>(v: f32) -> f32 {
-        f32::from_bits(core::arch::amdgpu::update_dpp::<CTRL, 0xF, 0xF, true>(0, v.to_bits()))
-    }
-    const XM1: u32 = 0x161;
-    const XM2: u32 = 0x162;
-    const XM4: u32 = 0x164;
-    const XM8: u32 = 0x168;
+    use common::gfx11::{dpp_xmask, other_row, wave_sum_dpp, XMASK1, XMASK2, XMASK4, XMASK8};
     /// The sum over a lane's quad (lanes `4q..4q + 4`): the Sinkhorn matrix's row, an entry a lane.
     #[inline(always)]
     unsafe fn quad_sum(v: f32) -> f32 {
-        let v = v + xmask::<XM1>(v);
-        v + xmask::<XM2>(v)
+        let v = v + dpp_xmask::<XMASK1>(v);
+        v + dpp_xmask::<XMASK2>(v)
     }
     #[inline(always)]
     unsafe fn quad_max(v: f32) -> f32 {
-        let o = xmask::<XM1>(v);
+        let o = dpp_xmask::<XMASK1>(v);
         let v = if o > v { o } else { v };
-        let o = xmask::<XM2>(v);
+        let o = dpp_xmask::<XMASK2>(v);
         if o > v { o } else { v }
     }
     /// The sum over lanes `{l, l ^ 4, l ^ 8, l ^ 12}`: the matrix's column.
     #[inline(always)]
     unsafe fn col_sum(v: f32) -> f32 {
-        let v = v + xmask::<XM4>(v);
-        v + xmask::<XM8>(v)
+        let v = v + dpp_xmask::<XMASK4>(v);
+        v + dpp_xmask::<XMASK8>(v)
+    }
+
+    /// A mix's inputs for this lane, loaded with phase B's first batch (inside `mix_token` the compiler sank them into
+    /// the branch arms that used them: a round trip each, four of B's seven drains in build 12): the lane's base
+    /// (coefficient `lane` for the pre/post lanes), its comb base, the three scales.
+    #[derive(Clone, Copy)]
+    struct MixIn {
+        b: f32,
+        b8: f32,
+        s0: f32,
+        s1: f32,
+        s2: f32,
+    }
+    #[inline(always)]
+    unsafe fn mix_in(base: *const f32, scale: *const f32, lu: usize) -> MixIn {
+        MixIn {
+            b: *base.add(if lu < 2 * HC { lu } else { 0 }),
+            b8: *base.add(2 * HC + if lu < HC * HC { lu } else { 0 }),
+            s0: *scale,
+            s1: *scale.add(1),
+            s2: *scale.add(2),
+        }
+    }
+    #[inline(always)]
+    unsafe fn sigmoid_rcp(x: f32) -> f32 {
+        rcp(1.0 + exp(-x))
     }
 
     /// One token's hyper-connection mix from its coefficients (`hc::pre`'s arithmetic: the sigmoids, the softmax rows
-    /// and Sinkhorn), an entry a lane: lanes 0–3 pre, 4–7 post (from `coef`, lane r's coefficient r, read across
-    /// the lanes), lanes 0–15 the comb matrix (entry `(lane / 4, lane % 4)`), its row and column sums as DPP
+    /// and Sinkhorn), an entry a lane: lanes 0–15 the comb matrix (entry `(lane / 4, lane % 4)`, its coefficient
+    /// computed on this very lane — `phase_b`'s lane 0–15 owns row `8 + lane`), lanes 0–3 pre and 4–7 post (their
+    /// coefficients rows 0–7, owned by lanes 16–23: one `v_permlanex16` brings them over). Row and column sums as DPP
     /// butterflies within the wave's first row — no LDS, no permute, and the critical wave issues ~12 instructions a
     /// Sinkhorn iteration instead of the ~60 of the form every lane computed alike (31 µs on one wave at ~9 cycles an
-    /// instruction, 2026-10-27). Returns this lane's entries: (pre or post, comb); lanes under `MIX` store a copy.
+    /// instruction, 2026-10-27). Both of pre/post computed and selected (a branch arm is where the compiler sinks
+    /// loads). Returns this lane's entries: (pre or post, comb); lanes under `MIX` store a copy.
     #[inline(always)]
-    unsafe fn mix_token(coef: f32, base: *const f32, scale: *const f32, lane: u32, mix: *mut f32) -> (f32, f32) {
-        use common::gfx11::lane_read;
-        let lu = lane as usize;
-        let (s0, s1, s2) = (*scale, *scale.add(1), *scale.add(2));
-        let b = *base.add(if lu < MIX { lu } else { 0 });
-        let b8 = *base.add(2 * HC + if lu < HC * HC { lu } else { 0 });
-        // lane l < 8: coefficient l (pre for l < 4, post for 4 ≤ l < 8); lane l < 16: coefficient 8 + l (comb)
-        let c_pp = lane_read(if lu < 2 * HC { lane } else { 0 }, coef);
-        let c_cb = lane_read(if lu < HC * HC { 2 * HC as u32 + lane } else { 0 }, coef);
-        let pp = if lu < HC { sigmoid(c_pp * s0 + b) + HC_EPS } else { 2.0 * sigmoid(c_pp * s1 + b) };
+    unsafe fn mix_token(coef: f32, m: MixIn, lu: usize, mix: *mut f32) -> (f32, f32) {
+        let c_pp = other_row(coef);
+        let pre = sigmoid_rcp(c_pp * m.s0 + m.b) + HC_EPS;
+        let post = 2.0 * sigmoid_rcp(c_pp * m.s1 + m.b);
+        let pp = if lu < HC { pre } else { post };
         // the softmax of the row, then Sinkhorn: the columns first, then rows and columns `HC_SINKHORN_ITERS - 1`
         // times (`hc::pre`'s order)
-        let e = c_cb * s2 + b8;
+        let e = coef * m.s2 + m.b8;
         let e = exp(e - quad_max(e));
         let mut cb = e * rcp(quad_sum(e)) + HC_EPS;
         let mut it = 0;
@@ -371,7 +385,10 @@ pub mod gfx11 {
         let lu = lane as usize;
         let sc = scratch.add(i * PRE_SCRATCH);
         let ml = mix_l.add(i * MIX);
-        let row = if lu < HC_COEFS { lu } else { 0 };
+        // lane l < 16 owns coefficient row 8 + l (the comb entry it will hold), lanes 16–23 rows 0–7 (pre, post)
+        let row = if lu < HC * HC { 2 * HC + lu } else if lu < HC_COEFS { lu - HC * HC } else { 0 };
+        let a_in = mix_in(a_base, a_scale, lu);
+        let f_in = mix_in(f_base, f_scale, lu);
         // alpha[j][a]: stood-in stream j = Σ_a alpha[j][a] · v_a — comb_kj over the streams, post_j over fyv
         let mut alpha = [[0f32; BASE]; HC];
         let mut j = 0;
@@ -437,7 +454,7 @@ pub mod gfx11 {
                 term += pick(&al[j], ga) * pick(&al[j], gb);
                 j += 1;
             }
-            let ss = wave_sum(lane, if lu < BASE * BASE { term * g } else { 0.0 });
+            let ss = wave_sum_dpp(if lu < BASE * BASE { term * g } else { 0.0 });
             let mut acc = 0f32;
             let mut j = 0;
             while j < HC {
@@ -448,11 +465,11 @@ pub mod gfx11 {
                 }
                 j += 1;
             }
-            acc * rsqrt(ss / (HC * H) as f32 + RMS_NORM_EPS)
+            acc * common::gfx11::rsq(ss * (1.0 / (HC * H) as f32) + RMS_NORM_EPS)
         };
         let dots = load_dots(0);
         let ca = coef(&alpha, &dots);
-        let (pp_a, cb_a) = mix_token(ca, a_base, a_scale, lane, sc.add(SCR_MIX));
+        let (pp_a, cb_a) = mix_token(ca, a_in, lu, sc.add(SCR_MIX));
         // the no-attention streams: s''_j = Σ_k comb_a[k][j] · s'_k, so alpha''[j][a] = Σ_k comb_a[k][j] · alpha[k][a];
         // comb_a's entry (k, j) is on lane 4k + j
         let mut comb = [[0f32; HC]; HC];
@@ -483,7 +500,7 @@ pub mod gfx11 {
         }
         let dots = load_dots(1);
         let cf = coef(&alpha2, &dots);
-        let (pp_f, _) = mix_token(cf, f_base, f_scale, lane, sc.add(SCR_MIX + MIX));
+        let (pp_f, _) = mix_token(cf, f_in, lu, sc.add(SCR_MIX + MIX));
         // pre_a[j] on lane j, post_a[j] on lane 4 + j, pre_f[j] on lane j (the FFN mix's): read across
         let mut pre_a = [0f32; HC];
         let mut post_a = [0f32; HC];

@@ -164,6 +164,8 @@ pub unsafe fn wave_sum_f32<const N: usize>(lane: u32, v: [f32; N]) -> [f32; N] {
 unsafe extern "C" {
     #[link_name = "llvm.amdgcn.rcp.f32"]
     fn amdgcn_rcp(x: f32) -> f32;
+    #[link_name = "llvm.amdgcn.rsq.f32"]
+    fn amdgcn_rsq(x: f32) -> f32;
 }
 /// `v_rcp_f32`: the hardware reciprocal (1 ulp), one instruction — a `/` lowers to the IEEE division sequence of ~10
 /// (`v_div_scale` … `v_div_fixup`), a dependent chain where a few divisions sit on one wave's critical path (the
@@ -172,11 +174,49 @@ unsafe extern "C" {
 pub unsafe fn rcp(x: f32) -> f32 {
     amdgcn_rcp(x)
 }
+/// `v_rsq_f32`, one instruction (`math::rsqrt` is `1.0 / sqrt(x)`: the IEEE division sequence after the sqrt; the
+/// bit-identical kernels keep it, the analog does not need it).
+#[inline(always)]
+pub unsafe fn rsq(x: f32) -> f32 {
+    amdgcn_rsq(x)
+}
 
 /// The value lane `src` holds, to every lane of the wave.
 #[inline(always)]
 pub unsafe fn lane_read(src: u32, v: f32) -> f32 {
     f32::from_bits(ds_bpermute(src * 4, v.to_bits()))
+}
+
+/// `v_mov_b32_dpp row_xmask:M`: the value lane `l ^ M` holds within its row of 16 — a butterfly step on the VALU,
+/// no LDS and no wait (a `ds_bpermute` is a round trip through LDS, ~a hundred cycles each in a dependent chain).
+/// `CTRL` = `0x160 | M`.
+#[inline(always)]
+pub unsafe fn dpp_xmask<const CTRL: u32>(v: f32) -> f32 {
+    f32::from_bits(core::arch::amdgpu::update_dpp::<CTRL, 0xF, 0xF, true>(0, v.to_bits()))
+}
+pub const XMASK1: u32 = 0x161;
+pub const XMASK2: u32 = 0x162;
+pub const XMASK4: u32 = 0x164;
+pub const XMASK8: u32 = 0x168;
+/// The sum over the lane's row of 16, on every lane of the row: four butterflies.
+#[inline(always)]
+pub unsafe fn row_sum16(v: f32) -> f32 {
+    let v = v + dpp_xmask::<XMASK1>(v);
+    let v = v + dpp_xmask::<XMASK2>(v);
+    let v = v + dpp_xmask::<XMASK4>(v);
+    v + dpp_xmask::<XMASK8>(v)
+}
+/// The value the same-numbered lane of the other row of 16 holds (`v_permlanex16`, a VALU op).
+#[inline(always)]
+pub unsafe fn other_row(v: f32) -> f32 {
+    f32::from_bits(core::arch::amdgpu::permlanex16_u32::<false, false>(0, v.to_bits(), 0x7654_3210, 0xFEDC_BA98))
+}
+/// The wave's sum on every lane with no LDS: four butterflies and one cross-row permute, against `wave_sum`'s five
+/// dependent `ds_bpermute` round trips.
+#[inline(always)]
+pub unsafe fn wave_sum_dpp(v: f32) -> f32 {
+    let r = row_sum16(v);
+    r + other_row(r)
 }
 
 /// Max of one f32 per lane across the wave; every lane gets the result.

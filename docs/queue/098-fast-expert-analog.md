@@ -514,6 +514,20 @@ Left in B: the intercept's 12.6 (the 7 drains and 15 `lgkmcnt(0)` waits), ~1,270
 change the analog alone could take), and the two Sinkhorns' 640 (a dependent chain of ~8 a step; not shorter than its
 20 iterations × two halves).
 
+**Build 13 (the intercept; staged, not booted: `kernels-an13` 5a732919, `-an13s` 5247c412; node unchanged, kernarg
+200).** Build 12's B region had 7 `vmcnt(0)` drains and 15 `lgkmcnt(0)` waits: two `wave_sum`s of five dependent
+`ds_bpermute` round trips each, four coefficient permutes, and `mix_token`'s base loads sunk by the compiler into the
+pre/post branch arms (a round trip each, four of the seven drains); plus two IEEE divisions (`math::rsqrt` is
+`1.0 / sqrt`). Phase B now touches no LDS: lane l < 16 owns coefficient row 8 + l (the comb entry it holds), lanes
+16–23 rows 0–7, so the comb coefficient is the lane's own and pre/post arrive by one `v_permlanex16`
+(`common::gfx11::other_row`); the norm's wave sum is four `row_xmask` butterflies and one permlanex16
+(`wave_sum_dpp`); the mix inputs are loaded with phase B's first batch (`MixIn`) and both pre and post are computed
+and selected; the sigmoid through `v_rcp`, the norm through `v_rsq` (`gfx11::rsq`; `math::rsqrt` kept for the
+bit-identical kernels). The B region: **1,819 instructions, 2 drains (the two dots batches), no LDS op, no division**;
+172 `row_xmask` adds, 4 permlane, 84 `v_rcp`, 2 `v_rsq`, 28 `v_readlane`, 79 depctr waits, 377 `s_delay_alu`. The
+line predicts 19.7; what it cannot say is how much of its 12.6 intercept was the fifteen LDS waits and the five drains
+now gone — an12s's point decides (rockem.lead booting an12s first for that reason, 2026-10-27), then this object.
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back
