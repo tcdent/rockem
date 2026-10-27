@@ -87,9 +87,13 @@ A core's rate of L3-hit delivery depends on its recent L3-hit traffic, with mill
   sharing an L3 take ~130 rounds (~10 ms: 263 → 125 → 93 → 81 → 72 µs a 16-item round from cold).
 - **The node lives in it:** every run follows a ~440 µs window of DRAM touching and `mwaitx` waits — no hits — so its
   warm items run at the decayed rate on every layer. The node's 10.6 µs own item is this plus its lost lines.
-- Mechanism not identified. A per-core structure does not fit the recovery (one core: one round; eight: 130); a shared
-  L3 structure whose benefit many cores' hits re-earn slowly, and which idle ages away, fits everything measured.
-  Candidates not separated: the L2 prefetcher's adaptive depth, L3 request credits, replacement-state convergence.
+- **Named (2026-10-27, bench boot; docs/l3-literature.md §5 B2–B4 run):** a per-core cap on outstanding requests toward
+  the L3, not a slower L3. The pointer chase (dependent loads, no prefetcher) reads an L3 hit at 12.3 ns steady and 13.1
+  after a 10 ms gap (+6 %) while the gemv's rate fell 4×; the L2's fill-pending cycles track the item's length (the same
+  fills outstanding) while each fill waits ~14× longer; disabling the L2 stream prefetcher makes the decay worse (4.7 →
+  14.0 µs after 3 ms), the L1 prefetchers likewise — not training. The throttle-level shape of US 11,294,810 (max
+  outstanding misses 50 / 35 / 20 / 10, re-earned) fits all eight facts; whether MBA's registers reach it is queue 100's
+  next run. The one-core-vs-eight recovery says the level is re-earned against contention for the same path.
 
 ### 2.4 The CCD's DRAM path, and the sum of sources
 
@@ -203,9 +207,10 @@ the bench: `bench-run` with the window shorter than its plan (the node's widths 
 
 ## 5. Open
 
-- **The mechanism of §2.3.** Discriminating experiments: a pointer chase (latency) in the decayed vs steady state — a
-  latency rise names the interface, a bandwidth-only loss names concurrency (prefetch depth or credits); the recovery's
-  dependence on the number of cores hitting (2 and 4 between 1 and 8).
+- **The mechanism of §2.3** is named to the request path (a per-core cap on outstanding misses re-earned by hits); the
+  knob is open: queue 100 run 4 (MBA registers read and set on the bench boot), and the recovery at 2 / 4 cores.
+- **A2 is a lever** (2026-10-27): a CCD-mate's single L3 read protects a touched set as well as the toucher's re-read
+  (loss 11.7 → 3.0 % at 12 MB a CCD). The stolen items' protection and the re-touch's placement can use any core.
 - **The node vs the bench, two disagreements, by the rule bench-first:** interleaving (+12 % in the bench warm, −10 % in
   the node) and the re-touch's width dependence (−10 % in the bench at width 3, −13 / −4 / −5 % in the node at widths
   2 / 3 / 4; the morning lab's null was the transient plus the amend). What the node has that `bench-run` lacks:

@@ -248,14 +248,22 @@ like. Finer items (`SUB_FEW` 4) cut the tail without moving the wall. This 375 i
    raises the next window's loss (4.2 → 8.4 %, `bench-window`). Loss is set by the fresh bytes a CCD inserts.
 7. **A non-temporal read does not protect:** the run's warm reads with `prefetchnta` cut the next round's loss 15 → 3 %,
    but the hinted gemv reads ~35 % slower (2026-10-26).
-8. **A core's L3 read rate decays when its L3 hits stop** (2026-10-26, queue 099): unprimed, 100 µs without hits →
-   +20 %, 500 µs → +45 %, 3 ms → +70 %, 10 ms → 4×, uniform over the run that follows, at a higher clock; not held by
-   compute, L2 hits or DRAM misses; held by ~5 GB/s of L3 hits (any lines); DRAM-fed reads unaffected; per core. **It
-   costs only under load:** one core recovers within one 2 MB round, eight cores sharing the L3 take ~130 rounds (~10 ms,
-   `bench-run --simple` from cold: 263 → 125 → 93 → 81 → 72 µs a 16-item round). Every node run follows a window without
-   hits — its warm items run decayed. **Every bench that reads L3-resident sets must warm the cores up first** (hundreds
-   of rounds: `bench-run --warmup`) or it measures the recovery — `bench-run`'s "unexplained 1.45×" of 2026-10-26 was that.
-   Mechanism not identified (a shared L3 structure that eight cores' hits re-earn slowly fits; a per-core one does not).
+8. **A core's L3 read rate decays when its L3 hits stop — a per-core cap on outstanding requests, not a slower L3**
+   (2026-10-26/27, queue 099 §2.3, docs/l3-literature.md §5 B2–B4): unprimed, 100 µs without hits → +20 %, 500 µs →
+   +45 %, 3 ms → +70 %, 10 ms → 4×, uniform over the run that follows, at a higher clock; held by ~5 GB/s of L3 hits (any
+   lines); DRAM-fed reads unaffected; per core; one core recovers in one 2 MB round, eight sharing an L3 in ~130 (~10 ms).
+   **Named on 2026-10-27:** a dependent-load pointer chase reads an L3 hit at 12.3 ns steady and 13.1 ns after a 10 ms
+   gap (+6 %) while the gemv's rate fell 4× — the L3 answers at its latency; the L2's fill-pending cycles grow with the
+   item (the same fills outstanding) while each fill waits ~14× longer to be served; with the L2 stream prefetcher
+   disabled (Prefetch Control bit 3) the decay is worse (4.7 → 14.0 µs after 3 ms), with the L1 prefetchers off likewise
+   — not prefetcher training. So the core is allowed fewer misses in flight toward the L3 (the shape of the throttle
+   levels in US 11,294,810: max MIBs 50 / 35 / 20 / 10), the level re-earned by hits, slowly under contention. Whether a
+   knob reaches it (MBA's L3QOS_BW_CONTROL, the dynamic mode) is queue 100's next run. Every node run follows a window
+   without hits — its warm items run throttled. **Every bench that reads L3-resident sets must warm the cores up first**
+   (`bench-run --warmup`) or it measures the recovery.
+8a. **A line read once by a second core is protected as well as by the toucher's re-read** (A2, 2026-10-27,
+   `bench-l3life --mate-read`): 8 cores × 1.5 MB fresh, loss 11.7 → 3.0 %; × 1.9 MB, 15.3 → 3.9 % — the SOG's
+   "read by more than one core" class. The protecting hit can come from any core of the CCD.
 9. **Interference, separate from loss:** a CCD's DRAM path saturates at ~40 GB/s with 3–4 streaming cores alone, ~17–18
    GB/s each with the whole socket streaming; streamers past saturation slow the CCD's L3-fed cores 2–5× (queue 099).
 10. **Benches:** `bench-l3` (keep/stream, CAT), `bench-reuse` (self/peer), `bench-l3life` (survival by position),
