@@ -494,6 +494,26 @@ drained at every LDS wait). The B region cut at the clocks: **6 drains against 1
 1 flat. Rule kept from here (rockem.lead): cut the stats object at its clock stamps and count the region's drains
 before handing an object over; ≤ ~5 is the shape that predicts B ~6. Prediction: B ~6, the phase ~24, chain ~120.
 
+**an11's boot (rockem.lead, 2026-10-27) and build 12.** The chain 149.6 / 154.3 and B **31.4** µs with its 6 drains
+(an9s 26.6 at 19 drains): the drain count was not B's price. rockem.lead's fit over the four tables (an7s 1,885 instr
+→ 19.9, an9s 3,806 → 26.6, an11s 4,858 → 31.4, an8s 5,217 → 44.1 with its 536 division ops): **B ≈ 12.6 µs + 3.9 ns an
+instruction** between the clocks — nine cycles each, one wave's dependent issue with every lane computing the same
+thing (the register Sinkhorn: 16 entries × 20 iterations × two halves on every lane alike). **Build 12** (`kernels-an12`
+6a8a2446, `-an12s` 071962ff; the node unchanged, kernarg 200): the lanes do different work. `mix_token` holds the
+Sinkhorn matrix an entry a lane (lanes 0–15, entry (lane / 4, lane % 4); pre and post on lanes 0–7), its row and
+column sums as DPP `row_xmask` butterflies (`v_add_f32_dpp`, no LDS, no permute: `xmask`, `quad_sum`, `col_sum`), the
+coefficient on lane r from its own row's dots; the norm's 25 Gram terms a lane each with one lockstep `wave_sum` (a
+lane-indexed read of a register array is a stack object — 164 bytes of scratch until the entries were selected,
+`pick`); the mixes' values read across the lanes (`lane_read` of a constant lane = `v_readlane`, 28 of them) for the
+no-attention streams' weights, c and the collapses. The B region at the clocks: **2,051 instructions against an11s's
+4,858** (the two Sinkhorns 317 each — 164 `row_xmask` adds, 86 `v_rcp`; the rest the coefficients' selects, the
+weights and the dots), 7 `vmcnt(0)` drains, no scratch, 192 VGPRs, 27 barriers as before. Predicted from the line: B
+20.6 (−10.8), the chain ≈ 139 / 143.5 — under an9's 143 on card0, at it on card1; booted on that prediction only.
+Left in B: the intercept's 12.6 (the 7 drains and 15 `lgkmcnt(0)` waits), ~1,270 instructions outside the Sinkhorns
+(no FMA contraction anywhere in the kernel tree — `v_mul` + `v_add` pairs, ~150–200 instructions here, a numerics
+change the analog alone could take), and the two Sinkhorns' 640 (a dependent chain of ~8 a step; not shorter than its
+20 iterations × two halves).
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back
