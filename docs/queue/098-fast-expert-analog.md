@@ -769,6 +769,13 @@ lockstep body ran slower than four single-token trips, so neither the static cou
 and eight permutes in flight a wave congest it where four did not — the chain's price was throughput, not
 latency). an18 stays the mark; an19t not booted; an20, which deletes the prologue, boots to the full gates.
 
+**an20's boot (rockem.lead, 2026-10-27; run 2de7f619; node rebuilt, `TAB_LEN` 42) — VALID, the new mark, serving.**
+an_chain **106.0 / 105.8** (an18 110.9 / 110.8; predicted ~96), p90 192 / 193, slow 0 / 0.1 %; slot wait
+2.98 / 1.48 / 0.94 ms at widths 2–4 (an18 3.09 / 1.49 / 0.98; production 1.3 / 0.87 / 0.8); step
+47.1 / 59.2 / 68.8; experts 11.79 / 19.09 / 27.22; coverage .776 to the digit; decode-identical; SCORE
+bit-identical. The prologue's removal bought 5 of the ~15 the table put in it, so R did not reach ~15–17: an20t's
+table (R alone, the per-workgroup rows, the no-tile band's reading of the copy + sync by itself) before any cut.
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back
