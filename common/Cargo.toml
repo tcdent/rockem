@@ -11,3 +11,4 @@ std = []
 # statistics from inside kernels (`stat!`); expands to nothing without it
 stats = []
 stats_tail = ["stats"]
+stats_r = ["stats"]

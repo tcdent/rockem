@@ -13,6 +13,7 @@ glm_5_3_flash = { path = ".." }
 [features]
 stats = ["glm_5_3_flash/stats"]
 stats_tail = ["stats", "glm_5_3_flash/stats_tail"]
+stats_r = ["stats", "glm_5_3_flash/stats_r"]
 
 [workspace]
 

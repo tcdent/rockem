@@ -627,6 +627,10 @@ pub mod gfx11 {
             // phase C and the third barrier. A `stats_tail` object stamps the tail instead: slot 0 phase R alone, 1 the
             // fourth barrier, F and the fifth, 2 S (with the sixth), 3 O to the end.
             const TAIL: bool = cfg!(feature = "stats_tail");
+            // a `stats_r` object stamps inside phase R's block wave: slot 0 the copy prologue, 1 the batches' loads landed
+            // (a drain at each batch's top, summed), 2 the groups' WMMA chain and flushes (summed), 3 the wave's hardware
+            // placement (`stat_hwid!`: the SE / SA / WGP it ran on — the rows by CU load)
+            const RIN: bool = cfg!(feature = "stats_r");
             let kt_w = common::stat_clock!();
             // the peer: the leader's shared output must be in (its word in this card's copy)
             let fyv_word = at(TAB_FYV_WORD) as *const u32;
@@ -657,12 +661,12 @@ pub mod gfx11 {
                 phase_a_gram(streams, fyv, scratch, g / A_CHUNKS, g % A_CHUNKS, t, wave, l);
             }
             let kta = common::stat_clock!();
-            if !TAIL {
+            if !TAIL && !RIN {
                 common::stat!(0, kta.wrapping_sub(kt0) & common::stats::CLOCK_MASK);
             }
             barrier(count, 0, t, wg, value);
             let ktb0 = common::stat_clock!();
-            if !TAIL {
+            if !TAIL && !RIN {
                 common::stat!(1, ktb0.wrapping_sub(kta) & common::stats::CLOCK_MASK);
             }
             // phase B: workgroup 0, a wave a token
@@ -670,7 +674,7 @@ pub mod gfx11 {
                 phase_b(wave, mix_l, a_base, a_scale, f_base, f_scale, c, scratch, lane);
             }
             let ktb1 = common::stat_clock!();
-            if !TAIL {
+            if !TAIL && !RIN {
                 common::stat!(2, ktb1.wrapping_sub(ktb0) & common::stats::CLOCK_MASK);
             }
             barrier(count, 1, t, wg, value);
@@ -757,7 +761,7 @@ pub mod gfx11 {
             }
             barrier(count, 2, t, wg, value);
             let kt1 = common::stat_clock!();
-            if !TAIL {
+            if !TAIL && !RIN {
                 common::stat!(3, kt1.wrapping_sub(ktb1) & common::stats::CLOCK_MASK);
             }
             // phase R: the small rows and the chosen heads' q, k, v rows over `x` normed with the input norm, into
@@ -791,6 +795,11 @@ pub mod gfx11 {
                     }
                 }
                 workgroup_sync();
+                let ktc = common::stat_clock!();
+                if RIN {
+                    common::stat!(0, ktc.wrapping_sub(kt1) & common::stats::CLOCK_MASK);
+                }
+                let (mut t_load, mut t_wmma) = (0u64, 0u64);
                 // sixteen rows a wave on the matrix unit (the experts' prefill form, `expert::tile16`): A the rows'
                 // q4 nibbles widened to unsigned bytes (lane l supplies row l % 16's sixteen k a step), B the a8
                 // activations signed (lane l supplies token l % 4's — tokens 4..15 of the fragment carry a repeat
@@ -842,7 +851,13 @@ pub mod gfx11 {
                     let mut gb = 0;
                     while gb < nb {
                         let g0 = kq * (NG / R_KSPLIT) + gb * GB;
+                        let kb0 = common::stat_clock!();
                         let mut mine = load4(g0);
+                        if RIN {
+                            common::stat_loads_landed!();
+                        }
+                        let kb1 = common::stat_clock!();
+                        t_load = t_load.wrapping_add(kb1.wrapping_sub(kb0));
                         let ngi = common::gfx11::opaque(GB as u32) as usize;
                         let mut gi = 0;
                         while gi < ngi {
@@ -890,8 +905,16 @@ pub mod gfx11 {
                             mine = [mine[1], mine[2], mine[3], mine[0]];
                             gi += 1;
                         }
+                        let kb2 = common::stat_clock!();
+                        t_wmma = t_wmma.wrapping_add(kb2.wrapping_sub(kb1));
                         gb += 1;
                     }
+                    if RIN {
+                        common::stat!(1, t_load & common::stats::CLOCK_MASK);
+                        common::stat!(2, t_wmma & common::stats::CLOCK_MASK);
+                        common::stat!(3, common::stat_hwid!());
+                    }
+                    let _ = (t_load, t_wmma);
                     // the join: each wave's eight partials a lane into LDS, the quarter-0 wave of the block sums
                     // its three siblings' (waves 4b'..4b' + 3 of this workgroup)
                     let part = (act.add(SPEC_TOKENS * ACT_BYTES) as *mut f32).add((wave * 32 + lu) * 8);
