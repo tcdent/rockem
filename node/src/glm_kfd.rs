@@ -432,6 +432,10 @@ struct AnalogPart {
     heads: Mem,
     crows: Mem,
     ln: Mem,
+    /// The selection's rows (the small rows, then the chosen heads' q, k, v) in q4g128, `q4::pack`'s layout, and
+    /// their scales: phase R's bytes, 1.5 → 0.53 a weight (098, 2026-10-27).
+    qrows: Mem,
+    qscales: Mem,
     /// `an_chain`'s table of device addresses (`an::TAB_*`), built once the cards' buffers and the pair's weights exist.
     tab: Mem,
 }
@@ -558,6 +562,44 @@ fn bf16_of(v: &[f32]) -> Vec<u16> {
 /// The analog's rows for part `i` of a KDA layer (098): `C = R·diag(ln)·O` over the part's output columns
 /// (`[E][PART_QKV]`, f32, the rows over the threads), the `NSEL` heads whose columns carry the most of it (by the
 /// squared norm of their blocks), and `C`'s columns of those heads in that order as bf16 (`[E][SEL_W]`).
+/// The analog's phase R rows of part `i` in q4g128: `sq`'s stacking (`f_a`, `g_a`, `b`, then the part's q, k, v)
+/// restricted to the chosen heads, in the selection's order (`an::SEL_ROWS` rows of `H`), round-to-nearest with a
+/// scale of absmax / 7 a group — the format the offline sim validated for the analog's margin (shared-q4-rn). Packed
+/// bytes and the scales in `q4::pack`'s tile layout.
+fn analog_q4_rows(kw: &glm_5_3_flash::weights::Kda, heads: &[u32], i: usize) -> (Vec<u8>, Vec<f32>) {
+    use common::gemv::widen;
+    use common::q4::GROUP;
+    const D: usize = KDA_DIM;
+    let head0 = i * g::PART_HEADS;
+    let mut rows: Vec<f32> = Vec::with_capacity(an::SEL_ROWS * H);
+    for part in [kw.f_a, kw.g_a, kw.b] {
+        rows.extend(part.iter().map(|&v| widen(v)));
+    }
+    for m in [kw.q, kw.k, kw.v] {
+        for &hl in heads {
+            let h = head0 + hl as usize;
+            rows.extend(m[h * D * H..(h + 1) * D * H].iter().map(|&v| widen(v)));
+        }
+    }
+    assert_eq!(rows.len(), an::SEL_ROWS * H);
+    let ng = H / GROUP;
+    let mut q = vec![0i8; an::SEL_ROWS * H];
+    let mut sc = vec![0f32; an::SEL_ROWS * ng];
+    for r in 0..an::SEL_ROWS {
+        for gi in 0..ng {
+            let seg = &rows[r * H + gi * GROUP..r * H + (gi + 1) * GROUP];
+            let amax = seg.iter().fold(0f32, |a, v| a.max(v.abs()));
+            let s = amax / 7.0;
+            let inv = if s > 0.0 { 1.0 / s } else { 0.0 };
+            sc[r * ng + gi] = s;
+            for (k, &v) in seg.iter().enumerate() {
+                q[r * H + gi * GROUP + k] = (v * inv).round().clamp(-8.0, 7.0) as i8;
+            }
+        }
+    }
+    common::q4::pack(an::SEL_ROWS, H, &q, &sc)
+}
+
 fn analog_rows(kw: &glm_5_3_flash::weights::Kda, router: &[u16], ln: &[f32], i: usize) -> (Vec<u32>, Vec<u16>) {
     use common::gemv::widen;
     const E: usize = glm_5_3_flash::E;
@@ -993,9 +1035,14 @@ impl Cards {
                         k.upload(&cm, 0, raw(&crows));
                         let lnm = k.vram_visible(H * 2);
                         k.upload(&lnm, 0, raw(&bf16_of(lw1.post_ln)));
-                        analog_bytes += hm.size + cm.size + lnm.size;
+                        let (qb, qs) = analog_q4_rows(kw1, &heads, i);
+                        let qm = k.vram_visible(qb.len());
+                        k.upload(&qm, 0, &qb);
+                        let qsm = k.vram_visible(qs.len() * 4);
+                        k.upload(&qsm, 0, raw(&qs));
+                        analog_bytes += hm.size + cm.size + lnm.size + qm.size + qsm.size;
                         let tab = k.vram_visible(an::TAB_LEN * 8);
-                        parts.push(AnalogPart { card: pc, part: i, heads: hm, crows: cm, ln: lnm, tab });
+                        parts.push(AnalogPart { card: pc, part: i, heads: hm, crows: cm, ln: lnm, qrows: qm, qscales: qsm, tab });
                     }
                     Some(parts)
                 }
@@ -1150,6 +1197,8 @@ impl Cards {
                 t[an::TAB_S2] = c.pred_s2.va as u64;
                 t[an::TAB_XL] = c.x.va as u64;
                 t[an::TAB_LN_L] = f.ln.va as u64;
+                t[an::TAB_QROWS] = ap.qrows.va as u64;
+                t[an::TAB_QSCALES] = ap.qscales.va as u64;
                 c.k.upload(&ap.tab, 0, raw(&t));
             }
         }

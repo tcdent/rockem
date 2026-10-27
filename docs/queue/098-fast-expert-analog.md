@@ -666,6 +666,58 @@ the fix, the plain / stats / tail objects differ from an13 / an13s in `an_chain`
 200; `an_chain` 12,349 instructions — the same count as the held an17: the analog's own code is unchanged, only the
 production kernels were). an16b was not needed; an16's phase O changes are `an_chain`-only and ride in an17.
 
+**an17's boot (rockem.lead, 2026-10-27; run efd9a8cd) — VALID and SERVING, the new mark.** an_chain **120.4 /
+121.6** (an13 129.0 / 133.3; an16 121.8 / 125.5), p90 206 / 210, slow 0.1 / 0.3 %; slot wait 3.27 / 1.62 / 0.97 ms
+at widths 2–4 (an13 3.40 / 1.72 / 1.00; production 1.3 / 0.87 / 0.8); step 46.95 / 59.55 / 68.24; coverage .767
+(29 requests); SCORE bit-identical; decode-identical in the post-SCORE steady state. R's one round bought ~1.5 / 4
+against an16, not the 10–15 its wave depth said: the pass is not one wave's serial batches alone — an17t's R
+against an16t's 45.1 / 45.7 is the number to read before the next R cut (an18t stamps R without its barrier).
+A finding for the model of the slot (rockem.lead): on every build the request sequence is cold → own path, hit 1 →
+own, hits before SCORE → a 45-step path, the first hit after SCORE → own, later hits → the reference's 54 — SCORE
+changes a later decode's bits (the open cold-vs-hit near-tie, now localized to a state SCORE perturbs: the draft's
+prompt cache / KDA mirror restore / pools — not residency, not the plan); the decode sits at a near-tie any ulp
+flips, so the gate samples post-SCORE (deploy.sh). Remaining to "fits" at width 2: chain ≤ ~115 and the slot wait
+toward 1.3; the section ~27 and R ~45 of the 120.
+
+**an18t's table (rockem.lead, 2026-10-27; run 0d69bb16, R stamped alone): R mean 30.7 / slowest workgroup 42.8
+(card0), 32.9 / 45.8 (card1); barrier 3 + F + barrier 4 mean 21.4 / max 49–51; S 17.0 / 18.8; O 2.4 / 9.2.** R is
+bytes, not a wave's depth: the rows pass reads `sq` in its Exp4 record (`exp4::CHUNK` = 12 bytes per 8 weights,
+1.5 B a weight), 3,392 × 4,096 = **20.8 MB a card = 32.6 µs at the 640 GB/s the kernels reach** — the working
+wave's 31–37 (the idle workgroups excluded from the mean) is that number and the slowest's 43–46 the saturated
+system's queue. It is why one round (an17) and the DPP reductions bought ~1.5–4: round trips, not bytes. (The
+per-workgroup instrument, `kernel_stats_wave` — every 256th stamped launch writes its slab, a row an entry with
+workgroup and wave — is in the node for the three bands' check and for A.)
+
+**Build 18 (staged: `kernels-an18` a602bd2e, `-an18s` 3e1d20b0, `-an18t` 2d57ddec; THE NODE REBUILT — `TAB_LEN`
+39 → 41; kernarg 200; 167 VGPRs, no scratch, 30 barriers = 29 + phase R's one staging sync).** Phase R on q4g128
+rows of the analog's own: at boot `analog_q4_rows` copies the selection (the 320 small rows, then the chosen heads'
+q, k, v, in the selection's order) from the bundle's bf16, round-to-nearest with absmax / 7 a group of 128 — the
+format the offline sim validated for the margin (shared-q4-rn) — packed in `q4::pack`'s tile layout (`TAB_QROWS`,
+`TAB_QSCALES`; 6.95 MB + 0.43 MB a card). In the chain every workgroup stages the activations itself: token i's
+x · ln as a8 per group (`q4::gfx11::quantize_groups`, the experts' own quantization, four groups a wave in
+lockstep), its norm's Σx² beside (DPP), 17.4 KB of LDS (`R_LDS`; `CHAIN_LDS` grows to it); then a four-row tile a
+wave (848 tiles over 1,344 waves), all sixteen 512-byte steps' weights loaded as one batch, each step's activation
+words of every token read from LDS ahead of the dots (`q4::gfx11::word_act` / `word_dot_act`, `word_dot` split),
+`v_dot4_i32_iu8` against them, the quad's and the row's two parities' sums by DPP, lane 4r emitting `smix` at the
+row's place scaled by the norm. The R region in the object: 4,093 instructions, 512 `v_dot4`, 22 global loads,
+204 LDS loads with 61 full waits, 9 drains, 40 `ds_bpermute` (the quantizer's four lockstep reductions a token).
+Bytes 20.8 → 7.4 MB: R ~33 → ~12 at the ceiling by the arithmetic, the chain ~120 → ~97. The one numerics change is
+the a8 activations (q4 weights were validated offline; a8 is what the experts run); coverage ≥ ~.77 decides, as
+with 16 heads. `kernel_diff` vs an17 (and the stats objects vs an13s): `an_chain` only. The F pass stays on the
+Exp4 `fg` rows (2,048 rows × 128: 0.4 MB).
+
+Housekeeping: the instrument object the lead booted as `kernels-an18t` (an17's kernel with R stamped alone,
+aade5fb1) is re-staged as **`kernels-an17r`** — `-an18t` now names build 18's tail object.
+
+**The per-workgroup column (rockem.lead, 2026-10-27; run e60c50b2, the booted instrument object): FLAT.** R alone,
+wave 0, the workgroup's median, min / median / max: the small rows (wg 0–13) card0 36.5 / 36.9 / 37.5, card1
+38.2 / 39.2 / 40.1; the heads' rows (wg 14–141) card0 32.2 / 35.1 / 39.1, card1 33.0 / 36.7 / 41.0; no rows
+(wg 142–167) ~1.0 / 1.2. The five slowest are ordinary head-row workgroups (card0 137 140 133 139 136 at
+38.6–39.1; card1 127 139 133 134 43 at 40.2–41.0), their eight waves spread 35.8–40.2 — no slow row kind, no slow
+wave: a bandwidth-bound pass with the saturated queue's tail; the 20.8 MB / 640 GB/s reading stands and bytes is
+the lever. Side facts: card1 runs R ~1.5–2 µs slower than card0 throughout (its chain 124 vs 121: its memory
+system, not the code); 26 workgroups (208 waves, 15 % of the grid) idle in R at `R_ROWS` 3.
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back

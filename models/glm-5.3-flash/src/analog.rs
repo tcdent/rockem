@@ -49,15 +49,23 @@ pub const CHAIN_LDS: u32 = {
     let b = crate::kda::gfx11_consts::STEP_LDS;
     let c = 4 * 4 * B_LDS;
     let m = if a > b { a } else { b };
-    (if m > c { m } else { c }) as u32 + 4 * NSEL as u32
+    let m = if m > c { m } else { c };
+    (if m > R_LDS { m } else { R_LDS }) as u32 + 4 * NSEL as u32
 };
 /// The rows of `sq` the selection covers: the small rows, then q, k, v of the chosen heads.
 pub const SEL_ROWS: usize = 2 * KDA_DIM + KDA_HEADS + 3 * NSEL * KDA_DIM;
 /// The rows of `fg` the selection covers: f_b then g_b of the chosen heads.
 pub const SEL_FG_ROWS: usize = 2 * NSEL * KDA_DIM;
-/// Phase R's rows a wave: enough that the grid's waves take the selection in one round.
-pub const R_ROWS: usize = SEL_ROWS.div_ceil(CHAIN_GRID as usize * CHAIN_WAVES);
-const _: () = assert!(R_ROWS * CHAIN_GRID as usize * CHAIN_WAVES >= SEL_ROWS && SEL_FG_ROWS <= crate::kda::gfx11_consts::E4_ROWS * CHAIN_GRID as usize * CHAIN_WAVES);
+/// Phase R reads the selection's rows in q4g128 (`TAB_QROWS`, `TAB_QSCALES`: a copy built at boot in selection order,
+/// `q4::pack`'s layout), a four-row tile a wave: 20.8 MB of `sq`'s Exp4 record (1.5 B a weight) was 31–37 µs at the
+/// card's bandwidth for the typical wave and 43–46 for the slowest, three eighths of the chain (an18t, 2026-10-27);
+/// 7.2 MB is ~12. The activations are a8 per group of 128 in LDS, the experts' own quantization.
+pub const R_TILES: usize = SEL_ROWS / common::q4::TILE;
+/// A token's staged activation in LDS: `H` bytes of i8, then a scale and a Σq a group.
+pub const ACT_BYTES: usize = H + 8 * (H / common::q4::GROUP);
+/// Phase R's LDS: the `SPEC_TOKENS` activations, then the norms' wave partials `[SPEC_TOKENS][8]`.
+pub const R_LDS: usize = SPEC_TOKENS * ACT_BYTES + SPEC_TOKENS * 8 * 4;
+const _: () = assert!(SEL_ROWS % common::q4::TILE == 0 && R_TILES <= CHAIN_GRID as usize * CHAIN_WAVES && H % 256 == 0 && SEL_FG_ROWS <= crate::kda::gfx11_consts::E4_ROWS * CHAIN_GRID as usize * CHAIN_WAVES);
 /// The output phase: a composed row a wave, eight a workgroup; the leader's workgroups past them take the router's
 /// rows over the no-attention input, then over the second margin's input.
 pub const OUT_WGS: usize = E / 8;
@@ -103,18 +111,19 @@ pub const TAB_K: usize = 35;
 pub const TAB_S2: usize = 36;
 pub const TAB_XL: usize = 37;
 pub const TAB_LN_L: usize = 38;
-pub const TAB_LEN: usize = 39;
+pub const TAB_QROWS: usize = 39;
+pub const TAB_QSCALES: usize = 40;
+pub const TAB_LEN: usize = 41;
 const _: () = assert!(E % 8 == 0 && SEL_W % 256 == 0 && H % 256 == 0 && HC == 4 && (HC * H) % 256 == 0 && CHAIN_GRID as usize >= OUT_WGS * 3 && CHAIN_GRID as usize >= 2 * HC_COEFS);
 
 #[cfg(target_arch = "amdgpu")]
 pub mod gfx11 {
     pub use super::*;
-    use crate::hc::gfx11_consts::{COEF_ROWS, MIX};
+    use crate::hc::gfx11_consts::MIX;
     use crate::kda::gfx11_consts::{E4_ROWS, PART_QKV};
     use common::gemv::gfx11::{exp4_rows_direct_rows, widen8_at, Exp4};
-    use common::gemv::widen;
-    use common::gfx11::{await_word, lds, rcp, wave_sum, wave_sum_f32, workgroup_sync};
-    use common::math::{exp, rsqrt, sqrt};
+    use common::gfx11::{await_word, lds, rcp, workgroup_sync};
+    use common::math::exp;
     use core::arch::amdgpu::{workgroup_id_x, workitem_id_x};
     use core::sync::atomic::{fence, AtomicU32, Ordering};
     const SMALL_ROWS: usize = 2 * KDA_DIM + KDA_HEADS;
@@ -589,8 +598,8 @@ pub mod gfx11 {
             // stats (a stats code object only), ticks of the 100 MHz clock as every wave sees them — the hyper-connection
             // phases apart, after three builds left their sum at 42–48 µs (2026-10-27): slot 0 phase A (after the peer's
             // wait), 1 the first grid barrier's wait, 2 phase B (workgroup 0's waves; 0 elsewhere), 3 the second barrier,
-            // phase C and the third barrier. A `stats_tail` object stamps the tail instead: slot 0 phase R (with the
-            // fourth barrier), 1 F (with the fifth), 2 S (with the sixth), 3 O to the end.
+            // phase C and the third barrier. A `stats_tail` object stamps the tail instead: slot 0 phase R alone, 1 the
+            // fourth barrier, F and the fifth, 2 S (with the sixth), 3 O to the end.
             const TAIL: bool = cfg!(feature = "stats_tail");
             let kt_w = common::stat_clock!();
             // the peer: the leader's shared output must be in (its word in this card's copy)
@@ -674,48 +683,174 @@ pub mod gfx11 {
             if !TAIL {
                 common::stat!(3, kt1.wrapping_sub(ktb1) & common::stats::CLOCK_MASK);
             }
-            // phase R: the small rows and the chosen heads' q, k, v rows of `sq` over `x` normed with the input norm,
-            // into `smix` at the rows' own places (the step reads it as `kda_step` reads `sq`'s output); every wave
-            // loops the selection E4_ROWS rows at a time
+            // phase R: the small rows and the chosen heads' q, k, v rows over `x` normed with the input norm, into
+            // `smix` at the rows' own places (the step reads it as `kda_step` reads `sq`'s output). The rows in q4g128
+            // (`R_TILES` tiles of four, a wave each), the activations a8 per group in LDS — every workgroup stages its
+            // own copy: token i's x · ln quantized as the experts' activations are (`q4::gfx11::quantize_groups`), its
+            // norm's sum of squares beside it. A wave's tile: all sixteen 512-byte steps loaded at once (a lane's
+            // 16 bytes of each), then per step and token the lane's two word dots against the group in LDS, the
+            // quad's sum and the row's two group parities by DPP — no LDS reduction, no permute.
             {
+                use common::q4::gfx11::{quantize_groups, word_act, word_dot_act};
+                use common::q4::{GROUP, TILE, WBIAS};
+                const NG: usize = H / GROUP;
+                const NSTEP: usize = H / 256;
+                let act = l as *mut u8;
+                let red = l.add(SPEC_TOKENS * ACT_BYTES / 4);
                 let ln = at(TAB_INPUT_LN) as *const u16;
-                let map = |r: usize| {
-                    if r < SMALL_ROWS {
-                        r
-                    } else {
-                        let j = r - SMALL_ROWS;
-                        let (part, rem) = (j / (NSEL * D), j % (NSEL * D));
-                        SMALL_ROWS + part * PART_QKV + *heads.add(rem / D) as usize * D + rem % D
-                    }
-                };
-                let emit = |row: usize, i: usize, y: f32| *smix.add(i * M_SMALL + row) = y;
-                let xs = |_: usize, i: usize| x.add(i * H) as *const f32;
-                // the rows a wave: the selection in one round of the grid's waves at widths 1–2 (`R_ROWS` = 3; at
-                // `E4_ROWS` = 2 the first 704 waves went round twice — twenty serial batches of loads instead of
-                // ten, with the rest of the grid idle: the phase is one wave's round trips, not bytes; 2026-10-27);
-                // widths 3–4 keep two (three rows at four tokens spill), their host run being the longer
-                let e4 = Exp4::<2, 8>::at::<H>(sq, M_SMALL);
-                macro_rules! rows_pass {
-                    ($np:expr, $r:expr) => {{
-                        let mut vrow = (wg * CHAIN_WAVES + wave) * $r;
-                        while vrow < SEL_ROWS {
-                            exp4_rows_direct_rows::<H, true, 2, 8, $r, $np, true>(t as u32, e4, ln, SEL_ROWS, n, RMS_NORM_EPS, vrow, &map, &xs, &emit);
-                            vrow += CHAIN_GRID as usize * CHAIN_WAVES * $r;
+                let xr = x as *const f32;
+                // the norms: thread t takes sixteen channels of each token
+                let mut i = 0;
+                while i < SPEC_TOKENS {
+                    let mut ss = 0f32;
+                    let mut j = 0;
+                    while j < 2 {
+                        let v: [f32; 8] = core::ptr::read(xr.add(i * H + (t * 2 + j) * 8) as *const [f32; 8]);
+                        let mut k = 0;
+                        while k < 8 {
+                            ss = fma(v[k], v[k], ss);
+                            k += 1;
                         }
-                    }};
+                        j += 1;
+                    }
+                    let ss = wave_sum_dpp(ss);
+                    if lane == 0 {
+                        *red.add(i * 8 + wave) = ss;
+                    }
+                    i += 1;
                 }
-                match n {
-                    1 => rows_pass!(1, R_ROWS),
-                    2 => rows_pass!(2, R_ROWS),
-                    3 => rows_pass!(3, E4_ROWS),
-                    _ => rows_pass!({ common::gemv::FEW }, E4_ROWS),
+                // the activations: a wave takes groups wave, wave + 8, wave + 16, wave + 24 of each token, in lockstep
+                let mut i = 0;
+                while i < SPEC_TOKENS {
+                    let mut v = [[0f32; 4]; NG / 8];
+                    let mut q = 0;
+                    while q < NG / 8 {
+                        let c0 = (wave + 8 * q) * GROUP + lane as usize * 4;
+                        let xv: [f32; 4] = core::ptr::read(xr.add(i * H + c0) as *const [f32; 4]);
+                        let lv: [u16; 4] = core::ptr::read(ln.add(c0) as *const [u16; 4]);
+                        let mut k = 0;
+                        while k < 4 {
+                            v[q][k] = xv[k] * f32::from_bits((lv[k] as u32) << 16);
+                            k += 1;
+                        }
+                        q += 1;
+                    }
+                    let (packed, scale, sum) = quantize_groups::<{ NG / 8 }>(lane, v);
+                    let tok = act.add(i * ACT_BYTES);
+                    let mut q = 0;
+                    while q < NG / 8 {
+                        let g = wave + 8 * q;
+                        *(tok.add(g * GROUP + lane as usize * 4) as *mut u32) = packed[q];
+                        if lane == 0 {
+                            *(tok.add(H) as *mut f32).add(g) = scale[q];
+                            *(tok.add(H + 4 * NG) as *mut i32).add(g) = sum[q];
+                        }
+                        q += 1;
+                    }
+                    i += 1;
+                }
+                workgroup_sync();
+                let mut rr = [0f32; SPEC_TOKENS];
+                let mut i = 0;
+                while i < SPEC_TOKENS {
+                    let mut ss = 0f32;
+                    let mut w = 0;
+                    while w < 8 {
+                        ss += *red.add(i * 8 + w);
+                        w += 1;
+                    }
+                    rr[i] = common::gfx11::rsq(ss * (1.0 / H as f32) + RMS_NORM_EPS);
+                    i += 1;
+                }
+                let tile = wg * CHAIN_WAVES + wave;
+                if tile < R_TILES {
+                    let lu = lane as usize;
+                    let (r, i0, gpar) = ((lu % 16) / 4, (lu % 4) * 2, lu / 16);
+                    let wt = (at(TAB_QROWS) as *const u8).add(tile * TILE * H / 2);
+                    let ws = (at(TAB_QSCALES) as *const f32).add(tile * NG * TILE);
+                    // the tile's bytes, this lane's of every step, as one batch
+                    let w: [(u64, u64); NSTEP] = core::array::from_fn(|st| {
+                        let p = wt.add(st * 512 + lu * 16);
+                        (core::ptr::read_unaligned(p as *const u64), core::ptr::read_unaligned(p.add(8) as *const u64))
+                    });
+                    // the lane's groups' scales (group 2 st + gpar, row r): a batch too — indexed by the lane's parity
+                    // at runtime they were a stack object in scratch
+                    let wsv: [f32; NSTEP] = core::array::from_fn(|st| *ws.add((2 * st + gpar) * TILE + r));
+                    // the steps written out (a loop over them left the batches a stack object in scratch)
+                    let mut y = [0f32; SPEC_TOKENS];
+                    macro_rules! step {
+                        ($st:expr) => {{
+                            let g = 2 * $st + gpar;
+                            // every token's activation words of the step read first, one wait for all (a read a dot
+                            // was an LDS wait a token a step)
+                            let qa: [[(u64, u64); 2]; SPEC_TOKENS] = core::array::from_fn(|i| {
+                                let qg = (act.add(i * ACT_BYTES) as *const i8).add(g * GROUP);
+                                [word_act(qg, i0), word_act(qg, i0 + 1)]
+                            });
+                            let gss: [(f32, f32); SPEC_TOKENS] = core::array::from_fn(|i| {
+                                let tok = act.add(i * ACT_BYTES);
+                                (*(tok.add(H + 4 * NG) as *const i32).add(g) as f32, *(tok.add(H) as *const f32).add(g))
+                            });
+                            let mut i = 0;
+                            while i < SPEC_TOKENS {
+                                let part = word_dot_act(w[$st].0, qa[i][0].0, qa[i][0].1) + word_dot_act(w[$st].1, qa[i][1].0, qa[i][1].1);
+                                // the quad's four lanes hold the cell's quarters: the group's exact integer sum
+                                let p = part as f32;
+                                let p = p + dpp_xmask::<XMASK1>(p);
+                                let sum = p + dpp_xmask::<XMASK2>(p);
+                                let term = (sum - WBIAS as f32 * gss[i].0) * wsv[$st] * gss[i].1;
+                                if lu % 4 == 0 {
+                                    y[i] += term;
+                                }
+                                i += 1;
+                            }
+                        }};
+                    }
+                    const { assert!(NSTEP == 16) };
+                    step!(0);
+                    step!(1);
+                    step!(2);
+                    step!(3);
+                    step!(4);
+                    step!(5);
+                    step!(6);
+                    step!(7);
+                    step!(8);
+                    step!(9);
+                    step!(10);
+                    step!(11);
+                    step!(12);
+                    step!(13);
+                    step!(14);
+                    step!(15);
+                    // the row's two parities (lanes 4r and 16 + 4r) summed, lane 4r emits
+                    let mut i = 0;
+                    while i < SPEC_TOKENS {
+                        let yt = y[i] + other_row(y[i]);
+                        if lu < 16 && lu % 4 == 0 {
+                            if i < n {
+                                let row = tile * TILE + r;
+                                let mrow = if row < SMALL_ROWS {
+                                    row
+                                } else {
+                                    let j = row - SMALL_ROWS;
+                                    let (part, rem) = (j / (NSEL * D), j % (NSEL * D));
+                                    SMALL_ROWS + part * PART_QKV + *heads.add(rem / D) as usize * D + rem % D
+                                };
+                                *smix.add(i * M_SMALL + mrow) = yt * rr[i];
+                            }
+                        }
+                        i += 1;
+                    }
                 }
             }
-            barrier(count, 3, t, wg, value);
+            // the tail's first stamp before the barrier: R's own time a wave, the barrier's wait in the next slot
+            // (stamped after it, R and its barrier were one number — 45 µs mean and slowest alike, 2026-10-27)
             let ktr = common::stat_clock!();
             if TAIL {
                 common::stat!(0, ktr.wrapping_sub(kt1) & common::stats::CLOCK_MASK);
             }
+            barrier(count, 3, t, wg, value);
             // phase F: the chosen heads' f_b and g_b rows of `fg` over the gates' first halves in `smix`
             {
                 let smix = smix as *const f32;
