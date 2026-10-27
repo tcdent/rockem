@@ -542,6 +542,28 @@ sixth, 3 O to the end — the first table of the chain's other ~80 µs, which on
 sums (five round trips for all 65 values), the rows passes' and the step's own (`exp4_rows_direct_rows`, `step_head`:
 shared, bit-identical code; not touched).
 
+**an12's boot (rockem.lead, 2026-10-27; an12s run 34aaec6a, an12 run c131716a, serving) — the first build that moved
+the chain.** an12s: A 5.6 / 12.2 (mean / slowest workgroup), the first barrier 10.9 / 21, **B 11.4** (an11s 31.4;
+the line said 20.6 — the line was the every-lane-alike builds' dependency chains, not instructions in general: the DPP
+build's 2,051 cost 11.4, under the old intercept), the rest 15.6; chain 128 / 131. an12 served: an_chain p50
+**130.8 / 134.7** (an11 149.6 / 154.3, an9 141.6 / 145.8), p90 210 / 214, slow > 250 µs 0.2 / 0.4 %; slot wait
+3.47 / 1.82 / 1.08 ms at widths 2–4 (an11 3.90 / 2.05 / 1.10; production 1.3 / 0.87 / 0.8); step 47.0 / 59.5 / 68.2
+(production 45.3 / 58.5 / 67.6); experts 12.13 / 19.55 / 27.08; coverage .773, @13 .851; long SCORE bit-identical;
+hardware clean. The hyper-connection section A_max 12.2 + B 11.4 + C ~4 ≈ 28 (was 44); the ~100 outside it (rows,
+F, S, O, the launch, the barriers) is now three quarters of the chain. A's slowest workgroup 12.2 against the mean 5.6:
+the barrier waits the 6.6 out — the Gram rode on rows 0..n (25 extra dots a channel-eight and two extra lockstep
+reductions on 2n of the 96 working workgroups); build 15 gives it workgroups of its own among the 72 idle, and takes
+phase A's lockstep `ds_bpermute` sums to the VALU too (`wave_sum_dpp_n`).
+
+**Build 15 (staged, not booted: `kernels-an15` 384efd20, `-an15s` 5c49d3c8, `-an15t` 93167843; node unchanged,
+kernarg 200).** The Gram on workgroups of its own (`phase_a_gram`: workgroup `A_GRID + i · A_CHUNKS + chunk` for
+token i, the same loads as a row's base vectors, 25 dots a channel-eight, one reduction round) — the 96 row
+workgroups all carry the same work now; phase A's and the Gram's reductions on the VALU (`gfx11::wave_sum_dpp_n`:
+every value's five-step DPP chain, interleaved; no LDS round trip). The A region (stamps 2 → 3): 2,168 instructions,
+0 `ds_bpermute` (an14s 300 of them in A's lockstep sums), 10 drains; the whole kernel 440 → 230 `ds_bpermute` (the
+rows passes' and the step's own remain). Barriers 27 → 29: the Gram workgroup's two syncs. Predicted: A's slowest
+workgroup ~6 (the mean), the first barrier's wait falls with it, chain ~124.
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back

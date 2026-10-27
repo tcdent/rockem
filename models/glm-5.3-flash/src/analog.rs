@@ -146,7 +146,7 @@ pub mod gfx11 {
         fence(Ordering::Acquire);
     }
 
-    use common::gfx11::{dpp_xmask, fma, other_row, wave_sum_dpp, XMASK1, XMASK2, XMASK4, XMASK8};
+    use common::gfx11::{dpp_xmask, fma, other_row, wave_sum_dpp, wave_sum_dpp_n, XMASK1, XMASK2, XMASK4, XMASK8};
     /// The sum over a lane's quad (lanes `4q..4q + 4`): the Sinkhorn matrix's row, an entry a lane.
     #[inline(always)]
     unsafe fn quad_sum(v: f32) -> f32 {
@@ -251,48 +251,22 @@ pub mod gfx11 {
     pub const SCR_MIX: usize = SCR_GRAM + A_CHUNKS * BASE * BASE;
     pub const SCR_BETA: usize = SCR_MIX + 2 * MIX;
     pub const SCRATCH: usize = SCR_BETA + 2 * BASE;
-    const _: () = assert!(SCRATCH <= PRE_SCRATCH && A_GRID as u32 <= CHAIN_GRID && HC_COEFS <= 32 && BASE * BASE <= 32 && 8 * (4 * DOTS + BASE * BASE) * 4 <= CHAIN_LDS as usize && H % (A_CHUNKS * 2048) == 0);
+    const _: () = assert!(SCRATCH <= PRE_SCRATCH && A_GRID as u32 + 4 * A_CHUNKS as u32 <= CHAIN_GRID && HC_COEFS <= 32 && BASE * BASE <= 32 && 8 * (4 * DOTS + BASE * BASE) * 4 <= CHAIN_LDS as usize && H % (A_CHUNKS * 2048) == 0);
 
-    /// Phase A for `NP` tokens from `i0`: this workgroup's row's dots with the base vectors over its four blocks, and
-    /// (workgroup `i < n`, the first pass) token `i`'s Gram; the partials of all of them held in registers, one
-    /// reduction round. A thread takes eight consecutive channels a chunk — the row's weights of each block as one
-    /// 16-byte load, each base vector's as one 32-byte load reused over the four blocks: the first form's single
-    /// strided loads (hundreds a thread, a round trip a batch) made the phase latency-bound at 42–46 µs (2026-10-27).
+    /// Phase A for `NP` tokens from `i0`: this workgroup's row's dots with the base vectors over its four blocks, the
+    /// partials held in registers, one reduction round. A thread takes eight consecutive channels a chunk — the row's
+    /// weights of each block as one 16-byte load, each base vector's as one 32-byte load reused over the four blocks:
+    /// the first form's single strided loads (hundreds a thread, a round trip a batch) made the phase latency-bound at
+    /// 42–46 µs (2026-10-27). The Gram is `phase_a_gram`'s, on workgroups of its own (it rode on rows 0..n here —
+    /// 25 extra dots a channel-eight and two extra reductions on those workgroups: A's slowest at 12.2 µs against the
+    /// others' ~6, and the first barrier waits for the slowest; an12s, 2026-10-27).
     #[inline(always)]
-    unsafe fn phase_a<const NP: usize>(w_row: *const u16, streams: *const f32, fyv: *const f32, scratch: *mut f32, row: usize, chunk: usize, n: usize, i0: usize, t: usize, lane: u32, wave: usize, red: *mut f32) {
+    unsafe fn phase_a<const NP: usize>(w_row: *const u16, streams: *const f32, fyv: *const f32, scratch: *mut f32, row: usize, chunk: usize, i0: usize, t: usize, wave: usize, red: *mut f32) {
         const CH: usize = H / (256 * 8) / A_CHUNKS;
         let mut acc = [[[0f32; BASE]; HC]; NP];
-        let mut gram = [[0f32; BASE]; BASE];
         let mut ch = 0;
         while ch < CH {
             let d8 = t * 8 + (chunk * CH + ch) * 2048;
-            // the Gram of token `wg`'s base vectors (workgroups under n), in the first pass, before the row's weights
-            // are live (the five vectors and the row's four blocks together spilled)
-            if row < n && i0 == 0 {
-                let st = streams.add(row * HC * H);
-                let mut v = [[0f32; 8]; BASE];
-                let mut a = 0;
-                while a < HC {
-                    v[a] = core::ptr::read(st.add(a * H + d8) as *const [f32; 8]);
-                    a += 1;
-                }
-                v[HC] = core::ptr::read(fyv.add(row * H + d8) as *const [f32; 8]);
-                let mut a = 0;
-                while a < BASE {
-                    let mut b = 0;
-                    while b < BASE {
-                        let mut d = 0f32;
-                        let mut k = 0;
-                        while k < 8 {
-                            d += v[a][k] * v[b][k];
-                            k += 1;
-                        }
-                        gram[a][b] += d;
-                        b += 1;
-                    }
-                    a += 1;
-                }
-            }
             // the row's four blocks' weights at these channels, held; the base vectors one at a time
             let mut wv = [[0f32; 8]; HC];
             let mut j = 0;
@@ -322,14 +296,14 @@ pub mod gfx11 {
             }
             ch += 1;
         }
-        // one reduction round: every value a wave sum — a token's twenty dots' butterflies in lockstep, the Gram's
-        // twenty-five likewise — lane 0's into LDS `[8 waves][NP·DOTS + BASE²]`, a thread a value
+        // one reduction round: every value a wave sum on the VALU (DPP butterflies; the lockstep `ds_bpermute` form
+        // before) — lane 0's into LDS `[8 waves][NP·DOTS]`, a thread a value
         const W: usize = 8;
-        let stride = NP * DOTS + BASE * BASE;
+        let stride = NP * DOTS;
         let mut i = 0;
         while i < NP {
-            let v = wave_sum_f32::<DOTS>(lane, core::array::from_fn(|k| acc[i][k / BASE][k % BASE]));
-            if lane == 0 {
+            let v = wave_sum_dpp_n::<DOTS>(core::array::from_fn(|k| acc[i][k / BASE][k % BASE]));
+            if t % 32 == 0 {
                 let mut k = 0;
                 while k < DOTS {
                     *red.add(wave * stride + i * DOTS + k) = v[k];
@@ -337,23 +311,6 @@ pub mod gfx11 {
                 }
             }
             i += 1;
-        }
-        // the Gram's twenty-five in two lockstep halves (all at once spilled at the kernel's register bound)
-        const G1: usize = BASE * BASE / 2;
-        const G2: usize = BASE * BASE - G1;
-        let g1 = wave_sum_f32::<G1>(lane, core::array::from_fn(|k| gram[k / BASE][k % BASE]));
-        let g2 = wave_sum_f32::<G2>(lane, core::array::from_fn(|k| gram[(G1 + k) / BASE][(G1 + k) % BASE]));
-        if lane == 0 {
-            let mut k = 0;
-            while k < G1 {
-                *red.add(wave * stride + NP * DOTS + k) = g1[k];
-                k += 1;
-            }
-            let mut k = 0;
-            while k < G2 {
-                *red.add(wave * stride + NP * DOTS + G1 + k) = g2[k];
-                k += 1;
-            }
         }
         workgroup_sync();
         if t < stride {
@@ -363,12 +320,65 @@ pub mod gfx11 {
                 sum += *red.add(w * stride + t);
                 w += 1;
             }
-            if t < NP * DOTS {
-                let (i, k) = (t / DOTS, t % DOTS);
-                *scratch.add((i0 + i) * PRE_SCRATCH + SCR_DOTS + (chunk * A_ROWS + row) * DOTS + k) = sum;
-            } else if row < n && i0 == 0 {
-                *scratch.add(row * PRE_SCRATCH + SCR_GRAM + chunk * BASE * BASE + (t - NP * DOTS)) = sum;
+            let (i, k) = (t / DOTS, t % DOTS);
+            *scratch.add((i0 + i) * PRE_SCRATCH + SCR_DOTS + (chunk * A_ROWS + row) * DOTS + k) = sum;
+        }
+        workgroup_sync();
+    }
+
+    /// Token `i`'s Gram of its five base vectors over one chunk, on a workgroup of its own (`A_GRID + i · A_CHUNKS +
+    /// chunk`): the same loads as a row's base vectors, 25 dots a channel-eight, one reduction round.
+    #[inline(always)]
+    unsafe fn phase_a_gram(streams: *const f32, fyv: *const f32, scratch: *mut f32, i: usize, chunk: usize, t: usize, wave: usize, red: *mut f32) {
+        const CH: usize = H / (256 * 8) / A_CHUNKS;
+        let mut gram = [[0f32; BASE]; BASE];
+        let st = streams.add(i * HC * H);
+        let mut ch = 0;
+        while ch < CH {
+            let d8 = t * 8 + (chunk * CH + ch) * 2048;
+            let mut v = [[0f32; 8]; BASE];
+            let mut a = 0;
+            while a < HC {
+                v[a] = core::ptr::read(st.add(a * H + d8) as *const [f32; 8]);
+                a += 1;
             }
+            v[HC] = core::ptr::read(fyv.add(i * H + d8) as *const [f32; 8]);
+            let mut a = 0;
+            while a < BASE {
+                let mut b = 0;
+                while b < BASE {
+                    let mut d = 0f32;
+                    let mut k = 0;
+                    while k < 8 {
+                        d += v[a][k] * v[b][k];
+                        k += 1;
+                    }
+                    gram[a][b] += d;
+                    b += 1;
+                }
+                a += 1;
+            }
+            ch += 1;
+        }
+        const W: usize = 8;
+        const G: usize = BASE * BASE;
+        let g = wave_sum_dpp_n::<G>(core::array::from_fn(|k| gram[k / BASE][k % BASE]));
+        if t % 32 == 0 {
+            let mut k = 0;
+            while k < G {
+                *red.add(wave * G + k) = g[k];
+                k += 1;
+            }
+        }
+        workgroup_sync();
+        if t < G {
+            let mut sum = 0f32;
+            let mut w = 0;
+            while w < W {
+                sum += *red.add(w * G + t);
+                w += 1;
+            }
+            *scratch.add(i * PRE_SCRATCH + SCR_GRAM + chunk * G + t) = sum;
         }
         workgroup_sync();
     }
@@ -598,12 +608,15 @@ pub mod gfx11 {
                 let mut i0 = 0;
                 while i0 < n {
                     if n - i0 >= 2 {
-                        phase_a::<2>(w_row, streams, fyv, scratch, row, chunk, n, i0, t, lane, wave, l);
+                        phase_a::<2>(w_row, streams, fyv, scratch, row, chunk, i0, t, wave, l);
                     } else {
-                        phase_a::<1>(w_row, streams, fyv, scratch, row, chunk, n, i0, t, lane, wave, l);
+                        phase_a::<1>(w_row, streams, fyv, scratch, row, chunk, i0, t, wave, l);
                     }
                     i0 += 2;
                 }
+            } else if wg < A_GRID + n * A_CHUNKS {
+                let g = wg - A_GRID;
+                phase_a_gram(streams, fyv, scratch, g / A_CHUNKS, g % A_CHUNKS, t, wave, l);
             }
             let kta = common::stat_clock!();
             if !TAIL {
