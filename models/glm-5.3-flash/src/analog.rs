@@ -200,48 +200,74 @@ pub mod gfx11 {
     pub const SCRATCH: usize = SCR_BETA + 2 * BASE;
     const _: () = assert!(SCRATCH <= PRE_SCRATCH && A_GRID as u32 <= CHAIN_GRID && HC_COEFS <= 32 && BASE * BASE <= 32 && 8 * (4 * DOTS + BASE * BASE) * 4 <= CHAIN_LDS as usize);
 
-    /// Phase A for `NP` tokens: this workgroup's row's dots with the base vectors over its four blocks, and
-    /// (workgroup `i < n`) token `i`'s Gram; the partials of all of them held in registers, one reduction round.
+    /// Phase A for `NP` tokens from `i0`: this workgroup's row's dots with the base vectors over its four blocks, and
+    /// (workgroup `i < n`, the first pass) token `i`'s Gram; the partials of all of them held in registers, one
+    /// reduction round. A thread takes eight consecutive channels a chunk — the row's weights of each block as one
+    /// 16-byte load, each base vector's as one 32-byte load reused over the four blocks: the first form's single
+    /// strided loads (hundreds a thread, a round trip a batch) made the phase latency-bound at 42–46 µs (2026-10-27).
     #[inline(always)]
     unsafe fn phase_a<const NP: usize>(w_row: *const u16, streams: *const f32, fyv: *const f32, scratch: *mut f32, wg: usize, n: usize, i0: usize, t: usize, lane: u32, wave: usize, red: *mut f32) {
-        // thread t's channels d = t + 256 s of every block: the row's weights of block j, the base vectors' values
-        // of tokens i0 .. i0 + NP (two at most a pass: four tokens' accumulators spilled at the grid's register bound)
+        const CH: usize = H / (256 * 8);
         let mut acc = [[[0f32; BASE]; HC]; NP];
         let mut gram = [[0f32; BASE]; BASE];
-        let mut sidx = 0;
-        while sidx < H / 256 {
-            let d = t + 256 * sidx;
-            let mut j = 0;
-            while j < HC {
-                let wv = widen(*w_row.add(j * H + d));
-                let mut i = 0;
-                while i < NP {
-                    let st = streams.add((i0 + i) * HC * H);
-                    let mut a = 0;
-                    while a < HC {
-                        acc[i][j][a] += wv * *st.add(a * H + d);
-                        a += 1;
-                    }
-                    acc[i][j][HC] += wv * *fyv.add((i0 + i) * H + d);
-                    i += 1;
-                }
-                j += 1;
-            }
-            // the Gram of token `wg`'s base vectors (workgroups under n), in the first pass
+        let mut ch = 0;
+        while ch < CH {
+            let d8 = t * 8 + ch * 2048;
+            // the Gram of token `wg`'s base vectors (workgroups under n), in the first pass, before the row's weights
+            // are live (the five vectors and the row's four blocks together spilled)
             if wg < n && i0 == 0 {
                 let st = streams.add(wg * HC * H);
-                let v: [f32; BASE] = [*st.add(d), *st.add(H + d), *st.add(2 * H + d), *st.add(3 * H + d), *fyv.add(wg * H + d)];
+                let mut v = [[0f32; 8]; BASE];
+                let mut a = 0;
+                while a < HC {
+                    v[a] = core::ptr::read(st.add(a * H + d8) as *const [f32; 8]);
+                    a += 1;
+                }
+                v[HC] = core::ptr::read(fyv.add(wg * H + d8) as *const [f32; 8]);
                 let mut a = 0;
                 while a < BASE {
                     let mut b = 0;
                     while b < BASE {
-                        gram[a][b] += v[a] * v[b];
+                        let mut d = 0f32;
+                        let mut k = 0;
+                        while k < 8 {
+                            d += v[a][k] * v[b][k];
+                            k += 1;
+                        }
+                        gram[a][b] += d;
                         b += 1;
                     }
                     a += 1;
                 }
             }
-            sidx += 1;
+            // the row's four blocks' weights at these channels, held; the base vectors one at a time
+            let mut wv = [[0f32; 8]; HC];
+            let mut j = 0;
+            while j < HC {
+                wv[j] = widen8_at(w_row.add(j * H + d8));
+                j += 1;
+            }
+            let mut a = 0;
+            while a < BASE {
+                let mut i = 0;
+                while i < NP {
+                    let xv: [f32; 8] = if a < HC { core::ptr::read(streams.add((i0 + i) * HC * H + a * H + d8) as *const [f32; 8]) } else { core::ptr::read(fyv.add((i0 + i) * H + d8) as *const [f32; 8]) };
+                    let mut j = 0;
+                    while j < HC {
+                        let mut d = 0f32;
+                        let mut k = 0;
+                        while k < 8 {
+                            d += wv[j][k] * xv[k];
+                            k += 1;
+                        }
+                        acc[i][j][a] += d;
+                        j += 1;
+                    }
+                    i += 1;
+                }
+                a += 1;
+            }
+            ch += 1;
         }
         // one reduction round: every value a wave sum, lane 0's into LDS `[8 waves][NP·DOTS + BASE²]`, a thread a value
         const W: usize = 8;
@@ -455,22 +481,33 @@ pub mod gfx11 {
                 phase_b(wave, mix_l, at(TAB_A_BASE) as *const f32, at(TAB_A_SCALE) as *const f32, at(TAB_F_BASE) as *const f32, at(TAB_F_SCALE) as *const f32, c, scratch, lane, l.add(wave * 64));
             }
             barrier(count, 1, t, wg, value);
-            // phase C: the collapses, a thread a channel, every token
-            let d = wg * 256 + t;
-            if d < H {
+            // phase C: the collapses, a thread eight channels (workgroups under H / 2048), every token
+            if wg < H / 2048 {
+                let d8 = wg * 2048 + t * 8;
                 let mut i = 0;
                 while i < n {
                     let (st, sc) = (streams.add(i * HC * H), scratch.add(i * PRE_SCRATCH + SCR_BETA));
-                    let v: [f32; BASE] = [*st.add(d), *st.add(H + d), *st.add(2 * H + d), *st.add(3 * H + d), *fyv.add(i * H + d)];
-                    let (mut xa, mut x0a) = (0f32, 0f32);
+                    let mut v = [[0f32; 8]; BASE];
                     let mut a = 0;
-                    while a < BASE {
-                        xa += *sc.add(a) * v[a];
-                        x0a += *sc.add(BASE + a) * v[a];
+                    while a < HC {
+                        v[a] = core::ptr::read(st.add(a * H + d8) as *const [f32; 8]);
                         a += 1;
                     }
-                    *x.add(i * H + d) = xa;
-                    *x0.add(i * H + d) = x0a;
+                    v[HC] = core::ptr::read(fyv.add(i * H + d8) as *const [f32; 8]);
+                    let (mut xa, mut x0a) = ([0f32; 8], [0f32; 8]);
+                    let mut a = 0;
+                    while a < BASE {
+                        let (ba, b0a) = (*sc.add(a), *sc.add(BASE + a));
+                        let mut k = 0;
+                        while k < 8 {
+                            xa[k] += ba * v[a][k];
+                            x0a[k] += b0a * v[a][k];
+                            k += 1;
+                        }
+                        a += 1;
+                    }
+                    core::ptr::write(x.add(i * H + d8) as *mut [f32; 8], xa);
+                    core::ptr::write(x0.add(i * H + d8) as *mut [f32; 8], x0a);
                     i += 1;
                 }
             }
