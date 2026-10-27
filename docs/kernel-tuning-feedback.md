@@ -239,6 +239,12 @@ do not enter. 098's rows pass on q4 rows: 1,344 waves on 96 SIMDs, ~2,200 issued
 of LDS reads ≈ 7.5 µs, measured ~24 flat — after the bytes, the prologue and the LDS waits had each been cut
 and the last of them moved nothing. The lever there is instructions and LDS bytes a tile, checked by the same
 arithmetic before a build.
+The per-wave slab read has one trap of its own: a slot of a wave that did not run this launch's path still
+holds whatever it last held, so a per-wave column over the whole grid mixes live and stale entries at every
+quantile unless the live waves are identified — by a fixed wave index when the mapping is fixed, or by a validity
+stamp the kernel writes beside its values when it is not (098's an27r: the one-block workgroups' four working waves
+are not a fixed index set, and the band read 430 µs at p90 where its live waves read ~10). The slots stamped from
+wave 0 of every workgroup read clean for the same reason the launcher's `wgmin`/`wgmax` do.
 
 **The rule that makes observation a property rather than a session.** Every launch site
 declares the bytes its kernel moves, the ceiling is measured on the box at startup, and
