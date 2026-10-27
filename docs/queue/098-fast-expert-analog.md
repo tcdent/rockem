@@ -906,6 +906,27 @@ The occupancy prediction held for the chain and the numerics held once `CHAIN_LD
 2.83 / 1.44 / 0.88 · 97 / 99; coverage .776 throughout. an25s boots for the section's per-workgroup rows (A by band:
 wg 0–95 the rows, 96–103 the Gram, 104–167 idle; B by workgroup 0).
 
+**an25s (rockem.lead, 2026-10-27; run 369eb2d5; the section): A mean 4.4 / slowest 10.0 (an13s 5.6 / 12.2), the
+first barrier 8.5 / 18, B 9.9 (workgroup 0), the rest 18.4.** A by band (wave 0, median a workgroup, min / med /
+max): the row workgroups (0–95) card0 6.5 / 7.8 / 8.6, card1 7.7 / 8.4 / 9.0 — flat; the Gram's (96–103) 0.5 /
+1.5 / 2.6; idle 0.5; the slowest five ordinary row workgroups. A's old 12.2-against-5.6 was the Gram on top of
+rows (an15) plus the idle workgroups in the mean; what is left is the row workgroups' own ~8 and B's one wave at
+~10: the section's critical path ≈ 10 + 10 + 4 = 25 of the 99. **Every piece of the chain is measured: A 10, B 10,
+C 4, R ~18, S 17, O ~9, F ~6, the barriers and the launch the rest.**
+
+**The slope (rockem.lead, from the ledger an9 → an25, seven builds): at width 2, slot wait ≈ 1.1 ms + 17.8 µs of
+wait a µs of chain a step (r .99)** — 41 layers × 1 µs = 41 µs, so ~43 % of every chain microsecond is exposed as
+wait, and the fit reaches production's 1.3 ms at a chain of ~11 µs (width 3: ~37 % exposed, production at ~20;
+width 4: ~16 %, at ~55). Reading, as arithmetic: shortening the chain alone cannot reach production's slot wait at
+width 2. What the fit says the cost is: the chain's queue time on the card, serialized with the forward's own
+kernels on the one AQL queue. The lever that changes the slope rather than the chain: **the chain on a second
+queue** (launch-fusion's open item), its ~97 µs overlapping the forward's latency-bound decode kernels on idle CUs
+instead of queuing ahead of them — a cost of contention, not length. A design fork for tcdent, which rockem.lead
+is bringing with these numbers. It also bears on the cascade: the peer's chain waits in-kernel for the leader's
+shared output, and on the one queue that wait holds the peer's forward kernels behind it (the lateness that
+accumulated across cards through `fyv`); on its own queue the wait blocks nothing but the chain. The per-piece cuts
+stay worth ~0.18 ms a step at width 2 for every 10 µs off the chain.
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back
