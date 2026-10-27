@@ -419,6 +419,25 @@ and the route-ahead's picks named of 8 on the same positions (the analog's must 
 ~190 µs; the slot lap back to ~0.3 ms a step at widths 2–4), long SCORE bit-identical, `plan_eval` at 18k against
 50bbd219 (the first boot's .711 / .787 should repeat), experts_ms and the step by width, a 300k+ turn.
 
+**The second boot (rockem.lead, 2026-10-26, run 2ac1b9ac) and the phases (2026-10-27, run e8d732b3, the stats
+object).** Accuracy repeats exactly (.711 / .776). The plan still late: slot wait 5.5 / 4.9 / 3.3 / 1.7 ms a step at
+widths 1–4 (production 1.45 / 1.3 / 0.87 / 0.8), the step +3.1 / +2.0 / +1.2 ms at 2 / 3 / 4 — 40 % of the first
+boot's cost, net negative. an_chain p50 168 / 177 µs (predicted 145), p90 286 / 302. The phases (medians, µs): the
+peer's wait for fyv 6.6 on fast chains and **148 on the slow 14 % of card0's / 3 % of card1's** — the tail is that wait
+entirely, the leader's queue ~140 µs behind on those layers (card1 leading late 5× more often); the hyper-connection
+phases A+B+C **42 against 18 predicted** — the three grid barriers, 168 arrivals serialized on one word, ~8 µs each (the
+lesson hc_pre learned on 2026-10-16); the rows 78 against 70 (540 GB/s: the head table read through a generic pointer
+a wave a row group); F+S+O as predicted. **The budget is smaller than assumed:** hc_post waits only 46 µs after the
+chain, so the host's run is ~170–200 µs at width 2 and ~50 at width 1 (~7 experts): the plan must be ready ≤ ~150 µs
+after the run starts at width 2 (chain ≤ ~115), and **width 1 cannot fit at any size** — tcdent's fork (a step-derived
+rule, the analog at n ≥ 2 and the route-ahead at n = 1, or an accepted wait).
+
+**Build 3 (branch 098-analog, 3272a28; `kernels-an3.gfx1100.elf`, `-an3s` the stats object).** The grid barriers
+hierarchical (a count a group of 8 workgroups, then the top word); the head table in LDS; the layer stamped in stats
+slot 3 to name the late chains. Expected: A+B+C ~20, the rows ~72, chain ~150 with 32 heads — still over the width-2
+budget: the rows are the floor, and the fit needs 16 heads (8 a part, ~22 MB a card, ~40 µs) if the offline gain
+holds (hb24 / hb16 / hb8 columns computing on both texts).
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back
