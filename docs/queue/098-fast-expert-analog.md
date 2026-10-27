@@ -593,6 +593,11 @@ bandwidth; the an1 lanes priced the rows at 75 for 32 heads). At widths 1–2 th
 longer). Predicted at width 2: R's serial depth halved, ~10–15 µs off the chain. Left in R: the batch width itself
 (`A` = 2 steps; four would hold NP ≤ 2's activations but not the fetches at this register bound) and the bytes (12
 heads, FP8 rows).
+Tried and dropped the same hour: phase C over every SPEC_TOKENS row instead of a loop to `n` — the object's C region
+went 325 → 831 instructions and 9 → 12 drains (the four tokens' loads were not batched across tokens; at width 2 the
+loop's two rounds cost fewer), so the loop stays. The step (S) is `step_head`'s production arithmetic — eight
+workgroup syncs, two `wave_sum`s and three division sequences a token — shared with `kda_step`; a DPP/`v_rsq` form for
+the read-only instantiation would be a fork inside shared code, flagged, not built.
 
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
