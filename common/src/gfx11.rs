@@ -224,6 +224,18 @@ pub unsafe fn wave_sum_dpp(v: f32) -> f32 {
     let r = row_sum16(v);
     r + other_row(r)
 }
+/// `wave_sum_dpp` of every value of an array: the chains are independent, so they interleave on the VALU; against
+/// `wave_sum_f32`'s five round trips through LDS for all values (phase A of the analog, 2026-10-27).
+#[inline(always)]
+pub unsafe fn wave_sum_dpp_n<const N: usize>(v: [f32; N]) -> [f32; N] {
+    let mut out = [0f32; N];
+    let mut k = 0;
+    while k < N {
+        out[k] = wave_sum_dpp(v[k]);
+        k += 1;
+    }
+    out
+}
 
 /// Max of one f32 per lane across the wave; every lane gets the result.
 #[inline(always)]

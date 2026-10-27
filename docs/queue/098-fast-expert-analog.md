@@ -542,6 +542,129 @@ sixth, 3 O to the end — the first table of the chain's other ~80 µs, which on
 sums (five round trips for all 65 values), the rows passes' and the step's own (`exp4_rows_direct_rows`, `step_head`:
 shared, bit-identical code; not touched).
 
+**an12's boot (rockem.lead, 2026-10-27; an12s run 34aaec6a, an12 run c131716a, serving) — the first build that moved
+the chain.** an12s: A 5.6 / 12.2 (mean / slowest workgroup), the first barrier 10.9 / 21, **B 11.4** (an11s 31.4;
+the line said 20.6 — the line was the every-lane-alike builds' dependency chains, not instructions in general: the DPP
+build's 2,051 cost 11.4, under the old intercept), the rest 15.6; chain 128 / 131. an12 served: an_chain p50
+**130.8 / 134.7** (an11 149.6 / 154.3, an9 141.6 / 145.8), p90 210 / 214, slow > 250 µs 0.2 / 0.4 %; slot wait
+3.47 / 1.82 / 1.08 ms at widths 2–4 (an11 3.90 / 2.05 / 1.10; production 1.3 / 0.87 / 0.8); step 47.0 / 59.5 / 68.2
+(production 45.3 / 58.5 / 67.6); experts 12.13 / 19.55 / 27.08; coverage .773, @13 .851; long SCORE bit-identical;
+hardware clean. The hyper-connection section A_max 12.2 + B 11.4 + C ~4 ≈ 28 (was 44); the ~100 outside it (rows,
+F, S, O, the launch, the barriers) is now three quarters of the chain. A's slowest workgroup 12.2 against the mean 5.6:
+the barrier waits the 6.6 out — the Gram rode on rows 0..n (25 extra dots a channel-eight and two extra lockstep
+reductions on 2n of the 96 working workgroups); build 15 gives it workgroups of its own among the 72 idle, and takes
+phase A's lockstep `ds_bpermute` sums to the VALU too (`wave_sum_dpp_n`).
+
+**Build 15 (staged, not booted: `kernels-an15` 384efd20, `-an15s` 5c49d3c8, `-an15t` 93167843; node unchanged,
+kernarg 200).** The Gram on workgroups of its own (`phase_a_gram`: workgroup `A_GRID + i · A_CHUNKS + chunk` for
+token i, the same loads as a row's base vectors, 25 dots a channel-eight, one reduction round) — the 96 row
+workgroups all carry the same work now; phase A's and the Gram's reductions on the VALU (`gfx11::wave_sum_dpp_n`:
+every value's five-step DPP chain, interleaved; no LDS round trip). The A region (stamps 2 → 3): 2,168 instructions,
+0 `ds_bpermute` (an14s 300 of them in A's lockstep sums), 10 drains; the whole kernel 440 → 230 `ds_bpermute` (the
+rows passes' and the step's own remain). Barriers 27 → 29: the Gram workgroup's two syncs. Predicted: A's slowest
+workgroup ~6 (the mean), the first barrier's wait falls with it, chain ~124.
+
+**Build 16 (staged, not booted: `kernels-an16` c1b03831, `-an16s` c814f7ec, `-an16t` 75f88f8f; node unchanged,
+kernarg 200; 178 VGPRs, no scratch, 29 barriers).** The tail's permutes and sunk loads, read from the an15t object
+(rockem.lead's cut agreed: R 3,921 instructions with 120 `ds_bpermute` and 28 drains, F 1,429 with 90, O 1,472 with
+41 drains — R and F held 210 of the kernel's 230 remaining permutes, the class that priced A and B). The analog's rows
+variant `exp4_rows_direct_rows` (its own copy; `exp4_rows_direct_map` and the production passes untouched) reduces
+on the VALU: the norm's sum one `wave_sum_dpp` a token and `v_rsq`, each row's dot a `wave_sum_dpp`. Phase O's loads
+read every one of the SPEC_TOKENS rows whether or not the token is in the step (`if i < n` around a load is a branch
+arm the compiler sinks the load into: a round trip a step), the second margin's shared output weighted by a uniform
+0 / 1 instead of branched, the products through `fma`. Per phase in the an16t object (instructions / `vmcnt(0)`
+drains / `lgkmcnt(0)` waits / `ds_bpermute`): A 2,168 / 10 / 10 / 0; B 1,637 / 2 / 1 / 0; C 325 / 9 / 5 / 0;
+**R 3,463 / 33 / 16 / 0** (was 3,889 / 27 / 124 / 120); **F 886 / 12 / 9 / 0** (1,459 / 15 / 104 / 90); S 1,595 / 10 /
+36 / 10 (the step's own, shared code, untouched; its 24 `v_div` likewise); **O 954 / 12 / 10 / 0** (1,413 / 39 / 32 /
+10). Kernel-wide `ds_bpermute` 440 → 10, `v_div` 64 → 24. Left by class: R's 33 drains (the rows pass's own load
+pipeline — the next read), S's form, the six grid barriers, the launch.
+
+A stats object's clock reads sit on the critical path (~1 µs a `MSG_RTN_GET_REALTIME`; the -s/-t objects carry 9–10
+against the an9s–an12s 6): chains compare only between production objects — an12's 130.8 / 134.7 is the mark; the
+-s/-t objects are for their tables alone (rockem.lead, 2026-10-27).
+
+**Build 17 (staged, not booted: `kernels-an17` 6f43bf99, `-an17s` 4fb083d8, `-an17t` a84ca335; node unchanged,
+kernarg 200; 171 VGPRs, no scratch, 29 barriers).** Phase R's depth. The selection is 3,392 rows (the 320 small rows
+and 16 heads × 3 × 128) over the grid's 1,344 waves at `E4_ROWS` = 2 rows a wave: the first 704 waves went round
+twice — the rows pass loads two 256-column steps a batch over H's twenty, ten drains a round, so those waves ran
+twenty serial batches with the rest of the grid idle. The phase is one wave's round trips (8.7 MB is ~14 µs of
+bandwidth; the an1 lanes priced the rows at 75 for 32 heads). At widths 1–2 the pass takes `R_ROWS` = 3 rows a wave
+(one round; three rows at four tokens put 12 bytes in scratch, so widths 3–4 keep two — their host run is the
+longer). Predicted at width 2: R's serial depth halved, ~10–15 µs off the chain. Left in R: the batch width itself
+(`A` = 2 steps; four would hold NP ≤ 2's activations but not the fetches at this register bound) and the bytes (12
+heads, FP8 rows).
+Tried and dropped the same hour: phase C over every SPEC_TOKENS row instead of a loop to `n` — the object's C region
+went 325 → 831 instructions and 9 → 12 drains (the four tokens' loads were not batched across tokens; at width 2 the
+loop's two rounds cost fewer), so the loop stays. The step (S) is `step_head`'s production arithmetic — eight
+workgroup syncs, two `wave_sum`s and three division sequences a token — shared with `kda_step`; a DPP/`v_rsq` form for
+the read-only instantiation would be a fork inside shared code, flagged, not built.
+
+**an13's boot (rockem.lead, 2026-10-27; an13s run fd213e01, an13 run 4a6ba8f4, serving — the new mark).** an13s:
+B **10.6** (an12s 11.4: the fifteen LDS waits and five drains were 0.8 µs), A 5.6 / 12.1, the first barrier
+10.9 / 21.2, the rest 14.8. an13 served: an_chain **129.0 / 133.3** (an12 130.8 / 134.7), p90 209 / 213, slow
+0.2 / 0.6 %; slot wait 3.40 / 1.72 / 1.00 ms at widths 2–4 (an12 3.47 / 1.82 / 1.08; production 1.3 / 0.87 / 0.8);
+step 46.9 / 59.8 / 68.4; coverage .773; both SCOREs bit-identical; hardware clean. So B is done at ~11 (the
+Sinkhorns' dependent chain), and the section's remaining 12 is A's slowest workgroup (build 15's Gram fix, in an16).
+
+**an16's boot (rockem.lead, 2026-10-27): the chain moved — and the decode changed.** an16: an_chain 121.8 / 125.5
+(an13 129.0 / 133.3), slot wait 2.92 / 1.80 / 0.90; the tail table (an16t, run 19360abb, mean / slowest workgroup):
+**R 45.1 / 45.7, F 6.4 / 6.9, S 17.0 / 18.9, O 2.5 / 9.5**. But the 24 cody-decode requests' step-width histogram —
+26 / 822 / 378 / 154 (1,380 steps) on an12, an13, an13s, identical, the generation deterministic — is
+25 / 600 / 241 / 295 (1,161 steps) on an16t and an16 alike: deterministic, different tokens. Both SCOREs were
+bit-identical (the analog runs only at decode widths; SCORE cannot see it). an16 came off the box (an13 restored,
+the histogram as the control); an17 held. **New gate for every build (rockem.lead): `bringup/box/decode_identical.sh`
+— the histogram must equal 26 / 822 / 378 / 154 / 1,380.**
+
+The audit of an13 → an16 (e0ccda3 against 0be775d; the diff is `gemv.rs`'s `exp4_rows_direct_rows` reductions,
+`gfx11.rs` additions, `analog.rs`, the Cargo features): every store in `an_chain` and `an_send` targets an analog or
+plan buffer — `an_scratch` (mix, dots, Gram, beta), the workgroup's LDS, `an_c`, `an_x` / `an_x0`, `an_smix`,
+`an_fg`, `an_part` / the peer's, `an_scores` / `pred_s2`, `an_k`, the barrier words, the peer's `an_fyv` — and the
+diff adds no store: the Gram's lands where it did (`SCR_GRAM`), the dots' guard is `t < NP · DOTS` as before, phase
+O's stores keep `i < n`. The new reads (phase O over every SPEC_TOKENS row of `an_normed`, `an_x0`, `x`, `fyv`) are
+in bounds — the buffers hold four rows (`x` holds STEP). So by the code the forward's path is untouched, and what
+the box sees has to come through the plan: a rounding-level change of the analog's margins (fma, DPP sum orders)
+flips near-tie picks, a different residency, and — if the join is not bit-identical across residencies after all —
+different bits. an12 → an13 was the same class of change (`v_rcp`, `v_rsq`) with the histogram unchanged, which fits
+either reading (near-tie flips are rare). The discriminator, staged: **`kernels-an13f`** (b5d15c78, from 7480af9 =
+build 13 + the fma contraction in phase B and nothing else; 192 VGPRs, no scratch, 27 barriers, kernarg 200). If
+an13f changes the histogram, the plan changes bits and the join / slot path is where to look, not the analog; if not,
+the ladder an14 (c48f22f5: + phase O's DPP sums, `v_rsq` on the router rows) → an15 (384efd20: + the Gram
+workgroups, phase A's DPP sums) → an16 bisects the rest in at most two boots.
+
+**The control, the fingerprint and an13f (rockem.lead, 2026-10-27).** The gate is now the `spec_step` path (pos, made,
+verified, accepted) against an13's run 4a6ba8f4, all 54 steps (`decode_identical.sh`; the step histogram's
+1,370 vs 1,380 was a run boundary). an13 restored (1d4f3cd4): identical across boots. an16 (17ef4a57) departs at the
+FIRST speculative step, pos 18121 — made 2 / verified 1 against 3 / 2 in every request: the draft of that step takes
+the model's hidden state from the plain width-1 decode step at 18120, the first step on which the analog runs, so
+an16 changed the width-1 forward's bits — a changed computation, not a near-tie. (In every run, request #1 follows
+its own path and #2–25 another: the cold prompt against its cache hits, the known cold-vs-hit difference; not
+today's fault.) **an13f (83cc8bb2): decode-identical to an13** — so two rounding-level changes of the analog's
+margins (an12 → an13's `v_rcp` / `v_rsq`, an13 → an13f's fma) left the output untouched: **the plan path does not
+change bits**; the fault is in an14 → an16's own changes. Bisection from the midpoint: an15 booting; then the splits
+staged here — `kernels-an16a` 419959ce (an15 + the rows variant's DPP reductions only), `-an16b` 54c3019f (an15 +
+phase O's reads past n, the fyv 0 / 1 weighting, O's fma), `-an14a` 2b32e578 (an13f + phase O's DPP wave sums
+only), `-an14b` 07965542 (an13f + the router rows' `v_rsq` only); an15's own two (the Gram workgroups, phase A's
+DPP sums) split as `-an15a` bf7e9ba9 (the Gram workgroups without A's DPP sums) and `-an15b` f23b8e10 (A's DPP sums with the Gram on rows 0..n). Built in a worktree at the ladder's commits (`~/Work/rockem-bis`).
+
+**an15 decode-identical; an16a DIFFERS with an16's signature — the fault and its mechanism (rockem.lead,
+2026-10-27).** an15 (373dee1c) held, so an14's and an15's changes are clear; an16a (1525ea8a; an15 + the rows
+variant's DPP reductions only) departs exactly as an16 did. The object says how: a per-symbol diff of an15 → an16a
+shows `an_chain` 12,605 → 12,068 **and three production kernels changed** — `rows_d2_e4` 1,582 → 1,466,
+`rows_h_e4` 4,312 → 3,748, `rows_part_e4` 2,994 → 2,876 — while an13 → an15 and an16a → an16 touch `an_chain`
+alone. `exp4_rows_direct_rows` was not the analog's own copy: `exp4_rows_direct_map` (the production decode-width
+rows passes) is implemented by calling it, so the reduction change reached the forward's decode-width rows kernels,
+and SCORE cannot see those kernels — past SPEC_TOKENS the rows passes are the WMMA twins. (The pass's `ds_bpermute`
+reduction is load-bearing: it replays the staged pass's exactly, which is what makes a decode step bit-identical
+to a prefill step.) **Fix (the branch's head):** `exp4_rows_direct_rows` takes a `DPP: bool` const generic — the
+analog's call sites `true`, `exp4_rows_direct_map` `false` with the original reduction verbatim — and the gate that
+would have caught it is static: `bringup/expert-cache/analog/kdiff.py <new.elf> <served.elf>` disassembles every
+kernel symbol of both objects and fails on any symbol outside `an_chain` / `an_send` that differs (it reproduces the
+an16a finding: the three rows kernels). rockem.lead's `bringup/gates/kernel_diff.sh` makes it a build gate. With
+the fix, the plain / stats / tail objects differ from an13 / an13s in `an_chain` only. **an17 re-staged on the fix:
+`kernels-an17` c842df31, `-an17s` 8ded64ea, `-an17t` 3f9c3a9b** (171 VGPRs, no scratch, 29 barriers, kernarg
+200; `an_chain` 12,349 instructions — the same count as the held an17: the analog's own code is unchanged, only the
+production kernels were). an16b was not needed; an16's phase O changes are `an_chain`-only and ride in an17.
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back
