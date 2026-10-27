@@ -403,6 +403,10 @@ pub mod gfx11 {
             let (x0, c, scratch, count) = (at(TAB_X0) as *mut f32, at(TAB_C) as *mut f32, at(TAB_SCRATCH) as *mut f32, at(TAB_COUNT) as *mut u32);
             let heads = at(TAB_HEADS) as *const u32;
             let lead = at(TAB_PART_WORD) == 0;
+            // stats (a stats code object only), ticks of the 100 MHz clock as every wave sees them: slot 0 the peer's
+            // wait for the leader's shared output (0 on the leader), 1 the hyper-connection phases A, B, C to the third
+            // barrier, 2 the rows phase R to the fourth, 3 the gates, the step and the output phase to the end
+            let kt_w = common::stat_clock!();
             // the peer: the leader's shared output must be in (its word in this card's copy)
             let fyv_word = at(TAB_FYV_WORD) as *const u32;
             if !fyv_word.is_null() {
@@ -412,6 +416,8 @@ pub mod gfx11 {
                 workgroup_sync();
                 fence(Ordering::Acquire);
             }
+            let kt0 = common::stat_clock!();
+            common::stat!(0, kt0.wrapping_sub(kt_w) & common::stats::CLOCK_MASK);
             // phase A: a coefficient row a workgroup (the attention half's rows, then the FFN half's)
             if wg < A_GRID {
                 let w_row = if wg < HC_COEFS { a_fn.add(wg * HC * H) } else { f_fn.add((wg - HC_COEFS) * HC * H) };
@@ -451,6 +457,8 @@ pub mod gfx11 {
                 }
             }
             barrier(count, 2, t, value);
+            let kt1 = common::stat_clock!();
+            common::stat!(1, kt1.wrapping_sub(kt0) & common::stats::CLOCK_MASK);
             // phase R: the small rows and the chosen heads' q, k, v rows of `sq` over `x` normed with the input norm,
             // into `smix` at the rows' own places (the step reads it as `kda_step` reads `sq`'s output); every wave
             // loops the selection E4_ROWS rows at a time
@@ -480,6 +488,8 @@ pub mod gfx11 {
                 }
             }
             barrier(count, 3, t, value);
+            let kt2 = common::stat_clock!();
+            common::stat!(2, kt2.wrapping_sub(kt1) & common::stats::CLOCK_MASK);
             // phase F: the chosen heads' f_b and g_b rows of `fg` over the gates' first halves in `smix`
             {
                 let smix = smix as *const f32;
@@ -607,6 +617,8 @@ pub mod gfx11 {
                     i += 1;
                 }
             }
+            let kt3 = common::stat_clock!();
+            common::stat!(3, kt3.wrapping_sub(kt2) & common::stats::CLOCK_MASK);
         }
     }
 

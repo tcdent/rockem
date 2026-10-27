@@ -322,7 +322,7 @@ struct Shared {
 /// 2026-10-24) run through `rows_pass`, whose slots are its phases: 0 the activation staging
 /// rounds, 1 the weight rounds (the FP8 decode and dot), 2 the tail (the norm's reduction, the
 /// ready, the emits) — shader cycles a wave, wave 0 of each workgroup the clean read.
-const STAT_KERNELS: &[&str] = &["hc_pre", "pred_rows", "mla_o"];
+const STAT_KERNELS: &[&str] = &["hc_pre", "pred_rows", "mla_o", "an_chain"];
 /// `Shared::xact`'s regions, in bytes.
 const HG: usize = H / common::q4::GROUP;
 const XA_Q: usize = 0;
