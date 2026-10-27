@@ -711,11 +711,13 @@ pub mod gfx11 {
                     _ => rows_pass!({ common::gemv::FEW }, E4_ROWS),
                 }
             }
-            barrier(count, 3, t, wg, value);
+            // the tail's first stamp before the barrier: R's own time a wave, the barrier's wait in the next slot
+            // (stamped after it, R and its barrier were one number — 45 µs mean and slowest alike, 2026-10-27)
             let ktr = common::stat_clock!();
             if TAIL {
                 common::stat!(0, ktr.wrapping_sub(kt1) & common::stats::CLOCK_MASK);
             }
+            barrier(count, 3, t, wg, value);
             // phase F: the chosen heads' f_b and g_b rows of `fg` over the gates' first halves in `smix`
             {
                 let smix = smix as *const f32;
