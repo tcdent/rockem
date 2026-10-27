@@ -10,7 +10,12 @@
 //! `--touch node`: every touch and reread with the node's prefetch touch (`touch_node.rs`: 32-byte loads, sixteen lines in
 //! flight) instead of one scalar load a line.
 //!
-//!   bench-l3life [--clock 0] [--touch scalar|node] [--sib-spin 0] [--cpus 56] [--set-kb 8192] [--gap-us 0] [--filler-kb 0] [--reps 20] [--pool-mb 1024]
+//! `--mate-read 1` (A2, docs/l3-literature.md §5/§7): after the touch, each core streams 1 MB of its own scratch (its set
+//! leaves its L2), then the NEXT listed core reads the set once (an L3 hit by another core: the SOG's "read by more than
+//! one core" class), then the filler, then the toucher's reread by source. Against the same run without it, the mate's
+//! one cheap read either protects the set or does not.
+//!
+//!   bench-l3life [--mate-read 0] [--clock 0] [--touch scalar|node] [--sib-spin 0] [--cpus 56] [--set-kb 8192] [--gap-us 0] [--filler-kb 0] [--reps 20] [--pool-mb 1024]
 use harness::arg;
 #[path = "touch_node.rs"]
 mod touch_node;
@@ -58,6 +63,7 @@ fn main() {
     let reps = num("--reps", 20);
     let pool = num("--pool-mb", 1024) << 20;
     let sib_spin = num("--sib-spin", 0) == 1;
+    let mate_read = num("--mate-read", 0) == 1;
     // `--clock 1`: APERF/MPERF around every first touch (MSR reads between the phases desynchronize the cores: on 46 cores
     // they changed the rate itself, 3.06 → 3.72 GB/s; off by default)
     let clock = num("--clock", 0) == 1;
@@ -86,6 +92,9 @@ fn main() {
         u64::from_le_bytes(b)
     }
     let t = cpus.len();
+    // --mate-read: each core's set base, published for its mate
+    let set_bases: Arc<Vec<std::sync::atomic::AtomicUsize>> = Arc::new((0..t).map(|_| std::sync::atomic::AtomicUsize::new(0)).collect());
+    let mate_bar = Arc::new(Barrier::new(t));
     let _ = std::fs::write("/proc/sys/kernel/nmi_watchdog", "0");
     assert!(cpus.iter().all(|&c| common::pmc::Pmc::open(c).is_some_and(|p| p.program(&common::pmc::FILLS))) && common::pmc::allow_rdpmc(), "pmc");
     // per decile: (L3, DRAM) lines summed over cores and reps; the first touch's and the filler's DRAM share
@@ -96,9 +105,11 @@ fn main() {
         .iter()
         .map(|&cpu| {
             let (acc, first, bar, touch_ns, perf) = (acc.clone(), first.clone(), bar.clone(), touch_ns.clone(), perf.clone());
+            let (set_bases, mate_bar, ti) = (set_bases.clone(), mate_bar.clone(), cpus.iter().position(|&c| c == cpu).unwrap());
             std::thread::spawn(move || {
                 harness::bench::pin(cpu);
                 let mem = vec![1u8; pool];
+                let scratch = vec![2u8; 1 << 20];
                 let step = set + filler;
                 assert!(3 * step <= pool, "pool too small for set + filler");
                 let mut at = 0usize;
@@ -125,6 +136,16 @@ fn main() {
                     }
                     let c1 = fills();
                     bar.wait();
+                    if mate_read {
+                        // the set leaves this core's L2 (1 MB of scratch), then the mate reads it once from L3
+                        set_bases[ti].store(sp as usize, std::sync::atomic::Ordering::Release);
+                        std::hint::black_box(touch(scratch.as_ptr(), scratch.len()));
+                        mate_bar.wait();
+                        let mate = (ti + 1) % t;
+                        let mb = set_bases[mate].load(std::sync::atomic::Ordering::Acquire) as *const u8;
+                        std::hint::black_box(touch(mb, set));
+                        mate_bar.wait();
+                    }
                     if filler > 0 {
                         std::hint::black_box(touch(fp, filler));
                     }
@@ -176,7 +197,7 @@ fn main() {
         set >> 10,
         (t * set) as f64 / (1 << 20) as f64,
         filler >> 10,
-        if sib_spin { ", siblings spinning" } else { "" } .to_string() + if node_touch { ", node touch" } else { ", scalar touch" },
+        if sib_spin { ", siblings spinning" } else { "" } .to_string() + if node_touch { ", node touch" } else { ", scalar touch" } + if mate_read { ", a mate read the set once (A2)" } else { "" },
         (set as f64 * reps as f64 * t as f64) / *touch_ns.lock().unwrap() as f64,
         { let p = perf.lock().unwrap(); 2.65 * p[0] as f64 / p[1].max(1) as f64 },
         100.0 * f[1] as f64 / (f[0] + f[1]).max(1) as f64,
