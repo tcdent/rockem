@@ -227,6 +227,11 @@ the same work buy nothing, and a cut that changes the shape must be measured, no
 the previous shape's line. The register pressure that moved loads into loops, the ALU chain
 that grew when they came back out, and the shape change that halved B left no trace in the
 slab; all three were in the object.
+A count is static; a cost is dynamic. Before pricing a region's instructions, find its
+back-edges (`s_branch`/`s_cbranch` with a negative offset — printed as a 16-bit two's complement, > 32767)
+and multiply each loop body by its trips: build an19's staging loop doubled its static permutes (40 → 80)
+while halving its trips (4 → 2) and its dependent depth — the same 160 dynamic permutes, half the waits.
+The straight-line rule above (one wave, every instruction serial) applies to a body once per trip.
 
 **The rule that makes observation a property rather than a session.** Every launch site
 declares the bytes its kernel moves, the ceiling is measured on the box at startup, and
