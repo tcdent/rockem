@@ -1,10 +1,29 @@
 #!/bin/bash
-# decode_identical.sh [run]: the decode-identity gate — the 24 cody-decode requests' step-width histogram must equal the
-# reference's (26 / 822 / 378 / 154 at widths 1–4, 1,380 steps: an12, an13, an13s on 2026-10-27; generation is
-# deterministic run to run). SCORE cannot see the analog (it runs only at decode widths); this can. A change here with
-# the forward's kernels untouched means the analog wrote, or read stale, something the forward uses (an16, 2026-10-27).
+# decode_identical.sh [run]: the decode-identity gate on the 24 cody-decode requests (the same 18k prompt, a cache hit
+# after the first). The fingerprint is the speculation path — spec_step's (pos, made, verified, accepted) sequence of the
+# steady-state requests (hits 2–24; the cold request and the first hit follow their own paths, consistently) — compared
+# with the reference taken from an13 (run 4a6ba8f4, 2026-10-27; identical on an12, an13s and the an13 restore across
+# boots and PCIe error bursts). SCORE cannot see a kernel that runs only at decode widths (the analog); this can: an16
+# departed at the FIRST speculative step (made 2 / verified 1 vs 3 / 2), i.e. a changed computation, not a near-tie.
 set -u; ROOT=/home/slomp/Work/rockem; B=$ROOT/bringup; cd $ROOT; . $B/reads/_run.sh
-RUN=${1:-$(pick_run "")}
-REF="26 822 378 154 1380"
-GOT=$(q "SELECT sum(CASE WHEN width=1 THEN 1 ELSE 0 END)||' '||sum(CASE WHEN width=2 THEN 1 ELSE 0 END)||' '||sum(CASE WHEN width=3 THEN 1 ELSE 0 END)||' '||sum(CASE WHEN width=4 THEN 1 ELSE 0 END)||' '||count(*) h FROM step WHERE run='$RUN' AND width BETWEEN 1 AND 4" | sed -n 3p | tr -s ' ' | sed 's/^ //; s/ $//')
-if [ "$GOT" = "$REF" ]; then echo "decode-identical: $GOT (run ${RUN:0:8})"; else echo "DECODE DIFFERS: $GOT vs reference $REF (run ${RUN:0:8})"; fi
+RUN=${1:-$(pick_run "")}; REF=$B/gates/cody-decode.fingerprint
+q "SELECT epoch_ms(ts) t, pos, made, verified, accepted FROM spec_step WHERE run LIKE '$RUN%' ORDER BY ts" | grep -E "^ *[0-9]" > /tmp/claude-1000/spec-gate.txt
+python3 - "$REF" "${2:-}" <<'PY'
+import sys, collections
+ref_path, make = sys.argv[1], sys.argv[2]
+rows=[tuple(int(x) for x in l.split()) for l in open('/tmp/claude-1000/spec-gate.txt')]
+reqs=[]; cur=[]; last=None
+for t,pos,m,v,a in rows:
+    if last is not None and pos<last: reqs.append(cur); cur=[]
+    cur.append((pos,m,v,a)); last=pos
+if cur: reqs.append(cur)
+fps=[' '.join(f"{p}:{m}{v}{a}" for p,m,v,a in r) for r in reqs]
+c=collections.Counter(fps); common,n=c.most_common(1)[0]
+if make=="--make-reference":
+    open(ref_path,'w').write(common+"\n"); print(f"reference written: {n} of {len(reqs)} requests share the path ({len(reqs[fps.index(common)])} steps)"); sys.exit(0)
+ref=open(ref_path).read().strip()
+if common==ref: print(f"decode-identical: {n} of {len(reqs)} requests on the reference path ({common.count(' ')+1} steps)")
+else:
+    a=common.split(); b=ref.split(); i=next((k for k in range(min(len(a),len(b))) if a[k]!=b[k]), min(len(a),len(b)))
+    print(f"DECODE DIFFERS: {n} of {len(reqs)} requests share a path of {len(a)} steps vs the reference's {len(b)}; first difference at step {i}: {a[i] if i<len(a) else '-'} vs {b[i] if i<len(b) else '-'}")
+PY

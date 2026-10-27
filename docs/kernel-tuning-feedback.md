@@ -141,12 +141,16 @@ feeling. Theirs: "Prefill + KV Transfer within 5 % of Prefill alone." Ours:
 | build hygiene | no scratch, no runtime `cfg`, no retyped constants across the Python boundary; the code object's static report (`make kernels` → `bringup/kernel_report.py`: registers, scratch, LDS, instruction/barrier/load counts per kernel, diffed against the last build's report) prints only what moved and fails on scratch, on more than 192 VGPRs, or on a barrier count that changed | in force |
 
 **Decode identity (2026-10-27).** The long SCORE gate exercises prefill-shaped steps; a kernel that runs only
-at decode widths (the expert-prediction analog, 098) is invisible to it. The decode gate is the 24 cody-decode
-requests' step-width histogram, which is deterministic run to run (26 / 822 / 378 / 154 at widths 1–4, 1,380 steps,
-identical across three builds and five runs): a build that changes it with the forward's kernels untouched has
-written, or read stale, something the forward uses — caught in build an16, whose SCORE was bit-identical.
-`bringup/box/decode_identical.sh`, run after the workload in every `an*_gates.sh`. Residency cannot move it: the
-card expert path is bit-identical to the host's (002, 003), so a plan change never changes bits.
+at decode widths (the expert-prediction analog, 098) is invisible to it. The decode gate is the speculation path of
+the 24 cody-decode requests (the same 18k prompt; `spec_step`'s (pos, made, verified, accepted) sequence of the
+steady-state hits), compared with a reference path: it is deterministic across builds, boots and PCIe error bursts
+(an12, an13, an13s, the an13 restore — 54 steps, 24 × 96/54/41), so a build that moves it with the forward's kernels
+untouched has changed the computation. Build an16 did, at the first speculative step, with its SCORE bit-identical.
+`bringup/box/decode_identical.sh` (reference `bringup/gates/cody-decode.fingerprint`), after the workload in
+every `an*_gates.sh`. The step-width histogram is not the fingerprint (its count moves with the run boundary).
+Residency cannot move the path by rounding: the card expert path is bit-identical to the host's and the join is in
+pick order (002, 003) — yet in every run the first hit follows its own path and hits 2–24 another, so something that
+changes between the first and second hit reaches the output; unexplained, consistent across builds.
 
 ## Observation: four channels, none inside a kernel
 
