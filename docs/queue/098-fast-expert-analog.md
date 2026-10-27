@@ -992,6 +992,25 @@ two-block band ~6 µs slower a wave at the median with the same p90: placement, 
 and the trip readings do not (a block wave on a unit with another working workgroup takes the pipe's time twice).
 an27r boots; the read groups its slot 2 by the number of working workgroups sharing a hardware id.
 
+**an27r (rockem.lead, 2026-10-27; run 836a6fed; the stamps inside the block wave).** The working workgroups (in
+the K-split layout every workgroup under 106 carries two blocks on all eight waves; 106–167 carry none, and their
+slots 1–3 are never written — the "contaminated half" is the idle workgroups' stale slab entries, the filter is
+wg < 106): copy p50 2.7–3.9, the batches' loads landed 1.4 (p10 1.1 / p90 2.5 — tight), **the WMMA chain and
+flushes p50 7.6–8.6** (p10 6.0–6.7, p90 9.1–11.0); by unit load (block waves sharing a hardware id within a
+launch): 12 waves → 7.5, 16 → 9.3, 20 → 9.5. 7.6–8.6 µs for a wave's 64 WMMAs is ~300 cycles each against ~32 of
+issue: **the matrix pipe shared by the 12–20 block waves on the unit — the throughput reading holds**; the loads
+(1.4) and the copy (3.4) are not it. R's floor in this form is the pipe at ~8–10 (the `v_dot4` form's ~24 was
+issue), and the spread is placement.
+
+The lever the pipe leaves (rockem.predictor): none inside the fragment. A `16×16×16` WMMA shares one A operand
+across its sixteen columns, so the columns can only hold right-hand sides of the same rows — the step's four
+tokens, nothing else; the tokens on the K side would sum over tokens (the wrong contraction); a block-diagonal A
+over K-slices wastes 16×; the iu4 variant has the same shape; gfx11 has no 16×16×4. What remains for R: placement
+balance (the grid's fixed residency leaves little), 12 heads (−25 % of the pipe's work, offline −.06 / −.04
+coverage), or a leaner `v_dot4` form (its per-token-step floor ~14 issued → ~6–7 µs against the measured 24 of
+build 22's — a rewrite with an uncertain margin over the pipe's ~8–10). R is at its floor for this shape; the
+chain's next pieces are S (~17, the shared-code fork) and the barriers, or the queue.
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back
