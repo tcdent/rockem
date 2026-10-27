@@ -187,19 +187,23 @@ queue, one dependent round trip), `flat_` against `global_` (a pointer that came
 device-address table is generic, and a generic load is also charged to `lgkmcnt`, so every
 LDS wait drains it too), `scratch_` and `.vgpr_spill_count` from `llvm-readobj --notes`.
 Read before the next build, not after: a measured phase that a rewrite did not move is a
-class the rewrite did not touch, and the counts say which — but the class must be fitted
-against more than one table before it gates anything. What it answered in 098 (2026-10-27):
-the analog chain's phase B, one wave a token with every lane computing alike, held at 20–31 µs
-through four rewrites of its Sinkhorn and its loads. Two tables fitted B to the region's
-`vmcnt(0)` drains (14 → 19.9 µs, 19 → 26.6); the build that cut the drains to 6 measured
-31.4, and the fit that survives four tables is the region's **instruction count**: 1,885 →
-19.9, 3,806 → 26.6, 4,858 → 31.4 µs, ≈ 12.6 µs + 3.9 ns an instruction — nine cycles each,
-the dependent-issue cost of a single wave with no other wave on the SIMD to hide its latency
-(a build whose Sinkhorn lowered to IEEE `v_div_*` sat above the line: 5,217 → 44.1). For a
-few tokens on one wave, straight-line instructions are the cost; lanes doing the same work
-buy nothing; the lever is lanes doing different work. The register pressure that moved
-loads into loops, and the ALU chain that grew when they came back out, left no trace in the
-slab; both were in the object.
+class the rewrite did not touch, and the counts say which — and a fit of phase time to any
+one class holds only for the code shape it was fitted on. What it answered in 098
+(2026-10-27): the analog chain's phase B, one wave a token with every lane computing alike,
+held at 20–31 µs through four rewrites of its Sinkhorn and its loads. A two-table fit to the
+region's `vmcnt(0)` drains (14 → 19.9 µs, 19 → 26.6) failed when a build cut the drains to 6
+and measured 31.4; a four-table fit to the region's instruction count (1,885 → 19.9, 3,806 →
+26.6, 4,858 → 31.4, ≈ 12.6 µs + 3.9 ns an instruction, nine cycles each — a single wave's
+dependent issue with nothing on the SIMD to hide its latency) priced those builds and then
+failed the other way when the lanes were given different work: 2,051 instructions of DPP
+butterflies, lockstep sums and `v_readlane` measured 11.4 µs, under the old intercept. What
+the tables actually priced was the dependent chain of a given shape; the general quantity is
+one wave's critical path, which the counts bound from above but do not give. The usable rule:
+for a few tokens on one wave, straight-line dependent instructions are the cost, lanes doing
+the same work buy nothing, and a cut that changes the shape must be measured, not read off
+the previous shape's line. The register pressure that moved loads into loops, the ALU chain
+that grew when they came back out, and the shape change that halved B left no trace in the
+slab; all three were in the object.
 
 **The rule that makes observation a property rather than a session.** Every launch site
 declares the bytes its kernel moves, the ceiling is measured on the box at startup, and
