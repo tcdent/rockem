@@ -140,17 +140,23 @@ feeling. Theirs: "Prefill + KV Transfer within 5 % of Prefill alone." Ours:
 | benchmark | a published benchmark, run against a served node through the edge's own client under the model's recipe, within its noise of the published number (`bringup/evals`, kept in `models/<name>/evals.toml`) | HumanEval in force |
 | build hygiene | no scratch, no runtime `cfg`, no retyped constants across the Python boundary; the code object's static report (`make kernels` → `bringup/kernel_report.py`: registers, scratch, LDS, instruction/barrier/load counts per kernel, diffed against the last build's report) prints only what moved and fails on scratch, on more than 192 VGPRs, or on a barrier count that changed | in force |
 
-**Decode identity (2026-10-27).** The long SCORE gate exercises prefill-shaped steps; a kernel that runs only
-at decode widths (the expert-prediction analog, 098) is invisible to it. The decode gate is the speculation path of
-the 24 cody-decode requests (the same 18k prompt; `spec_step`'s (pos, made, verified, accepted) sequence of the
-steady-state hits), compared with a reference path: it is deterministic across builds, boots and PCIe error bursts
-(an12, an13, an13s, the an13 restore — 54 steps, 24 × 96/54/41), so a build that moves it with the forward's kernels
-untouched has changed the computation. Build an16 did, at the first speculative step, with its SCORE bit-identical.
-`bringup/box/decode_identical.sh` (reference `bringup/gates/cody-decode.fingerprint`), after the workload in
-every `an*_gates.sh`. The step-width histogram is not the fingerprint (its count moves with the run boundary).
-Residency cannot move the path by rounding: the card expert path is bit-identical to the host's and the join is in
-pick order (002, 003) — yet in every run the first hit follows its own path and hits 2–24 another, so something that
-changes between the first and second hit reaches the output; unexplained, consistent across builds.
+**Decode identity (2026-10-27).** The long SCORE gate exercises only the kernels of steps past `SPEC_TOKENS`
+(the WMMA rows twins and the step-shaped passes); every decode-width kernel — the `rows_*_e4` passes, the
+expert-prediction analog — is invisible to it. Build an16 changed `rows_d2_e4`, `rows_h_e4` and `rows_part_e4`
+through a reduction helper in gemv.rs that the analog's rows variant shared with them, with SCORE bit-identical,
+and the decode moved from its first speculative step. Two gates close the gap:
+*static, before any boot* — `bringup/gates/kernel_diff.sh new.elf served.elf`: every kernel symbol's instruction
+stream diffed against the served object; a change outside the allowed prefixes (`an_`) fails the object (an16
+fails on the three rows kernels, an15 passes); *on the box* — `bringup/box/decode_identical.sh`: the speculation
+path of the cody-decode hits (`spec_step`'s (pos, made, verified, accepted) sequence) against the reference
+`bringup/gates/cody-decode.fingerprint` taken from an13; deterministic across builds, boots and PCIe error bursts
+(an12, an13, an13s, an13f, an15, two restores — 54 steps, 96/54/41 a request), so a build that moves it has changed
+the computation. deploy.sh runs it after its prow reads (three extra hits give the steady-state path); the
+`an*_gates.sh` workloads run it over 24. The step-width histogram is not the fingerprint (its count moves with the
+run boundary). Residency cannot move the path by rounding — the card expert path is bit-identical to the host's
+and the join is in pick order (002, 003), and an12 → an13 → an13f (rounding-level changes to the analog's margins)
+left it untouched — yet in every run the cold request, the first hit and the second hit each follow their own path
+and hits 3+ another, same prompt; unexplained, consistent across builds.
 
 ## Observation: four channels, none inside a kernel
 

@@ -34,10 +34,12 @@ req() { # req <label> <json>: one request, wall time, the hardware watch over th
 }
 echo "--- 18k cold ---";   req "cody 18k cold" $REQ/cody-user.json
 echo "--- 18k decode ---"; req "cody 18k hit, 96 tokens" $REQ/cody-decode.json
+for i in 1 2 3; do curl -s -m 300 http://192.168.88.3:8765/v1/chat/completions -H 'content-type: application/json' -d @$REQ/cody-decode.json > /dev/null; done # three more hits: the decode-identity gate below needs the steady-state path (the cold request and the first two hits follow their own)
 [ "$SHORT" = short ] || { echo "--- 18k decode 512 ---"; req "cody 18k hit, up to 512 tokens" $REQ/cody-decode512.json; }
 [ "$SHORT" = short ] || { echo "--- 18k warm ---";   req "cody2 18k warm box" $REQ/cody-user2.json; }
 echo "--- long SCORE ---"
 cd /home/slomp/Work/rockem/api && t0=$(date +%s); timeout 600 uv run python ../bringup/gates/score_client.py 192.168.88.6 /home/slomp/Work/rockem/bundles/glm-5.3-flash-q4rtn glm-5.3-flash $(cat $REQ/score-long.ids) > $LOG/score-long-${V}-ld.lp 2>/dev/null; echo "SCORE 3632 ids: $(( $(date +%s) - t0 )) s"; cmp $LOG/score-long-rw1-ld.lp $LOG/score-long-${V}-ld.lp && echo "long SCORE bit-identical"
 sleep 8
 echo "--- prow reads ---"; $R/runs.sh 2; $R/requests.sh "" 6; $R/steps.sh "" "$T0"
+echo "--- decode identity ---"; /home/slomp/Work/rockem/bringup/box/decode_identical.sh # spec_step's path against bringup/gates/cody-decode.fingerprint: SCORE cannot see decode-width kernels (an16, 2026-10-27)
 echo done
