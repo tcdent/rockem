@@ -840,6 +840,8 @@ with the copy, the chain ~106 → ~87 by the arithmetic — the first shape that
 milliseconds. `kernel_diff` vs an22 and vs an13s: `an_chain` only. Numerics: the same integer sums and the same
 flush as the `v_dot4` form (exact i32 either way), the f32 accumulation in group order as before — coverage should
 hold to the digit.
+an21t (rockem.lead, 2026-10-27; run 308e0112): R 17.8 / 27.3 against an20t's 18.1 / 27.4 — the lookahead left
+R unchanged to the tenth: the waits were never on R's clock, the throughput reading confirmed from the table side.
 
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
