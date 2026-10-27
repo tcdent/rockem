@@ -66,7 +66,12 @@ pub const ACT_BYTES: usize = H + 8 * (H / common::q4::GROUP);
 /// Phase R's LDS: the `SPEC_TOKENS` staged activations, copied from `TAB_ACT`, then the K-quarters' partial
 /// sums `[8 waves][32 lanes][8]` f32 for the join.
 pub const R_KSPLIT: usize = 4;
-pub const R_LDS: usize = SPEC_TOKENS * ACT_BYTES + CHAIN_WAVES * 32 * 8 * 4;
+/// The join's partials, then the workgroup's two blocks' scales (`[2 blocks][4 tiles][NG][TILE]` f32, `q4::pack`'s
+/// order): read from LDS at each group's flush — read from VRAM there, the eight scale loads a group were a round
+/// trip a group on the block wave's clock, the trip the batched weights did not move (an26 null, 2026-10-27).
+pub const R_JOIN_BYTES: usize = CHAIN_WAVES * 32 * 8 * 4;
+pub const R_WS_FLOATS: usize = (CHAIN_WAVES / R_KSPLIT) * 4 * (H / common::q4::GROUP) * common::q4::TILE;
+pub const R_LDS: usize = SPEC_TOKENS * ACT_BYTES + R_JOIN_BYTES + R_WS_FLOATS * 4;
 /// `TAB_ACT`, VRAM: the activations quantized once by phase C's workgroups (`[SPEC_TOKENS][ACT_BYTES]`), then the
 /// norms' partial sums of squares `[SPEC_TOKENS][ACT_SS]` (a value a wave of phase C's `H / 2048` workgroups).
 /// Every one of phase R's 168 workgroups quantizing the four tokens itself was ~20.8 µs on the critical path
@@ -774,6 +779,17 @@ pub mod gfx11 {
                     *(act.add(c * 16) as *mut [u32; 4]) = core::ptr::read((src.add(c * 16)) as *const [u32; 4]);
                     c += 256;
                 }
+                // the workgroup's two blocks' scales (its blocks are consecutive tiles: one 4 KB span), a 16-byte
+                // chunk a thread
+                let lws = act.add(SPEC_TOKENS * ACT_BYTES + R_JOIN_BYTES) as *mut f32;
+                const { assert!(R_WS_FLOATS == 4 * 256) };
+                {
+                    let wb0 = wg * CHAIN_WAVES / R_KSPLIT;
+                    let p = qscales.add((wb0 * 16 / TILE) * (NG * TILE) + t * 4);
+                    if wb0 * 16 < SEL_ROWS {
+                        *(lws.add(t * 4) as *mut [f32; 4]) = core::ptr::read_unaligned(p as *const [f32; 4]);
+                    }
+                }
                 workgroup_sync();
                 // sixteen rows a wave on the matrix unit (the experts' prefill form, `expert::tile16`): A the rows'
                 // q4 nibbles widened to unsigned bytes (lane l supplies row l % 16's sixteen k a step), B the a8
@@ -803,7 +819,7 @@ pub mod gfx11 {
                     // the lane's eight rows' scales from one base: row 2r + h (h = l / 16) is tile r / 2 of the
                     // wave's four, row-in-tile 2 (r % 2) + h — constant offsets (eight pointers advanced a group
                     // were 24 64-bit ops a group)
-                    let wsb = qscales.add((row0 / TILE) * (NG * TILE) + lu / 16);
+                    let wsb = lws.add(((wave / R_KSPLIT) * 4) * (NG * TILE) + lu / 16) as *const f32;
                     let mut y = [0f32; 8];
                     // the quarter's eight groups in two batches of four: a batch's weights issued as one set of
                     // loads before its groups' WMMAs — two VRAM round trips a wave instead of eight (the block waves

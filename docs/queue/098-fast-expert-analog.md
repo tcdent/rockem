@@ -949,6 +949,21 @@ static, the group loop's body ~130 issued (an25 ~90: the moves and the permutes)
 top, 4 drains. By the rows: a block wave ~12–15 → ~6–7 if the trip was the round trip; the issue cost ~+1.3 µs
 over the grid. Numerics unchanged (the same bytes reach the same lanes).
 
+**an26's boot (rockem.lead, 2026-10-27; run d34429b7): a NULL** — 98.3 / 98.9 (an25 97.3 / 99.3), slot wait
+2.85 / 1.46 / 0.92, coverage .776, gates clean. Eight round trips → two moved nothing: a block wave's ~1.6 µs a
+trip is not the weights' round trip. From the object (the group body of the an26 tail object): the flush reads the
+lane's eight row scales from VRAM each group — eight `global_load_b32` waited (`vmcnt(0)`) before the `fma`s — so
+every group still pays a round trip, for 32 bytes of scales where the weights' 64 had been batched away. an26t's
+per-wave rows (booting) read the block waves against an24t's 12–15.
+
+**Build 27 (staged: `kernels-an27` bf83d1fd, `-an27s` 093f0b94, `-an27t` a0c1d0c2; THE NODE REBUILT — `CHAIN_LDS` 25,632 →
+29,728 (the ABI assert refuses the old node); kernarg 224; 156 VGPRs, no scratch, 31 barriers).** The workgroup's
+two blocks' scales (one 4 KB span of `q4::pack`'s tile-major layout) copied into LDS with the activations, a
+16-byte chunk a thread, and read there at each group's flush: the group body has no global load and no `vmcnt`
+wait of its own (the batch's eight weight loads at the batch's top, nine LDS loads a group). If the round trip was
+the trip, a block wave ~12–15 → ~5–7 and the chain ~97 → ~89; if an26t's rows show the block waves already at
+~6 with the chain unmoved, the join or the barriers hold it and 27 is a minor.
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back
