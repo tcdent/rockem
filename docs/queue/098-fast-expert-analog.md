@@ -1061,6 +1061,14 @@ The survey text (d12), the same read: R = 24 (15.54 non-resident): early today .
 .722 / .740 / .757. Both texts, either residency: **+.02 at 16 heads, +.03–.04 at 32**, against the benchmark's
 served +.007.
 
+**The warm-pass test (cody, R = 48, two warm passes over the text before the scored one): today's early plan
+.590 → .637 (+.047), the 16-head analog's .615 → .651; the analog's delta .025 → .014; rows .643 → .698 and
+.667 → .711, delta .024 → .013.** Repeating the text lifts today's plan and halves the analog's margin in two
+passes — the benchmark's 25 repetitions plausibly take it the rest of the way to the served +.007. So the sim's
++.02–.04 is the prediction for an unrepeated workload (the long sessions) and the served +.007 is the repeated
+benchmark's; the long-context boot is the measurement, and the sim predicts it comes out between +.02 and +.04 at
+16 heads if the generated tokens and the 380k-matured state behave like prompt text — which the sim cannot say.
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back
