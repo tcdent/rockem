@@ -1,9 +1,11 @@
 # 098 — A fast analog of the model, for predicting experts
 
-**Status:** Open — measured offline 2026-10-25 (below): layer l + 1's own attention at 4-bit, fed layer l's shared
-output, as the predictor's first margin: inside tcdent's budget (hundreds of MB) shared-h32-rn — the layer's own bf16
-rows of 32 heads, ~80 MB of VRAM — adds +0.44 / +0.31 used experts a layer to the window (two texts, all depths) for
-~112 MB of reads in the cards' idle; q4 (1.8 GB) is out of budget; no card kernel
+**Status:** Quantified, on the shelf (tcdent, 2026-10-27) — the analog built, served and measured: an25's chain
+97.3 / 99.3 µs (from 149.6 / 154.3), R at the matrix pipe's floor; served coverage +.007 / +.007 over production on
+the benchmark (the 18k cody prompt × 25, 77d23b03 .769 / .800 → .776 / .807) at +1.6 / +1.1 / +0.7 ms a step at
+widths 2–4; the offline sim predicts +.02 (16 heads) / +.03–.04 (32) on unrepeated text, where the original
+baseline's long sessions live, unmeasured served; the slot wait's slope says only a second queue removes the
+step cost. The closing section records it; the gates and instruments stay (general).
 **Area:** decode, the prefetch's predictor
 **Gain:** unknown; the room is measured — the prefetch covers 64 % of the non-resident experts a layer needs (rows
 plan, 17.1 a layer, `plan_eval` on aff85), and its last posts are 67–72 % right
@@ -1083,6 +1085,50 @@ reference's. The served-session `plan_eval` is the confirmation before anything 
 rockem.lead brings it to tcdent: the selected heads' rows read on each card in the host's run, the composed rows
 (80 MB) the only new VRAM. Untested here: the selection balanced per card (16 + 16), and an earlier host prefetch
 (099: discounted by the leak of prefetched lines, not capped by streamers).
+
+## Closing status (2026-10-27)
+
+tcdent's decision: we stay on the existing predictor. 098 goes on the shelf as **Quantified, on the shelf** with
+these numbers, so it is not re-derived:
+
+- **The chain.** an25 (the mark): an_chain 97.3 / 99.3 µs a layer pair at decode widths, from an11's 149.6 / 154.3
+  on 2026-10-26 (and an1's ~300); every piece measured — A 10, B 10, C 4, R ~10 (the 16-wide WMMA fragment's matrix
+  pipe, ~300 cycles a WMMA shared by the unit's block waves; the Exp4 pass's ~45 and the `v_dot4` form's ~24 behind
+  it), S ~17 (`step_head`'s production code), O ~9, F ~6, the six grid barriers and the launch the rest. The pieces
+  left are tcdent's forks: S as a read-only instantiation inside shared code; the chain on a second AQL queue.
+- **The two workloads.** The day-one baseline, 50bbd219 (.658 early / .692 rows), was 36 requests including ten real
+  conversations at 377k–392k tokens of context generating 1,600–2,476 tokens each — production's predictor on real
+  long-context sessions, 16.0 non-resident picks a layer. The production run deployed against, 77d23b03 (.769 /
+  .800), and every analog run (an1 → an27) were the 18k cody prompt × 25, 96 tokens — the repeated benchmark, 14.4
+  non-resident picks a layer. **Served, on the benchmark: an25 .776 / .807 = +.007 / +.007**, the experts phase
+  flat (11.55 vs 11.74 / 18.76 vs 18.74 / 26.73 vs 26.38 ms a step), the step slower at every width (46.88 vs
+  45.27, 59.58 vs 58.51, 68.15 vs 67.48 = +1.6 / +1.1 / +0.7 ms). an1 at 32 heads read the same .776 / .809: the
+  head count was not the limit on the benchmark.
+- **The warm-pass numbers (the sim).** At the resident sizes that reproduce the workloads' non-resident counts
+  (R = 48 → 14.25 a layer, the benchmark's; R = 24 → 16.9, the long sessions' 16.0 between), the analog's coverage
+  over today's plan is +.025 (16 heads) / +.042 (32) on cody and +.016–.018 / +.03 on the survey, either
+  residency — residency is not what lost the served gain. Two warm passes over the text before the scored one lift
+  today's plan .590 → .637 and halve the analog's delta .025 → .014 (rows .024 → .013): **the served +.007 is the
+  repeated benchmark's number, where today's learned plan has seen the text it is scored on; the sim's +.02 / +.03–.04
+  is its prediction for unrepeated text — the long sessions — unmeasured served.** The sim scores teacher-forced
+  prompt text at 12k in one pass; it cannot price model-generated tokens or a 380k-matured state.
+- **The slope (rockem.lead's fit over an9 → an25, seven builds).** Slot wait a step against the chain p50: width 2
+  = 1.06 ms + 18.3 µs/µs (45 % of each chain microsecond exposed, r .997; production's 1.3 ms at a chain of ~13);
+  width 3 = 0.24 + 11.9 (29 %, production's 0.87 at ~53); width 4 = 0.45 + 4.5 (11 %, production's 0.80 at ~78).
+  The chain's cost is its queue time serialized with the forward's kernels on the one AQL queue; **the condition
+  for the step cost to go away at width 2 is the chain on a second queue** (launch-fusion's open item), which also
+  removes the cross-card cascade by construction — a design fork, not a build. Per-piece cuts are worth ~0.18 ms a
+  step at width 2 per 10 µs and fit widths 3–4 at chains of ~53 / ~78.
+- **What reopens it.** A long-context served measurement (an25 against production on the same long requests) if
+  tcdent wants the number the sim predicts; 32 heads for the larger signal (an1's object; the rows copy doubles,
+  R's pipe time ~20); the second queue for the slope. 12 heads (−25 % of the pipe's work, −.06 / −.04 offline) stays
+  quantified beside it.
+- **Kept, general:** `bringup/gates/kernel_diff.sh` (every kernel symbol of a new object against the served one —
+  the an16 lesson), the launch-constant ABI (`ROCKEM_AN_ABI` asserted by the node at load — the an24 lesson),
+  the decode fingerprint (`decode_identical.sh`, the post-SCORE `spec_step` path), `kernel_stats_wave` (the
+  per-workgroup / per-wave rows), the stamp objects (`stats`, `stats_tail`, `stats_r`) and the reading rules in
+  `docs/kernel-tuning-feedback.md` (a count is static, a cost is dynamic; drains, instructions, occupancy and the
+  matrix pipe each priced a phase once and failed to price the next).
 
 ## Related
 005 (layer-ahead routing), 082 (card-side prediction), 092 (attention-ahead predictor, shelved), 093 (the rows plan),
