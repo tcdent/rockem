@@ -187,14 +187,19 @@ queue, one dependent round trip), `flat_` against `global_` (a pointer that came
 device-address table is generic, and a generic load is also charged to `lgkmcnt`, so every
 LDS wait drains it too), `scratch_` and `.vgpr_spill_count` from `llvm-readobj --notes`.
 Read before the next build, not after: a measured phase that a rewrite did not move is a
-class the rewrite did not touch, and the counts say which. What it answered in 098
-(2026-10-27): the analog chain's phase B held at 20–27 µs through three rewrites of its
-Sinkhorn (wave form, registers with `/`, registers with `v_rcp_f32`) because the Sinkhorn was
-~4 µs of it — the region's `vmcnt(0)` drains were 14 in one build and 19 in the next, against
-19.9 and 26.6 µs measured: ~1.2 µs a drain plus ~5 µs of ALU, the loads of a few floats
-issued one at a time behind a wait. The counts also showed the next object unchanged in
-that class before it was booted, which saved the boot. The register pressure that moved
-the loads into the loop left no trace in the slab; it was in the object.
+class the rewrite did not touch, and the counts say which — but the class must be fitted
+against more than one table before it gates anything. What it answered in 098 (2026-10-27):
+the analog chain's phase B, one wave a token with every lane computing alike, held at 20–31 µs
+through four rewrites of its Sinkhorn and its loads. Two tables fitted B to the region's
+`vmcnt(0)` drains (14 → 19.9 µs, 19 → 26.6); the build that cut the drains to 6 measured
+31.4, and the fit that survives four tables is the region's **instruction count**: 1,885 →
+19.9, 3,806 → 26.6, 4,858 → 31.4 µs, ≈ 12.6 µs + 3.9 ns an instruction — nine cycles each,
+the dependent-issue cost of a single wave with no other wave on the SIMD to hide its latency
+(a build whose Sinkhorn lowered to IEEE `v_div_*` sat above the line: 5,217 → 44.1). For a
+few tokens on one wave, straight-line instructions are the cost; lanes doing the same work
+buy nothing; the lever is lanes doing different work. The register pressure that moved
+loads into loops, and the ALU chain that grew when they came back out, left no trace in the
+slab; both were in the object.
 
 **The rule that makes observation a property rather than a session.** Every launch site
 declares the bytes its kernel moves, the ceiling is measured on the box at startup, and
