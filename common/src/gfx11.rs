@@ -212,6 +212,15 @@ pub unsafe fn row_sum16(v: f32) -> f32 {
     let v = v + dpp_xmask::<XMASK4>(v);
     v + dpp_xmask::<XMASK8>(v)
 }
+/// `x`, opaque to the compiler (an empty `asm!` through a scalar register, no instruction): a loop bound the
+/// optimizer must not see, so the loop is not unrolled and its iterations not interleaved (`core::hint::black_box`
+/// does the same through a stack slot — scratch on a GPU, 2026-10-27).
+#[inline(always)]
+pub fn opaque(x: u32) -> u32 {
+    let mut v = x;
+    unsafe { core::arch::asm!("/* {0} */", inout(sgpr32) v, options(pure, nomem, nostack, preserves_flags)) };
+    v
+}
 /// A compiler fence: no memory operation moves across it (an empty `asm!` with a memory clobber, no instruction
 /// emitted). For a hand-pipelined body whose loads the scheduler would otherwise hoist to the register bound.
 #[inline(always)]
@@ -234,6 +243,11 @@ pub unsafe fn row_max16(v: f32) -> f32 {
 #[inline(always)]
 pub unsafe fn other_row(v: f32) -> f32 {
     f32::from_bits(core::arch::amdgpu::permlanex16_u32::<false, false>(0, v.to_bits(), 0x7654_3210, 0xFEDC_BA98))
+}
+/// `other_row` on a 32-bit word.
+#[inline(always)]
+pub unsafe fn other_row_u32(v: u32) -> u32 {
+    core::arch::amdgpu::permlanex16_u32::<false, false>(0, v, 0x7654_3210, 0xFEDC_BA98)
 }
 /// The wave's sum on every lane with no LDS: four butterflies and one cross-row permute, against `wave_sum`'s five
 /// dependent `ds_bpermute` round trips.

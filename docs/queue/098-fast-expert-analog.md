@@ -926,6 +926,28 @@ is bringing with these numbers. It also bears on the cascade: the peer's chain w
 shared output, and on the one queue that wait holds the peer's forward kernels behind it (the lateness that
 accumulated across cards through `fyv`); on its own queue the wait blocks nothing but the chain. The per-piece cuts
 stay worth ~0.18 ms a step at width 2 for every 10 µs off the chain.
+The corrected fit (rockem.lead, plain Python over the seven builds, chain p50 card0 against the slot wait a step):
+width 2: 1.06 ms + 18.3 µs/µs, 45 % exposed, r .997, production's 1.3 at a chain of ~13; width 3: 0.24 + 11.9,
+29 % exposed, r .94, production's 0.87 at ~53; width 4: 0.45 + 4.5, 11 % exposed, r .95, production's 0.80 at
+~78. an25's 97 is ~20 short of fitting width 4 and ~45 short of width 3; the exposure falls with width because
+the host run lengthens under it — the second queue is the width-2 lever, the per-piece cuts the width-3/4 one.
+
+**Build 26 (staged: `kernels-an26` 4c9c54a1, `-an26s` a484ccb0, `-an26t` 785bce35; the node as an25's — the ABI unchanged, the
+assert passes; 156 VGPRs, no scratch, 31 barriers).** R's remaining chain by the an24t rows: the block waves flat
+at 12–15 for eight trips, ~1.6 µs a trip — a VRAM round trip for the group's 64 weight bytes a lane, serialized
+eight times, the nine waves a SIMD in phase after the barrier and waiting together rather than hiding each other.
+The quarter's eight groups now go in two batches of four: a batch's weights issued as one set of loads before its
+groups' WMMAs — two round trips a wave instead of eight. The room: the fragment's two wave halves hold the same
+rows, so each half loads one half of a group's 64 bytes a lane and takes the other from its sibling lane by
+`v_permlanex16` (`gfx11::other_row_u32`), 8 registers a group, 32 a batch. What the compiler did with it, each
+read in the object: the batch loop unrolled with both batches' loads hoisted together (192 VGPRs, 164 B scratch);
+the four groups' bodies unrolled and interleaved (77 scratch ops); a batch entry picked by the group index (a stack
+object); `core::hint::black_box` as the opaque bound (a stack slot: 24 B of scratch — its stores and loads). The
+form that holds: the loop bounds opaque through an empty `asm!` in a scalar register (`gfx11::opaque`, no
+instruction), the batch rotated a group so the body always takes entry 0 (32 moves a group). The R region: 686
+static, the group loop's body ~130 issued (an25 ~90: the moves and the permutes), 8 batch loads at each batch's
+top, 4 drains. By the rows: a block wave ~12–15 → ~6–7 if the trip was the round trip; the issue cost ~+1.3 µs
+over the grid. Numerics unchanged (the same bytes reach the same lanes).
 
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
