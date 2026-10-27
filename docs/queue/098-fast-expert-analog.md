@@ -1011,6 +1011,14 @@ coverage), or a leaner `v_dot4` form (its per-token-step floor ~14 issued → ~6
 build 22's — a rewrite with an uncertain margin over the pipe's ~8–10). R is at its floor for this shape; the
 chain's next pieces are S (~17, the shared-code fork) and the barriers, or the queue.
 
+The working set re-read with the filter (rockem.lead; 111,088 block waves, card0): copy 3.5 (p90 6.4), loads
+landed 1.4 (p90 2.0), the WMMA chain 8.6 (p90 11.0, max 13.2); by unit load 16 waves → 7.6, 24 → 9.6. **Recorded as
+R's floor ~10 for the 16-wide fragment** (the Exp4 pass's ~45 and the `v_dot4` form's ~24 behind it). The 12-head
+served check: **Quantified, on the shelf — ~2–3 µs (≈ 0.05 ms a step by the slope) against −.06 offline coverage**;
+accuracy is tcdent's criterion. The chain's remaining pieces are tcdent's two forks (S's shared-code instantiation;
+the second queue for the slope) and the barriers; rockem.lead brings him the state; this work holds until he
+answers.
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back
