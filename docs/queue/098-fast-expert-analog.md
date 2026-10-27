@@ -793,6 +793,36 @@ region: 2,949 instructions, **10 full LDS waits (55)**, 5 drains, 512 `v_dot4`, 
 table: the chain's waits halved, the tile ~24 → ~13–15, R ~27 → ~16, the chain ~106 → ~95. `kernel_diff` vs an20
 and vs an13s: `an_chain` only.
 
+**an21's boot (rockem.lead, 2026-10-27; run 0e33476d): a NULL** — 106.1 / 106.5 (an20 106.0 / 105.8), slot wait
+2.97 / 1.47 / 0.94, coverage .776, gates clean. R's waits 55 → 10 moved nothing: the tile's ~24 is not bytes, not
+the prologue, not the LDS waits. The object says what it is (rockem.lead): the sixteen steps are fully unrolled
+(~2,950 straight-line instructions a wave; one back-edge, the copy loop) and the grid is 1,344 waves on 96 SIMDs
+= 14 a SIMD — **issue throughput**: ~2,200 issued slots a wave × 1,344 / 96 ≈ 31k cycles ≈ 13 µs at 2.4 GHz, plus
+the LDS traffic (82 KB a wave, 110 MB over the grid at 128 B/clk/CU over 48 CUs ≈ 7.5) ≈ 20 against the measured
+24, flat across every wave because all waves share the SIMDs and finish together. The rule for a candidate: count
+its R body's issued slots × 1,344 / 96 + the LDS bytes / (48 × 128); under ~12 µs or no boot.
+
+**Build 22 (staged, a minor by that rule: `kernels-an22` 58c2a28c, `-an22s` 1c6fbfbb, `-an22t` b89aecf0; THE NODE
+REBUILT — the rows, scales and activations as kernel arguments, kernarg 224; 155 VGPRs, no scratch, 30 barriers).**
+Through the table they were generic pointers (flat loads, on the LDS counter) and every read re-derived its
+address (348 adds a wave): one base a lane with the step and token as immediate offsets, the activation reads as
+16-byte `ds_load_b128` (a 16-aligned type; as two 8-byte reads the compiler paired them into `ds_load_2addr_b64`,
+whose 8-bit offsets forced an add a read). The R region: issued 2,209 → **2,037** (11.9 µs by the rule), adds
+348 → 175, no flat loads, full LDS waits 55 → 8, drains 3. What did NOT work, each measured in the object: every
+lane accumulating (the quad's sum is on all four lanes — the guard on lane 4r is an exec-masked region a token a
+step) put the kernel at 192 VGPRs with ~100 scratch ops — the guard's branches are what keep the scheduler from
+flattening the sixteen steps into one region; a compiler fence a step made it worse (400 bytes); the norms before
+the steps were the long-lived values the body spilled (computed after them now). The 4-step window and the
+one-step lookahead are moot at this bound and were left out.
+
+**Next, build 23 — WMMA iu8 (the lead's lever d):** `v_wmma_i32_16x16x16_iu8` is one instruction for 4,096 MACs
+against `v_dot4`'s 4 (the experts' prefill path has the form, `expert.rs`: A the q4 nibbles widened to unsigned
+bytes, B the a8 activations signed, the `WBIAS · Σq` correction at the flush — exactly `word_dot`'s rule). Sixteen
+rows a wave (212 working waves instead of 848; the tokens padded 4 → 16 waste MACs, not issue): ~256 WMMA + 256
+activation loads + ~400 unpack ops + a flush a group a wave — the grid's issued slots fall ~4×, the LDS bytes ~8×;
+R's tile ~24 → ~5–6 by the rule. The q4 copy's layout at boot is the analog's own, so it can be laid out as the
+B... the A fragment wants it (a lane's 16 bytes = one row's sixteen k).
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back
