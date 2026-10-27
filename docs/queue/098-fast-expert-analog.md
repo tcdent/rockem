@@ -709,6 +709,15 @@ Exp4 `fg` rows (2,048 rows × 128: 0.4 MB).
 Housekeeping: the instrument object the lead booted as `kernels-an18t` (an17's kernel with R stamped alone,
 aade5fb1) is re-staged as **`kernels-an17r`** — `-an18t` now names build 18's tail object.
 
+**The per-workgroup column (rockem.lead, 2026-10-27; run e60c50b2, the booted instrument object): FLAT.** R alone,
+wave 0, the workgroup's median, min / median / max: the small rows (wg 0–13) card0 36.5 / 36.9 / 37.5, card1
+38.2 / 39.2 / 40.1; the heads' rows (wg 14–141) card0 32.2 / 35.1 / 39.1, card1 33.0 / 36.7 / 41.0; no rows
+(wg 142–167) ~1.0 / 1.2. The five slowest are ordinary head-row workgroups (card0 137 140 133 139 136 at
+38.6–39.1; card1 127 139 133 134 43 at 40.2–41.0), their eight waves spread 35.8–40.2 — no slow row kind, no slow
+wave: a bandwidth-bound pass with the saturated queue's tail; the 20.8 MB / 640 GB/s reading stands and bytes is
+the lever. Side facts: card1 runs R ~1.5–2 µs slower than card0 throughout (its chain 124 vs 121: its memory
+system, not the code); 26 workgroups (208 waves, 15 % of the grid) idle in R at `R_ROWS` 3.
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back
