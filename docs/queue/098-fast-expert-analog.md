@@ -889,6 +889,81 @@ without the symbol prints a warning. Rule: a kernel's dynamic LDS size, grid and
 like its kernarg — a change to any of them is a node rebuild, and from build 25 the node refuses the mismatch at
 boot.
 
+**an24t (rockem.lead, 2026-10-27; run f1050fbd; the 17,440 node — timing valid, sums not): R mean 10.3 / slowest
+18.0 (an23t 5.2 / 31.2; the `v_dot4` passes 18 / 27); b3 + F + b4 16.0 / 25.6; S 16.6 / 18.6; O 2.3 / 9.2.** The
+per-wave rows: wg 0–43 waves 0–7 all 13.6–15.1, wg 44–167 all 12.2–12.8 (max ~20) — the four K-quarter waves of a
+block run alike, and the idle waves read ~12 because they wait at the join's sync. Coverage .765 / .847 again:
+deterministic, the LDS truncation confirmed on a second reading. The block waves' 12–15 against an23's single
+wave's 20–26 is the occupancy gain; what remains (R_max 18 against the bytes' ~3 a block-quarter) is the 8-trip
+chain on nine waves a SIMD — the next R lever, if any, is depth or slots, with the per-wave instrument to price it.
+
+**an25's boot (rockem.lead, 2026-10-27; run 0b595dbf; the merged node 53595aa) — VALID, the new mark, serving.**
+an_chain **97.3 / 99.3** (an22 105.0 / 105.8), p90 185 / 187, slow 0.1 / 0.2 %; slot wait **2.83 / 1.44 / 0.88** ms
+at widths 2–4 (an22 3.02 / 1.58 / 0.92; production 1.3 / 0.87 / 0.8); step 46.9 / 59.6 / 68.2; experts
+11.56 / 18.85 / 26.73; coverage **.776** / picked .859 — back to the digit; decode-identical; SCORE bit-identical.
+The occupancy prediction held for the chain and the numerics held once `CHAIN_LDS` matched. Ledger (slot wait
+2–4 · chain): production 1.3 / 0.87 / 0.8 · an18 3.09 / 1.49 / 0.98 · 111 · an22 3.02 / 1.58 / 0.92 · 105 · an25
+2.83 / 1.44 / 0.88 · 97 / 99; coverage .776 throughout. an25s boots for the section's per-workgroup rows (A by band:
+wg 0–95 the rows, 96–103 the Gram, 104–167 idle; B by workgroup 0).
+
+**an25s (rockem.lead, 2026-10-27; run 369eb2d5; the section): A mean 4.4 / slowest 10.0 (an13s 5.6 / 12.2), the
+first barrier 8.5 / 18, B 9.9 (workgroup 0), the rest 18.4.** A by band (wave 0, median a workgroup, min / med /
+max): the row workgroups (0–95) card0 6.5 / 7.8 / 8.6, card1 7.7 / 8.4 / 9.0 — flat; the Gram's (96–103) 0.5 /
+1.5 / 2.6; idle 0.5; the slowest five ordinary row workgroups. A's old 12.2-against-5.6 was the Gram on top of
+rows (an15) plus the idle workgroups in the mean; what is left is the row workgroups' own ~8 and B's one wave at
+~10: the section's critical path ≈ 10 + 10 + 4 = 25 of the 99. **Every piece of the chain is measured: A 10, B 10,
+C 4, R ~18, S 17, O ~9, F ~6, the barriers and the launch the rest.**
+
+**The slope (rockem.lead, from the ledger an9 → an25, seven builds): at width 2, slot wait ≈ 1.1 ms + 17.8 µs of
+wait a µs of chain a step (r .99)** — 41 layers × 1 µs = 41 µs, so ~43 % of every chain microsecond is exposed as
+wait, and the fit reaches production's 1.3 ms at a chain of ~11 µs (width 3: ~37 % exposed, production at ~20;
+width 4: ~16 %, at ~55). Reading, as arithmetic: shortening the chain alone cannot reach production's slot wait at
+width 2. What the fit says the cost is: the chain's queue time on the card, serialized with the forward's own
+kernels on the one AQL queue. The lever that changes the slope rather than the chain: **the chain on a second
+queue** (launch-fusion's open item), its ~97 µs overlapping the forward's latency-bound decode kernels on idle CUs
+instead of queuing ahead of them — a cost of contention, not length. A design fork for tcdent, which rockem.lead
+is bringing with these numbers. It also bears on the cascade: the peer's chain waits in-kernel for the leader's
+shared output, and on the one queue that wait holds the peer's forward kernels behind it (the lateness that
+accumulated across cards through `fyv`); on its own queue the wait blocks nothing but the chain. The per-piece cuts
+stay worth ~0.18 ms a step at width 2 for every 10 µs off the chain.
+The corrected fit (rockem.lead, plain Python over the seven builds, chain p50 card0 against the slot wait a step):
+width 2: 1.06 ms + 18.3 µs/µs, 45 % exposed, r .997, production's 1.3 at a chain of ~13; width 3: 0.24 + 11.9,
+29 % exposed, r .94, production's 0.87 at ~53; width 4: 0.45 + 4.5, 11 % exposed, r .95, production's 0.80 at
+~78. an25's 97 is ~20 short of fitting width 4 and ~45 short of width 3; the exposure falls with width because
+the host run lengthens under it — the second queue is the width-2 lever, the per-piece cuts the width-3/4 one.
+
+**Build 26 (staged: `kernels-an26` 4c9c54a1, `-an26s` a484ccb0, `-an26t` 785bce35; the node as an25's — the ABI unchanged, the
+assert passes; 156 VGPRs, no scratch, 31 barriers).** R's remaining chain by the an24t rows: the block waves flat
+at 12–15 for eight trips, ~1.6 µs a trip — a VRAM round trip for the group's 64 weight bytes a lane, serialized
+eight times, the nine waves a SIMD in phase after the barrier and waiting together rather than hiding each other.
+The quarter's eight groups now go in two batches of four: a batch's weights issued as one set of loads before its
+groups' WMMAs — two round trips a wave instead of eight. The room: the fragment's two wave halves hold the same
+rows, so each half loads one half of a group's 64 bytes a lane and takes the other from its sibling lane by
+`v_permlanex16` (`gfx11::other_row_u32`), 8 registers a group, 32 a batch. What the compiler did with it, each
+read in the object: the batch loop unrolled with both batches' loads hoisted together (192 VGPRs, 164 B scratch);
+the four groups' bodies unrolled and interleaved (77 scratch ops); a batch entry picked by the group index (a stack
+object); `core::hint::black_box` as the opaque bound (a stack slot: 24 B of scratch — its stores and loads). The
+form that holds: the loop bounds opaque through an empty `asm!` in a scalar register (`gfx11::opaque`, no
+instruction), the batch rotated a group so the body always takes entry 0 (32 moves a group). The R region: 686
+static, the group loop's body ~130 issued (an25 ~90: the moves and the permutes), 8 batch loads at each batch's
+top, 4 drains. By the rows: a block wave ~12–15 → ~6–7 if the trip was the round trip; the issue cost ~+1.3 µs
+over the grid. Numerics unchanged (the same bytes reach the same lanes).
+
+**an26's boot (rockem.lead, 2026-10-27; run d34429b7): a NULL** — 98.3 / 98.9 (an25 97.3 / 99.3), slot wait
+2.85 / 1.46 / 0.92, coverage .776, gates clean. Eight round trips → two moved nothing: a block wave's ~1.6 µs a
+trip is not the weights' round trip. From the object (the group body of the an26 tail object): the flush reads the
+lane's eight row scales from VRAM each group — eight `global_load_b32` waited (`vmcnt(0)`) before the `fma`s — so
+every group still pays a round trip, for 32 bytes of scales where the weights' 64 had been batched away. an26t's
+per-wave rows (booting) read the block waves against an24t's 12–15.
+
+**Build 27 (staged: `kernels-an27` bf83d1fd, `-an27s` 093f0b94, `-an27t` a0c1d0c2; THE NODE REBUILT — `CHAIN_LDS` 25,632 →
+29,728 (the ABI assert refuses the old node); kernarg 224; 156 VGPRs, no scratch, 31 barriers).** The workgroup's
+two blocks' scales (one 4 KB span of `q4::pack`'s tile-major layout) copied into LDS with the activations, a
+16-byte chunk a thread, and read there at each group's flush: the group body has no global load and no `vmcnt`
+wait of its own (the batch's eight weight loads at the batch's top, nine LDS loads a group). If the round trip was
+the trip, a block wave ~12–15 → ~5–7 and the chain ~97 → ~89; if an26t's rows show the block waves already at
+~6 with the chain unmoved, the join or the barriers hold it and 27 is a minor.
+
 **Confirmation.** The prediction first: this sim's numbers on the served text (cody at 18k: P(picked) @13 early / rows
 .549 / .637 → .622 / .709, +0.44 used experts a layer at W = 10); then the node must match it — `plan_eval` on the
 served session at 18k and on a 300k+ turn, and the launches' timeline against the ~150 µs; a disagreement goes back

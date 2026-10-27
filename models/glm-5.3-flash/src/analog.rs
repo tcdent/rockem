@@ -66,7 +66,12 @@ pub const ACT_BYTES: usize = H + 8 * (H / common::q4::GROUP);
 /// Phase R's LDS: the `SPEC_TOKENS` staged activations, copied from `TAB_ACT`, then the K-quarters' partial
 /// sums `[8 waves][32 lanes][8]` f32 for the join.
 pub const R_KSPLIT: usize = 4;
-pub const R_LDS: usize = SPEC_TOKENS * ACT_BYTES + CHAIN_WAVES * 32 * 8 * 4;
+/// The join's partials, then the workgroup's two blocks' scales (`[2 blocks][4 tiles][NG][TILE]` f32, `q4::pack`'s
+/// order): read from LDS at each group's flush — read from VRAM there, the eight scale loads a group were a round
+/// trip a group on the block wave's clock, the trip the batched weights did not move (an26 null, 2026-10-27).
+pub const R_JOIN_BYTES: usize = CHAIN_WAVES * 32 * 8 * 4;
+pub const R_WS_FLOATS: usize = (CHAIN_WAVES / R_KSPLIT) * 4 * (H / common::q4::GROUP) * common::q4::TILE;
+pub const R_LDS: usize = SPEC_TOKENS * ACT_BYTES + R_JOIN_BYTES + R_WS_FLOATS * 4;
 /// `TAB_ACT`, VRAM: the activations quantized once by phase C's workgroups (`[SPEC_TOKENS][ACT_BYTES]`), then the
 /// norms' partial sums of squares `[SPEC_TOKENS][ACT_SS]` (a value a wave of phase C's `H / 2048` workgroups).
 /// Every one of phase R's 168 workgroups quantizing the four tokens itself was ~20.8 µs on the critical path
@@ -774,6 +779,17 @@ pub mod gfx11 {
                     *(act.add(c * 16) as *mut [u32; 4]) = core::ptr::read((src.add(c * 16)) as *const [u32; 4]);
                     c += 256;
                 }
+                // the workgroup's two blocks' scales (its blocks are consecutive tiles: one 4 KB span), a 16-byte
+                // chunk a thread
+                let lws = act.add(SPEC_TOKENS * ACT_BYTES + R_JOIN_BYTES) as *mut f32;
+                const { assert!(R_WS_FLOATS == 4 * 256) };
+                {
+                    let wb0 = wg * CHAIN_WAVES / R_KSPLIT;
+                    let p = qscales.add((wb0 * 16 / TILE) * (NG * TILE) + t * 4);
+                    if wb0 * 16 < SEL_ROWS {
+                        *(lws.add(t * 4) as *mut [f32; 4]) = core::ptr::read_unaligned(p as *const [f32; 4]);
+                    }
+                }
                 workgroup_sync();
                 // sixteen rows a wave on the matrix unit (the experts' prefill form, `expert::tile16`): A the rows'
                 // q4 nibbles widened to unsigned bytes (lane l supplies row l % 16's sixteen k a step), B the a8
@@ -803,48 +819,78 @@ pub mod gfx11 {
                     // the lane's eight rows' scales from one base: row 2r + h (h = l / 16) is tile r / 2 of the
                     // wave's four, row-in-tile 2 (r % 2) + h — constant offsets (eight pointers advanced a group
                     // were 24 64-bit ops a group)
-                    let wsb = qscales.add((row0 / TILE) * (NG * TILE) + lu / 16);
+                    let wsb = lws.add(((wave / R_KSPLIT) * 4) * (NG * TILE) + lu / 16) as *const f32;
                     let mut y = [0f32; 8];
-                    let mut g = kq * (NG / R_KSPLIT);
-                    while g < (kq + 1) * (NG / R_KSPLIT) {
-                        let mut acc: v8i32 = ZERO_I32;
-                        let ab = a_row.add(g * TILE * (GROUP / 2));
-                        let bb = b.add(g * GROUP);
-                        // the group's eight k-steps in two halves of four, each half's loads before its WMMAs:
-                        // bytes c·32 + q·16.. of the row hold k c·64 + q·16.. in their low nibbles, k + 32 in the high
-                        let mut c = 0;
-                        while c < 2 {
-                            let raw0: [u32; 4] = core::ptr::read_unaligned(ab.add(c * 32) as *const [u32; 4]);
-                            let raw1: [u32; 4] = core::ptr::read_unaligned(ab.add(c * 32 + 16) as *const [u32; 4]);
-                            let b0: [i32; 4] = core::ptr::read_unaligned(bb.add(c * 64) as *const [i32; 4]);
-                            let b1: [i32; 4] = core::ptr::read_unaligned(bb.add(c * 64 + 16) as *const [i32; 4]);
-                            let b2: [i32; 4] = core::ptr::read_unaligned(bb.add(c * 64 + 32) as *const [i32; 4]);
-                            let b3: [i32; 4] = core::ptr::read_unaligned(bb.add(c * 64 + 48) as *const [i32; 4]);
-                            let (mut lo0, mut lo1, mut hi0, mut hi1) = ([0i32; 4], [0i32; 4], [0i32; 4], [0i32; 4]);
-                            let mut q = 0;
-                            while q < 4 {
-                                lo0[q] = (raw0[q] & 0x0F0F_0F0F) as i32;
-                                lo1[q] = (raw1[q] & 0x0F0F_0F0F) as i32;
-                                hi0[q] = ((raw0[q] >> 4) & 0x0F0F_0F0F) as i32;
-                                hi1[q] = ((raw1[q] >> 4) & 0x0F0F_0F0F) as i32;
-                                q += 1;
+                    // the quarter's eight groups in two batches of four: a batch's weights issued as one set of
+                    // loads before its groups' WMMAs — two VRAM round trips a wave instead of eight (the block waves
+                    // sat flat at 12–15 µs for eight trips, ~1.6 µs each, the nine waves a SIMD in phase after the
+                    // barrier and waiting together; an24t, 2026-10-27). The room: the fragment's two wave halves
+                    // hold the same rows, so each half loads one half of a group's 64 bytes a lane and takes the
+                    // other half from its sibling lane by `v_permlanex16` (`other_row_u32`), 8 registers a group.
+                    const GB: usize = 4;
+                    const { assert!(NG / R_KSPLIT == 2 * GB) };
+                    let h = lu / 16;
+                    let load4 = |g0: usize| -> [[[u32; 4]; 2]; GB] {
+                        core::array::from_fn(|gi| {
+                            let ab = a_row.add((g0 + gi) * TILE * (GROUP / 2));
+                            core::array::from_fn(|c| core::ptr::read_unaligned(ab.add(c * 32 + h * 16) as *const [u32; 4]))
+                        })
+                    };
+                    // (the batch loop's trip count hidden from the compiler: unrolled, both batches' loads were
+                    // hoisted together — 64 registers of weights, 192 and scratch)
+                    let nb = common::gfx11::opaque(2) as usize;
+                    let mut gb = 0;
+                    while gb < nb {
+                        let g0 = kq * (NG / R_KSPLIT) + gb * GB;
+                        let mut mine = load4(g0);
+                        let ngi = common::gfx11::opaque(GB as u32) as usize;
+                        let mut gi = 0;
+                        while gi < ngi {
+                            let g = g0 + gi;
+                            let mut acc: v8i32 = ZERO_I32;
+                            let bb = b.add(g * GROUP);
+                            let mut c = 0;
+                            while c < 2 {
+                                // this lane's 16 bytes are raw0 on the first half of the wave, raw1 on the second;
+                                // the other 16 come across
+                                // (the group index opaque too: four groups' bodies unrolled and interleaved were 77
+                                // scratch ops; the batch rotated a group so the body always takes entry 0 — an
+                                // entry picked by the index was a stack object)
+                                let m = mine[0][c];
+                                let o: [u32; 4] = core::array::from_fn(|q| common::gfx11::other_row_u32(m[q]));
+                                let (raw0, raw1) = if h == 0 { (m, o) } else { (o, m) };
+                                let b0: [i32; 4] = core::ptr::read_unaligned(bb.add(c * 64) as *const [i32; 4]);
+                                let b1: [i32; 4] = core::ptr::read_unaligned(bb.add(c * 64 + 16) as *const [i32; 4]);
+                                let b2: [i32; 4] = core::ptr::read_unaligned(bb.add(c * 64 + 32) as *const [i32; 4]);
+                                let b3: [i32; 4] = core::ptr::read_unaligned(bb.add(c * 64 + 48) as *const [i32; 4]);
+                                let (mut lo0, mut lo1, mut hi0, mut hi1) = ([0i32; 4], [0i32; 4], [0i32; 4], [0i32; 4]);
+                                let mut q = 0;
+                                while q < 4 {
+                                    lo0[q] = (raw0[q] & 0x0F0F_0F0F) as i32;
+                                    lo1[q] = (raw1[q] & 0x0F0F_0F0F) as i32;
+                                    hi0[q] = ((raw0[q] >> 4) & 0x0F0F_0F0F) as i32;
+                                    hi1[q] = ((raw1[q] >> 4) & 0x0F0F_0F0F) as i32;
+                                    q += 1;
+                                }
+                                acc = wmma_u8i8(v4i32(lo0), v4i32(b0), acc);
+                                acc = wmma_u8i8(v4i32(lo1), v4i32(b1), acc);
+                                acc = wmma_u8i8(v4i32(hi0), v4i32(b2), acc);
+                                acc = wmma_u8i8(v4i32(hi1), v4i32(b3), acc);
+                                c += 1;
                             }
-                            acc = wmma_u8i8(v4i32(lo0), v4i32(b0), acc);
-                            acc = wmma_u8i8(v4i32(lo1), v4i32(b1), acc);
-                            acc = wmma_u8i8(v4i32(hi0), v4i32(b2), acc);
-                            acc = wmma_u8i8(v4i32(hi1), v4i32(b3), acc);
-                            c += 1;
+                            let (xs, xg) = (*bs.add(g), *bg.add(g));
+                            let d: [i32; 8] = core::mem::transmute(acc);
+                            let mut r = 0;
+                            while r < 8 {
+                                let sum = d[r] - WBIAS * xg;
+                                let ws = *wsb.add(g * TILE + (r / 2) * (NG * TILE) + 2 * (r % 2));
+                                y[r] = fma(sum as f32, ws * xs, y[r]);
+                                r += 1;
+                            }
+                            mine = [mine[1], mine[2], mine[3], mine[0]];
+                            gi += 1;
                         }
-                        let (xs, xg) = (*bs.add(g), *bg.add(g));
-                        let d: [i32; 8] = core::mem::transmute(acc);
-                        let mut r = 0;
-                        while r < 8 {
-                            let sum = d[r] - WBIAS * xg;
-                            let ws = *wsb.add(g * TILE + (r / 2) * (NG * TILE) + 2 * (r % 2));
-                            y[r] = fma(sum as f32, ws * xs, y[r]);
-                            r += 1;
-                        }
-                        g += 1;
+                        gb += 1;
                     }
                     // the join: each wave's eight partials a lane into LDS, the quarter-0 wave of the block sums
                     // its three siblings' (waves 4b'..4b' + 3 of this workgroup)
