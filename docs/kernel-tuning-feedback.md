@@ -140,6 +140,14 @@ feeling. Theirs: "Prefill + KV Transfer within 5 % of Prefill alone." Ours:
 | benchmark | a published benchmark, run against a served node through the edge's own client under the model's recipe, within its noise of the published number (`bringup/evals`, kept in `models/<name>/evals.toml`) | HumanEval in force |
 | build hygiene | no scratch, no runtime `cfg`, no retyped constants across the Python boundary; the code object's static report (`make kernels` → `bringup/kernel_report.py`: registers, scratch, LDS, instruction/barrier/load counts per kernel, diffed against the last build's report) prints only what moved and fails on scratch, on more than 192 VGPRs, or on a barrier count that changed | in force |
 
+**Decode identity (2026-10-27).** The long SCORE gate exercises prefill-shaped steps; a kernel that runs only
+at decode widths (the expert-prediction analog, 098) is invisible to it. The decode gate is the 24 cody-decode
+requests' step-width histogram, which is deterministic run to run (26 / 822 / 378 / 154 at widths 1–4, 1,380 steps,
+identical across three builds and five runs): a build that changes it with the forward's kernels untouched has
+written, or read stale, something the forward uses — caught in build an16, whose SCORE was bit-identical.
+`bringup/box/decode_identical.sh`, run after the workload in every `an*_gates.sh`. Residency cannot move it: the
+card expert path is bit-identical to the host's (002, 003), so a plan change never changes bits.
+
 ## Observation: four channels, none inside a kernel
 
 The question tcdent put on 2026-09-17 — "is there a way we can do that without
