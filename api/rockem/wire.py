@@ -40,6 +40,10 @@ class Refused(WireError):
 class ContextFull(WireError):
     """The ids would not fit in the positions the node has."""
 
+    def __init__(self, message: str, wanted: int = 0, room: int = 0):
+        super().__init__(message)
+        self.wanted, self.room = wanted, room
+
 
 class Disconnected(WireError):
     """The stream ended where the protocol did not: the node stopped or the socket broke."""
@@ -138,7 +142,7 @@ class Session:
         if not self.started:
             raise WireError("feed before BOS")
         if len(ids) > self.remaining:
-            raise ContextFull(f"{len(ids)} ids, {self.remaining} positions left")
+            raise ContextFull(f"{len(ids)} ids, {self.remaining} positions left", len(ids), self.remaining)
         for id in ids:
             if not 0 <= id < self.vocab_size or id == self.bos:
                 raise WireError(f"id {id} is not a token")
@@ -307,7 +311,7 @@ class Client:
                 raise WireError("audio windows with no placeholder to fill")
             cut = ids.index(s.audio_spec.placeholder)
         if len(ids) > s.remaining:
-            raise ContextFull(f"{len(ids)} ids, {s.remaining} positions left")
+            raise ContextFull(f"{len(ids)} ids, {s.remaining} positions left", len(ids), s.remaining)
         out = head + s.feed(ids[:cut])
         for w in windows:
             out += s.audio(w)

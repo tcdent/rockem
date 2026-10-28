@@ -140,14 +140,14 @@ async def test_anthropic_adapter(client):
     assert r.status_code == 200, r.text
     b = r.json()
     assert b["type"] == "message" and b["content"] == [{"type": "text", "text": " paris"}] and b["stop_reason"] == "max_tokens"
-    assert b["usage"] == {"input_tokens": 2, "output_tokens": 1}
+    assert b["usage"]["input_tokens"] == 2 and b["usage"]["output_tokens"] == 1
     r = await client.post("/v1/messages", json={**body, "stream": True, "max_tokens": 10, "stop_sequences": ["stop"]})
     names = [l[7:] for l in r.text.split("\n") if l.startswith("event: ")]
     assert names[:2] == ["message_start", "content_block_start"] and names[-3:] == ["content_block_stop", "message_delta", "message_stop"]
     assert set(names[2:-3]) == {"content_block_delta"} and len(names) > 5
     delta = [json.loads(l[6:]) for l in r.text.split("\n") if l.startswith("data: ")][-2]
     assert delta["delta"] == {"stop_reason": "stop_sequence", "stop_sequence": "stop"}
-    assert (await client.post("/v1/messages", json={"model": "m", "messages": []})).status_code == 422
+    assert (await client.post("/v1/messages", json={"messages": []})).status_code == 400  # no model: Anthropic's error shape
 
 
 async def test_health(client):
@@ -401,3 +401,79 @@ async def test_a_node_that_vanishes_ends_the_http_stream_with_an_error(client, n
     evs = data_events(await client.post("/rockem/v1/generate", json={"prompt": "hello"}))
     assert evs[-1]["type"] == "error" and "node" in evs[-1]["message"]
     assert (await client.get("/health")).json()["free"] == 1
+
+
+def claude_code_body(**over):
+    """The shape Claude Code sends: system blocks with cache_control, tools, a thinking + text +
+    tool_use assistant turn, its tool_result in the next user turn, sampling and thinking fields."""
+    body = {
+        "model": "claude-sonnet-4-5", "max_tokens": 32, "stream": True, "temperature": 1, "metadata": {"user_id": "x"},
+        "thinking": {"type": "enabled", "budget_tokens": 1024},
+        "system": [{"type": "text", "text": "You are Claude Code.", "cache_control": {"type": "ephemeral"}}],
+        "tools": [{"name": "read", "description": "Read a file.", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}},
+                  {"type": "web_search_20250305", "name": "web_search"}],
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}}]},
+            {"role": "assistant", "content": [{"type": "thinking", "thinking": " hello", "signature": "rockem"},
+                                              {"type": "text", "text": " paris"},
+                                              {"type": "tool_use", "id": "toolu_1", "name": "read", "input": {"path": "b"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": [{"type": "text", "text": "world"}]},
+                                         {"type": "text", "text": "and?"}]},
+        ],
+    }
+    return body | over
+
+
+def test_anthropic_maps_claude_codes_messages():
+    from rockem.adapters import anthropic
+
+    req = anthropic.to_request(anthropic.Request(**claude_code_body()))
+    assert [m["role"] for m in req.messages] == ["system", "user", "assistant", "tool", "user"]
+    a = req.messages[2]
+    assert (a["content"], a["reasoning_content"]) == (" paris", " hello")
+    assert a["tool_calls"] == [{"id": "toolu_1", "type": "function", "function": {"name": "read", "arguments": {"path": "b"}}}]
+    assert req.messages[3] == {"role": "tool", "tool_call_id": "toolu_1", "content": "world"}
+    assert [t["function"]["name"] for t in req.tools] == ["read"]  # the server tool has no schema: left out
+    assert req.max_tokens == 32
+
+
+def sse_events(r) -> list[tuple[str, dict]]:
+    out = []
+    for chunk in r.text.split("\n\n"):
+        lines = chunk.split("\n")
+        if len(lines) == 2 and lines[0].startswith("event: "):
+            out.append((lines[0][7:], json.loads(lines[1][6:])))
+    return out
+
+
+async def test_anthropic_streams_thinking_text_and_tool_use(client, engine, node):
+    import dataclasses
+
+    engine.edge.format = dataclasses.replace(engine.edge.format, think=("<think>", "</think>"))
+    node.max_ctx = 128
+    node.draws = [THINK_OPEN, 0, THINK_CLOSE, 2, CALL_START, CALL_BODY, CALL_END, EOS]
+    evs = sse_events(await client.post("/v1/messages", json=claude_code_body()))
+    starts = [e["content_block"] for k, e in evs if k == "content_block_start"]
+    assert [b["type"] for b in starts] == ["thinking", "text", "tool_use"]
+    assert starts[2]["name"] == "read" and starts[2]["id"].startswith("toolu_")
+    deltas = [e["delta"] for k, e in evs if k == "content_block_delta"]
+    assert {"type": "signature_delta", "signature": "rockem"} in deltas
+    assert json.loads(next(d["partial_json"] for d in deltas if d["type"] == "input_json_delta")) == {"path": "a"}
+    assert [k for k, _ in evs].count("content_block_stop") == 3
+    end = next(e for k, e in evs if k == "message_delta")
+    assert end["delta"]["stop_reason"] == "tool_use"
+    r = await client.post("/v1/messages", json=claude_code_body(stream=False))  # the same, whole
+    assert [b["type"] for b in r.json()["content"]] == ["thinking", "text", "tool_use"] and r.json()["stop_reason"] == "tool_use"
+
+
+async def test_anthropic_errors_count_tokens_and_the_compaction_cue(client, node):
+    r = await client.post("/v1/messages/count_tokens", json=claude_code_body())
+    assert r.status_code == 200 and r.json()["input_tokens"] > 5
+    image = claude_code_body(messages=[{"role": "user", "content": [{"type": "image", "source": {}}]}])
+    r = await client.post("/v1/messages", json=image)
+    assert r.status_code == 400 and r.json()["type"] == "error" and r.json()["error"]["type"] == "invalid_request_error"
+    long = claude_code_body(messages=[{"role": "user", "content": " ".join(["hello"] * 500)}])
+    r = await client.post("/v1/messages", json=long)
+    assert r.status_code == 400 and r.json()["error"]["message"].startswith("prompt is too long:")
+    r = await client.post("/v1/messages", json={"model": "m"})
+    assert r.status_code == 400 and r.json()["type"] == "error"

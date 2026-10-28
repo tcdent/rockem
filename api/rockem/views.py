@@ -12,7 +12,7 @@ from collections.abc import AsyncIterator
 from typing import Annotated
 
 from fastapi import Depends, HTTPException, Request as HttpRequest
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastcbv import BaseView
 
 from . import core
@@ -137,15 +137,35 @@ class OpenAIChatView(GenerationView):
 
 class AnthropicMessagesView(GenerationView):
     async def post(self, body: anthropic.Request) -> anthropic.Response:
+        """Anthropic's Messages API, for Claude Code: tools, tool results and thinking included."""
         try:
             req = anthropic.to_request(body)
+            run = await self._start(req)
         except ValueError as e:
-            raise HTTPException(400, str(e)) from e
-        run = await self._start(req)
+            return anthropic_error(400, str(e))
+        except HTTPException as e:
+            if isinstance(e.__cause__, ContextFull):
+                # the error Claude Code answers by compacting the conversation
+                c = e.__cause__
+                return anthropic_error(400, f"prompt is too long: {c.wanted} tokens > {c.room} maximum")
+            return anthropic_error(e.status_code, str(e.detail))
         if body.stream:
             return self._sse(anthropic.stream(run.events(), self.model, run.prompt_tokens))
-        text, _, _, done = await fold_or_abort(run, self.request.receive)
-        return anthropic.fold(text, done, self.model)
+        events = await until_disconnect(anthropic.collect(run.events()), self.request.receive)
+        return anthropic.fold(events, self.model)
+
+
+class AnthropicCountTokensView(GenerationView):
+    async def post(self, body: anthropic.Request) -> dict:
+        """The prompt's tokens as the node would be sent them; no node is asked."""
+        try:
+            return {"input_tokens": len(self.engine.ids(anthropic.to_request(body)))}
+        except (TemplateError, ValueError) as e:
+            return anthropic_error(400, str(e))
+
+
+def anthropic_error(status: int, message: str) -> JSONResponse:
+    return JSONResponse(anthropic.error(status, message), status_code=status)
 
 
 async def no_speech() -> AsyncIterator[core.Event]:

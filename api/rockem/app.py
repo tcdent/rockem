@@ -20,15 +20,19 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastcbv import APIRouter
+
+from .adapters import anthropic
 
 from .bundle import Bundle
 from .core import Engine
 from .edge import Edge
 from .scheduler import Addr, Scheduler
 from .transcribe import Transcriber
-from .views import RUNS, AnthropicMessagesView, HealthView, InternalView, OpenAIChatView, TranscribeView
+from .views import RUNS, AnthropicCountTokensView, AnthropicMessagesView, HealthView, InternalView, OpenAIChatView, TranscribeView
 
 
 def parse_nodes(spec: str) -> list[Addr]:
@@ -67,6 +71,7 @@ router.add_view("/rockem/v1/generate", InternalView, tags=["rockem"])
 router.add_view("/rockem/v1/transcribe", TranscribeView, tags=["rockem"])
 router.add_view("/v1/chat/completions", OpenAIChatView, tags=["openai"])
 router.add_view("/v1/messages", AnthropicMessagesView, tags=["anthropic"])
+router.add_view("/v1/messages/count_tokens", AnthropicCountTokensView, tags=["anthropic"])
 router.add_view("/health", HealthView, tags=["internal"])
 
 
@@ -97,4 +102,12 @@ class ReleaseRuns:
 
 app = FastAPI(title="rockem", lifespan=lifespan)
 app.add_middleware(ReleaseRuns)
+
+
+@app.exception_handler(RequestValidationError)
+async def malformed(request, exc: RequestValidationError):
+    """A malformed request: Anthropic's error shape on its paths, FastAPI's elsewhere."""
+    if request.url.path.startswith("/v1/messages"):
+        return JSONResponse(anthropic.error(400, str(exc.errors())[:2000]), status_code=400)
+    return await request_validation_exception_handler(request, exc)
 app.include_router(router)
