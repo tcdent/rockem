@@ -124,7 +124,7 @@ fn a_thinking_stream() {
 
 #[test]
 fn the_transcribe_request_rust_builds_is_the_fixture() {
-    let req = TranscribeRequest::new(b"RIFF".to_vec()).language("en").max_tokens(512);
+    let req = TranscribeRequest::new(b"RIFF".to_vec()).language("en").max_tokens(512).keywords(["rockem", "GLM-5.3-Flash"]);
     let ours: Value = serde_json::to_value(&req).unwrap();
     let theirs: Value = serde_json::from_str(&fixture("transcribe.json")).unwrap();
     assert_eq!(ours, theirs);

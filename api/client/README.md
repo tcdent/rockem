@@ -59,6 +59,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+To help with words the model may not know, pass the spellings you expect: names, acronyms,
+jargon. The model favors them when it hears something close.
+
+```rust,no_run
+# use rockem_client::TranscribeRequest;
+# let audio = vec![];
+let req = TranscribeRequest::new(audio).keywords(["Kubernetes", "rockem", "GLM-5.3-Flash"]);
+```
+
+Each keyword is a word or phrase without commas or newlines. The spelling carries over, but the
+capitalization does not: the transcript stays lowercase.
+
 A recording with no voice in it, such as silence, hiss or noise, ends at once with
 `Reason::NoSpeech` and no text: the service checks before sending it to the model, which would
 otherwise invent a transcript. A single short word is enough to pass.

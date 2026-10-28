@@ -239,7 +239,7 @@ of a conversation. The audio itself never enters a conversation.
 ### Request
 
 ```json
-{"audio": "<base64 of the recording>", "language": "en", "max_tokens": 4096}
+{"audio": "<base64 of the recording>", "language": "en", "max_tokens": 4096, "keywords": ["Kubernetes", "rockem"]}
 ```
 
 | field | meaning |
@@ -247,6 +247,7 @@ of a conversation. The audio itself never enters a conversation.
 | `audio` | the recording, base64: any format libsndfile reads (WAV, FLAC, OGG, MP3), any rate, any channels |
 | `language` | optional, a code like `en`. Granite detects the language itself and ignores this |
 | `max_tokens` | optional: ids to generate at most |
+| `keywords` | optional: spellings to favor, such as names, acronyms and jargon; each a word or phrase without commas or newlines. Granite takes them through its trained keyword-biasing request (`transcribe the speech to text. Keywords: …` in place of the raw request); the spelling carries over, the capitalization does not |
 
 The text arrives as `started`, then `text` events, then `done` with `end_turn`.
 

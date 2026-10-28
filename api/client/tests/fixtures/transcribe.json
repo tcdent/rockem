@@ -1,5 +1,9 @@
 {
   "audio": "UklGRg==",
   "language": "en",
-  "max_tokens": 512
+  "max_tokens": 512,
+  "keywords": [
+    "rockem",
+    "GLM-5.3-Flash"
+  ]
 }

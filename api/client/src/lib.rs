@@ -151,6 +151,9 @@ pub struct TranscribeRequest {
     /// A code like "en"; `None`, the model detects the language.
     pub language: Option<String>,
     pub max_tokens: Option<u32>,
+    /// Spellings to favor: names, acronyms, jargon the speaker may say. Each a word or phrase,
+    /// without commas or newlines. Empty: none.
+    pub keywords: Vec<String>,
 }
 
 impl TranscribeRequest {
@@ -163,6 +166,10 @@ impl TranscribeRequest {
     }
     pub fn max_tokens(mut self, n: u32) -> Self {
         self.max_tokens = Some(n);
+        self
+    }
+    pub fn keywords(mut self, words: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.keywords = words.into_iter().map(Into::into).collect();
         self
     }
 }
@@ -178,6 +185,9 @@ impl Serialize for TranscribeRequest {
         }
         if let Some(n) = self.max_tokens {
             m.serialize_entry("max_tokens", &n)?;
+        }
+        if !self.keywords.is_empty() {
+            m.serialize_entry("keywords", &self.keywords)?;
         }
         m.end()
     }
