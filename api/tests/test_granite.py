@@ -33,6 +33,33 @@ def test_the_log_mel_is_the_references(granite):
 
 
 def test_the_prompt_is_the_references(granite):
-    ids = FORMATS[granite.name](granite, 150, None)
+    ids = FORMATS[granite.name](granite, 150, None, [])
     assert ids == [6584, 25, 220] + [100352] * 150 + [4919, 499, 1380, 3191, 279, 8982, 1139, 264, 5439, 3645, 30, 198, 36660, 3931, 2891, 25]
-    assert FORMATS[granite.name](granite, 30, "fr") == FORMATS[granite.name](granite, 30, None)  # language ignored
+    assert FORMATS[granite.name](granite, 30, "fr", []) == FORMATS[granite.name](granite, 30, None, [])  # language ignored
+
+
+SNAPSHOT = Path.home() / ".cache/huggingface/hub/models--ibm-granite--granite-speech-4.1-2b/snapshots/de575db64086f84fdc79da4932d1076e965bc546"
+
+
+def test_keywords_take_the_model_cards_keyword_prompt(granite):
+    """The keyword-biased request of the model card, its text exactly; tokenized as the reference."""
+    from rockem.transcribe import _gpt2_split
+
+    ids = FORMATS[granite.name](granite, 30, None, ["rockem", "GLM-5.3-Flash"])
+    tok = _gpt2_split(granite.read("tokenizer.json").decode())
+    text = tok.decode(ids, skip_special_tokens=False)
+    assert text.endswith("transcribe the speech to text. Keywords: rockem, GLM-5.3-Flash\n ASSISTANT:")
+    assert ids.count(granite.audio["placeholder"]) == 30
+
+
+@pytest.mark.skipif(not (SNAPSHOT / "vocab.json").exists(), reason="no Granite checkpoint (for GPT2Tokenizer)")
+def test_the_split_is_gpt2tokenizers(granite):
+    transformers = pytest.importorskip("transformers")
+    from rockem.transcribe import _gpt2_split
+
+    ref = transformers.GPT2Tokenizer.from_pretrained(str(SNAPSHOT))
+    tok = _gpt2_split(granite.read("tokenizer.json").decode())
+    for t in ["USER: <|audio|>can you transcribe the speech into a written format?\n ASSISTANT:",
+              "transcribe the speech to text. Keywords: rockem, GLM-5.3-Flash, C++, (OpenAI), 12345, tcdent's, naïve, Zürich, x86_64\n ASSISTANT:",
+              "a  b\t\tc   \n\n  d?!\n x"]:
+        assert tok.encode(t, add_special_tokens=False).ids == ref.encode(t, add_special_tokens=False)

@@ -70,6 +70,7 @@ class TranscribeRequest(BaseModel):
     audio: str  # the recording, base64: any format soundfile reads (WAV, FLAC, OGG, MP3)
     language: str | None = None  # a code like "en"; omitted, the model detects it
     max_tokens: int | None = Field(default=None, ge=1)
+    keywords: list[str] = Field(default_factory=list)  # spellings to favor: names, acronyms, jargon
 
 
 class Usage(BaseModel):

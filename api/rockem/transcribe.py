@@ -16,6 +16,7 @@ its bundles.
 
 from __future__ import annotations
 
+import functools
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -45,7 +46,9 @@ class NoSpeech(Exception):
 MIN_VOICED_SECONDS = 0.2
 
 
-def _voxtral(m: Model, placeholders: int, language: str | None) -> list[int]:
+def _voxtral(m: Model, placeholders: int, language: str | None, keywords: list[str]) -> list[int]:
+    if keywords:
+        raise TranscribeError(f"{m.name}: keywords are not something this model was trained to take")
     tok = m.tokenizer
 
     def special(s: str) -> int:
@@ -60,34 +63,39 @@ def _voxtral(m: Model, placeholders: int, language: str | None) -> list[int]:
     return ids + [special("[TRANSCRIBE]")]
 
 
-def _granite(m: Model, placeholders: int, language: str | None) -> list[int]:
-    """Granite Speech's chat template, `USER: {content}\n ASSISTANT:`, with the model card's "ASR,
-    raw" request as content: `<|audio|>can you transcribe the speech into a written format?`
-    (lowercase, no punctuation: tcdent wants word accuracy, not cleanup). No BOS: the sequence
-    begins with the text. The one `<|audio|>` is the clip's placeholders. Language is not part
-    of the prompt (the model detects it; the English request serves every language): ignored."""
-    tok = m.tokenizer
+@functools.cache
+def _gpt2_split(tokenizer_json: str):
+    """Granite's tokenizer with the split rule its reference uses. The checkpoint's processor loads
+    GPT2Tokenizer (vocab.json + merges.txt): GPT-2's pre-tokenizer regex. Its tokenizer.json carries
+    a newer cl100k-style rule that splits punctuation, digits and newlines differently ("?\n" one
+    token there, two in the reference). Same vocabulary and merges, GPT-2's byte-level split: equal
+    to GPT2Tokenizer on the prompt and on keyword text (tests/test_granite.py, 2026-10-27)."""
+    from tokenizers import Tokenizer, pre_tokenizers
 
-    def encode(text: str) -> list[int]:
-        # Line by line, the newlines on their own. The checkpoint's processor loads GPT2Tokenizer,
-        # whose split rule never joins a newline to punctuation ("?" "\n" = 30, 198), while its
-        # tokenizer.json's newer rule makes "?\n" one token (5380). The reference's prompt and its
-        # golden transcripts use the former (rockem.lead's oracle, 2026-10-24).
-        out: list[int] = []
-        for i, line in enumerate(text.split("\n")):
-            if i:
-                out += tok.encode("\n", add_special_tokens=False).ids
-            if line:
-                out += tok.encode(line, add_special_tokens=False).ids
-        return out
+    tok = Tokenizer.from_str(tokenizer_json)
+    tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=True)
+    return tok
 
-    before = encode("USER: ")
-    after = encode("can you transcribe the speech into a written format?\n ASSISTANT:")
+
+def _granite(m: Model, placeholders: int, language: str | None, keywords: list[str]) -> list[int]:
+    """Granite Speech's chat template, `USER: {content}\n ASSISTANT:`, with one of the model card's
+    trained requests as content (its "Preferred prompt by task" table):
+      - raw ASR, `can you transcribe the speech into a written format?`: lowercase, unpunctuated
+        (tcdent wants word accuracy, not cleanup);
+      - keyword-biased ASR, `transcribe the speech to text. Keywords: <kw1>, <kw2>, ...`: the
+        spellings of names, acronyms and jargon the speaker may use (tcdent 2026-10-27).
+    No BOS: the sequence begins with the text. The one `<|audio|>` is the clip's placeholders.
+    Language is not part of the prompt (the model detects it; the English request serves every
+    language): ignored."""
+    tok = _gpt2_split(m.read("tokenizer.json").decode())
+    request = f"transcribe the speech to text. Keywords: {', '.join(keywords)}" if keywords else "can you transcribe the speech into a written format?"
+    before = tok.encode("USER: ", add_special_tokens=False).ids
+    after = tok.encode(f"{request}\n ASSISTANT:", add_special_tokens=False).ids
     return before + [m.audio["placeholder"]] * placeholders + after
 
 
 # the model's manifest name → its transcription prompt
-FORMATS: dict[str, Callable[[Model, int, str | None], list[int]]] = {
+FORMATS: dict[str, Callable[[Model, int, str | None, list[str]], list[int]]] = {
     "voxtral-small-24b": _voxtral,
     "granite-speech-4.1-2b": _granite,
 }
@@ -99,7 +107,7 @@ LANGUAGE = re.compile(r"^[a-z]{2,3}$")
 class Transcriber:
     engine: core.Engine
     spectrogram: Spectrogram
-    prompt: Callable[[Model, int, str | None], list[int]]
+    prompt: Callable[[Model, int, str | None, list[str]], list[int]]
 
     @classmethod
     def of(cls, engine: core.Engine) -> Transcriber:
@@ -114,9 +122,12 @@ class Transcriber:
     def model(self) -> Model:
         return self.engine.edge.model
 
-    def request(self, audio: bytes, language: str | None = None, max_tokens: int | None = None) -> core.Request:
+    def request(self, audio: bytes, language: str | None = None, max_tokens: int | None = None, keywords: list[str] | None = None) -> core.Request:
         """The clip's windows and the prompt they fill. `AudioError` for bytes that are not audio,
         `NoSpeech` for a clip with no voice in it."""
+        keywords = [k.strip() for k in keywords or []]
+        if any(not k or "," in k or "\n" in k for k in keywords):
+            raise TranscribeError("keywords: each a non-empty word or phrase, without commas or newlines (the list is comma-separated)")
         if language is not None and not LANGUAGE.match(language):
             raise TranscribeError(f"language {language!r}: a code like en or fr")
         signal = self.spectrogram.signal(audio)
@@ -124,5 +135,5 @@ class Transcriber:
         if voiced < MIN_VOICED_SECONDS:
             raise NoSpeech(voiced)
         windows = self.spectrogram.windows_of(signal)
-        ids = self.prompt(self.model, len(windows) * self.model.audio["rows"], language)
+        ids = self.prompt(self.model, len(windows) * self.model.audio["rows"], language, keywords)
         return core.Request(ids=ids, windows=windows, max_tokens=max_tokens)

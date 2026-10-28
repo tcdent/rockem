@@ -120,3 +120,12 @@ async def test_no_speech_never_reaches_the_node(client, transcribing, node):
     node.max_ctx = 64
     evs = events(await client.post("/rockem/v1/transcribe", json={"audio": base64.b64encode(clip(voice(0.4))).decode()}))
     assert evs[0]["type"] == "started" and evs[-1]["reason"] == "end_turn"  # a short word still goes through
+
+
+
+async def test_keywords_reach_the_prompt_or_are_refused(client, transcribing, node):
+    node.max_ctx = 64
+    ok = await client.post("/rockem/v1/transcribe", json={"audio": base64.b64encode(clip(voice(0.4))).decode(), "keywords": ["x"]})
+    assert ok.status_code == 400  # the test model has Voxtral's prompt: keywords are not one of its inputs
+    bad = await client.post("/rockem/v1/transcribe", json={"audio": base64.b64encode(clip(voice(0.4))).decode(), "keywords": ["a, b"]})
+    assert bad.status_code == 400

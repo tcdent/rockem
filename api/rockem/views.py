@@ -185,7 +185,7 @@ class TranscribeView(BaseView):
             raise HTTPException(400, f"audio: not base64: {e}") from e
         t = self.transcriber
         try:
-            req = t.request(audio, body.language, body.max_tokens)
+            req = t.request(audio, body.language, body.max_tokens, body.keywords)
         except NoSpeech:
             return sse(internal.stream(no_speech(), t.model.name, f"{t.model.identity:016x}"))
         except (AudioError, ValueError) as e:
