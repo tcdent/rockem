@@ -68,9 +68,15 @@ of each model, and a transcript always continues the same way.
 | `GET /health` | the model, the bundle's identity, and the line: `{model, identity, nodes, free, waiting}` |
 | `GET /` | a chat page for talking to the service by hand |
 
-Beside these, `POST /v1/chat/completions` and `POST /v1/messages` emulate OpenAI's and
-Anthropic's formats for tools that already speak them. They stream text only, and are not
-described here.
+Beside these, two endpoints emulate other formats for tools that already speak them; they are
+not described here:
+
+- `POST /v1/messages` and `POST /v1/messages/count_tokens`: Anthropic's Messages API, complete
+  enough for Claude Code (`ANTHROPIC_BASE_URL=https://rockem.a10k.co`): tool use and tool
+  results, thinking blocks, streamed content blocks, Anthropic's error shape, and the "prompt is
+  too long" error Claude Code compacts on. Images and documents are refused
+  (`api/rockem/adapters/anthropic.py`).
+- `POST /v1/chat/completions`: OpenAI's chat completions, text only.
 
 Both of rockem's endpoints share one response form, described next: a stream of events,
 the same refusals before it, and the same abort.
