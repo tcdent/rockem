@@ -1,0 +1,36 @@
+SIO global:
+20=86 21=13 22=08 23=40 24=00 25=01 26=f3 27=00 28=00 29=00 2a=00 2b=48 2c=41 2d=00 2e=00 2f=00 
+LDN 4: 30=01 60=0a 61=30 62=0a 63=20 70=00 71=02 72=00 73=00 74=04 f0=80 f1=00 f2=00 f3=00 f4=00 f5=00 f6=f0
+LDN 7: 30=00 60=0a 61=10 62=0a 63=00 70=00 71=01 72=20 73=38 74=00 f0=00 f1=00 f2=00 f3=00 f4=00 f5=00 f6=0e
+LDN a: 30=00 60=03 61=10 62=00 63=00 70=0b 71=02 72=00 73=00 74=04 f0=06 f1=00 f2=00 f3=00 f4=00 f5=00 f6=00
+EC@0xa30 (index a35 / data a36):
+00: 19 10 00 40 00 00 00 00 00 c0 44 00 00 00 e5 20
+10: ff ff ff e0 c0 00 80 80 00 02 03 ff ff ff 80 80
+20: 6c 76 b8 c4 b8 b9 c4 ad 8f 33 22 22 22 22 22 97
+30: ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00
+40: 7f 80 7f 80 7f 80 7f 80 ad 6a d4 00 5f 40 fc 25
+50: 37 18 7f 7f 7f 40 00 00 90 00 00 12 60 00 00 00
+60: 7f 7f 7f 80 00 00 0f 80 23 28 50 5f 20 00 0f 8b
+70: 23 28 50 5f 20 00 0f 8b 10 20 7f 7f 04 00 0f 88
+80: 00 00 00 00 ff ff ff ff 00 00 00 00 00 70 00 50
+90: 00 00 00 00 00 00 00 ff 42 99 00 00 01 6e f2 33
+a0: 10 20 7f 7f 04 00 0f 88 7f 7f 7f 80 00 00 0f 80
+b0: 9d 1a ff ff 7f 80 7f 80 51 b2 08 e4 a1 ec d4 4f
+c0: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+d0: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff 01
+e0: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+f0: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+bank reg 0x06 = 00
+bank 1 (0x06=20):
+  10: ff ff ff e0 c0 00 80 80 00 02 03 ff ff ff 80 80
+  20: 6c 76 b9 c4 b8 b9 c4 ad 8f 33 22 22 22 22 22 97
+  30: ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00
+bank 2 (0x06=40):
+  10: 7f 00 00 00 7f 00 00 00 7f 00 00 00 7f 03 00 00
+  20: 7f 00 00 00 7f 00 00 00 7f 00 00 00 7f 7f ff 97
+  30: 7f 00 00 00 7f 00 00 00 7f 00 00 00 7f 00 00 00
+bank 3 (0x06=60):
+  10: ff ff ff e0 c0 00 80 80 00 02 03 ff ff ff 80 80
+  20: 6c 76 b9 c4 b8 b9 c4 ad 8f 33 22 22 22 22 22 97
+  30: ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff 00
+restored 0x06 = 00

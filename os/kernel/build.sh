@@ -7,6 +7,8 @@ SRC=$HERE/src/linux-7.2.6
 OUT=$HERE/../release/staging/$PROFILE
 mkdir -p "$OUT"
 cd "$SRC"
+# tracked replacements for files in the untracked tree (os/kernel/patches/README.md)
+for f in "$HERE"/patches/*/*; do cp "$f" "drivers/$(basename "$(dirname "$f")")/"; done
 cp "$HERE/configs/generated-$PROFILE.config" .config
 make -s olddefconfig
 time make -j"$(nproc)" bzImage 2>&1 | grep -E '^(  (LD|AS|CC|OBJCOPY) .*(vmlinux|bzImage)|.*error|.*Error|Kernel: )' | tail -20
