@@ -104,18 +104,20 @@ impl Zone {
 /// junction ~35 °C, r ≈ 0.25; a little slower. Setpoints: idle a few degrees above today's, peaks
 /// under today's maxima (socket 1 87, junctions 81). All of it to be replaced by the fits.
 pub fn defaults() -> Vec<Params> {
-    let socket = |name, ambient, idle_sp| Params {
-        name, r: 0.17, tau_heat: 45.0, tau_cool: 90.0, ambient, idle_sp, peak_sp: 72.0, ramp_down: 1.0,
-        load_w: 120.0, full_w: 280.0, floor: 60.0, kp: 12.0, ki: 0.05, kff: 0.5,
+    // from pass 1 (queue 101 §Characterization, 2026-10-31): the dies' swing is ~15 °C per 140 W and they relax
+    // within a minute; card0 carried the heat
+    let socket = |name, ambient, idle_sp, tau_cool| Params {
+        name, r: 0.11, tau_heat: 40.0, tau_cool, ambient, idle_sp, peak_sp: 72.0, ramp_down: 1.0,
+        load_w: 140.0, full_w: 280.0, floor: 60.0, kp: 12.0, ki: 0.05, kff: 0.5,
     };
-    let card = |name, ambient, idle_sp| Params {
-        name, r: 0.25, tau_heat: 60.0, tau_cool: 120.0, ambient, idle_sp, peak_sp: 75.0, ramp_down: 1.0,
-        load_w: 40.0, full_w: 150.0, floor: 38.0, kp: 10.0, ki: 0.04, kff: 0.5,
+    let card = |name, ambient, idle_sp, r, tau_cool| Params {
+        name, r, tau_heat: 60.0, tau_cool, ambient, idle_sp, peak_sp: 75.0, ramp_down: 1.0,
+        load_w: 80.0, full_w: 150.0, floor: 38.0, kp: 10.0, ki: 0.04, kff: 0.5,
     };
     vec![
-        socket("socket0", 38.0, 55.0),
-        socket("socket1", 44.0, 62.0),
-        card("card0", 40.0, 52.0),
-        card("card1", 44.0, 55.0),
+        socket("socket0", 41.0, 55.0, 36.0),
+        socket("socket1", 46.0, 62.0, 150.0),
+        card("card0", 41.0, 55.0, 0.25, 60.0),
+        card("card1", 54.0, 60.0, 0.12, 260.0),
     ]
 }

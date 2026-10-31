@@ -100,6 +100,47 @@ cycles a day, steepest fall a minute, duty.
 7. **Measure.** Two weeks A/B in voria with the queries above; then the IPMI question for the BMC's own sensors (VR
    temperatures) if step 3 took the in-band route.
 
+## Characterization (bringup/box/thermal/load.py + analyze.py; chassis fans at 50 %, CPU coolers and cards on their own curves)
+
+**Pass 1, `warm4k-3min`, 2026-10-31 15:39–15:42:** 12 serial requests of 4k prompt + 256 tokens, 191 s, 48k prompt
+tokens. Baseline → peak (°C), time to peak (min), the steepest fall in the minute after the end (°C/min), the cooling
+time constant τ (min, log-linear fit over 10 min), time to within 2 °C of baseline (min):
+
+| Series | base | peak | rise | t_peak | fall/min | τ | settle |
+|---|---|---|---|---|---|---|---|
+| socket 0 Tctl | 51.7 | 66.5 | 14.8 | 2.5 | **−12.4** | **0.6** | 1.2 |
+| socket 1 Tctl | 58.8 | 75.6 | 16.9 | 2.9 | **−10.5** | 2.5 | 3.4 |
+| card0 c3 junction | 54.4 | 84.0 | 29.6 | 2.9 | **−22.0** | 1.0 | 2.7 |
+| card1 a3 junction | 61.0 | 76.0 | 15.0 | 3.0 | −5.0 | 4.3 | 9.2 |
+| board thermistor | 30.0 | 39.0 | 9.0 | 3.0 | −2.0 | 6.3 | 9.2 |
+| BMC Vcore VR | 51.5 | 68.0 | 16.5 | 3.0 | −6.0 | 2.0 | 4.9 |
+| BMC VSoC VR | 53.5 | 71.0 | 17.5 | 3.0 | −7.0 | 2.2 | 5.4 |
+| BMC inlet / outlet | 44 / 41.5 | 50 / 50 | 6 / 8.5 | 3.0 | −2.0 | 4.2 / 4.5 | 6.9 / 8.5 |
+| socket power (one socket's hwmon) W | 97 | 238 | | | | | |
+| cards power W | 113 | 349 | | | | | |
+| CPU fan2 rpm | 921 | 1280 | | | | | |
+| card0 fan rpm | 0 | 1488 | | | | 7.1 | |
+
+What it says, and it bears on the goal directly:
+
+- **The dies cool in well under a minute no matter what the fans do.** Socket 0's Tctl has a time constant of ~36 s
+  and falls 12 °C in the first minute after a pass, with its fan still at the post-load speed (1280 → 1231 rpm in that
+  minute). Card0's junction falls 22 °C in that minute with its fan at 1488 rpm for the next seven. The die's swing is
+  the junction-to-heatsink drop, R_jc × P, about 15 °C per 140 W here; that part is physics, and no fan policy slows it.
+- **What a fan policy can hold is the slow mass**: the heatsink bases, the VRMs (τ 2 min), the cards' coolers and the
+  air around them (τ 4–6 min). The 2026-10-26 week's "14 °C/min" falls were these dies, and they are the same here at
+  50 % as at 100 %.
+- So the smoothing target is reframed: **hold the heatsinks and the VRM warm at idle, cap the peak, and ramp the air
+  down slowly after a pass** so the slow mass descends on the setpoint's slope. The die rides on top of that with its
+  fixed R_jc × P step; its amplitude shrinks only through a warmer base at idle (fans slower when nothing runs) and a
+  lower peak (fans earlier and harder when a pass starts). Both are what the setpoint scheme does.
+- **Card0 took the heat** (+30 °C, fan from zero to 1488 rpm) while card1 moved +15 °C: the upper card in SLOT2 carries
+  the attention work in this configuration, or its cooler sits in the warmer air; the per-card zone needs its own
+  constants.
+- First constants for the daemon's model from this pass: sockets r ≈ 0.11 °C/W, τ_heat ≈ 40 s, τ_cool 36 s (socket 0)
+  / 150 s (socket 1); card0 r ≈ 0.25, τ ≈ 60 s; card1 r ≈ 0.12, τ_cool ≈ 260 s; the cards' "loaded" threshold 80 W
+  (they idle at 50–55 W with the performance level forced high).
+
 ## Open questions
 
 - The BMC's fan-write command (step 3), and whether its daemon reverts a manual duty.
