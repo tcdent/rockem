@@ -48,6 +48,9 @@ p=$(arg rockem.nfs);      [ -n "$p" ] && { mount -t nfs4 -o ro,nolock "$p" /bund
 # host and GPU metrics to voria (INFRA-52); it waits for a real host name and a set clock on its own.
 # Started here, from a running init: as an rdinit= wrapper ahead of init it stalled metatron's boot.
 setsid /usr/bin/voria-agent </dev/null >/dev/null 2>&1 &
+# the thermal daemon (docs/queue/101-fan-control.md): observes the sockets, cards and Super I/O a second and
+# records to prow; its lines go through the kernel log like the node's. Pinned to a housekeeping core.
+[ -x /thermal ] && setsid /thermal </dev/null >/dev/kmsg 2>&1 &
 # the node's output goes through the kernel log: on the console as before, in `dmesg` over telnet,
 # and over netconsole to the log host when the command line names one (printk.devkmsg=on lifts the
 # rate limit on these writes). Backtraces on a panic, with line numbers (the node keeps line tables).

@@ -1,0 +1,19 @@
+[package]
+name = "thermal"
+version = "0.1.0"
+edition = "2021"
+description = "rockem's thermal daemon — the box's fans held to zone setpoints that move slowly (queue 101). Static musl beside the node; v1 observes, models and logs what it would command, and writes nothing."
+
+[dependencies]
+prow = { path = "../../prow" }
+libc = "0.2"
+
+[build-dependencies]
+prow = { path = "../../prow" }
+
+[features]
+default = ["track-thermal"]
+# a row a second of every sensor (thermal_sense), a row a second a zone of setpoint, error and the duty it
+# would command against the duty in force (thermal_zone), and the model's one-step prediction error
+# (thermal_model)
+track-thermal = []

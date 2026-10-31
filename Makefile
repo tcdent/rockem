@@ -2,7 +2,7 @@
 PROFILE ?= dev
 RUN = os/run.sh
 
-.PHONY: image configure kernel kernels kernels-glm node initramfs release publish qemu kvm clean gate-dump lasenora-vm
+.PHONY: image configure kernel kernels kernels-glm node thermal initramfs release publish qemu kvm clean gate-dump lasenora-vm
 
 image:            ## build the pinned builder image
 	os/builder/build-image.sh
@@ -26,7 +26,10 @@ kernels-glm:      ## GLM-5.3-Flash's gfx1100 code object and its static report
 node:             ## the static node binary (musl); NODE_FEATURES="--features track-launches" adds a prow category, "--no-default-features" records nothing
 	$(RUN) cargo build --release --target x86_64-unknown-linux-musl -p node $(NODE_FEATURES)
 
-initramfs: node   ## initramfs.cpio.zst for $(PROFILE)
+thermal:          ## the static thermal daemon (musl), started by init beside the node (docs/queue/101-fan-control.md)
+	$(RUN) cargo build --release --target x86_64-unknown-linux-musl -p thermal
+
+initramfs: node thermal   ## initramfs.cpio.zst for $(PROFILE)
 	$(RUN) os/initramfs/build.sh $(PROFILE)
 
 knobs:            ## knobs.efi: the firmware knobs (os/firmware/knobs.toml) applied ahead of the kernel; the host's toolchain (x86_64-unknown-uefi)

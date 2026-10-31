@@ -8,6 +8,7 @@ ROOT=$HERE/../..
 OUT=$HERE/../release/staging/$PROFILE
 STAGE=$HERE/stage/$PROFILE
 NODE=$ROOT/target/x86_64-unknown-linux-musl/release/node
+THERMAL=$ROOT/target/x86_64-unknown-linux-musl/release/thermal
 BB=${BUSYBOX:-/opt/busybox/busybox}
 [ -x "$NODE" ] || { echo "build the node binary first: cargo build --release --target x86_64-unknown-linux-musl -p node"; exit 1; }
 file "$BB" | grep -q 'statically linked' || { echo "$BB is not static"; exit 1; }
@@ -22,6 +23,7 @@ file "$AGENT" | grep -qE 'statically linked|static-pie linked' || { echo "$AGENT
 rm -rf "$STAGE"; mkdir -p "$STAGE"/{bin,dev,proc,sys,tmp,etc,usr/bin} "$OUT"
 cp "$HERE/init" "$STAGE/init"; cp "$HERE/udhcpc.sh" "$STAGE/etc/udhcpc.sh"
 cp "$NODE" "$STAGE/node"
+[ -x "$THERMAL" ] && cp "$THERMAL" "$STAGE/thermal"
 cp "$BB" "$STAGE/bin/busybox"
 install -m 0755 "$AGENT" "$STAGE/usr/bin/voria-agent"
 for a in $("$BB" --list); do ln -s busybox "$STAGE/bin/$a"; done
