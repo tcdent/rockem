@@ -52,8 +52,11 @@ bottom-left. Seen unless marked inferred.
   socket 0 = CPU1, socket 1 = CPU2 (the cards sit on NUMA 2 and 3 = socket 1, in CPU2's slots; the Super I/O
   and BMC hang off socket 0's FCH and sit on CPU1's side) — inferred from the NUMA evidence, consistent.
 - **Slots.** Seven x16 at the bottom-left, SLOT1 nearest the sockets: CPU2 owns 1, 2, 3, 5, 6; CPU1 owns 4 and 7.
-  Our two cards are a3:00.0 (NUMA 3) and c3:00.0 (NUMA 2), both CPU2's, in two of its five slots; which two,
-  and the order, is one look inside the case (no firmware slot table on this board).
+  Our two cards are a3:00.0 (NUMA 3) and c3:00.0 (NUMA 2), both CPU2's. tcdent (2026-10-31): the NIC is in
+  SLOT1, the first card in SLOT2, the second in SLOT4 or 5 — SLOT5, since SLOT4 is CPU1's. The PCI topology
+  agrees: NIC (e1, root e0, NUMA 2), card0 = c3:00.0 (root c0, NUMA 2) and card1 = a3:00.0 (root a0, NUMA 3)
+  hang off three different root complexes, one quadrant port each. So **card0 c3:00.0 is the upper card in
+  SLOT2 and card1 a3:00.0 the lower card in SLOT5**, and the lower one runs ~6 °C hotter.
 - **VRMs.** A tall finned heatsink between the sockets (its wide upper part on CPU2's flank, the narrower
   lower part on CPU1's), a heatsinked row of ~8 stages under CPU1's lower DIMM bank, a six-inductor cluster
   under CPU2's lower DIMMs, small clusters on each socket's outer flank. Vendor: "8+6 / 8+6 phases, 60 A
@@ -87,9 +90,7 @@ Which it is here is the chassis question of §3.5.
 
 ## 3. What needs a hand or an experiment
 
-1. **Which PCIe slot is which card.** The board doc's slot-to-socket mapping gives slot → root port; a3:00.0 and
-   c3:00.0 hang off root ports a0:03.1 and c0:03.1 (NUMA nodes 2 and 3, socket 1). The physical slot order
-   decides which card is downstream. One look inside the case.
+1. ~~Which PCIe slot is which card~~ — settled 2026-10-31 (§2b): card0 c3:00.0 in SLOT2, card1 a3:00.0 in SLOT5, the NIC in SLOT1.
 2. **Which header is which fan.** pwm2/pwm3 are CPU_FAN1 and SYS_FAN in some order; the chassis fans' three BMC
    headers; whether anything sits on the IT8613E's two spare headers. One look.
 3. **Differential heating, the clean mapping.** Load one socket's cores for two minutes (bench-power, one
