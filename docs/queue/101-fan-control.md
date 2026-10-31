@@ -35,7 +35,7 @@ Three fan domains, three owners, three control surfaces:
 |---|---|---|---|---|
 | CPU coolers | 2, with tachs (~900 rpm idle) | IT8613E SmartGuardian running the BIOS curve 35/40/80 °C on the CPU temperature | hwmon `pwm2`, `pwm3` (software mode, duty 0–255) and every curve parameter; two more headers `pwm4`, `pwm5` unpopulated | **Works** (test 2026-10-31: 910 → 1290 rpm, handed back) |
 | Chassis | 3 of the BMC's 6 headers populated, no tachs read anywhere | BMC (HUANANZHI OpenBMC on the AST2500); tcdent sets a fixed duty by hand, 50 % now, 100 % before | none yet. In-band IPMI exists: KCS at I/O 0xCA2 (SMBIOS type 38), kernel support compiled out | **Open**: the BMC's PWM-write command is unknown |
-| Cards | 2 × 7900 XT, own fans, zero-RPM below ~50 °C | the PMFW (78.128.0) | the overdrive fan table `gpu_od/fan_ctrl/*` (curve, minimum PWM, zero-RPM off, target temperature) — absent today only because `amdgpu.ppfeaturemask=0xfff73fff` lacks the overdrive bit 0x4000; manual `pwm1` is impossible on RDNA3 by firmware design | **One cmdline change away**: `0xfff77fff` and a reboot |
+| Cards | 2 × 7900 XT, own fans, zero-RPM below ~50 °C | the PMFW (78.128.0) | the overdrive fan table `gpu_od/fan_ctrl/*` (curve, minimum PWM, zero-RPM off, target temperature) — absent today only because `amdgpu.ppfeaturemask=0xfff73fff` lacks the overdrive bit 0x4000; manual `pwm1` is impossible on RDNA3 by firmware design | **Live 2026-10-31 15:21**: `0xfff77fff` booted; minimum PWM, curve and zero-RPM switch all verified on card0 |
 
 Inputs the host already has at 100 ms: socket power (HSMP), per-CCD and Tctl (k10temp, both sockets), the cards'
 junction/edge/memory temperatures and power, and now the Super I/O's fan tachs, board thermistors and rails. Not on the
@@ -85,8 +85,8 @@ cycles a day, steepest fall a minute, duty.
    - *Rewire.* The IT8613E has two unpopulated PWM headers (pwm4, pwm5, the BIOS's "Fan 3/4"). Three chassis fans on two
      headers with one Y-splitter puts every fan the box has under the host's own chip, no BMC in the loop, tachs on two
      of them. Hardware work, tcdent's hands; it makes step 3's software the same as step 2's.
-4. **Cards.** `amdgpu.ppfeaturemask=0xfff77fff` (ours plus the overdrive bit) in `bringup/box/dev.cmdline.serving`, one
-   reboot, and `gpu_od/fan_ctrl/` appears: the daemon then writes a five-point `fan_curve`, `fan_minimum_pwm` as the
+4. **Cards — done 2026-10-31.** `amdgpu.ppfeaturemask=0xfff77fff` is live and `gpu_od/fan_ctrl/` exists on both cards; a
+   curve, the minimum PWM and the zero-RPM switch were each written, seen in the tach, and reset. The daemon writes a five-point `fan_curve`, `fan_minimum_pwm` as the
    floor, `fan_zero_rpm_enable=0` so the fans never stop at idle, and commits (`c`). The PMFW keeps running the curve, so
    this domain's fail-safe is built in; the daemon only moves the curve. The other OD knobs (clocks, voltage) stay
    untouched. Caveat from the field: on some 7900 XTs the PMFW overrode zero-RPM settings until a 2026-03 kernel fix;
@@ -104,5 +104,4 @@ cycles a day, steepest fall a minute, duty.
 
 - The BMC's fan-write command (step 3), and whether its daemon reverts a manual duty.
 - Which physical header is which: CPU_FAN1/SYS_FAN ↔ pwm2/pwm3; where the three chassis fans plug in today.
-- Whether `gpu_od/fan_ctrl` appears with the overdrive bit set (expected: yes; no 7900 XT report of a VBIOS refusal).
 - Whether firmware touches the IT8613E's registers at runtime (the ACPI reservation says it may; nothing seen yet).

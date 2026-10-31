@@ -188,8 +188,19 @@ is absent on metatron for one reason: **our `amdgpu.ppfeaturemask=0xfff73fff` ha
 reboot: `amdgpu.ppfeaturemask=0xfff77fff` (ours plus 0x4000). An earlier note here blamed the PMFW's
 powerplay table (`FeatureCtrlMask` 0); the tables I parsed were the firmware image's, not the combo
 table navi31 fetches at boot, and the check never runs with the bit clear — retracted. Zero-RPM mode
-has no switch outside that table (kernel 6.13+ `fan_zero_rpm_enable`). What the host can set today:
-`power1_cap` 238–290 W. The card is a Sapphire 7900 XT (0x1da2:0x471e), VBIOS 113-D70401XT-P11; no
+has no switch outside that table (kernel 6.13+ `fan_zero_rpm_enable`).
+
+**Done 2026-10-31 15:21 (commit 345b521, lead's reboot): `gpu_od/fan_ctrl/` is up on both cards and every
+control works, tested on card0 with the box idle** (`bringup/box/thermal/gpu-od-write-test-2026-10-31.txt`,
+script `gpu-od-test.sh`): `fan_minimum_pwm` 15 → 40 + commit took the fan 588 → 1601 rpm in 10 s; a
+five-point `fan_curve` (30 °C/20 %, 45/30, 55/60, 70/80, 85/100) + commit ran 2021 rpm at 51 °C junction,
+the PMFW interpolating between points (pwm 117–122 of 255 ≈ 46 %); `fan_zero_rpm_enable` 0 accepted;
+`r` then `c` on each file returned the card to the PMFW's defaults, and with the junction at 47 °C the
+default zero-RPM mode stopped the fan. Ranges: curve hotspot 25–100 °C, speed 15–100 %; minimum PWM
+15–100 %; target temperature 25–105 °C (default 81); zero-RPM stop temperature 25–100 °C (default 60);
+acoustic limit/target 500–3600 rpm (defaults 3600/1400). `r` needs a following `c` to apply. The PMFW runs
+whatever curve is committed, so the cards' fail-safe is the firmware itself; the daemon only moves the
+curve, the floor and the zero-RPM switch. `power1_cap` 238–290 W is also writable. The card is a Sapphire 7900 XT (0x1da2:0x471e), VBIOS 113-D70401XT-P11; no
 consumer 7900 XT report of overdrive refused by the VBIOS was found. See `docs/queue/101-fan-control.md`.
 
 ## 6. The plan

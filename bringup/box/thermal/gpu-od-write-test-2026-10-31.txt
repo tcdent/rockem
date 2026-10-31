@@ -1,0 +1,36 @@
+Terminated
+-- card0 before
+22:26:25 fan=588 pwm=38 junction=55000 min=15 zr=1
+-- minimum pwm 40 + commit
+write rc=0
+commit rc=0
+22:26:30 fan=1218 pwm=99 junction=54000 min=40 zr=1
+22:26:35 fan=1601 pwm=102 junction=52000 min=40 zr=1
+-- reset minimum
+rc=0
+22:26:41 fan=1591 pwm=99 junction=52000 min=15 zr=1
+-- curve 30/20 45/30 55/60 70/80 85/100 + commit
+commit rc=0
+0: 30C 20% 1: 45C 30% 2: 55C 60% 3: 70C 80% 4: 85C 100% 
+22:26:47 fan=2021 pwm=122 junction=51000 min=15 zr=1
+22:26:53 fan=1893 pwm=117 junction=50000 min=15 zr=1
+-- zero rpm off + commit
+rc=0 zr=0
+22:26:56 fan=1820 pwm=112 junction=49000 min=15 zr=0
+-- reset curve and zero rpm
+rc=0
+0: 0C 0% 1: 0C 0% 2: 0C 0% 3: 0C 0% 4: 0C 0% 
+22:27:04 fan=1709 pwm=107 junction=48000 min=15 zr=1
+22:27:10 fan=1674 pwm=104 junction=48000 min=15 zr=1
+Terminated
+card0 22:27:23 fan=1549 pwm=94 junction=47000 min=15 zr=1 curve=0: 0C 0% 1: 0C 0% 2: 0C 0% 3: 0C 0% 4: 0C 0% 
+card1 22:27:23 fan=571 pwm=38 junction=62000 min=15 zr=1 curve=0: 0C 0% 1: 0C 0% 2: 0C 0% 3: 0C 0% 4: 0C 0% 
+Terminated
+22:27:34 fan=0 pwm=0 junction=47000
+commit after reset
+rc=0
+rc=0
+rc=0
+22:27:42 fan=0 pwm=0 junction=48000
+22:27:50 fan=0 pwm=0 junction=48000
+22:27:58 fan=0 pwm=0 junction=48000

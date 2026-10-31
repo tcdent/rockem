@@ -1,0 +1,42 @@
+Terminated
+== fan_curve
+OD_FAN_CURVE:
+0: 0C 0%
+1: 0C 0%
+2: 0C 0%
+3: 0C 0%
+4: 0C 0%
+OD_RANGE:
+FAN_CURVE(hotspot temp): 25C 100C
+FAN_CURVE(fan speed): 15% 100%
+== fan_minimum_pwm
+FAN_MINIMUM_PWM:
+15
+OD_RANGE:
+MINIMUM_PWM: 15 100
+== fan_target_temperature
+FAN_TARGET_TEMPERATURE:
+81
+OD_RANGE:
+TARGET_TEMPERATURE: 25 105
+== fan_zero_rpm_enable
+FAN_ZERO_RPM_ENABLE:
+1
+OD_RANGE:
+ZERO_RPM_ENABLE: 0 1
+== fan_zero_rpm_stop_temperature
+FAN_ZERO_RPM_STOP_TEMPERATURE:
+60
+OD_RANGE:
+ZERO_RPM_STOP_TEMPERATURE: 25 100
+== acoustic_limit_rpm_threshold
+OD_ACOUSTIC_LIMIT:
+3600
+OD_RANGE:
+ACOUSTIC_LIMIT: 500 3600
+== acoustic_target_rpm_threshold
+OD_ACOUSTIC_TARGET:
+1400
+OD_RANGE:
+ACOUSTIC_TARGET: 500 3600
+== level high; fan=588 pwm=38 junction=57000
