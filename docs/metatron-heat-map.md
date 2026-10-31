@@ -8,15 +8,20 @@ layout: `docs/metatron-thermal-map.md`; the chip and the cards: `docs/it8613-sup
 
 ## 1. Frame
 
-Front-to-back airflow, three fans across the front (tcdent, 2026-10-31). The board stands as in a tower:
-rear I/O at the back, the edge with the SATA/MCIO/M.2 connectors at the front, the ATX-power edge at the
-top, the slots' far ends at the bottom. In board-photo terms (rear I/O on the left) the air crosses the photo
-**right to left**, and "up" in the photo is up in the case. Coordinates below: **x** = distance from the
-front of the board (0 at the front edge, 330 mm at the rear I/O); **y** = height from the board's bottom edge
-(0) to its top (305 mm). From the vendor's 1500 px photo at ≈0.25 mm/px; ±10 mm.
+**The chassis (tcdent, 2026-10-31): a Sliger CX4150a** — 4U, 15" deep, the board lying flat; three 120 mm
+Noctuas side by side across the front, one 120 mm rear exhaust position; rated for motherboards to 10.5"
+deep, so this 12"-deep E-ATX board overhangs toward the front fans (the reason for the CX4170a, 17" deep, in
+the mail). Both CPUs under Noctua 120 mm tower coolers. Two Radeon 7900 XT (324 mm is the chassis's card
+limit). A Corsair ATX power supply with its own 140 mm fan, which draws from inside the case, sits at the
+rear **in socket 1's corner**: tcdent sees it bleed warm air into that socket's region whenever the case
+lacks positive pressure, on top of socket 1 already breathing socket 0's exhaust.
 
-Assumed until a look confirms: a 0.25 mm/px scale (the board is E-ATX 330 × 305), the chassis is a tower
-with the board vertical, and the three front fans span the board's height.
+So the plane is horizontal. Air enters across the front edge of the board (the SATA/MCIO/M.2 edge) and
+leaves at the rear I/O edge; the three front fans divide the board's *width*, not a height. In board-photo
+terms (rear I/O on the left) the air crosses the photo **right to left**; the photo's "up" is the chassis's
+side where the PSU sits. Coordinates below: **x** = distance from the front of the board (0 at the front
+edge, 330 mm at the rear I/O); **y** = position across the chassis from the slots' edge (0) to the ATX-power
+edge (305 mm), the PSU side. From the vendor's 1500 px photo at ≈0.25 mm/px; ±10 mm.
 
 ## 2. Everything that heats, senses or moves air
 
@@ -40,10 +45,13 @@ with the board vertical, and the three front fans span the board's height.
 | SYS_FAN5 | 40 | 300 | BMC | top edge, front |
 | SYS_FAN4 | 5 | 95 | BMC | front edge, low |
 | SYS_FAN1, SYS_FAN2, SYS_FAN3 | 150, 130, 55 | 5 | BMC | bottom edge |
-| PSU | outside the board | — | no sensor; needs airflow it does not get (tcdent) | position in the case: tcdent |
+| **PSU** (Corsair, 140 mm fan) | 330+ (rear) | ~305+ (beyond the ATX-power edge, socket 1's corner) | no sensor; draws from inside the case; bleeds into socket 1's region without positive pressure (tcdent) | the fourth exhaust nobody controls |
+| Rear exhaust fan position | 330+ | ~150 (behind the sockets) | — | fitted or not: a look; BMC header if fitted |
 
 Three of the BMC's six headers carry the three front fans (tcdent); which three is a look. Front fans
-mount on the case, not the board: their y positions are what define the zones.
+mount on the case, not the board: their y positions across the chassis width are what define the zones.
+With the board overhanging the chassis's motherboard depth, the front edge of the board sits close to or
+against the fan plane: the cards' noses and the MCIO/SATA block are the first things the fans hit.
 
 ## 3. The plane at idle and at peak
 
@@ -64,24 +72,35 @@ left of each cell, peak on the right; "—" is a region with no sensor:
         x = 0                                                              x = 330
 ```
 
-What the picture already says:
+What the picture already says (read it with y across the chassis: the slots' side at the bottom of the
+drawing, the PSU side at the top):
 
-- **The hottest things are in the middle of the height**: the VRM tower and the two sockets at y 85–250.
-  Socket 1 sits in air that has already crossed socket 0 and the tower, and reads 8 °C hotter at idle for it.
-- **The cards occupy the lower third**, and everything that senses "ambient" is in that third too, at the
-  bottom edge. The ambient sensors measure the card region, not the case.
-- **The top third has no sensor and little heat**: DIMMs and power connectors.
+- **The hottest things are in the middle strip**: the VRM tower and the two sockets at y 85–250.
+  Socket 1 sits in air that has already crossed socket 0 and the tower, reads 8 °C hotter at idle for it,
+  and has the PSU's recirculation on its far side.
+- **The cards occupy the slots' strip**, and everything that senses "ambient" is in that strip too, along
+  the slots' edge. The ambient sensors measure the card region, not the case.
+- **The PSU-side strip has no sensor and little heat of its own**: DIMMs and power connectors — but it is
+  where the PSU's warm air arrives if pressure is low.
 - Nothing measures the inlet air itself. The first sensor the air meets is socket 0's die.
 
 ## 4. Zones for three front fans
 
-If the three fans stack top / middle / bottom across the board's height, the zones fall out of the picture:
+Three 120 mm fans side by side across a chassis about 430 mm wide cover the board's 305 mm width and some
+margin; each fan's 120 mm lane maps onto the board's strips:
 
-| Fan | Covers (y) | Heat it carries | Sensor to hold | Today |
+| Fan lane | Covers (y) | Heat it carries | Sensor to hold | Also |
 |---|---|---|---|---|
-| Top | 200–305 | socket 0 and 1 upper halves, upper DIMMs | the two Tctls (max of the two, or each socket's own share) | — |
-| Middle | 85–200 | the VRM tower, the sockets' lower halves, lower DIMMs, the NIC | `cpu_vcore_vr_t` / `cpu_vsoc_vr_t` (BMC) and the Tctls | — |
-| Bottom | 0–85 | the two cards' coolers and their exhaust, the SIO/BMC region | the junctions (amdgpu), with `temp2` and the BMC pair as the exhaust check | — |
+| PSU side | ~200–305 | the sockets' upper halves, upper DIMMs, the power connectors; the lane the PSU's bleed enters from the rear | the two Tctls | this lane's pressure is what keeps the PSU's air out of socket 1 |
+| Middle | ~85–200 | the VRM tower, the sockets' lower halves, lower DIMMs, the NIC | `cpu_vcore_vr_t` / `cpu_vsoc_vr_t` (BMC) and the Tctls | the two CPU coolers draw from this lane |
+| Slots side | ~0–85 | the two cards' coolers and their exhaust, the SIO/BMC region | the junctions (amdgpu), with `temp2` and the BMC pair as the exhaust check | the cards' coolers dump into the case, not out the back |
+
+**Pressure is a zone of its own.** Exhaust is the rear 120 mm position (if fitted), the PSU's 140 mm fan
+(uncontrolled), and the rear I/O gaps; the cards' coolers recirculate inside. Positive pressure means the
+three intakes move more air than those exhausts. The PSU bleed tcdent sees is the sign it is not always so,
+which argues for a floor on the three front fans that no setpoint may undercut, and for the PSU-side lane
+to carry the highest floor. In the CX4170a the same geometry gets 2" more depth between the board's front
+edge and the fans, which is airflow the cards' noses currently block.
 
 Plus the sources that have their own fans: the two CPU coolers (the SIO's pwm2/pwm3, each from its socket's
 Tctl and power), the two cards (the PMFW's curve, shaped through the overdrive table once it exists), and
