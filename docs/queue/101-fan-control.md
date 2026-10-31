@@ -121,6 +121,13 @@ time constant τ (min, log-linear fit over 10 min), time to within 2 °C of base
 | CPU fan2 rpm | 921 | 1280 | | | | | |
 | card0 fan rpm | 0 | 1488 | | | | 7.1 | |
 
+**Pass 2, `decode512-4min`, 16:27–16:31:** 18 requests of ~250 prompt + up to 512 generated tokens, 244 s, 8k
+generated. The sockets' work, the cards lighter: Tctl +14.8 / +15.6 (peaks 64.9 / 73.9), VRs +16.4 / +17.0 (68 / 71),
+junctions +16.9 / +14.5 (73 / 77), thermistor +4.4; the first-minute falls −9.6 / −8.6 (sockets), −8 / −5 (cards),
+−6 / −7 (VRs); τ 3.4–4.2 min for sockets, VRs and card0 (the decay started from a lower, longer plateau than pass 1's,
+so the fit reads slower), 6.5 for card1, 8–13 for the ambient group. Socket power (one hwmon) 90 → 191 W, cards
+129 → 293 W. Same die physics, a gentler cliff when the cards are not the ones heating.
+
 What it says, and it bears on the goal directly:
 
 - **The dies cool in well under a minute no matter what the fans do.** Socket 0's Tctl has a time constant of ~36 s
