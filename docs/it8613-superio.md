@@ -40,8 +40,8 @@ double). Fan main control 0x13 = 0xE0 (fan2, fan3 tachs enabled); fan control
 mode 0x14 = 0xC0: PWM **active-high**, base clock 6 MHz → 23.4 kHz PWM. Which physical header is which
 is tcdent's to confirm by eye; the two tach-bearing channels are presumably the CPU coolers.
 
-**Temperatures.** 0x29 = 51 °C, 0x2A = 34 °C, 0x2B = 34 °C (0x2C–0x2E also read 34; whether they are
-inputs or aliases is unknown). TMPIN1 tracked socket 0's k10temp Tctl at the time. Temperature enable
+**Temperatures.** 0x29 = 51 °C, 0x2A = 34 °C, 0x2B = 34 °C (0x2C–0x2E also read 34: aliases of TMPIN2,
+see §4.1). TMPIN1 tracked socket 0's k10temp Tctl at the time. Temperature enable
 0x51 = 0x18 → thermistor bits for TMPIN1 and TMPIN2, nothing for TMPIN3, bits 7:6 clear. Interface
 select 0x0A = 0x44 → SMBus external-sensor host on, bits 5:4 = 0. **Bank 2 register 0x1D = 0x03**: the
 TMPIN source-select nibble for TMPIN1 is 3, TMPIN2's is 0; 0x1E = 0x00 for TMPIN3. So TMPIN1 is an
@@ -135,9 +135,11 @@ same as ours).
 
 1. **Temperature types.** Fork and mainline type a TMPIN from 0x51 (diode / thermistor bits) and the
    reserved bits 7:6 plus 0x0A for PECI-vs-TSI. On this board that labels TMPIN1 a thermistor when it
-   is the CPU over TSI (`temp1_type` reads 4 on the box), and leaves TMPIN3 untyped (shown, no
-   `temp3_type`). Ours reads bank 2's TSS nibbles: nibble ≠ 0 → external (3 = AMD TSI, 4 = PECI), else
-   the 0x51 bits.
+   is the CPU over TSI (`temp1_type` reads 4 on the box). Ours reads bank 2's TSS nibbles: nibble ≠ 0
+   → external (3 = AMD TSI, 4 = PECI), else the 0x51 bits. **TMPIN3 is not a sensor here:** over 1104
+   samples it never differed from TMPIN2, and with its thermistor bit forced on (0x51 = 0x38, 10 s,
+   2026-10-31) registers 0x2B and 0x2C still tracked 0x2A step for step. One board thermistor, read on
+   TMPIN2; hide temp3 (mainline shows it untyped).
 2. **pwm4.** The SIO 0x2A bit 0 rule would hide pwm4 and fan4 on this board while the BIOS drives a
    curve there. Ours decides presence by the EC itself: a channel with a non-default control byte or
    curve is present; the SIO pin bits become a report, not a gate. fan4/fan5 tach presence is 0x0C
@@ -160,7 +162,37 @@ same as ours).
    fallback is therefore "write the curve we want as the automatic curve, then run in software mode",
    and any exit, crash or watchdog returns to it with one register write.
 
-## 5. The plan
+## 5. Control tests on the live box (2026-10-31)
+
+**pwm2 (a CPU cooler), through hwmon:** `pwm2_enable=1`, `pwm2=200` → the tach rose 910 → 1290 rpm within
+4 s; `pwm2_enable=2` returned the channel to SmartGuardian. **Trap:** the duty register (0x6B) is the
+same byte as the curve's start PWM in automatic mode, so after the hand-back `pwm2_auto_start` read 200
+and the fan settled at 1530 rpm instead of 910. Writing `pwm2_auto_start=95` restored the BIOS curve.
+Any controller that takes a channel into software mode must restore `auto_start` when handing it back,
+or write the curve it wants first. All six attributes of the curve are writable live (points, start,
+slope, hysteresis, temperature source), so "the fail-safe curve" is programmable, not just the BIOS's.
+
+**The cards' fans, through amdgpu:** `pwm1_enable=1` is accepted (rc 0) but reads back 2: the PMFW
+(78.128.0) takes the DisableSmuFeatures(FAN_CONTROL) message and keeps the feature on, so manual duty
+is refused ("manual fan speed control should be enabled first"). `pwm1_enable=0` fails outright: the
+direct FDO register path finds `FMAX_DUTY100` = 0, so the host has no register-level fan path either.
+Manual fan control is impossible on RDNA3 by firmware design: the amdgpu maintainer's words on it
+(drm/amd issue 2402, 2023) are that the fan "always remains under the control of the power management
+firmware" and only the curve can be tuned, and LACT and CoreCtrl both drive RDNA3 fans through the
+overdrive fan table only. That table (`gpu_od/fan_ctrl/*`: `fan_curve`, `fan_minimum_pwm`,
+`fan_zero_rpm_enable`, `fan_zero_rpm_stop_temperature`, `fan_target_temperature`, acoustic thresholds)
+is absent on metatron for one reason: **our `amdgpu.ppfeaturemask=0xfff73fff` has the overdrive bit
+(`PP_OVERDRIVE_MASK` = 0x4000, bit 14) clear** — 0x3fff in the low nibbles clears bits 14 and 15; the
+2026-10-15 GFXOFF-off edit of the default 0xfff7bfff never had OD on either. With the bit clear
+`smu_set_funcs()` leaves `od_enabled` false and nothing else matters. The fix is a cmdline change and a
+reboot: `amdgpu.ppfeaturemask=0xfff77fff` (ours plus 0x4000). An earlier note here blamed the PMFW's
+powerplay table (`FeatureCtrlMask` 0); the tables I parsed were the firmware image's, not the combo
+table navi31 fetches at boot, and the check never runs with the bit clear — retracted. Zero-RPM mode
+has no switch outside that table (kernel 6.13+ `fan_zero_rpm_enable`). What the host can set today:
+`power1_cap` 238–290 W. The card is a Sapphire 7900 XT (0x1da2:0x471e), VBIOS 113-D70401XT-P11; no
+consumer 7900 XT report of overdrive refused by the VBIOS was found. See `docs/queue/101-fan-control.md`.
+
+## 6. The plan
 
 Step 1 is done: kernel #8 (commit ee9b8ff) booted on metatron 2026-10-31 11:26, `it87: Found IT8613E
 chip at 0xa30, revision 8`, gates clean, and voria carries the chip's 13 series (`chip="it8613"`) with

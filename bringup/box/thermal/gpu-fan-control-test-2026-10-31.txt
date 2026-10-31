@@ -1,0 +1,29 @@
+Terminated
+before
+21:08:13 fan1=585 pwm1=38 en=2 junction=57000
+manual 110
+sh: write error: Invalid argument
+21:08:18 fan1=586 pwm1=38 en=2 junction=57000
+21:08:21 fan1=585 pwm1=38 en=2 junction=57000
+back to auto
+21:08:26 fan1=585 pwm1=38 en=2 junction=57000
+21:08:31 fan1=586 pwm1=38 en=2 junction=57000
+Terminated
+rc=0 en_now=2
+[  247.238632] granite  : 4096 positions of context (0.7 GB of K/V), the prefix computed in 5.1s
+[  247.246469] cache    : 452300 cached positions (74.1 GB of host memory), 160 KB each, for granite-speech-4.1-2b
+[  247.262340] ready    : wire on 0.0.0.0:7332, identity 8c8f7427eb09e010, models glm-5.3-flash granite-speech-4.1-2b
+[ 9940.985427] amdgpu: manual fan speed control should be enabled first
+restore rc=0 en=2 fan=581
+Terminated
+21:14:03 fan1=580 pwm1=38 en=2
+sh: write error: Invalid argument
+rc=1
+21:14:05 fan1=580 pwm1=38 en=2
+21:14:09 fan1=580 pwm1=38 en=2
+restore rc=0
+21:14:13 fan1=580 pwm1=38 en=2
+21:14:17 fan1=580 pwm1=38 en=2
+[  247.262340] ready    : wire on 0.0.0.0:7332, identity 8c8f7427eb09e010, models glm-5.3-flash granite-speech-4.1-2b
+[ 9940.985427] amdgpu: manual fan speed control should be enabled first
+[10290.853220] amdgpu 0000:c3:00.0: [smu_v13_0_set_fan_control_mode]Set fan control mode failed!

@@ -1,0 +1,13 @@
+Terminated
+before
+21:07:56 fan2=910 pwm2=95 en=2 fan3=843
+manual 200
+21:08:00 fan2=1290 pwm2=200 en=1 fan3=845
+21:08:03 fan2=1293 pwm2=200 en=1 fan3=845
+back to auto
+21:08:07 fan2=1537 pwm2=200 en=2 fan3=843
+21:08:11 fan2=1527 pwm2=200 en=2 fan3=843
+auto points intact: 35000 40000 80000 start=200 slope=32 src=1
+Terminated
+21:09:22 fan2=783 pwm2=95 en=2 start=95
+21:09:27 fan2=786 pwm2=95 start=95

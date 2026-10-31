@@ -1,0 +1,63 @@
+0
+0000:a3:00.0
+0000:c3:00.0
+1
+128
+129
+bridges
+client-1
+client-2
+client-3
+== /sys/kernel/debug/dri/0
+amdgpu_pm_info amdgpu_smu_debug 
+== /sys/kernel/debug/dri/0000:a3:00.0
+amdgpu_pm_info amdgpu_smu_debug 
+== /sys/kernel/debug/dri/0000:c3:00.0
+amdgpu_pm_info amdgpu_smu_debug 
+== /sys/kernel/debug/dri/1
+amdgpu_pm_info amdgpu_smu_debug 
+== /sys/kernel/debug/dri/128
+amdgpu_pm_info amdgpu_smu_debug 
+== /sys/kernel/debug/dri/129
+amdgpu_pm_info amdgpu_smu_debug 
+pm_info:
+GFX Clocks and Power:
+        1249 MHz (MCLK)
+        34 MHz (SCLK)
+        1567 MHz (PSTATE_SCLK)
+        1249 MHz (PSTATE_MCLK)
+        669 mV (VDDGFX)
+        62.00 W (average SoC)
+
+GPU Temperature: 47 C
+GPU Load: 0 %
+MEM Load: 0 %
+VCN Load: 0 %
+
+SMC Feature Mask: 0x0003ebb871ffffff
+VCN: Powered down
+
+Clock Gating Flags Mask: 0x3bc08030d
+        Graphics Fine Grain Clock Gating: On
+        Graphics Medium Grain Clock Gating: On
+        Graphics Medium Grain memory Light Sleep: Off
+        Graphics Coarse Grain Clock Gating: On
+        Graphics Coarse Grain memory Light Sleep: On
+        Graphics Coarse Grain Tree Shader Clock Gating: Off
+        Graphics Coarse Grain Tree Shader Light Sleep: Off
+        Graphics Command Processor Light Sleep: Off
+        Graphics Run List Controller Light Sleep: Off
+        Graphics 3D Coarse Grain Clock Gating: Off
+        Graphics 3D Coarse Grain memory Light Sleep: Off
+        Memory Controller Light Sleep: On
+        Memory Controller Medium Grain Clock Gating: On
+        System Direct Memory Access Light Sleep: Off
+        System Direct Memory Access Medium Grain Clock Gating: Off
+        Bus Interface Medium Grain Clock Gating: On
+        Bus Interface Light Sleep: Off
+        Unified Video Decoder Medium Grain Clock Gating: Off
+        Video Compression Engine Medium Grain Clock Gating: Off
+        Host Data Path Light Sleep: Off
+        Host Data Path Medium Grain Clock Gating: Off
+        Digital Right Management Medium Grain Clock Gating: Off
+        Digital Right Management Light Sleep: Off
