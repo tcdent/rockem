@@ -29,13 +29,14 @@ rows 51–82), which names the channels:
 
 | Channel | Ctrl / duty / curve base | Live curve (off / start / full °C, start PWM, slope) | BIOS knob block | Tachometer |
 |---|---|---|---|---|
-| pwm2 | 0x16 / 0x6B / 0x68 | 35 / 40 / 80, 95, 4 PWM per °C | CPU_FAN1 or SYS_FAN | fan2 (0x0E/0x19) 0x02E5 → **~1820 rpm** |
-| pwm3 | 0x17 / 0x73 / 0x70 | same | the other of the two | fan3 (0x0F/0x1A) 0x0320 → **~1690 rpm** |
+| pwm2 | 0x16 / 0x6B / 0x68 | 35 / 40 / 80, 95, 4 PWM per °C | CPU_FAN1 or SYS_FAN | fan2 (0x0E/0x19) 0x02E5 → **~910 rpm** (995 at first boot) |
+| pwm3 | 0x17 / 0x73 / 0x70 | same | the other of the two | fan3 (0x0F/0x1A) 0x0320 → **~840 rpm** (915 at first boot) |
 | pwm4 | 0x1E / 0x7B / 0x78 | 16 / 32 / 127, 127, 0.5 PWM per °C | Fan 3 or Fan 4 | fan4 (0x80/0x81) reads 0, tach disabled (0x0C bit 4 clear) |
 | pwm5 | 0x1F / 0xA3 / 0xA0 | same | the other | fan5 (0x82/0x83) reads 0, tach disabled (0x0C bit 5 clear) |
 | pwm1 | 0x15 / 0x63 / 0x60 | factory defaults | — | absent on this chip |
 
-RPM = 1 350 000 / (count × 2). Fan main control 0x13 = 0xE0 (fan2, fan3 tachs enabled); fan control
+RPM = 1 350 000 / (count × 2), two pulses a revolution (the driver's figure; an earlier note here had
+double). Fan main control 0x13 = 0xE0 (fan2, fan3 tachs enabled); fan control
 mode 0x14 = 0xC0: PWM **active-high**, base clock 6 MHz → 23.4 kHz PWM. Which physical header is which
 is tcdent's to confirm by eye; the two tach-bearing channels are presumably the CPU coolers.
 
@@ -134,9 +135,9 @@ same as ours).
 
 1. **Temperature types.** Fork and mainline type a TMPIN from 0x51 (diode / thermistor bits) and the
    reserved bits 7:6 plus 0x0A for PECI-vs-TSI. On this board that labels TMPIN1 a thermistor when it
-   is the CPU over TSI, and hides TMPIN3 (no enable bit) though it reads a valid 34 °C. Ours reads bank
-   2's TSS nibbles: nibble ≠ 0 → external (3 = AMD TSI, 4 = PECI), else the 0x51 bits, and exposes a
-   TMPIN whose register reads a plausible value regardless.
+   is the CPU over TSI (`temp1_type` reads 4 on the box), and leaves TMPIN3 untyped (shown, no
+   `temp3_type`). Ours reads bank 2's TSS nibbles: nibble ≠ 0 → external (3 = AMD TSI, 4 = PECI), else
+   the 0x51 bits.
 2. **pwm4.** The SIO 0x2A bit 0 rule would hide pwm4 and fan4 on this board while the BIOS drives a
    curve there. Ours decides presence by the EC itself: a channel with a non-default control byte or
    curve is present; the SIO pin bits become a report, not a gate. fan4/fan5 tach presence is 0x0C
@@ -145,22 +146,37 @@ same as ours).
    calibrated against the BMC's 12 V / 5 V / 3.3 V readings; until then they are raw.
 4. **Probe writes.** Mainline writes only three temperature limits and the VIN minimums at probe and
    never touches PWM, duty or curves, so the BIOS state survives the driver loading. Keep that.
-5. **PWM frequency.** The shared base clock lives in 0x14, which the drivers expose only through pwm1,
+5. **pwm4/pwm5's own curves.** Mainline wires the `pwm4/5/6_auto_point*_temp` attributes all to pwm3's
+   registers (nr 2 in the attribute table), the IT8620E/IT8628E layout where the extra channels share
+   one set of temperature points; `auto_start` and `auto_slope` use the channel's own
+   block. On the box pwm5 therefore shows 35/40/80 while its 0xA0 block holds 16/32/127. The IT8613E
+   has full blocks at 0x78 and 0xA0 (coreboot, the dump): point the attributes at nr 3 and 4. Mainline's
+   visibility arithmetic for pwm4–6 under the newer auto-PWM also hides `pwmN_auto_start` (the
+   "no auto_point4" rule lands on the wrong slot of the six-attribute group): fix the index.
+6. **PWM frequency.** The shared base clock lives in 0x14, which the drivers expose only through pwm1,
    absent here. Expose it on pwm3+ for this chip.
-6. **Fail-safe by design.** SmartGuardian is always on behind software mode: `pwmN_enable = 2` hands a
+7. **Fail-safe by design.** SmartGuardian is always on behind software mode: `pwmN_enable = 2` hands a
    channel back to the chip's own curve, which keeps running whatever the host does. The daemon's
    fallback is therefore "write the curve we want as the automatic curve, then run in software mode",
    and any exit, crash or watchdog returns to it with one register write.
 
 ## 5. The plan
 
+Step 1 is done: kernel #8 (commit ee9b8ff) booted on metatron 2026-10-31 11:26, `it87: Found IT8613E
+chip at 0xa30, revision 8`, gates clean, and voria carries the chip's 13 series (`chip="it8613"`) with
+no agent change. First-boot readings: fan2 995 / fan3 915 rpm, pwm2/pwm3/pwm5 in automatic mode (pwm4
+hidden by the pin-mux rule, as predicted), temp1 54 °C typed thermistor, temp2/temp3 31 °C, rails as in
+§1, `intrusion0_alarm` latched at 1. The lead's console capture:
+`/tmp/agent-message/rockem.lead/it87-first-boot-2026-10-31.txt`.
+
 1. `os/kernel/patches/hwmon/it87.c` = mainline master's file (the IT8613E series on our 7.2.6 base),
    copied into the untracked tree by `build.sh`; `CONFIG_SENSORS_IT87=y` in `configs/base.config`;
    `it87.ignore_resource_conflict=1` on the cmdline. Our changes on top live in that tracked file.
 2. First boot, read everything through hwmon and diff against the dump above; voria-agent picks the
    chip up through `/sys/class/hwmon` with no change, so the new sensors graph beside the rest.
-3. Patch 1: TSS-based temperature typing and TMPIN3. Patch 2: EC-decided channel presence (pwm4).
-   Patch 3: the divided rails' scaling after calibration against the BMC.
+3. Patch 1: pwm4/pwm5's own curve registers and the hidden `auto_start`. Patch 2: TSS-based temperature
+   typing. Patch 3: EC-decided channel presence (pwm4). Patch 4: the divided rails' scaling after
+   calibration against the BMC (in7 "3VSB" reads 3.8 V, also suspect).
 4. Then the daemon (`docs/queue`, to be written): software mode on pwm2–5 and the cards' `pwm1`,
    SmartGuardian curves as the fail-safe, inputs from k10temp, HSMP power, amdgpu and this chip.
 
