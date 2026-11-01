@@ -27,14 +27,21 @@
 //! mla       a run of positions through an MLA layer: the inference step forward; the
 //!           absorbed attention's backward straight into the latents' gradient, the query
 //!           path, then the run's own latents through their norm and kv_a — to d xn
+//! head      the streams' mean, the final norm, lm_head — to d streams
+//! loss      a position's loss against a top-K teacher, and its gradient at the logits
+//! model     the layers over a run: the embedding to the logits forward, the logits'
+//!           gradient down to the first MoE layer's input backward; runs chain through
+//!           the states and a carry
 //! ```
-//! The head and the layer's composition follow.
 
 pub mod expert;
 pub mod ffn;
 pub mod hc;
+pub mod head;
 pub mod kda;
+pub mod loss;
 pub mod mla;
+pub mod model;
 pub mod reference;
 #[cfg(test)]
 pub mod testing;
