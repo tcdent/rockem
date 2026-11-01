@@ -15,10 +15,31 @@ COMMIT=$(git -C "$HERE" rev-parse --short HEAD)$(git -C "$HERE" diff --quiet HEA
 TAG=latest
 cp "$HERE/$PROFILE.cmdline" "$S/cmdline"
 for f in bzImage initramfs.cpio.zst config cmdline knobs.efi; do [ -r "$S/$f" ] || { echo "missing $S/$f: make release PROFILE=$PROFILE"; exit 1; }; done
+# The thermal daemon's BMC credential (docs/queue/101-fan-control.md; tcdent 2026-11-01: reference the existing
+# one and send it up at deploy): /etc/ipmi/metatron-bmc-admin.env goes into the published initramfs as
+# /etc/rockem/bmc.env (root, 0600), an uncompressed cpio appended to the image, zero-padded to 4 bytes
+# (the kernel finds an appended archive only at an aligned offset). Assembled in a temporary directory and
+# removed after the push: the staged release and the repo never hold it. Without sudo access to the file
+# the image goes up without it and the daemon leaves the chassis fans alone.
+BMC_ENV=${BMC_ENV:-/etc/ipmi/metatron-bmc-admin.env}
+PACK=$(mktemp -d); trap 'rm -rf "$PACK"' EXIT
+for f in bzImage knobs.efi config cmdline; do ln -s "$S/$f" "$PACK/$f"; done
+cp "$S/initramfs.cpio.zst" "$PACK/initramfs.cpio.zst"
+if sudo -n test -r "$BMC_ENV" 2>/dev/null; then
+  O=$PACK/overlay; mkdir -p "$O/etc/rockem"
+  sudo -n cat "$BMC_ENV" > "$O/etc/rockem/bmc.env"; chmod 600 "$O/etc/rockem/bmc.env"; chmod 700 "$O/etc/rockem"
+  n=$(stat -c %s "$PACK/initramfs.cpio.zst"); pad=$(( (4 - n % 4) % 4 ))
+  head -c $pad /dev/zero >> "$PACK/initramfs.cpio.zst"
+  ( cd "$O" && find etc -print0 | cpio --null --quiet -o -H newc -R 0:0 ) >> "$PACK/initramfs.cpio.zst"
+  rm -rf "$O"
+  echo "secret   : $BMC_ENV appended as /etc/rockem/bmc.env"
+else
+  echo "secret   : $BMC_ENV not readable (sudo -n); published without the BMC credential"
+fi
 # explicit file types: podman's guess for text carries a charset parameter, which the OCI schema (and zot) reject
 pack() {
   podman artifact rm "$1" >/dev/null 2>&1 || true
-  ( cd "$S"
+  ( cd "$PACK"
     podman artifact add --type application/vnd.rockem.os.v1 --file-type application/octet-stream "${ANN[@]}" "$1" bzImage initramfs.cpio.zst knobs.efi >/dev/null
     podman artifact add --append --file-type text/plain "${ANN[@]}" "$1" config cmdline >/dev/null )
 }

@@ -93,9 +93,9 @@ cycles a day, steepest fall a minute, duty.
    the BMC's temperatures every five seconds as `thermal_bmc` rows and a fifth zone, `chassis`, held on the hotter VR
    temperature and fed forward by the box's whole power, floor 40 %, all six headers as one ratio, PATCHes rate-limited;
    hand-back is Manual 100 %. Keys: `thermal.control=cpu,cards,chassis thermal.bmc=172.16.66.6 thermal.bmc_pin=<sha256>
-   thermal.bmc_env=<file with IPMI_USER/IPMI_PASSWORD>`. Open: where the credentials live for the box (the bundles share
-   is exported with root_squash, so a file there must be world-readable on elsenor; or a dedicated BMC account for the
-   daemon). The earlier routes, for the record:
+   thermal.bmc_env=<file with IPMI_USER/IPMI_PASSWORD>`. The credential (tcdent 2026-11-01): the existing admin env,
+   `/etc/ipmi/metatron-bmc-admin.env`, appended to the published initramfs by `os/release/publish.sh` as
+   `/etc/rockem/bmc.env` (root, 0600) in a temporary copy; the staged release and the repo never hold it. The earlier routes, for the record:
    - *In-band IPMI.* Kernel `IPMI_HANDLER` + `IPMI_DEVICE_INTERFACE` + `IPMI_SI` (KCS at 0xCA2, polled; cap `kipmid_max_busy_us`
      and pin the poller to a housekeeping core). The BMC exports pwm1–6 as IPMI sensors, so the first experiment is Set
      Sensor Reading (NetFn 0x04, cmd 0x30) on a pwm sensor with the BMC's fan daemon in manual mode, which is what the web
