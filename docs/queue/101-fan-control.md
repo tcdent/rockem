@@ -155,6 +155,26 @@ thermistor 44, BMC inlet 58; rises of 17–26 °C; first-minute falls 10 (dies),
 slow mass dominated. At 50 % chassis a longer pass keeps climbing: the VRs' 79 after ten minutes points past 85 by
 thirty. **A 20–30 min pass waits for either the chassis fans up or control mode on**; the guard would stop it at VR 90.
 
+**Pass 5, `ctl-warm4k-3min`, 2026-11-01 02:07 UTC — the first pass under control (a574d27: kff 0.5, peaks 72/75, descent
+1 °C/min, floors 60 / 38), the same shape as pass 1:**
+
+| Series | BIOS/PMFW (pass 1) base → peak, fall/min, τ | control (pass 5) base → peak, fall/min, τ |
+|---|---|---|
+| socket 0 Tctl | 51.7 → 66.5, −12.4, 0.6 | 59.8 → 76.2, **−8.2, 5.6** |
+| socket 1 Tctl | 58.8 → 75.6, −10.5, 2.5 | 64.8 → **84.8**, −11.1, 2.3 |
+| card0 junction | 54.4 → 84.0, −22, 1.0 | 52.0 → 82.0, −17, 1.4 |
+| card1 junction | 61.0 → 76.0, −5, 4.3 | 58.5 → **88.0**, −16, 3.7 |
+| Vcore / VSoC VR | 51.5 / 53.5 → 68 / 71 | 55.9 / 58.0 → 73 / 75 |
+| CPU fan2 rpm | 921 → 1280 | 669 → 1350, then −815 in the minute after |
+
+What the first controlled pass bought and cost: socket 0's cool-down is the goal's shape at last — a fall of 8 °C/min
+against 12 and a time constant of 5.6 min against 0.6, because its fan went to the floor after the pass and the
+heatsink was left to cool on its own. The price was the peaks: +10 °C on the sockets and +12 on card1, from a warm idle
+(the setpoint still descending from the boot's gates run at 1 °C/min), a feed-forward at half strength (full duty was
+reached two minutes in), peak setpoints the coolers cannot hold at 280 W with the chassis at 50 %, and card1's fan
+starting from zero-RPM. Tuning round 1 (c28db88): kff 1.0, peaks 75 / 78, descent 2 °C/min, the cards' floor 20 %.
+The VRMs ran +4 at idle and +4–5 at peak with the slower CPU fans: they want air of their own (step 5).
+
 What it says, and it bears on the goal directly:
 
 - **The dies cool in well under a minute no matter what the fans do.** Socket 0's Tctl has a time constant of ~36 s
