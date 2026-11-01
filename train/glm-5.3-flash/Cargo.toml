@@ -1,0 +1,10 @@
+[package]
+name = "glm_5_3_flash_train"
+version = "0.0.0"
+edition = "2021"
+description = "GLM-5.3-Flash's training side: the backward of each layer over the inference crate's bytes and kernels, the adapters on the routed experts, and the f32 reference backward the kernels are diffed against. Depends on glm_5_3_flash; changes nothing in it."
+
+[dependencies]
+common = { path = "../../common", features = ["std"] }
+glm_5_3_flash = { path = "../../models/glm-5.3-flash", features = ["std"] }
+train_common = { path = "../common" }

@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["common", "models/deepseek-v2-lite", "models/voxtral-small-24b", "models/granite-speech-4.1-2b", "node", "thermal"]
-exclude = ["api/client", "bringup", "bundle", "models/deepseek-v2-lite/gpu"]
+exclude = ["api/client", "bringup", "bundle", "models/deepseek-v2-lite/gpu", "train"]
 
 [profile.release]
 opt-level = 3

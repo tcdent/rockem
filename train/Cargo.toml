@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["common", "glm-5.3-flash"]
+
+[profile.release]
+opt-level = 3
+debug = "line-tables-only"
+lto = true
+panic = "abort"
+codegen-units = 1
+
+# tests at a usable speed: the backward diffs run full-width experts
+[profile.test]
+opt-level = 2

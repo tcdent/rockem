@@ -1,0 +1,8 @@
+[package]
+name = "train_common"
+version = "0.0.0"
+edition = "2021"
+description = "Training primitives with no model in them: the transposed products over the inference byte formats (the gradient with respect to a frozen matrix's input), the adapter's low-rank steps. Reads `common`'s formats; adds nothing to them."
+
+[dependencies]
+common = { path = "../../common", features = ["std"] }
