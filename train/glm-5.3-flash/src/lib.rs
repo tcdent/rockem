@@ -20,10 +20,15 @@
 //!           and their weights, the shared expert — to d xn
 //! hc        the hyper-connection around a block half: post's backward to d y and the
 //!           residual's share, pre's through the Sinkhorn chain and the norm to d S
+//! kda       a run of positions through a KDA layer: the inference step forward, the
+//!           recurrence in reverse per head (recomputed from the entering memory), the
+//!           convolution over the run's timeline, the projections — to d xn and the
+//!           entering state's gradient
 //! ```
-//! The rest of the layer (KDA, MLA, the head) follows, one op at a time.
+//! The rest of the layer (MLA, the head) follows, one op at a time.
 
 pub mod expert;
 pub mod ffn;
 pub mod hc;
+pub mod kda;
 pub mod reference;

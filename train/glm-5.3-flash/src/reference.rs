@@ -579,3 +579,371 @@ mod tests {
         assert!(checked > 40);
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// KDA (Kimi delta attention), dense, any shape, over a sequence — `reference::Kda::forward`'s
+// arithmetic with every intermediate kept, and its backward.
+
+/// Shapes are `[out][in]`: `nh` heads of `d`; `q, k, v: [nh·d][h]`; `conv: [3·nh·d][taps]`;
+/// `f_a, g_a: [d][h]`; `f_b, g_b: [nh·d][d]`; `b: [nh][h]`; `o: [h][nh·d]`.
+pub struct KdaRef<'a> {
+    pub nh: usize,
+    pub d: usize,
+    pub h: usize,
+    pub taps: usize,
+    pub lower: f32,
+    pub rms_eps: f32,
+    pub q: &'a [f32],
+    pub k: &'a [f32],
+    pub v: &'a [f32],
+    pub conv: &'a [f32],
+    pub f_a: &'a [f32],
+    pub f_b: &'a [f32],
+    pub dt_bias: &'a [f32],
+    pub a_log: &'a [f32],
+    pub b: &'a [f32],
+    pub g_a: &'a [f32],
+    pub g_b: &'a [f32],
+    pub o_norm: &'a [f32],
+    pub o: &'a [f32],
+}
+
+/// The layer's state: the convolution's last `taps − 1` inputs (`[taps−1][3·nh·d]`, oldest
+/// first) and the memory `[nh][d][d]`.
+#[derive(Clone)]
+pub struct KdaState {
+    pub window: Vec<f32>,
+    pub mem: Vec<f32>,
+}
+
+/// Everything the forward computed, per position and per head.
+pub struct KdaSaved {
+    pub n: usize,
+    pub mixed: Vec<f32>,  // [n][3·nh·d]
+    pub pre: Vec<f32>,    // [n][3·nh·d]: the convolution before SiLU
+    pub conv: Vec<f32>,   // [n][3·nh·d]
+    pub fa: Vec<f32>,     // [n][d]
+    pub f: Vec<f32>,      // [n][nh·d]
+    pub beta: Vec<f32>,   // [n][nh]
+    pub ga: Vec<f32>,     // [n][d]
+    pub gate: Vec<f32>,   // [n][nh·d]
+    pub qn: Vec<f32>,     // [n][nh·d]: l2-normed q (unscaled)
+    pub kn: Vec<f32>,     // [n][nh·d]
+    pub e: Vec<f32>,      // [n][nh·d]: the forget gate
+    pub s_prev: Vec<f32>, // [n+1][nh][d][d]: the memory before each position, and after the last
+    pub mem_read: Vec<f32>, // [n][nh·d]
+    pub delta: Vec<f32>,  // [n][nh·d]
+    pub o: Vec<f32>,      // [n][nh·d]
+    pub on: Vec<f32>,     // [n][nh·d]
+    pub normed: Vec<f32>, // [n][nh·d]
+    pub window_in: Vec<f32>,
+}
+
+fn l2norm_ref(x: &[f32]) -> (Vec<f32>, f32) {
+    let r = 1.0 / common::math::sqrt(x.iter().map(|v| v * v).sum::<f32>() + 1e-6);
+    (x.iter().map(|v| v * r).collect(), r)
+}
+/// y = x · r, r = (Σx² + 1e-6)^-½: dx = r·dy − x·r³·⟨dy, x⟩.
+fn l2norm_backward_ref(x: &[f32], dy: &[f32]) -> Vec<f32> {
+    let r = 1.0 / common::math::sqrt(x.iter().map(|v| v * v).sum::<f32>() + 1e-6);
+    let dot: f32 = dy.iter().zip(x).map(|(a, b)| a * b).sum();
+    x.iter().zip(dy).map(|(xi, dyi)| r * dyi - xi * r * r * r * dot).collect()
+}
+fn rms_ref(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
+    let n = x.len();
+    let r = common::math::rsqrt(x.iter().map(|v| v * v).sum::<f32>() / n as f32 + eps);
+    (0..n).map(|i| w[i] * (x[i] * r)).collect()
+}
+fn rms_backward_ref(x: &[f32], w: &[f32], eps: f32, dy: &[f32]) -> Vec<f32> {
+    let n = x.len();
+    let r = common::math::rsqrt(x.iter().map(|v| v * v).sum::<f32>() / n as f32 + eps);
+    let dot: f32 = (0..n).map(|i| w[i] * dy[i] * x[i]).sum();
+    let c = r * r * r / n as f32 * dot;
+    (0..n).map(|i| r * w[i] * dy[i] - x[i] * c).collect()
+}
+
+/// `x: [n][h]` → (`y: [n][h]`, everything kept, the state after).
+pub fn kda_forward(r: &KdaRef, x: &[f32], n: usize, st: &KdaState) -> (Vec<f32>, KdaSaved, KdaState) {
+    let (nh, d, h, taps) = (r.nh, r.d, r.h, r.taps);
+    let (qkv, cd) = (nh * d, 3 * nh * d);
+    let scale = 1.0 / common::math::sqrt(d as f32);
+    let mut sv = KdaSaved { n, mixed: vec![0.0; n * cd], pre: vec![0.0; n * cd], conv: vec![0.0; n * cd], fa: vec![0.0; n * d], f: vec![0.0; n * qkv], beta: vec![0.0; n * nh], ga: vec![0.0; n * d], gate: vec![0.0; n * qkv], qn: vec![0.0; n * qkv], kn: vec![0.0; n * qkv], e: vec![0.0; n * qkv], s_prev: vec![0.0; (n + 1) * nh * d * d], mem_read: vec![0.0; n * qkv], delta: vec![0.0; n * qkv], o: vec![0.0; n * qkv], on: vec![0.0; n * qkv], normed: vec![0.0; n * qkv], window_in: st.window.clone() };
+    // the mixed timeline: the entering window, then each position's projections
+    let mut timeline = st.window.clone();
+    let mut mem = st.mem.clone();
+    sv.s_prev[..nh * d * d].copy_from_slice(&mem);
+    let mut y = vec![0f32; n * h];
+    for t in 0..n {
+        let xt = &x[t * h..(t + 1) * h];
+        let (q, k, v) = (matvec(qkv, h, r.q, xt), matvec(qkv, h, r.k, xt), matvec(qkv, h, r.v, xt));
+        let mixed = [q, k, v].concat();
+        sv.mixed[t * cd..(t + 1) * cd].copy_from_slice(&mixed);
+        timeline.extend_from_slice(&mixed);
+        let base = timeline.len() - taps * cd; // tap j reads timeline[(base + j·cd) + c]
+        for c in 0..cd {
+            let mut acc = 0f32;
+            for j in 0..taps {
+                acc += r.conv[c * taps + j] * timeline[base + j * cd + c];
+            }
+            sv.pre[t * cd + c] = acc;
+            sv.conv[t * cd + c] = silu(acc);
+        }
+        let fa = matvec(d, h, r.f_a, xt);
+        let f = matvec(qkv, d, r.f_b, &fa);
+        let beta = matvec(nh, h, r.b, xt);
+        let ga = matvec(d, h, r.g_a, xt);
+        let gate = matvec(qkv, d, r.g_b, &ga);
+        sv.fa[t * d..(t + 1) * d].copy_from_slice(&fa);
+        sv.f[t * qkv..(t + 1) * qkv].copy_from_slice(&f);
+        sv.beta[t * nh..(t + 1) * nh].copy_from_slice(&beta);
+        sv.ga[t * d..(t + 1) * d].copy_from_slice(&ga);
+        sv.gate[t * qkv..(t + 1) * qkv].copy_from_slice(&gate);
+        let conv = &sv.conv[t * cd..(t + 1) * cd];
+        for hh in 0..nh {
+            let (qn, _) = l2norm_ref(&conv[hh * d..(hh + 1) * d]);
+            let (kn, _) = l2norm_ref(&conv[qkv + hh * d..qkv + (hh + 1) * d]);
+            let vh = &conv[2 * qkv + hh * d..2 * qkv + (hh + 1) * d];
+            sv.qn[t * qkv + hh * d..t * qkv + (hh + 1) * d].copy_from_slice(&qn);
+            sv.kn[t * qkv + hh * d..t * qkv + (hh + 1) * d].copy_from_slice(&kn);
+            let decay = common::math::exp(r.a_log[hh]);
+            let bt = glm_5_3_flash::hc::sigmoid(beta[hh]);
+            let s = &mut mem[hh * d * d..(hh + 1) * d * d];
+            for kk in 0..d {
+                let e = common::math::exp(r.lower * glm_5_3_flash::hc::sigmoid(decay * (f[hh * d + kk] + r.dt_bias[hh * d + kk])));
+                sv.e[t * qkv + hh * d + kk] = e;
+                for vv in 0..d {
+                    s[kk * d + vv] *= e;
+                }
+            }
+            let mut delta = vec![0f32; d];
+            for vv in 0..d {
+                let m: f32 = (0..d).map(|kk| s[kk * d + vv] * kn[kk]).sum();
+                sv.mem_read[t * qkv + hh * d + vv] = m;
+                delta[vv] = (vh[vv] - m) * bt;
+            }
+            for kk in 0..d {
+                for vv in 0..d {
+                    s[kk * d + vv] += kn[kk] * delta[vv];
+                }
+            }
+            sv.delta[t * qkv + hh * d..t * qkv + (hh + 1) * d].copy_from_slice(&delta);
+            let o: Vec<f32> = (0..d).map(|vv| (0..d).map(|kk| s[kk * d + vv] * qn[kk] * scale).sum()).collect();
+            let on = rms_ref(&o, r.o_norm, r.rms_eps);
+            for vv in 0..d {
+                sv.normed[t * qkv + hh * d + vv] = on[vv] * glm_5_3_flash::hc::sigmoid(gate[hh * d + vv]);
+            }
+            sv.o[t * qkv + hh * d..t * qkv + (hh + 1) * d].copy_from_slice(&o);
+            sv.on[t * qkv + hh * d..t * qkv + (hh + 1) * d].copy_from_slice(&on);
+        }
+        sv.s_prev[(t + 1) * nh * d * d..(t + 2) * nh * d * d].copy_from_slice(&mem);
+        let yt = matvec(h, qkv, r.o, &sv.normed[t * qkv..(t + 1) * qkv]);
+        y[t * h..(t + 1) * h].copy_from_slice(&yt);
+    }
+    let window = timeline[timeline.len() - (taps - 1) * cd..].to_vec();
+    (y, sv, KdaState { window, mem })
+}
+
+/// Given `dy: [n][h]` and the gradient at the state after (`d window`, `d mem`), → (`dx: [n][h]`,
+/// the gradient at the state before).
+pub fn kda_backward(r: &KdaRef, x: &[f32], sv: &KdaSaved, dy: &[f32], dst_out: &KdaState) -> (Vec<f32>, KdaState) {
+    let (nh, d, h, taps, n) = (r.nh, r.d, r.h, r.taps, sv.n);
+    let (qkv, cd) = (nh * d, 3 * nh * d);
+    let scale = 1.0 / common::math::sqrt(d as f32);
+    let mut dx = vec![0f32; n * h];
+    let mut dconv = vec![0f32; n * cd];
+    let mut df = vec![0f32; n * qkv];
+    let mut dbeta = vec![0f32; n * nh];
+    let mut dgate = vec![0f32; n * qkv];
+    let mut dnormed = vec![0f32; n * qkv];
+    for t in 0..n {
+        dnormed[t * qkv..(t + 1) * qkv].copy_from_slice(&matvec_t(h, qkv, r.o, &dy[t * h..(t + 1) * h]));
+    }
+    let mut dmem_in = vec![0f32; nh * d * d];
+    for hh in 0..nh {
+        let decay = common::math::exp(r.a_log[hh]);
+        let mut ds = dst_out.mem[hh * d * d..(hh + 1) * d * d].to_vec();
+        for t in (0..n).rev() {
+            fn at<'a>(v: &'a [f32], t: usize, qkv: usize, hh: usize, d: usize) -> &'a [f32] {
+                &v[t * qkv + hh * d..t * qkv + (hh + 1) * d]
+            }
+            let (qn, kn, e, mr, delta, o, on) = (at(&sv.qn, t, qkv, hh, d), at(&sv.kn, t, qkv, hh, d), at(&sv.e, t, qkv, hh, d), at(&sv.mem_read, t, qkv, hh, d), at(&sv.delta, t, qkv, hh, d), at(&sv.o, t, qkv, hh, d), at(&sv.on, t, qkv, hh, d));
+            let gate = at(&sv.gate, t, qkv, hh, d);
+            let conv = &sv.conv[t * cd..(t + 1) * cd];
+            let vh = &conv[2 * qkv + hh * d..2 * qkv + (hh + 1) * d];
+            let s_prev = &sv.s_prev[t * nh * d * d + hh * d * d..t * nh * d * d + (hh + 1) * d * d];
+            let s2 = &sv.s_prev[(t + 1) * nh * d * d + hh * d * d..(t + 1) * nh * d * d + (hh + 1) * d * d];
+            let bt = glm_5_3_flash::hc::sigmoid(sv.beta[t * nh + hh]);
+            // the gated norm
+            let dout = at(&dnormed, t, qkv, hh, d);
+            let mut don = vec![0f32; d];
+            for vv in 0..d {
+                let sg = glm_5_3_flash::hc::sigmoid(gate[vv]);
+                don[vv] = dout[vv] * sg;
+                dgate[t * qkv + hh * d + vv] = dout[vv] * on[vv] * sg * (1.0 - sg);
+            }
+            let do_ = rms_backward_ref(o, r.o_norm, r.rms_eps, &don);
+            // o = S2ᵀ (qn · scale): dS2 += (qn·scale) ⊗ do; d qn = scale · S2 · do
+            let mut dqn = vec![0f32; d];
+            for kk in 0..d {
+                let mut acc = 0f32;
+                for vv in 0..d {
+                    ds[kk * d + vv] += qn[kk] * scale * do_[vv];
+                    acc += s2[kk * d + vv] * do_[vv];
+                }
+                dqn[kk] = acc * scale;
+            }
+            // S2 = S1 + kn ⊗ delta: d kn += dS · delta; d delta = dSᵀ kn
+            let mut dkn = vec![0f32; d];
+            let mut ddelta = vec![0f32; d];
+            for kk in 0..d {
+                for vv in 0..d {
+                    dkn[kk] += ds[kk * d + vv] * delta[vv];
+                    ddelta[vv] += ds[kk * d + vv] * kn[kk];
+                }
+            }
+            // delta = (v − mem) · b
+            let mut dv = vec![0f32; d];
+            let mut dmem = vec![0f32; d];
+            let mut db = 0f32;
+            for vv in 0..d {
+                dv[vv] = ddelta[vv] * bt;
+                dmem[vv] = -ddelta[vv] * bt;
+                db += ddelta[vv] * (vh[vv] - mr[vv]);
+            }
+            dbeta[t * nh + hh] = db * bt * (1.0 - bt);
+            // mem = S1ᵀ kn, S1 = diag(e) S_prev: dS1 += kn ⊗ dmem; d kn += S1 · dmem
+            for kk in 0..d {
+                let mut acc = 0f32;
+                for vv in 0..d {
+                    ds[kk * d + vv] += kn[kk] * dmem[vv];
+                    acc += e[kk] * s_prev[kk * d + vv] * dmem[vv];
+                }
+                dkn[kk] += acc;
+            }
+            // S1 = diag(e) S_prev: d e_kk = Σ_vv dS1[kk][vv] S_prev[kk][vv]; dS_prev = diag(e) dS1
+            for kk in 0..d {
+                let mut de = 0f32;
+                for vv in 0..d {
+                    de += ds[kk * d + vv] * s_prev[kk * d + vv];
+                    ds[kk * d + vv] *= e[kk];
+                }
+                // e = exp(lower · σ(z)), z = decay · (f + dt_bias)
+                let z = decay * (sv.f[t * qkv + hh * d + kk] + r.dt_bias[hh * d + kk]);
+                let sg = glm_5_3_flash::hc::sigmoid(z);
+                df[t * qkv + hh * d + kk] = de * e[kk] * r.lower * sg * (1.0 - sg) * decay;
+            }
+            // the l2 norms, back to the convolution's output
+            let dq = l2norm_backward_ref(&conv[hh * d..(hh + 1) * d], &dqn);
+            let dk = l2norm_backward_ref(&conv[qkv + hh * d..qkv + (hh + 1) * d], &dkn);
+            dconv[t * cd + hh * d..t * cd + (hh + 1) * d].copy_from_slice(&dq);
+            dconv[t * cd + qkv + hh * d..t * cd + qkv + (hh + 1) * d].copy_from_slice(&dk);
+            dconv[t * cd + 2 * qkv + hh * d..t * cd + 2 * qkv + (hh + 1) * d].copy_from_slice(&dv);
+        }
+        dmem_in[hh * d * d..(hh + 1) * d * d].copy_from_slice(&ds);
+    }
+    // the convolution: a timeline of d mixed, the entering window first
+    let mut dtl = vec![0f32; (taps - 1 + n) * cd];
+    let out0 = (n + taps - 1 - (taps - 1)) * cd; // the out window is the timeline's last taps−1 entries
+    dtl[out0..].copy_from_slice(&dst_out.window);
+    for t in 0..n {
+        for c in 0..cd {
+            let da = dconv[t * cd + c] * train_common::swiglu::dsilu(sv.pre[t * cd + c]);
+            for j in 0..taps {
+                dtl[(t + j) * cd + c] += da * r.conv[c * taps + j];
+            }
+        }
+    }
+    let dwindow_in = dtl[..(taps - 1) * cd].to_vec();
+    for t in 0..n {
+        let dm = &dtl[(taps - 1 + t) * cd..(taps + t) * cd];
+        let mut dxt = matvec_t(qkv, h, r.q, &dm[..qkv]);
+        for (a, b) in dxt.iter_mut().zip(matvec_t(qkv, h, r.k, &dm[qkv..2 * qkv])) {
+            *a += b;
+        }
+        for (a, b) in dxt.iter_mut().zip(matvec_t(qkv, h, r.v, &dm[2 * qkv..])) {
+            *a += b;
+        }
+        let dfa = matvec_t(qkv, d, r.f_b, &df[t * qkv..(t + 1) * qkv]);
+        for (a, b) in dxt.iter_mut().zip(matvec_t(d, h, r.f_a, &dfa)) {
+            *a += b;
+        }
+        for (a, b) in dxt.iter_mut().zip(matvec_t(nh, h, r.b, &dbeta[t * nh..(t + 1) * nh])) {
+            *a += b;
+        }
+        let dga = matvec_t(qkv, d, r.g_b, &dgate[t * qkv..(t + 1) * qkv]);
+        for (a, b) in dxt.iter_mut().zip(matvec_t(d, h, r.g_a, &dga)) {
+            *a += b;
+        }
+        dx[t * h..(t + 1) * h].copy_from_slice(&dxt);
+    }
+    let _ = x;
+    (dx, KdaState { window: dwindow_in, mem: dmem_in })
+}
+
+#[cfg(test)]
+mod kda_tests {
+    use super::*;
+    use common::testing::Rng;
+
+    /// The KDA backward against central differences at a small shape over three positions, with a
+    /// loss on the outputs and on the state after (so the state's gradient is exercised too).
+    #[test]
+    fn kda_backward_is_the_gradient() {
+        let (nh, d, h, taps, n) = (2usize, 4usize, 6usize, 4usize, 3usize);
+        let (qkv, cd) = (nh * d, 3 * nh * d);
+        let mut rnd = Rng::new(0xF1D0_0004);
+        let mut u = |m: usize, s: f32| -> Vec<f32> { (0..m).map(|_| rnd.unit() * s).collect() };
+        let (q, k, v) = (u(qkv * h, 0.6), u(qkv * h, 0.6), u(qkv * h, 0.6));
+        let conv = u(cd * taps, 0.5);
+        let (f_a, f_b, dt_bias, a_log) = (u(d * h, 0.5), u(qkv * d, 0.5), u(qkv, 0.5), u(nh, 0.3));
+        let (b, g_a, g_b) = (u(nh * h, 0.5), u(d * h, 0.5), u(qkv * d, 0.5));
+        let o_norm: Vec<f32> = u(d, 0.5).iter().map(|v| 1.0 + v).collect();
+        let o = u(h * qkv, 0.5);
+        let r = KdaRef { nh, d, h, taps, lower: -5.0, rms_eps: 1e-5, q: &q, k: &k, v: &v, conv: &conv, f_a: &f_a, f_b: &f_b, dt_bias: &dt_bias, a_log: &a_log, b: &b, g_a: &g_a, g_b: &g_b, o_norm: &o_norm, o: &o };
+        let st = KdaState { window: u((taps - 1) * cd, 0.5), mem: u(nh * d * d, 0.3) };
+        let mut x = u(n * h, 1.0);
+        let dy = u(n * h, 1.0);
+        let dst = KdaState { window: u((taps - 1) * cd, 1.0), mem: u(nh * d * d, 1.0) };
+        let loss = |x: &[f32], st: &KdaState| -> f64 {
+            let (y, _, out) = kda_forward(&r, x, n, st);
+            let a: f64 = y.iter().zip(&dy).map(|(a, b)| (*a as f64) * (*b as f64)).sum();
+            let bw: f64 = out.window.iter().zip(&dst.window).map(|(a, b)| (*a as f64) * (*b as f64)).sum();
+            let bm: f64 = out.mem.iter().zip(&dst.mem).map(|(a, b)| (*a as f64) * (*b as f64)).sum();
+            a + bw + bm
+        };
+        let (_, sv, _) = kda_forward(&r, &x, n, &st);
+        let (dx, dst_in) = kda_backward(&r, &x, &sv, &dy, &dst);
+        let eps = 1e-3f32;
+        let check = |analytic: f32, numeric: f32, what: &str| {
+            assert!((numeric - analytic).abs() <= 3e-3 * (1.0 + analytic.abs()), "{what}: numeric {numeric} analytic {analytic}");
+        };
+        for i in 0..n * h {
+            let base = x[i];
+            x[i] = base + eps;
+            let p = loss(&x, &st);
+            x[i] = base - eps;
+            let m = loss(&x, &st);
+            x[i] = base;
+            check(dx[i], ((p - m) / (2.0 * eps as f64)) as f32, &format!("dx[{i}]"));
+        }
+        let mut st2 = st.clone();
+        for i in 0..st.mem.len() {
+            let base = st2.mem[i];
+            st2.mem[i] = base + eps;
+            let p = loss(&x, &st2);
+            st2.mem[i] = base - eps;
+            let m = loss(&x, &st2);
+            st2.mem[i] = base;
+            check(dst_in.mem[i], ((p - m) / (2.0 * eps as f64)) as f32, &format!("dmem[{i}]"));
+        }
+        for i in 0..st.window.len() {
+            let base = st2.window[i];
+            st2.window[i] = base + eps;
+            let p = loss(&x, &st2);
+            st2.window[i] = base - eps;
+            let m = loss(&x, &st2);
+            st2.window[i] = base;
+            check(dst_in.window[i], ((p - m) / (2.0 * eps as f64)) as f32, &format!("dwindow[{i}]"));
+        }
+    }
+}
