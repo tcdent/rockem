@@ -198,6 +198,22 @@ against 0.6–2.5, card0 6.3). Open for tcdent: the trade of ~7 °C on the socke
 gentler descent and the faster cards; the cards' zero-RPM (both stopped again at idle before the pass despite the 26 / 33 %
 curves); the VRMs' own air.
 
+**Pass 7, `ctl2-mixed8k-20min`, 03:22 UTC — the twenty-minute attempt under the tuned controller, chassis at 50 %: aborted
+by the guard at 5.3 min** (Tctl 88.9 against the 88 limit; junctions 87 / 90; VRs 78 / 81; BMC inlet 58). Every duty was at
+255 from the second minute: both coolers at the Noctuas' ceiling (1480 rpm), both card fans at 3650. The cards drew 492 W
+(the BIOS/PMFW 10-minute pass: 300 W, Tctl 80 at ten minutes). So with the chassis at 50 % the box is airflow-limited under
+sustained load, and the controller, which can only run the fans it owns to their maximum, cannot hold a plateau; worse,
+by keeping the cards cool it lets them run their full power, and the sockets breathe that heat. Under the PMFW's own
+curve the cards ran hotter, throttled themselves to ~350 W and the box lasted twice as long. The cool-down kept its
+shape (sockets τ 2.3–3.5 min). At idle the card0 zone hunts with a ~15-minute period (duty 51 ↔ 158) as the PMFW's
+zero-RPM state stops and starts the fan against the loop.
+
+**Where this leaves the plan (2026-11-01):** the edges are the controller's and it has them — warmer idle, gentle descent,
+VR peaks no worse than the BIOS's for short passes. The plateau is the chassis's: a sustained pass needs more air through
+the case than 50 % gives, from the three front fans (the BMC's, step 3), the VRM headers (step 5), or the CX4170a's extra
+depth; or it needs the cards' power held (their own throttling, or `power1_cap`) — tcdent's trade between the cards' 6 %
+and the sockets' 7 °C. Until one of those moves, long passes trip the guard, and that is the guard doing its job.
+
 What it says, and it bears on the goal directly:
 
 - **The dies cool in well under a minute no matter what the fans do.** Socket 0's Tctl has a time constant of ~36 s
