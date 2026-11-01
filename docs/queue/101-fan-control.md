@@ -229,6 +229,25 @@ the case than 50 % gives, from the three front fans (the BMC's, step 3), the VRM
 depth; or it needs the cards' power held (their own throttling, or `power1_cap`) — tcdent's trade between the cards' 6 %
 and the sockets' 7 °C. Until one of those moves, long passes trip the guard, and that is the guard doing its job.
 
+**Pass 8, `all-mixed8k-20min`, 2026-11-01 17:07 UTC — every fan under the daemon (CPU coolers, cards, and the six chassis
+headers through the BMC), 20 min, 53 requests, 432k prompt tokens, clean:**
+
+| Series | 100 % chassis by hand (`ctl2-full-mixed8k-20min`) peak, fall/min, τ | all under control, peak, fall/min, τ |
+|---|---|---|
+| socket 0 Tctl | 71.4, −8.9, 0.7 | 71.6, −7.4, **3.1** |
+| socket 1 Tctl | 77.1, −6.6, 2.3 | 78.2, −6.2, **3.5** |
+| card0 / card1 junction | 79 / 83 | 80 / 82 |
+| Vcore / VSoC VR | 65 / 69, −9 / −10, 0.8 | 67 / 70, −6 / −7, **4.4 / 4.3** |
+| BMC inlet / outlet | 51 / 49, τ 1.2–1.4 | 52 / 50, τ 3.6–4.1 |
+| board thermistor | 38, −4, 1.0 | 39, −2, 3.9 |
+
+**This is the goal's shape.** The plateau holds as it did with the chassis pinned at 100 % (peaks within 1–2 °C), and the
+descent after the pass is 3–5 times slower: the chassis zone took its fans to 100 % within a minute of the load, held them
+there for the pass (its VR temperature never reached the 72 setpoint), then walked the setpoint down at 1 °C/min and the
+fans down with it, 100 → 79 → 53 % over five minutes, instead of leaving full air on cooling parts. Socket peaks are
+6.6 °C apart (were 9–11), the cards 2 °C apart. Next tuning: the chassis peak setpoint could rise toward the VRs' real
+plateau (~68–70) so the fans spend less of a long pass at 100 %; the cards' fans still go to 3600 rpm at peak.
+
 What it says, and it bears on the goal directly:
 
 - **The dies cool in well under a minute no matter what the fans do.** Socket 0's Tctl has a time constant of ~36 s
