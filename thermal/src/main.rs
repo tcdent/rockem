@@ -1,16 +1,26 @@
 //! thermal — rockem's thermal daemon (docs/queue/101-fan-control.md). Started by init beside the node,
 //! on a housekeeping core. v1 observes: a tick a second it reads the sockets, the cards and the
 //! Super I/O, runs each zone's model and controller, and records to prow what it sees, what it
-//! predicted and what it would command. It writes to no fan. `thermal.mode=control` is refused
-//! until the record says the model and the gains are right.
+//! predicted and what it would command. In observe mode (the default) it writes to no fan. With
+//! `thermal.mode=control` it drives the domains named in `thermal.control` (cpu: the two coolers
+//! through the IT8613E; cards: the overdrive fan table) and hands every one back on SIGTERM/SIGINT.
 //!
 //! Command line (from /proc/cmdline, then the arguments): thermal.mode=observe|control (observe),
-//! thermal.hz=N (1), thermal.core=N (0: the first housekeeping core), thermal.prow=host:port.
+//! thermal.control=cpu,cards (both, when controlling), thermal.hz=N (1), thermal.core=N (0: the
+//! first housekeeping core), thermal.prow=host:port.
 
+mod actuate;
 mod sense;
 mod zone;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+static STOP: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_signal(_: libc::c_int) {
+    STOP.store(true, Ordering::SeqCst);
+}
 
 const PROW_SERVER: &str = "192.168.88.3:7380";
 
@@ -37,24 +47,44 @@ fn opt(v: Option<f64>) -> f64 {
 
 fn main() {
     let mode = config("thermal.mode").unwrap_or_else(|| "observe".into());
-    if mode != "observe" {
-        say(&format!("mode {mode} is not built yet; observing"));
-    }
+    let control = mode == "control";
+    let domains = config("thermal.control").unwrap_or_else(|| "cpu,cards".into());
+    let control_cpu = control && domains.split(',').any(|d| d == "cpu");
+    let control_cards = control && domains.split(',').any(|d| d == "cards");
     let hz: f64 = config("thermal.hz").and_then(|s| s.parse().ok()).unwrap_or(1.0);
     let core: usize = config("thermal.core").and_then(|s| s.parse().ok()).unwrap_or(0);
     pin(core);
+    unsafe {
+        let handler: extern "C" fn(libc::c_int) = on_signal;
+        libc::signal(libc::SIGTERM, handler as usize as libc::sighandler_t);
+        libc::signal(libc::SIGINT, handler as usize as libc::sighandler_t);
+    }
     let map = sense::Map::find();
-    say(&format!("observe at {hz} Hz on core {core}; {}", map.describe()));
+    say(&format!("{} at {hz} Hz on core {core}; {}", if control { format!("control ({domains})") } else { "observe".into() }, map.describe()));
     prow::Run::new("rockem")
         .attrs(prow::build_attrs!())
         .server(config("thermal.prow").unwrap_or_else(|| PROW_SERVER.into()))
         .core(core)
         .attr("role", "thermal")
-        .attr("mode", "observe")
+        .attr("mode", mode.as_str())
+        .attr("control", if control { domains.as_str() } else { "" })
         .attr("hz", hz)
         .start();
 
     let mut zones: Vec<zone::Zone> = zone::defaults().into_iter().map(zone::Zone::new).collect();
+    // the actuators, taken at the floor; a crash leaves the last duty standing, so init restarts us
+    let mut cpu = if control_cpu { actuate::CpuFans::find() } else { None };
+    if let Some(c) = cpu.as_mut() {
+        let floor = zones[0].p.floor as u8;
+        say(&format!("cpu coolers: software mode at {floor} {}", if c.take(floor) { "taken" } else { "REFUSED" }));
+    }
+    let mut cards = if control_cards { actuate::CardFan::find_all() } else { Vec::new() };
+    for (i, c) in cards.iter_mut().enumerate() {
+        let floor = zones.get(2 + i).map_or(38.0, |z| z.p.floor) as u8;
+        let pci = c.pci.clone();
+        let took = c.take(floor);
+        say(&format!("card {i} {pci}: zero-RPM off, flat curve at {floor} {}", if took { "taken" } else { "REFUSED" }));
+    }
     let period = Duration::from_secs_f64(1.0 / hz);
     let mut last = Instant::now();
     let mut tick: u64 = 0;
@@ -73,6 +103,7 @@ fn main() {
                 "c0_junction" => opt(c0.junction), "c0_edge" => opt(c0.edge), "c0_mem" => opt(c0.mem), "c0_fan" => opt(c0.fan_rpm), "c0_pwm" => opt(c0.pwm), "c0_w" => opt(c0.watts),
                 "c1_junction" => opt(c1.junction), "c1_edge" => opt(c1.edge), "c1_mem" => opt(c1.mem), "c1_fan" => opt(c1.fan_rpm), "c1_pwm" => opt(c1.pwm), "c1_w" => opt(c1.watts),
                 "sio_fan2" => opt(s.sio.fan2), "sio_fan3" => opt(s.sio.fan3), "sio_pwm2" => opt(s.sio.pwm2), "sio_pwm3" => opt(s.sio.pwm3), "sio_pwm5" => opt(s.sio.pwm5),
+                "sio_pwm2_mode" => opt(s.sio.pwm2_enable), "sio_pwm3_mode" => opt(s.sio.pwm3_enable), "c0_pci" => c0.pci.as_str(), "c1_pci" => c1.pci.as_str(),
                 "sio_temp1" => opt(s.sio.temp1), "sio_temp2" => opt(s.sio.temp2)
             });
         }
@@ -83,15 +114,38 @@ fn main() {
             (s.cards.first().and_then(|c| c.junction), s.cards.first().and_then(|c| c.watts), s.cards.first().and_then(|c| c.pwm)),
             (s.cards.get(1).and_then(|c| c.junction), s.cards.get(1).and_then(|c| c.watts), s.cards.get(1).and_then(|c| c.pwm)),
         ];
-        for (z, (temp, watts, actual)) in zones.iter_mut().zip(inputs) {
+        let mut duties = [None::<f64>; 4];
+        for (i, (z, (temp, watts, actual))) in zones.iter_mut().zip(inputs).enumerate() {
             let (Some(t), Some(w)) = (temp, watts) else { continue };
             let st = z.step(t, w, dt);
-            let _ = (&st, actual);
+            duties[i] = Some(st.duty);
             #[cfg(feature = "track-thermal")]
             prow::row!("track-thermal", "thermal_zone", {
                 "zone" => z.p.name, "temp" => st.temp, "watts" => st.watts, "setpoint" => st.setpoint, "error" => st.error,
                 "loaded" => st.loaded, "would" => st.duty, "actual" => opt(actual), "pred_err" => st.pred_err, "mae" => z.mean_abs_err()
             });
+        }
+        // the coolers share one duty until the headers are mapped to sockets: the hotter zone's
+        if let Some(c) = cpu.as_mut() {
+            if let Some(d) = duties[0].into_iter().chain(duties[1]).fold(None, |m: Option<f64>, d| Some(m.map_or(d, |m| m.max(d)))) {
+                c.set(d.round() as u8);
+            }
+        }
+        for (i, c) in cards.iter_mut().enumerate() {
+            if let Some(d) = duties[2 + i] {
+                c.set(d.round() as u8);
+            }
+        }
+        if STOP.load(Ordering::SeqCst) {
+            if let Some(c) = cpu.as_mut() {
+                c.release();
+            }
+            for c in cards.iter_mut() {
+                c.release();
+            }
+            say("stopping: every fan handed back");
+            prow::finish();
+            return;
         }
         tick += 1;
         if tick % 300 == 0 {

@@ -1,8 +1,13 @@
 # 101 — Dynamic fan control from the host
 
-**Status:** Pitched (2026-10-31). The sensor side is live: the IT8613E Super I/O is in the kernel (`docs/it8613-superio.md`,
-kernel #8 on metatron since 2026-10-31 11:26) and the CPU coolers' PWM was driven from the host and handed back the same
-day. Nothing controls fans dynamically yet; the daemon is unwritten.
+**Status:** Built, observing (2026-10-31). The sensors are in the kernel (`docs/it8613-superio.md`), the cards' overdrive fan
+table is live, and the daemon (`thermal/`, static musl beside the node, started and restarted by init) has run on metatron
+since 15:55 in observe mode: a tick a second of every sensor, each zone's setpoint, the duty it would command and the
+model's prediction error, as prow rows `thermal_sense` / `thermal_zone` (project rockem, run attr `role=thermal`). Control
+mode is built and off: `thermal.mode=control thermal.control=cpu,cards` on the cmdline takes the two CPU coolers (software
+mode, hand-back to SmartGuardian with the start PWM restored) and the cards (zero-RPM off, a flat committed curve at the
+duty, `r`+`c` on hand-back), both rate-limited; SIGTERM hands everything back. Enabling it is a deploy and tcdent's call,
+after the characterization below says the model and gains hold. The chassis fans are still the BMC's.
 **Area:** the box's fans and thermals: the two CPU coolers (Super I/O), the chassis fans (BMC), the cards' fans (PMFW);
 the daemon that owns them; the kernel's IPMI path
 **Gain:** hardware preservation, not speed: VRM peaks of 92–95 °C under the expert gemm, a 40 °C die swing ~80 times a
