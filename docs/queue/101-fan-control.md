@@ -175,6 +175,29 @@ reached two minutes in), peak setpoints the coolers cannot hold at 280 W with th
 starting from zero-RPM. Tuning round 1 (c28db88): kff 1.0, peaks 75 / 78, descent 2 °C/min, the cards' floor 20 %.
 The VRMs ran +4 at idle and +4–5 at peak with the slower CPU fans: they want air of their own (step 5).
 
+**Pass 6, `ctl2-warm4k-3min`, 2026-11-01 02:54 UTC — tuning round 1 (c28db88: kff 1.0, peaks 75 / 78, descent 2 °C/min,
+cards' floor 20 %), the same shape a third time:**
+
+| Series | BIOS/PMFW (pass 1) | control v1 (pass 5) | control tuned (pass 6) |
+|---|---|---|---|
+| socket 0: base → peak, fall/min, τ | 51.7 → 66.5, −12.4, 0.6 | 59.8 → 76.2, −8.2, 5.6 | 53.5 → 73.8, **−7.9, 3.8** |
+| socket 1 | 58.8 → 75.6, −10.5, 2.5 | 64.8 → 84.8, −11.1, 2.3 | 60.2 → 82.1, −10.4, 3.1 |
+| card0 junction | 54.4 → 84.0, −22, 1.0 | 52.0 → 82.0, −17, 1.4 | 51.8 → **79.0**, −17, 6.3 |
+| card1 junction | 61.0 → 76.0, −5, 4.3 | 58.5 → 88.0, −16, 3.7 | 59.4 → 85.0, −17 |
+| Vcore / VSoC VR peaks | 68 / 71 | 73 / 75 | **68 / 71** |
+| cards' power peak W | 349 | 478 | 480 |
+| a request (4k + 256) | 16.2 s | — | **15.0–15.4 s** |
+| CPU fan2 peak rpm | 1280 | 1350 | 1427 |
+| card0 fan peak rpm | 1488 | 3290 | 3678 |
+
+The tuning fixed the warm idle (socket 0 back to 53.5) and brought the VR peaks back to the BIOS pass's. The sockets still
+peak ~7 °C above the BIOS pass with their fans at the Noctuas' ceiling, and the cards' power tells why: 480 W against
+349 — kept at 79–85 instead of 84 by fans at 3300–3700 rpm, the cards run their full power, finish a request 6 % sooner,
+and put 130 W more heat into the case for the sockets to breathe. The cool-down keeps the goal's shape (sockets τ 3–4 min
+against 0.6–2.5, card0 6.3). Open for tcdent: the trade of ~7 °C on the socket peaks and the cards' fan noise against the
+gentler descent and the faster cards; the cards' zero-RPM (both stopped again at idle before the pass despite the 26 / 33 %
+curves); the VRMs' own air.
+
 What it says, and it bears on the goal directly:
 
 - **The dies cool in well under a minute no matter what the fans do.** Socket 0's Tctl has a time constant of ~36 s
