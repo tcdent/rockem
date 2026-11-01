@@ -6,10 +6,13 @@
 //! through the IT8613E; cards: the overdrive fan table) and hands every one back on SIGTERM/SIGINT.
 //!
 //! Command line (from /proc/cmdline, then the arguments): thermal.mode=observe|control (observe),
-//! thermal.control=cpu,cards (both, when controlling), thermal.hz=N (1), thermal.core=N (0: the
-//! first housekeeping core), thermal.prow=host:port.
+//! thermal.control=cpu,cards,chassis (all three, when controlling), thermal.hz=N (1), thermal.core=N
+//! (0: the first housekeeping core), thermal.prow=host:port; the BMC: thermal.bmc=host,
+//! thermal.bmc_pin=<sha256 of its certificate>, thermal.bmc_env=<file with IPMI_USER/IPMI_PASSWORD>.
+//! Without the three BMC keys the chassis fans are neither read nor driven.
 
 mod actuate;
+mod bmc;
 mod sense;
 mod zone;
 
@@ -51,6 +54,7 @@ fn main() {
     let domains = config("thermal.control").unwrap_or_else(|| "cpu,cards".into());
     let control_cpu = control && domains.split(',').any(|d| d == "cpu");
     let control_cards = control && domains.split(',').any(|d| d == "cards");
+    let control_chassis = control && domains.split(',').any(|d| d == "chassis");
     let hz: f64 = config("thermal.hz").and_then(|s| s.parse().ok()).unwrap_or(1.0);
     let core: usize = config("thermal.core").and_then(|s| s.parse().ok()).unwrap_or(0);
     pin(core);
@@ -78,6 +82,22 @@ fn main() {
         let floor = zones[0].p.floor as u8;
         say(&format!("cpu coolers: software mode at {floor} {}", if c.take(floor) { "taken" } else { "REFUSED" }));
     }
+    // the BMC: readings whenever the keys are given, the chassis fans only when controlling them
+    let mut bmc = match (config("thermal.bmc"), config("thermal.bmc_pin"), config("thermal.bmc_env")) {
+        (Some(h), Some(pin), Some(env)) => match bmc::Bmc::new(&h, &pin, &env) {
+            Ok(b) => { say(&format!("bmc {h}: pinned, credentials read")); Some(b) }
+            Err(e) => { say(&format!("bmc {h}: {e}; chassis fans untouched")); None }
+        },
+        _ => None,
+    };
+    if let (Some(b), true) = (bmc.as_mut(), control_chassis) {
+        let floor = zones[4].p.floor;
+        let ratio = (floor / 255.0 * 100.0).round() as u8;
+        match b.take(ratio) {
+            Ok(()) => say(&format!("chassis fans: manual at {ratio} % taken")),
+            Err(e) => say(&format!("chassis fans: REFUSED ({e})")),
+        }
+    }
     let mut cards = if control_cards { actuate::CardFan::find_all() } else { Vec::new() };
     for (i, c) in cards.iter_mut().enumerate() {
         let floor = zones.get(2 + i).map_or(38.0, |z| z.p.floor) as u8;
@@ -88,11 +108,36 @@ fn main() {
     let period = Duration::from_secs_f64(1.0 / hz);
     let mut last = Instant::now();
     let mut tick: u64 = 0;
+    let mut bmc_r: Option<bmc::Readings> = None;
+    if let Some(b) = bmc.as_ref() {
+        if control_chassis {
+            say(&format!("chassis PWM1 reads {:?} %", b.pwm(1)));
+        }
+    }
     loop {
         let now = Instant::now();
         let dt = now.duration_since(last).as_secs_f64().max(1e-3);
         last = now;
         let s = map.sense();
+        // the BMC's temperatures every fifth tick (a TLS connection a request)
+        if let Some(b) = bmc.as_ref() {
+            if tick % 5 == 0 {
+                match b.readings() {
+                    Ok(r) => {
+                        if bmc_r.is_none() {
+                            say(&format!("bmc readings: vcore VR {:?} vsoc VR {:?} inlet {:?} outlet {:?} cpu {:?} ratio {:?}", r.vcore_vr, r.vsoc_vr, r.inlet, r.outlet, r.cpu, b.last_ratio));
+                        }
+                        #[cfg(feature = "track-thermal")]
+                        prow::row!("track-thermal", "thermal_bmc", {
+                            "vcore_vr" => opt(r.vcore_vr), "vsoc_vr" => opt(r.vsoc_vr), "inlet" => opt(r.inlet), "outlet" => opt(r.outlet),
+                            "cpu" => opt(r.cpu), "ratio" => b.last_ratio.map_or(f64::NAN, |x| x as f64)
+                        });
+                        bmc_r = Some(r);
+                    }
+                    Err(e) => { if tick % 300 == 0 { say(&format!("bmc readings: {e}")); } }
+                }
+            }
+        }
         #[cfg(feature = "track-thermal")]
         {
             let c0 = s.cards.first().cloned().unwrap_or_default();
@@ -108,13 +153,17 @@ fn main() {
             });
         }
         // each zone's temperature, power and the duty in force today
-        let inputs: [(Option<f64>, Option<f64>, Option<f64>); 4] = [
+        let total_w = [s.sockets[0].watts, s.sockets[1].watts, s.cards.first().and_then(|c| c.watts), s.cards.get(1).and_then(|c| c.watts)]
+            .iter().flatten().sum::<f64>();
+        let vr_max = bmc_r.as_ref().and_then(|r| match (r.vcore_vr, r.vsoc_vr) { (Some(a), Some(b)) => Some(a.max(b)), (a, b) => a.or(b) });
+        let inputs: [(Option<f64>, Option<f64>, Option<f64>); 5] = [
             (s.sockets[0].tctl, s.sockets[0].watts, s.sio.pwm2),
             (s.sockets[1].tctl, s.sockets[1].watts, s.sio.pwm3),
             (s.cards.first().and_then(|c| c.junction), s.cards.first().and_then(|c| c.watts), s.cards.first().and_then(|c| c.pwm)),
             (s.cards.get(1).and_then(|c| c.junction), s.cards.get(1).and_then(|c| c.watts), s.cards.get(1).and_then(|c| c.pwm)),
+            (vr_max, if bmc_r.is_some() { Some(total_w) } else { None }, bmc.as_ref().and_then(|b| b.last_ratio).map(|r| r as f64 * 2.55)),
         ];
-        let mut duties = [None::<f64>; 4];
+        let mut duties = [None::<f64>; 5];
         for (i, (z, (temp, watts, actual))) in zones.iter_mut().zip(inputs).enumerate() {
             let (Some(t), Some(w)) = (temp, watts) else { continue };
             let st = z.step(t, w, dt);
@@ -136,12 +185,20 @@ fn main() {
                 c.set(d.round() as u8);
             }
         }
+        if let (Some(b), Some(d)) = (bmc.as_mut(), duties[4]) {
+            if let Some(Err(e)) = b.set((d / 255.0 * 100.0).round() as u8) {
+                say(&format!("chassis fans: {e}"));
+            }
+        }
         if STOP.load(Ordering::SeqCst) {
             if let Some(c) = cpu.as_mut() {
                 c.release();
             }
             for c in cards.iter_mut() {
                 c.release();
+            }
+            if let Some(b) = bmc.as_mut() {
+                b.release();
             }
             say("stopping: every fan handed back");
             prow::finish();

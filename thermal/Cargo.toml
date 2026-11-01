@@ -7,6 +7,11 @@ description = "rockem's thermal daemon — the box's fans held to zone setpoints
 [dependencies]
 prow = { path = "../../prow" }
 libc = "0.2"
+# the BMC's Redfish is HTTPS only (bmcweb, TLS 1.3, a self-signed cert pinned by its SHA-256): a TLS client
+# with no roots, no webpki, ring for the crypto
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1"
+ring = "0.17"
 
 [build-dependencies]
 prow = { path = "../../prow" }

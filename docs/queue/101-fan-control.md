@@ -80,7 +80,22 @@ cycles a day, steepest fall a minute, duty.
    temperature typing and pwm4 presence (docs/it8613-superio.md §4). Each is a kernel build and a deploy.
 2. **CPU coolers first.** The daemon with the IT8613E as its only output: software mode on pwm2/pwm3, curve-as-fail-safe,
    rows, watchdog. This alone covers the two fans we can see and control completely, and proves the policy on real data.
-3. **Chassis fans, the BMC question.** Two routes, tcdent's call after the first fact is in:
+3. **Chassis fans — the BMC path found (2026-11-01, `bringup/box/thermal/bmc/`).** IPMI's Set Sensor Reading is refused
+   by this BMC (0xC1), and the phosphor-pid-control tables behind `Managers/1 Oem.OpenBmc.Fan` (six controllers, two CPU
+   PIDs, stepwise curves, zones) accept writes but are inert, because the vendor keeps the fans in a manual mode of its
+   own: `GET/PATCH /redfish/v1/Chassis/1/Oem/Public/Thermal` — `{"ControlMode":"Manual","Fans":[{"PwmSensorName":"PWMn",
+   "SpeedRatio":0-100},…]}` with the resource's ETag in `If-Match` — the request the web UI makes (read out of its
+   `app.js`). PWM1 → 100 % answered in 5 s; all six set to 100 % the same hour (tcdent: no 50 % limit intended). The PWMs
+   read back at `Chassis/1/Sensors/fanpwm_PWMn`, the BMC's temperatures (both VRs, inlet, outlet, CPU) at `Chassis/1/Thermal`.
+   bmcweb is HTTPS only (TLS 1.3, self-signed, SHA-256
+   `D255B4647B38F4FE9E6A43BBDF71F9DBA94D7A8D1F5CDA83CA630C122E23CB24`), reachable from the box on 443 through the router.
+   **The daemon has it** (`thermal/src/bmc.rs`: rustls with the certificate pinned, basic auth, one connection a request):
+   the BMC's temperatures every five seconds as `thermal_bmc` rows and a fifth zone, `chassis`, held on the hotter VR
+   temperature and fed forward by the box's whole power, floor 40 %, all six headers as one ratio, PATCHes rate-limited;
+   hand-back is Manual 100 %. Keys: `thermal.control=cpu,cards,chassis thermal.bmc=172.16.66.6 thermal.bmc_pin=<sha256>
+   thermal.bmc_env=<file with IPMI_USER/IPMI_PASSWORD>`. Open: where the credentials live for the box (the bundles share
+   is exported with root_squash, so a file there must be world-readable on elsenor; or a dedicated BMC account for the
+   daemon). The earlier routes, for the record:
    - *In-band IPMI.* Kernel `IPMI_HANDLER` + `IPMI_DEVICE_INTERFACE` + `IPMI_SI` (KCS at 0xCA2, polled; cap `kipmid_max_busy_us`
      and pin the poller to a housekeeping core). The BMC exports pwm1–6 as IPMI sensors, so the first experiment is Set
      Sensor Reading (NetFn 0x04, cmd 0x30) on a pwm sensor with the BMC's fan daemon in manual mode, which is what the web
@@ -239,6 +254,6 @@ What it says, and it bears on the goal directly:
 - The cards' zero-RPM: the switch does not start a stopped fan (docs/it8613-superio.md §5); the cold-start excursion
   stands until a reliable start is found, and the card zones' floor only holds once the fan runs.
 
-- The BMC's fan-write command (step 3), and whether its daemon reverts a manual duty.
+- Which three of the six BMC headers carry the front fans (the daemon drives all six alike until a look says).
 - Which physical header is which: CPU_FAN1/SYS_FAN ↔ pwm2/pwm3; where the three chassis fans plug in today.
 - Whether firmware touches the IT8613E's registers at runtime (the ACPI reservation says it may; nothing seen yet).

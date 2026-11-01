@@ -99,6 +99,10 @@ impl Zone {
     }
 }
 
+/// The chassis zone: the six BMC headers as one, held on the hotter of the two VR temperatures (the
+/// component that peaks highest and the one only the chassis air reaches), fed forward by the box's whole
+/// power; floor 40 % (the BMC's own fail-safe figure), duty 0..255 mapped to the BMC's 0..100 ratio.
+///
 /// The first guesses. Sockets: 280 W over ~75 W idle lifts Tctl ~35 °C (metatron 2026-10-26 … 31), so
 /// r ≈ 0.17 °C/W with the chassis at 50 %; the dies move within a minute. Cards: 140 W lifts the
 /// junction ~35 °C, r ≈ 0.25; a little slower. Setpoints: idle a few degrees above today's, peaks
@@ -118,10 +122,17 @@ pub fn defaults() -> Vec<Params> {
         name, r, tau_heat: 60.0, tau_cool, ambient, idle_sp, peak_sp: 78.0, ramp_down: 2.0,
         load_w: 80.0, full_w: 150.0, floor: 51.0, kp: 10.0, ki: 0.04, kff: 1.0,
     };
+    // one setpoint a class (tcdent 2026-11-01: balance the components — the two CPUs alike, the two
+    // cards alike; the hotter unit's fan does the extra work)
+    let chassis = Params {
+        name: "chassis", r: 0.05, tau_heat: 120.0, tau_cool: 180.0, ambient: 40.0, idle_sp: 60.0, peak_sp: 72.0, ramp_down: 1.0,
+        load_w: 300.0, full_w: 800.0, floor: 102.0, kp: 8.0, ki: 0.03, kff: 1.0,
+    };
     vec![
-        socket("socket0", 41.0, 55.0, 36.0),
-        socket("socket1", 46.0, 62.0, 150.0),
-        card("card0", 41.0, 55.0, 0.25, 60.0),
-        card("card1", 54.0, 60.0, 0.12, 260.0),
+        socket("socket0", 41.0, 58.0, 36.0),
+        socket("socket1", 46.0, 58.0, 150.0),
+        card("card0", 41.0, 58.0, 0.25, 60.0),
+        card("card1", 54.0, 58.0, 0.12, 260.0),
+        chassis,
     ]
 }

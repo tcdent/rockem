@@ -27,7 +27,7 @@ node:             ## the static node binary (musl); NODE_FEATURES="--features tr
 	$(RUN) cargo build --release --target x86_64-unknown-linux-musl -p node $(NODE_FEATURES)
 
 thermal:          ## the static thermal daemon (musl), started by init beside the node (docs/queue/101-fan-control.md)
-	$(RUN) cargo build --release --target x86_64-unknown-linux-musl -p thermal
+	$(RUN) env CC_x86_64_unknown_linux_musl=gcc AR_x86_64_unknown_linux_musl=ar cargo build --release --target x86_64-unknown-linux-musl -p thermal
 
 initramfs: node thermal   ## initramfs.cpio.zst for $(PROFILE)
 	$(RUN) os/initramfs/build.sh $(PROFILE)
