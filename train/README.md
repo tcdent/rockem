@@ -31,6 +31,7 @@ small shape; one op at a time, measured.
 | `dx += Σ dy_r·W[row_r]` over bf16 rows (the router's picks) | `common/src/bf16.rs` | AVX2 = scalar bit for bit; = dense |
 | the clamped SwiGLU's and the RMS norm's backward | `common/src/swiglu.rs`, `common/src/rmsnorm.rs` | finite differences |
 | the MoE half on its normed input: router (frozen; picked rows), experts with adapters and their weights, shared expert — to `d xn` | `glm-5.3-flash/src/ffn.rs` | zero adapters = `ffn::moe_routed` + `moe_shared` value for value; vs the dense reference at the real shape 1e-4, except the two adapter gradients downstream of the quantized ĥ, gated at a quantizer step (the sides' h differ by summation order; a boundary element flips one INT8 step) |
+| the hyper-connection around a block half: `post`'s backward to `d y` and the residual's share; `pre`'s through the sigmoids, the softmax and the Sinkhorn chain (unrolled in reverse over recomputed intermediates), `fn_ᵀ·dc` and the unweighted norm, to `d S` | `glm-5.3-flash/src/hc.rs` | over the inference forward, vs the dense reference 1e-4 at the real shape |
 | the dense f32 reference of the above | `glm-5.3-flash/src/reference.rs` | finite differences on every parameter class and on `dx`, for the expert and for the whole MoE (router path included) |
 
 ## Measured

@@ -246,10 +246,221 @@ pub fn moe_backward(m: &MoeRef, sv: &MoeSaved, dout: &[f32]) -> (Vec<f32>, Vec<(
     (dx, grads)
 }
 
+/// The hyper-connection, dense, any shape: `hc` streams of `h`, `fn_: [(2 + hc)·hc][hc·h]`.
+pub struct HcRef<'a> {
+    pub hc: usize,
+    pub h: usize,
+    pub fn_: &'a [f32],
+    pub base: &'a [f32],
+    pub scale: [f32; 3],
+    pub eps: f32,
+    pub rms_eps: f32,
+    pub iters: usize,
+}
+
+/// `pre`'s mix: `post: [hc]`, `comb: [hc][hc]` row-major, with the coefficients for the backward.
+pub struct HcMix {
+    pub pre: Vec<f32>,
+    pub post: Vec<f32>,
+    pub comb: Vec<f32>,
+    pub coef: Vec<f32>,
+}
+
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + common::math::exp(-x))
+}
+
+/// The Sinkhorn chain from the coefficients: the softmax rows and the matrix after each
+/// normalization (`[0]` the softmax + ε, then columns, then (rows, columns) × (iters − 1)).
+fn hc_sinkhorn(r: &HcRef, c: &[f32]) -> (Vec<f32>, Vec<Vec<f32>>) {
+    let hc = r.hc;
+    let mut a = vec![0f32; hc * hc];
+    for i in 0..hc {
+        let row: Vec<f32> = (0..hc).map(|j| c[2 * hc + i * hc + j] * r.scale[2] + r.base[2 * hc + i * hc + j]).collect();
+        let mx = row.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
+        let e: Vec<f32> = row.iter().map(|&v| common::math::exp(v - mx)).collect();
+        let s: f32 = e.iter().sum();
+        for j in 0..hc {
+            a[i * hc + j] = e[j] / s;
+        }
+    }
+    let soft = a.clone();
+    for v in a.iter_mut() {
+        *v += r.eps;
+    }
+    let mut steps = vec![a.clone()];
+    let cols = |a: &mut Vec<f32>| {
+        for j in 0..hc {
+            let s = (0..hc).map(|i| a[i * hc + j]).sum::<f32>() + r.eps;
+            for i in 0..hc {
+                a[i * hc + j] /= s;
+            }
+        }
+    };
+    let rows = |a: &mut Vec<f32>| {
+        for i in 0..hc {
+            let s = a[i * hc..(i + 1) * hc].iter().sum::<f32>() + r.eps;
+            for v in a[i * hc..(i + 1) * hc].iter_mut() {
+                *v /= s;
+            }
+        }
+    };
+    cols(&mut a);
+    steps.push(a.clone());
+    for _ in 0..r.iters - 1 {
+        rows(&mut a);
+        steps.push(a.clone());
+        cols(&mut a);
+        steps.push(a.clone());
+    }
+    (soft, steps)
+}
+
+pub fn hc_pre(r: &HcRef, s: &[f32]) -> (Vec<f32>, HcMix) {
+    let (hc, h) = (r.hc, r.h);
+    let n = hc * h;
+    let ss: f32 = s[..n].iter().map(|v| v * v).sum();
+    let rr = common::math::rsqrt(ss / n as f32 + r.rms_eps);
+    let flat: Vec<f32> = s[..n].iter().map(|v| v * rr).collect();
+    let nc = (2 + hc) * hc;
+    let coef = matvec(nc, n, r.fn_, &flat);
+    let pre: Vec<f32> = (0..hc).map(|i| sigmoid(coef[i] * r.scale[0] + r.base[i]) + r.eps).collect();
+    let post: Vec<f32> = (0..hc).map(|i| 2.0 * sigmoid(coef[hc + i] * r.scale[1] + r.base[hc + i])).collect();
+    let (_, steps) = hc_sinkhorn(r, &coef);
+    let comb = steps.last().unwrap().clone();
+    let x: Vec<f32> = (0..h).map(|d| (0..hc).map(|i| pre[i] * s[i * h + d]).sum()).collect();
+    (x, HcMix { pre, post, comb, coef })
+}
+
+/// `S'_j = post_j · y + Σ_i comb_ij · S_i`.
+pub fn hc_post(r: &HcRef, m: &HcMix, y: &[f32], s: &[f32]) -> Vec<f32> {
+    let (hc, h) = (r.hc, r.h);
+    let mut out = vec![0f32; hc * h];
+    for j in 0..hc {
+        for d in 0..h {
+            out[j * h + d] = m.post[j] * y[d] + (0..hc).map(|i| m.comb[i * hc + j] * s[i * h + d]).sum::<f32>();
+        }
+    }
+    out
+}
+
+/// → (d y, the residual's share of d S, (d post, d comb)).
+pub fn hc_post_backward(r: &HcRef, m: &HcMix, y: &[f32], s: &[f32], ds_out: &[f32]) -> (Vec<f32>, Vec<f32>, (Vec<f32>, Vec<f32>)) {
+    let (hc, h) = (r.hc, r.h);
+    let mut dy = vec![0f32; h];
+    let mut ds = vec![0f32; hc * h];
+    let mut dpost = vec![0f32; hc];
+    let mut dcomb = vec![0f32; hc * hc];
+    for j in 0..hc {
+        for d in 0..h {
+            let g = ds_out[j * h + d];
+            dy[d] += m.post[j] * g;
+            dpost[j] += y[d] * g;
+            for i in 0..hc {
+                dcomb[i * hc + j] += s[i * h + d] * g;
+                ds[i * h + d] += m.comb[i * hc + j] * g;
+            }
+        }
+    }
+    (dy, ds, (dpost, dcomb))
+}
+
+/// Given d x and the mix's gradient, `ds += …`.
+pub fn hc_pre_backward(r: &HcRef, s: &[f32], m: &HcMix, dx: &[f32], dm: &(Vec<f32>, Vec<f32>), ds: &mut [f32]) {
+    let (hc, h) = (r.hc, r.h);
+    let n = hc * h;
+    let nc = (2 + hc) * hc;
+    let mut dc = vec![0f32; nc];
+    for i in 0..hc {
+        let dp: f32 = (0..h).map(|d| s[i * h + d] * dx[d]).sum();
+        for d in 0..h {
+            ds[i * h + d] += m.pre[i] * dx[d];
+        }
+        let sg = m.pre[i] - r.eps;
+        dc[i] = dp * sg * (1.0 - sg) * r.scale[0];
+        let sp = m.post[i] / 2.0;
+        dc[hc + i] = dm.0[i] * 2.0 * sp * (1.0 - sp) * r.scale[1];
+    }
+    let (soft, steps) = hc_sinkhorn(r, &m.coef);
+    let mut g = dm.1.clone();
+    for k in (1..steps.len()).rev() {
+        let (before, after) = (&steps[k - 1], &steps[k]);
+        let mut gin = vec![0f32; hc * hc];
+        let line = |idx: &dyn Fn(usize) -> usize, g: &[f32], gin: &mut [f32]| {
+            let sum = (0..hc).map(|t| before[idx(t)]).sum::<f32>() + r.eps;
+            let dot: f32 = (0..hc).map(|t| g[idx(t)] * after[idx(t)]).sum();
+            for t in 0..hc {
+                gin[idx(t)] = (g[idx(t)] - dot) / sum;
+            }
+        };
+        if k % 2 == 1 {
+            for j in 0..hc {
+                line(&|t| t * hc + j, &g, &mut gin);
+            }
+        } else {
+            for i in 0..hc {
+                line(&|t| i * hc + t, &g, &mut gin);
+            }
+        }
+        g = gin;
+    }
+    for i in 0..hc {
+        let dot: f32 = (0..hc).map(|j| g[i * hc + j] * soft[i * hc + j]).sum();
+        for j in 0..hc {
+            dc[2 * hc + i * hc + j] = soft[i * hc + j] * (g[i * hc + j] - dot) * r.scale[2];
+        }
+    }
+    let dflat = matvec_t(nc, n, r.fn_, &dc);
+    let ss: f32 = s[..n].iter().map(|v| v * v).sum();
+    let rr = common::math::rsqrt(ss / n as f32 + r.rms_eps);
+    let dot: f32 = (0..n).map(|i| dflat[i] * s[i]).sum();
+    let c = rr * rr * rr / n as f32 * dot;
+    for i in 0..n {
+        ds[i] += rr * dflat[i] - s[i] * c;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use common::testing::Rng;
+
+    /// The hyper-connection's analytic gradient against central differences at a small shape,
+    /// the block between pre and post a fixed random linear map so both halves are exercised
+    /// through one loss.
+    #[test]
+    fn hc_backward_is_the_gradient() {
+        let (hc, h) = (3usize, 6usize);
+        let mut rnd = Rng::new(0xF1D0_0003);
+        let nc = (2 + hc) * hc;
+        let fn_: Vec<f32> = (0..nc * hc * h).map(|_| rnd.unit() * 0.5).collect();
+        let base: Vec<f32> = (0..nc).map(|_| rnd.unit()).collect();
+        let r = HcRef { hc, h, fn_: &fn_, base: &base, scale: [0.8, 1.2, 0.9], eps: 1e-6, rms_eps: 1e-5, iters: 4 };
+        let block: Vec<f32> = (0..h * h).map(|_| rnd.unit()).collect();
+        let mut s: Vec<f32> = (0..hc * h).map(|_| rnd.unit()).collect();
+        let ds_out: Vec<f32> = (0..hc * h).map(|_| rnd.unit()).collect();
+        let loss = |s: &[f32]| -> f64 {
+            let (x, m) = hc_pre(&r, s);
+            let y = matvec(h, h, &block, &x);
+            hc_post(&r, &m, &y, s).iter().zip(&ds_out).map(|(a, b)| (*a as f64) * (*b as f64)).sum()
+        };
+        let (x, m) = hc_pre(&r, &s);
+        let y = matvec(h, h, &block, &x);
+        let (dy, mut ds, dm) = hc_post_backward(&r, &m, &y, &s, &ds_out);
+        let dx = matvec_t(h, h, &block, &dy);
+        hc_pre_backward(&r, &s, &m, &dx, &dm, &mut ds);
+        let eps = 1e-3f32;
+        for i in 0..hc * h {
+            let base_v = s[i];
+            s[i] = base_v + eps;
+            let plus = loss(&s);
+            s[i] = base_v - eps;
+            let minus = loss(&s);
+            s[i] = base_v;
+            let num = ((plus - minus) / (2.0 * eps as f64)) as f32;
+            assert!((num - ds[i]).abs() <= 3e-3 * (1.0 + num.abs()), "dS[{i}]: numeric {num} analytic {}", ds[i]);
+        }
+    }
 
     /// The MoE's analytic gradient against central differences at a small shape, quantizers
     /// off: the routing weights' path through the renormalization and the sigmoid into the

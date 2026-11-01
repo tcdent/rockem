@@ -21,6 +21,24 @@ pub fn backward<const N: usize>(x: &[f32], w: &[f32], eps: f32, dy: &[f32], dx: 
     }
 }
 
+/// The same for the unweighted norm `y = x · r` (the hyper-connections' flattened streams).
+#[inline(always)]
+pub fn backward_unweighted<const N: usize>(x: &[f32], eps: f32, dy: &[f32], dx: &mut [f32]) {
+    let mut ss = 0f32;
+    for &v in &x[..N] {
+        ss += v * v;
+    }
+    let r = rsqrt(ss / N as f32 + eps);
+    let mut dot = 0f32;
+    for i in 0..N {
+        dot += dy[i] * x[i];
+    }
+    let c = r * r * r / N as f32 * dot;
+    for i in 0..N {
+        dx[i] += r * dy[i] - x[i] * c;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

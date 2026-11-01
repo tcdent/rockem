@@ -18,10 +18,12 @@
 //!           needs, and the backward — dx and the adapter's gradients
 //! ffn       the MoE half on its normed input: the router's picked rows, the experts
 //!           and their weights, the shared expert — to d xn
+//! hc        the hyper-connection around a block half: post's backward to d y and the
+//!           residual's share, pre's through the Sinkhorn chain and the norm to d S
 //! ```
-//! The rest of the layer (the norms and hyper-connections, KDA, MLA, the
-//! head) follows, one op at a time.
+//! The rest of the layer (KDA, MLA, the head) follows, one op at a time.
 
 pub mod expert;
 pub mod ffn;
+pub mod hc;
 pub mod reference;
