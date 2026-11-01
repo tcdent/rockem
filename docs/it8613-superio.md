@@ -200,7 +200,16 @@ default zero-RPM mode stopped the fan. Ranges: curve hotspot 25–100 °C, speed
 15–100 %; target temperature 25–105 °C (default 81); zero-RPM stop temperature 25–100 °C (default 60);
 acoustic limit/target 500–3600 rpm (defaults 3600/1400). `r` needs a following `c` to apply. The PMFW runs
 whatever curve is committed, so the cards' fail-safe is the firmware itself; the daemon only moves the
-curve, the floor and the zero-RPM switch. `power1_cap` 238–290 W is also writable. The card is a Sapphire 7900 XT (0x1da2:0x471e), VBIOS 113-D70401XT-P11; no
+curve, the floor and the zero-RPM switch. `power1_cap` 238–290 W is also writable.
+
+**The zero-RPM switch does not start a stopped fan (2026-10-31 evening, under control,
+`bringup/box/thermal/card1-zero-rpm-2026-10-31.txt`):** with the junction at 58–60 °C card1's fan stayed
+at 0 rpm through `fan_zero_rpm_enable=0`, flat curves at 17–30 %, `fan_minimum_pwm` 20 and 25, the stop
+temperature at 25, the switch toggled, and a full reset; it ran for a while twice, after a minimum-PWM
+commit and after a stop-temperature commit, and stopped again after the next commit. Card0, turning at
+583–841 rpm at a 50–54 °C junction, was later found at 0 too. Same VBIOS and board on both. So on PMFW
+78.128.0 the fan's stopped/running state is the firmware's, set at its own thresholds, and the table only
+shapes the speed once it runs. Open: what starts a stopped fan short of heating the card past ~60 °C. The card is a Sapphire 7900 XT (0x1da2:0x471e), VBIOS 113-D70401XT-P11; no
 consumer 7900 XT report of overdrive refused by the VBIOS was found. See `docs/queue/101-fan-control.md`.
 
 ## 6. The plan

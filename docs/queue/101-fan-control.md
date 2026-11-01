@@ -177,6 +177,9 @@ What it says, and it bears on the goal directly:
 
 ## Open questions
 
+- The cards' zero-RPM: the switch does not start a stopped fan (docs/it8613-superio.md §5); the cold-start excursion
+  stands until a reliable start is found, and the card zones' floor only holds once the fan runs.
+
 - The BMC's fan-write command (step 3), and whether its daemon reverts a manual duty.
 - Which physical header is which: CPU_FAN1/SYS_FAN ↔ pwm2/pwm3; where the three chassis fans plug in today.
 - Whether firmware touches the IT8613E's registers at runtime (the ACPI reservation says it may; nothing seen yet).

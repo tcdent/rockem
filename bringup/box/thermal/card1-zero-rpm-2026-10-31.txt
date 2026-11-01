@@ -1,0 +1,53 @@
+Terminated
+card1 before: zr=0 stop=60 min=15 curve=0: 25C 17% 1: 40C 17% 2: 55C 17% 3: 70C 17% 4: 85C 17%  fan=0 pwm=0 en=2 junction=60000
+recommit zr rc=0
+after zr: fan=0 pwm=0
+min 20 rc=0
+after min: fan=808 pwm=51 min=20
+min back 15: fan=0 pwm=0
+[    6.496756] amdgpu 0000:a3:00.0: SECUREDISPLAY: optional securedisplay ta ucode is not available
+[    6.658752] amdgpu: Topology: Add GPU node [0x1002:0x744c]
+[   31.333962] cmdline  : 1b83c7c7e808703718bd3ea1affd6566912f6c5717da397d5b4963611ad3822a initrd=initramfs.cpio.zst console=tty0 panic=10 amdgpu.ppfeaturemask=
+Terminated
+02:02:00 card1 fan=0 pwm=0 junction=60000 zr=0 stop=60 min=20
+02:02:05 card1 fan=0 pwm=0 junction=59000 zr=0 stop=60 min=20
+-- stop temperature 25 + commit
+rc=0
+02:02:10 card1 fan=619 pwm=38 junction=59000 zr=0 stop=25 min=20
+02:02:15 card1 fan=571 pwm=38 junction=59000 zr=0 stop=25 min=20
+-- zero rpm toggled 1 then 0
+02:02:23 card1 fan=581 pwm=38 junction=58000 zr=0 stop=25 min=20
+02:02:28 card1 fan=0 pwm=0 junction=58000 zr=0 stop=25 min=20
+-- minimum 25 + commit
+02:02:34 card1 fan=0 pwm=0 junction=58000 zr=0 stop=25 min=25
+-- minimum 20 + commit
+02:02:40 card1 fan=0 pwm=0 junction=58000 zr=0 stop=25 min=20
+Terminated
+card1 113-D70401XT-P11 sub=0x1da2:0x471e   card0 113-D70401XT-P11 sub=0x1da2:0x471e
+02:03:13 curve 22%: fan=0 pwm=0 junction=58000
+02:03:21 curve 22%: fan=0 pwm=0
+02:03:29 curve 25%: fan=0 pwm=0 junction=58000
+02:03:37 curve 25%: fan=0 pwm=0
+02:03:45 curve 30%: fan=0 pwm=0 junction=59000
+02:03:53 curve 30%: fan=0 pwm=0
+02:04:01 curve 20%: fan=0 pwm=0 junction=59000
+02:04:09 curve 20%: fan=0 pwm=0
+Terminated
+02:04:34 card1 fan=0 pwm=0 junction=59000 zr=0 stop=25
+-- zero rpm ENABLED with stop temperature 25
+02:04:42 card1 fan=0 pwm=0 junction=58000 zr=1 stop=25
+02:04:50 card1 fan=0 pwm=0 junction=58000 zr=1 stop=25
+02:04:58 card1 fan=0 pwm=0 junction=58000 zr=1 stop=25
+02:05:06 card1 fan=0 pwm=0 junction=58000 zr=1 stop=25
+02:05:14 card1 fan=0 pwm=0 junction=58000 zr=1 stop=25
+02:05:22 card1 fan=0 pwm=0 junction=58000 zr=1 stop=25
+Terminated
+-- reset everything to PMFW defaults (r + c)
+02:05:49 card1 fan=0 pwm=0 junction=59000 zr=1 stop=60 min=15
+02:05:57 card1 fan=0 pwm=0 junction=58000 zr=1 stop=60 min=15
+-- curve only, flat 20%
+02:06:05 card1 fan=0 pwm=0 junction=59000 zr=1 stop=60 min=15
+02:06:13 card1 fan=0 pwm=0 junction=59000 zr=1 stop=60 min=15
+-- then zero rpm 0
+02:06:21 card1 fan=0 pwm=0 junction=58000 zr=0 stop=60 min=15
+02:06:29 card1 fan=0 pwm=0 junction=58000 zr=0 stop=60 min=15
