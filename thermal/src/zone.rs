@@ -106,13 +106,17 @@ impl Zone {
 pub fn defaults() -> Vec<Params> {
     // from pass 1 (queue 101 §Characterization, 2026-10-31): the dies' swing is ~15 °C per 140 W and they relax
     // within a minute; card0 carried the heat
+    // tuning round 1 (the first controlled pass, 2026-10-31 02:07: socket 1 to 85 °C and the cards to 85/88 at
+    // full duty, 5–9 °C over the BIOS/PMFW curves' peaks for the same work): the fans must be at full the
+    // moment a pass starts (kff 1.0), the peaks the fans can actually hold (75 / 78), and a quicker descent
+    // so a warm idle does not carry into the next pass (2 °C/min)
     let socket = |name, ambient, idle_sp, tau_cool| Params {
-        name, r: 0.11, tau_heat: 40.0, tau_cool, ambient, idle_sp, peak_sp: 72.0, ramp_down: 1.0,
-        load_w: 140.0, full_w: 280.0, floor: 60.0, kp: 12.0, ki: 0.05, kff: 0.5,
+        name, r: 0.11, tau_heat: 40.0, tau_cool, ambient, idle_sp, peak_sp: 75.0, ramp_down: 2.0,
+        load_w: 140.0, full_w: 280.0, floor: 60.0, kp: 12.0, ki: 0.05, kff: 1.0,
     };
     let card = |name, ambient, idle_sp, r, tau_cool| Params {
-        name, r, tau_heat: 60.0, tau_cool, ambient, idle_sp, peak_sp: 75.0, ramp_down: 1.0,
-        load_w: 80.0, full_w: 150.0, floor: 51.0, kp: 10.0, ki: 0.04, kff: 0.5,
+        name, r, tau_heat: 60.0, tau_cool, ambient, idle_sp, peak_sp: 78.0, ramp_down: 2.0,
+        load_w: 80.0, full_w: 150.0, floor: 51.0, kp: 10.0, ki: 0.04, kff: 1.0,
     };
     vec![
         socket("socket0", 41.0, 55.0, 36.0),
