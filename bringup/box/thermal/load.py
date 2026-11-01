@@ -54,12 +54,18 @@ def voria(query: str):
 
 
 def guard() -> dict:
-    return {
-        "tctl": voria('max(host_hwmon_celsius{host="metatron",chip="k10temp",sensor="Tctl"})'),
-        "vr": voria('max(ipmi_sensor_value{host="metatron",status_code="ok",name=~"cpu_v(core|soc)_vr_t"})'),
-        "junction": voria('max(host_hwmon_celsius{host="metatron",chip="amdgpu",sensor="junction"})'),
-        "watts": voria('sum(host_hwmon_watts{host="metatron",chip="amd_hsmp_hwmon"})'),
-    }
+    # a voria that does not answer is a missing reading, not the end of the run: the run goes on and
+    # aborts only when three guards in a row come back empty
+    out = {}
+    for k, q in (("tctl", 'max(host_hwmon_celsius{host="metatron",chip="k10temp",sensor="Tctl"})'),
+                 ("vr", 'max(ipmi_sensor_value{host="metatron",status_code="ok",name=~"cpu_v(core|soc)_vr_t"})'),
+                 ("junction", 'max(host_hwmon_celsius{host="metatron",chip="amdgpu",sensor="junction"})'),
+                 ("watts", 'sum(host_hwmon_watts{host="metatron",chip="amd_hsmp_hwmon"})')):
+        try:
+            out[k] = voria(q)
+        except Exception:
+            out[k] = None
+    return out
 
 
 def main():
@@ -92,8 +98,9 @@ def main():
     g = guard()
     emit("start", label=a.label, minutes=a.minutes, context=a.context, max_tokens=a.max_tokens, mode=a.mode, guard=g)
     print(f"[{a.label}] start: {g}", flush=True)
-    t_start = time.time(); t_end = t_start + 60 * a.minutes; last_guard = time.time(); n = 0; aborted = None
-    while time.time() < t_end:
+    t_start = time.time(); t_end = t_start + 60 * a.minutes; last_guard = time.time(); n = 0; aborted = None; blind = 0
+    try:
+      while time.time() < t_end:
         try:
             r = request(prompt_of(a.context, rng), a.max_tokens)
         except Exception as e:  # the API's error is the data here, not a crash
@@ -106,8 +113,13 @@ def main():
         if time.time() - last_guard >= 20:
             g = guard(); last_guard = time.time(); emit("guard", **g)
             print(f"[{a.label}] guard: {g}", flush=True)
+            blind = blind + 1 if all(v is None for v in g.values()) else 0
+            if blind >= 3:
+                aborted = {"blind": blind}; break
             if (g["tctl"] or 0) >= a.tctl_max or (g["vr"] or 0) >= a.vr_max or (g["junction"] or 0) >= a.junction_max:
                 aborted = g; break
+    except BaseException as e:  # whatever happens, the window gets its end row
+        aborted = {"exception": repr(e)}
     g = guard()
     emit("end", requests=n, aborted=aborted, guard=g, elapsed_s=time.time() - t_start)
     print(f"[{a.label}] end after {n} requests, {time.time() - t_start:.0f} s; {'ABORTED ' + str(aborted) if aborted else 'clean'}; {g}", flush=True)

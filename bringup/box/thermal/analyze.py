@@ -43,9 +43,12 @@ def fetch(query, start, end, step=10):
 def window(label):
     rows = [json.loads(l) for l in open(os.path.join(LOGS, f"{label}.jsonl"))]
     starts = [r for r in rows if r["kind"] == "start"]; ends = [r for r in rows if r["kind"] == "end"]
-    if not starts or not ends:
-        sys.exit("no complete start/end in the log")
-    return starts[-1]["t"], ends[-1]["t"], [r for r in rows if r["kind"] == "request"]
+    reqs = [r for r in rows if r["kind"] == "request"]
+    if not starts or not reqs:
+        sys.exit("no start or no request in the log")
+    # a run that died without its end row ends with its last request
+    end = ends[-1]["t"] if ends else reqs[-1]["t"]
+    return starts[-1]["t"], end, reqs
 
 
 def stats(series, t0, t1, fit_min):
