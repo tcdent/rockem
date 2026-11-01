@@ -9,7 +9,11 @@ cd /home/slomp/Work/rockem
 # the production command line, always (a lab boot leaves its own in os/release/dev.cmdline)
 cp bringup/box/dev.cmdline.serving os/release/dev.cmdline
 /usr/bin/grep -E "kernels" bundles/glm-5.3-flash-q4rtn/manifest.toml | cut -c1-100
-timeout 500 make initramfs NODE_FEATURES="${NODE_FEATURES---features track-launches}" 2>&1 | tail -n 2 | cut -c1-100
+# a failed or timed-out build must stop the deploy: a `| tail` alone swallowed a timeout once and published the
+# previous initramfs under a new cmdline (2026-11-01). 900 s: a full rebuild after a workspace change is ~7 min.
+timeout 900 make initramfs NODE_FEATURES="${NODE_FEATURES---features track-launches}" 2>&1 | tail -n 2 | cut -c1-100
+[ "${PIPESTATUS[0]}" = 0 ] || { echo "initramfs: BUILD FAILED or timed out (status ${PIPESTATUS[0]}) — not publishing"; exit 1; }
+[ "$(find os/release/staging/dev/initramfs.cpio.zst -mmin -15 | wc -l)" = 1 ] || { echo "initramfs: the staged image is older than this build — not publishing"; exit 1; }
 timeout 180 make publish 2>&1 | /usr/bin/grep -E 'pushed|error|missing'
 : > $LOG/metatron-console.log
 (sleep 1; printf 'echo b > /proc/sysrq-trigger\r\n'; sleep 2) | timeout 8 nc 192.168.88.6 23 >/dev/null 2>&1
