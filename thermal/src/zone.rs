@@ -112,7 +112,7 @@ pub fn defaults() -> Vec<Params> {
     };
     let card = |name, ambient, idle_sp, r, tau_cool| Params {
         name, r, tau_heat: 60.0, tau_cool, ambient, idle_sp, peak_sp: 75.0, ramp_down: 1.0,
-        load_w: 80.0, full_w: 150.0, floor: 38.0, kp: 10.0, ki: 0.04, kff: 0.5,
+        load_w: 80.0, full_w: 150.0, floor: 51.0, kp: 10.0, ki: 0.04, kff: 0.5,
     };
     vec![
         socket("socket0", 41.0, 55.0, 36.0),

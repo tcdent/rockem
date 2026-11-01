@@ -114,14 +114,20 @@ impl CardFan {
         out
     }
 
+    /// The PMFW stops the fan at its 15 % floor even with zero-RPM off (card1, 2026-10-31: 0 rpm at a
+    /// 17 % curve and `fan_minimum_pwm` 15; 808 rpm the moment the minimum was 20). 20 % is the floor.
+    const MIN_PCT: u8 = 20;
+
     fn pct(duty: u8) -> u8 {
-        ((duty as u32 * 100 + 127) / 255).clamp(15, 100) as u8
+        ((duty as u32 * 100 + 127) / 255).clamp(Self::MIN_PCT as u32, 100) as u8
     }
 
-    /// Zero-RPM off and a flat curve at the duty, committed.
+    /// Zero-RPM off, the minimum PWM at the floor, and a flat curve at the duty, committed.
     pub fn take(&mut self, duty: u8) -> bool {
         let z = self.fan_ctrl.join("fan_zero_rpm_enable");
         let mut ok = write(&z, "0") && write(&z, "c");
+        let m = self.fan_ctrl.join("fan_minimum_pwm");
+        ok &= write(&m, &Self::MIN_PCT.to_string()) && write(&m, "c");
         ok &= self.curve(Self::pct(duty));
         self.taken = ok;
         ok
@@ -158,7 +164,7 @@ impl CardFan {
         if !self.taken {
             return;
         }
-        for f in ["fan_curve", "fan_zero_rpm_enable"] {
+        for f in ["fan_curve", "fan_zero_rpm_enable", "fan_minimum_pwm"] {
             let p = self.fan_ctrl.join(f);
             write(&p, "r");
             write(&p, "c");
