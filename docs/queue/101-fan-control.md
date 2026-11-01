@@ -128,6 +128,18 @@ junctions +16.9 / +14.5 (73 / 77), thermistor +4.4; the first-minute falls −9.
 so the fit reads slower), 6.5 for card1, 8–13 for the ambient group. Socket power (one hwmon) 90 → 191 W, cards
 129 → 293 W. Same die physics, a gentler cliff when the cards are not the ones heating.
 
+**Pass 3, `prefill16k-3min`, 17:00–17:04:** 6 requests of 16k prompt + 32 tokens, 217 s, 95k prompt tokens, 37 s a
+request. Tctl +14.4 / +16.0 (65.6 / 74.8), VRs +17.0 / +17.6 (68 / 71), junctions +15.3 / +14.8 (72 / 78: card0 started
+with its fan already at 586 rpm, so no 84 this time), thermistor +4.9; first-minute falls −10.8 / −9.9 (sockets), −6 /
+−5 (cards), −8 / −7 (VRs); τ 0.6 / 1.9 min for the sockets, 2.2 / 2.9 for the cards, 2.1 for the VRs, 4–7 for the
+ambient group. Socket power (one hwmon) 90 → 245 W, cards 129 → 293 W.
+
+**Across the three shapes** the dies rise 14–17 °C and the VRs 17 °C whatever the work; the cards rise 15 °C when their
+fans are already turning and 30 when the PMFW has them stopped; the dies fall 9–12 °C in the first minute, the VRs
+6–8, the cards 5–22; the ambient group moves 4–9 °C with τ 4–13 min. Pass 1's card0 excursion is the zero-RPM mode's
+doing: the fan starts from nothing a minute into the pass. `fan_zero_rpm_enable=0` with a floor is the first card
+setting the daemon should hold.
+
 What it says, and it bears on the goal directly:
 
 - **The dies cool in well under a minute no matter what the fans do.** Socket 0's Tctl has a time constant of ~36 s
