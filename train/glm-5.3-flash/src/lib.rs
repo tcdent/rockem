@@ -24,11 +24,17 @@
 //!           recurrence in reverse per head (recomputed from the entering memory), the
 //!           convolution over the run's timeline, the projections — to d xn and the
 //!           entering state's gradient
+//! mla       a run of positions through an MLA layer: the inference step forward; the
+//!           absorbed attention's backward straight into the latents' gradient, the query
+//!           path, then the run's own latents through their norm and kv_a — to d xn
 //! ```
-//! The rest of the layer (MLA, the head) follows, one op at a time.
+//! The head and the layer's composition follow.
 
 pub mod expert;
 pub mod ffn;
 pub mod hc;
 pub mod kda;
+pub mod mla;
 pub mod reference;
+#[cfg(test)]
+pub mod testing;

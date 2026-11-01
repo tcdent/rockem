@@ -947,3 +947,184 @@ mod kda_tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// MLA (NoPE, dense causal attention — the selection under DENSE_BELOW positions), any shape,
+// over a sequence, in the reference's expanded form (keys and values from the latent per head).
+
+/// `nh` heads; query/key width `dq`, value width `dv`; latent rank `r`, query rank `qr`.
+/// `q_a: [qr][h]`, `q_b: [nh·dq][qr]`, `kv_a: [r][h]`, `kv_b: [nh][dq + dv][r]`, `o: [h][nh·dv]`.
+pub struct MlaRef<'a> {
+    pub nh: usize,
+    pub dq: usize,
+    pub dv: usize,
+    pub r: usize,
+    pub qr: usize,
+    pub h: usize,
+    pub rms_eps: f32,
+    pub q_a: &'a [f32],
+    pub q_a_ln: &'a [f32],
+    pub q_b: &'a [f32],
+    pub kv_a: &'a [f32],
+    pub kv_a_ln: &'a [f32],
+    pub kv_b: &'a [f32],
+    pub o: &'a [f32],
+    /// Store the latent at bf16 precision, as the node's cache does.
+    pub round: bool,
+}
+
+pub struct MlaSaved {
+    pub n: usize,
+    pub qa: Vec<f32>,     // [n][qr]
+    pub q: Vec<f32>,      // [n][nh·dq]
+    pub kva: Vec<f32>,    // [n][r]
+    pub latent: Vec<f32>, // [n][r]
+    pub att: Vec<f32>,    // [n][nh][n]: query t, head h, key j ≤ t
+    pub heads: Vec<f32>,  // [n][nh·dv]
+}
+
+pub fn mla_forward(m: &MlaRef, x: &[f32], n: usize) -> (Vec<f32>, MlaSaved) {
+    let (nh, dq, dv, r, qr, h) = (m.nh, m.dq, m.dv, m.r, m.qr, m.h);
+    let scale = 1.0 / common::math::sqrt(dq as f32);
+    let mut sv = MlaSaved { n, qa: vec![0.0; n * qr], q: vec![0.0; n * nh * dq], kva: vec![0.0; n * r], latent: vec![0.0; n * r], att: vec![0.0; n * nh * n], heads: vec![0.0; n * nh * dv] };
+    for t in 0..n {
+        let xt = &x[t * h..(t + 1) * h];
+        let qa = matvec(qr, h, m.q_a, xt);
+        let q = matvec(nh * dq, qr, m.q_b, &rms_ref(&qa, m.q_a_ln, m.rms_eps));
+        let kva = matvec(r, h, m.kv_a, xt);
+        let mut lat = rms_ref(&kva, m.kv_a_ln, m.rms_eps);
+        if m.round {
+            for v in lat.iter_mut() {
+                *v = common::math::bf16_round(*v);
+            }
+        }
+        sv.qa[t * qr..(t + 1) * qr].copy_from_slice(&qa);
+        sv.q[t * nh * dq..(t + 1) * nh * dq].copy_from_slice(&q);
+        sv.kva[t * r..(t + 1) * r].copy_from_slice(&kva);
+        sv.latent[t * r..(t + 1) * r].copy_from_slice(&lat);
+    }
+    let mut y = vec![0f32; n * h];
+    for t in 0..n {
+        for hh in 0..nh {
+            let qh = &sv.q[t * nh * dq + hh * dq..t * nh * dq + (hh + 1) * dq];
+            let w_uk = &m.kv_b[hh * (dq + dv) * r..(hh * (dq + dv) + dq) * r];
+            let w_uv = &m.kv_b[(hh * (dq + dv) + dq) * r..(hh + 1) * (dq + dv) * r];
+            let mut sc = vec![0f32; t + 1];
+            let mut mx = f32::NEG_INFINITY;
+            for j in 0..=t {
+                let k = matvec(dq, r, w_uk, &sv.latent[j * r..(j + 1) * r]);
+                sc[j] = qh.iter().zip(&k).map(|(a, b)| a * b).sum::<f32>() * scale;
+                mx = mx.max(sc[j]);
+            }
+            let mut sum = 0f32;
+            for v in sc.iter_mut() {
+                *v = common::math::exp(*v - mx);
+                sum += *v;
+            }
+            let mut oh = vec![0f32; dv];
+            for j in 0..=t {
+                let a = sc[j] / sum;
+                sv.att[(t * nh + hh) * n + j] = a;
+                let v = matvec(dv, r, w_uv, &sv.latent[j * r..(j + 1) * r]);
+                for d in 0..dv {
+                    oh[d] += a * v[d];
+                }
+            }
+            sv.heads[t * nh * dv + hh * dv..t * nh * dv + (hh + 1) * dv].copy_from_slice(&oh);
+        }
+        let yt = matvec(h, nh * dv, m.o, &sv.heads[t * nh * dv..(t + 1) * nh * dv]);
+        y[t * h..(t + 1) * h].copy_from_slice(&yt);
+    }
+    (y, sv)
+}
+
+/// → (dx `[n][h]`, d latent `[n][r]` — every position's, as accumulated from the queries).
+pub fn mla_backward(m: &MlaRef, sv: &MlaSaved, dy: &[f32]) -> (Vec<f32>, Vec<f32>) {
+    let (nh, dq, dv, r, qr, h, n) = (m.nh, m.dq, m.dv, m.r, m.qr, m.h, sv.n);
+    let scale = 1.0 / common::math::sqrt(dq as f32);
+    let mut dx = vec![0f32; n * h];
+    let mut dlatent = vec![0f32; n * r];
+    for t in 0..n {
+        let dheads = matvec_t(h, nh * dv, m.o, &dy[t * h..(t + 1) * h]);
+        let mut dq_all = vec![0f32; nh * dq];
+        for hh in 0..nh {
+            let qh = &sv.q[t * nh * dq + hh * dq..t * nh * dq + (hh + 1) * dq];
+            let w_uk = &m.kv_b[hh * (dq + dv) * r..(hh * (dq + dv) + dq) * r];
+            let w_uv = &m.kv_b[(hh * (dq + dv) + dq) * r..(hh + 1) * (dq + dv) * r];
+            let doh = &dheads[hh * dv..(hh + 1) * dv];
+            let att = &sv.att[(t * nh + hh) * n..(t * nh + hh) * n + t + 1];
+            // d att_j = ⟨doh, v_j⟩; d v_j = att_j · doh
+            let mut datt = vec![0f32; t + 1];
+            let mut dot = 0f32;
+            for j in 0..=t {
+                let v = matvec(dv, r, w_uv, &sv.latent[j * r..(j + 1) * r]);
+                datt[j] = doh.iter().zip(&v).map(|(a, b)| a * b).sum();
+                dot += att[j] * datt[j];
+                let dv_j: Vec<f32> = doh.iter().map(|d| att[j] * d).collect();
+                for (a, b) in dlatent[j * r..(j + 1) * r].iter_mut().zip(matvec_t(dv, r, w_uv, &dv_j)) {
+                    *a += b;
+                }
+            }
+            // the softmax; d q += scale · Σ ds_j k_j; d k_j = scale · ds_j · q
+            let mut dqh = vec![0f32; dq];
+            for j in 0..=t {
+                let ds = att[j] * (datt[j] - dot) * scale;
+                let k = matvec(dq, r, w_uk, &sv.latent[j * r..(j + 1) * r]);
+                for d in 0..dq {
+                    dqh[d] += ds * k[d];
+                }
+                let dk: Vec<f32> = qh.iter().map(|q| ds * q).collect();
+                for (a, b) in dlatent[j * r..(j + 1) * r].iter_mut().zip(matvec_t(dq, r, w_uk, &dk)) {
+                    *a += b;
+                }
+            }
+            dq_all[hh * dq..(hh + 1) * dq].copy_from_slice(&dqh);
+        }
+        let dqr = matvec_t(nh * dq, qr, m.q_b, &dq_all);
+        let dqa = rms_backward_ref(&sv.qa[t * qr..(t + 1) * qr], m.q_a_ln, m.rms_eps, &dqr);
+        for (a, b) in dx[t * h..(t + 1) * h].iter_mut().zip(matvec_t(qr, h, m.q_a, &dqa)) {
+            *a += b;
+        }
+    }
+    // every position's latent back through its norm and kv_a (the rounding straight through)
+    for j in 0..n {
+        let dkva = rms_backward_ref(&sv.kva[j * r..(j + 1) * r], m.kv_a_ln, m.rms_eps, &dlatent[j * r..(j + 1) * r]);
+        for (a, b) in dx[j * h..(j + 1) * h].iter_mut().zip(matvec_t(r, h, m.kv_a, &dkva)) {
+            *a += b;
+        }
+    }
+    (dx, dlatent)
+}
+
+#[cfg(test)]
+mod mla_tests {
+    use super::*;
+    use common::testing::Rng;
+
+    #[test]
+    fn mla_backward_is_the_gradient() {
+        let (nh, dq, dv, r, qr, h, n) = (2usize, 4usize, 3usize, 5usize, 6usize, 7usize, 4usize);
+        let mut rnd = Rng::new(0xF1D0_0005);
+        let mut u = |m: usize, s: f32| -> Vec<f32> { (0..m).map(|_| rnd.unit() * s).collect() };
+        let (q_a, q_b, kv_a, kv_b, o) = (u(qr * h, 0.7), u(nh * dq * qr, 0.7), u(r * h, 0.7), u(nh * (dq + dv) * r, 0.7), u(h * nh * dv, 0.7));
+        let q_a_ln: Vec<f32> = u(qr, 0.3).iter().map(|v| 1.0 + v).collect();
+        let kv_a_ln: Vec<f32> = u(r, 0.3).iter().map(|v| 1.0 + v).collect();
+        let m = MlaRef { nh, dq, dv, r, qr, h, rms_eps: 1e-5, q_a: &q_a, q_a_ln: &q_a_ln, q_b: &q_b, kv_a: &kv_a, kv_a_ln: &kv_a_ln, kv_b: &kv_b, o: &o, round: false };
+        let mut x = u(n * h, 1.0);
+        let dy = u(n * h, 1.0);
+        let loss = |x: &[f32]| -> f64 { mla_forward(&m, x, n).0.iter().zip(&dy).map(|(a, b)| (*a as f64) * (*b as f64)).sum() };
+        let (_, sv) = mla_forward(&m, &x, n);
+        let (dx, _) = mla_backward(&m, &sv, &dy);
+        let eps = 1e-3f32;
+        for i in 0..n * h {
+            let base = x[i];
+            x[i] = base + eps;
+            let p = loss(&x);
+            x[i] = base - eps;
+            let mm = loss(&x);
+            x[i] = base;
+            let num = ((p - mm) / (2.0 * eps as f64)) as f32;
+            assert!((num - dx[i]).abs() <= 3e-3 * (1.0 + num.abs()), "dx[{i}]: numeric {num} analytic {}", dx[i]);
+        }
+    }
+}
