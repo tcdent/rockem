@@ -2,6 +2,7 @@
 # rockem /init — mount what the node binary needs, bring up the LAN, mount the weights, then become the node.
 #   rockem.net=dhcp          DHCP on every ethernet link (busybox udhcpc, /etc/udhcpc.sh), clock from the lease's NTP servers
 #   rockem.nfs=<ip>:/<path>  the weights share, read-only at /bundle; rockem.bundle=/bundle/<name> picks one
+#   rockem.secrets=<ip>:/<path>  the secrets export (served to this host only), read-only at /etc/rockem
 #   rockem.telnet=1          dev: a root shell on the LAN, port 23
 mount -t devtmpfs devtmpfs /dev 2>/dev/null
 mount -t proc     proc     /proc
@@ -44,6 +45,9 @@ fi
 # dev rung: a bundle shared in by QEMU over virtio-9p (see os/qemu.sh)
 p=$(arg rockem.bundle9p); [ -n "$p" ] && mount -t 9p -o trans=virtio,version=9p2000.L,msize=1048576 "$p" /bundle
 p=$(arg rockem.nfs);      [ -n "$p" ] && { mount -t nfs4 -o ro,nolock "$p" /bundle && echo "nfs      : $p at /bundle" || echo "nfs      : mount of $p failed"; }
+# the secrets carrier (tcdent 2026-11-01): a second NFS export, served only to this host's address, read-only, mounted
+# at /etc/rockem; the thermal daemon reads /etc/rockem/bmc.env there. Nothing secret is built into the image.
+p=$(arg rockem.secrets);  [ -n "$p" ] && { mkdir -p /etc/rockem; mount -t nfs4 -o ro,nolock "$p" /etc/rockem && echo "secrets  : $p at /etc/rockem" || echo "secrets  : $p FAILED to mount"; }
 [ "$(arg rockem.telnet)" = 1 ] && telnetd -l /bin/sh && echo "telnet   : root shell on port 23"
 # host and GPU metrics to voria (INFRA-52); it waits for a real host name and a set clock on its own.
 # Started here, from a running init: as an rdinit= wrapper ahead of init it stalled metatron's boot.
