@@ -27,7 +27,11 @@ small shape; one op at a time, measured.
 | `dx += Wᵀ·dy` over `q4g128` | `common/src/q4.rs` | AVX2 = scalar bit for bit; scalar = dense `Wᵀ·dy` |
 | adapter steps `y += B·(A·x)` and their backward | `common/src/lowrank.rs` | through the expert's diffs |
 | routed expert with adapter: forward (keeps what the backward needs) and backward | `glm-5.3-flash/src/expert.rs` | zero adapter = `glm_5_3_flash::expert::forward` value for value; forward and backward within ~2e-6 of the dense f32 reference (gate 1e-4) |
-| the dense f32 reference of the above | `glm-5.3-flash/src/reference.rs` | finite differences on every parameter class and on `dx` |
+| `dx += Wᵀ·dy` over FP8 128×128-block rows | `common/src/fp8.rs` | AVX2 = scalar bit for bit (both `fma`); scalar = dense `Wᵀ·dy` |
+| `dx += Σ dy_r·W[row_r]` over bf16 rows (the router's picks) | `common/src/bf16.rs` | AVX2 = scalar bit for bit; = dense |
+| the clamped SwiGLU's and the RMS norm's backward | `common/src/swiglu.rs`, `common/src/rmsnorm.rs` | finite differences |
+| the MoE half on its normed input: router (frozen; picked rows), experts with adapters and their weights, shared expert — to `d xn` | `glm-5.3-flash/src/ffn.rs` | zero adapters = `ffn::moe_routed` + `moe_shared` value for value; vs the dense reference at the real shape 1e-4, except the two adapter gradients downstream of the quantized ĥ, gated at a quantizer step (the sides' h differ by summation order; a boundary element flips one INT8 step) |
+| the dense f32 reference of the above | `glm-5.3-flash/src/reference.rs` | finite differences on every parameter class and on `dx`, for the expert and for the whole MoE (router path included) |
 
 ## Measured
 

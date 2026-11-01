@@ -51,7 +51,7 @@ fn main() {
     let mut out = vec![0f32; H];
     let mut dx = vec![0f32; H];
 
-    let time = |name: &str, bytes: f64, mut f: &mut dyn FnMut()| {
+    let time = |name: &str, bytes: f64, f: &mut dyn FnMut()| {
         for _ in 0..3 {
             f();
         }

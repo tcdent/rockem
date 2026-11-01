@@ -151,10 +151,170 @@ pub fn backward(d: &Dense, a: &LowRank, s: &Saved, dout: &[f32]) -> (Vec<f32>, G
     (dx, gr)
 }
 
+/// The MoE's router, dense: `w: [e][h]`, `bias: [e]`, picks `top_k`, weights scaled by `scale`.
+pub struct Router<'a> {
+    pub e: usize,
+    pub top_k: usize,
+    pub h: usize,
+    pub w: &'a [f32],
+    pub bias: &'a [f32],
+    pub scale: f32,
+}
+
+/// → (picks ascending, their sigmoid scores, S) — `reference::Moe::route`'s arithmetic.
+pub fn route(r: &Router, x: &[f32]) -> (Vec<usize>, Vec<f32>, f32) {
+    let logits = matvec(r.e, r.h, r.w, x);
+    let s: Vec<f32> = logits.iter().map(|&l| glm_5_3_flash::hc::sigmoid(l)).collect();
+    let mut order: Vec<usize> = (0..r.e).collect();
+    order.sort_by(|&a, &b| (s[b] + r.bias[b]).total_cmp(&(s[a] + r.bias[a])).then(a.cmp(&b)));
+    let mut idx = order[..r.top_k].to_vec();
+    idx.sort();
+    let sum = idx.iter().map(|&e| s[e]).sum::<f32>() + 1e-20;
+    (idx.clone(), idx.iter().map(|&e| s[e]).collect(), sum)
+}
+
+/// The MoE: a router, the shared expert (as a `Dense` with a rank-0 adapter), and the routed
+/// experts that exist (`(e, dense, adapter)`; a pick without one is a bug in the test).
+pub struct MoeRef<'a> {
+    pub router: &'a Router<'a>,
+    pub shared: &'a Dense<'a>,
+    pub shared_lr: &'a LowRank<'a>,
+    pub experts: &'a [(usize, Dense<'a>, LowRank<'a>)],
+}
+
+pub struct MoeSaved {
+    pub idx: Vec<usize>,
+    pub s: Vec<f32>,
+    pub sum: f32,
+    pub experts: Vec<(Vec<f32>, Saved)>, // each pick's raw output and saved state
+    pub shared: Saved,
+}
+
+fn expert_of<'a, 'b>(m: &'b MoeRef<'a>, e: usize) -> (&'b Dense<'a>, &'b LowRank<'a>) {
+    let (_, d, a) = m.experts.iter().find(|(ee, _, _)| *ee == e).expect("a picked expert exists");
+    (d, a)
+}
+
+pub fn moe_forward(m: &MoeRef, x: &[f32], quant: bool) -> (Vec<f32>, MoeSaved) {
+    let (idx, s, sum) = route(m.router, x);
+    let h = m.router.h;
+    let mut out = vec![0f32; h];
+    let mut experts = Vec::new();
+    for (k, &e) in idx.iter().enumerate() {
+        let (d, a) = expert_of(m, e);
+        let (eo, saved) = forward(d, a, x, quant);
+        let wt = s[k] / sum * m.router.scale;
+        for i in 0..h {
+            out[i] += wt * eo[i];
+        }
+        experts.push((eo, saved));
+    }
+    let (so, shared) = forward(m.shared, m.shared_lr, x, false);
+    for i in 0..h {
+        out[i] += so[i];
+    }
+    (out, MoeSaved { idx, s, sum, experts, shared })
+}
+
+/// → (dx, the picked experts' adapter gradients by expert).
+pub fn moe_backward(m: &MoeRef, sv: &MoeSaved, dout: &[f32]) -> (Vec<f32>, Vec<(usize, Grads)>) {
+    let h = m.router.h;
+    let (mut dx, _) = backward(m.shared, m.shared_lr, &sv.shared, dout);
+    let mut grads = Vec::new();
+    let mut dwt = vec![0f32; sv.idx.len()];
+    for (k, &e) in sv.idx.iter().enumerate() {
+        let (d, a) = expert_of(m, e);
+        let (eo, saved) = &sv.experts[k];
+        let wt = sv.s[k] / sv.sum * m.router.scale;
+        dwt[k] = eo.iter().zip(dout).map(|(o, g)| o * g).sum();
+        let scaled: Vec<f32> = dout.iter().map(|g| wt * g).collect();
+        let (edx, g) = backward(d, a, saved, &scaled);
+        for i in 0..h {
+            dx[i] += edx[i];
+        }
+        grads.push((e, g));
+    }
+    // wt_j = c · s_j / S, S = ε + Σ s: d s_e = c/S · (d wt_e − Σ_j d wt_j s_j / S)
+    let mixed: f32 = (0..sv.idx.len()).map(|k| dwt[k] * sv.s[k]).sum::<f32>() / sv.sum;
+    for (k, &e) in sv.idx.iter().enumerate() {
+        let ds = m.router.scale / sv.sum * (dwt[k] - mixed);
+        let dl = ds * sv.s[k] * (1.0 - sv.s[k]);
+        for i in 0..h {
+            dx[i] += dl * m.router.w[e * h + i];
+        }
+    }
+    (dx, grads)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use common::testing::Rng;
+
+    /// The MoE's analytic gradient against central differences at a small shape, quantizers
+    /// off: the routing weights' path through the renormalization and the sigmoid into the
+    /// router's rows, and the shared expert, on top of the experts' own (checked below).
+    #[test]
+    fn moe_backward_is_the_gradient() {
+        let (e, top_k, h, ff, sff, r) = (6usize, 2usize, 12usize, 10usize, 8usize, 2usize);
+        let mut rnd = Rng::new(0xF1D0_0002);
+        let rw: Vec<f32> = (0..e * h).map(|_| rnd.unit()).collect();
+        let bias: Vec<f32> = (0..e).map(|_| rnd.unit() * 0.1).collect();
+        let router = Router { e, top_k, h, w: &rw, bias: &bias, scale: 2.5 };
+        let sgu: Vec<f32> = (0..2 * sff * h).map(|_| rnd.unit()).collect();
+        let sd: Vec<f32> = (0..h * sff).map(|_| rnd.unit()).collect();
+        let shared = Dense { h, ff: sff, gate_up: &sgu, down: &sd, limit: 10.0 };
+        let none = LowRank { r: 0, ga: &[], gb: &[], ua: &[], ub: &[], da: &[], db: &[] };
+        let dense: Vec<(Vec<f32>, Vec<f32>)> = (0..e).map(|_| ((0..2 * ff * h).map(|_| rnd.unit()).collect(), (0..h * ff).map(|_| rnd.unit()).collect())).collect();
+        let mut ads: Vec<Grads> = (0..e).map(|_| Grads { ga: (0..r * h).map(|_| rnd.unit()).collect(), gb: (0..ff * r).map(|_| rnd.unit()).collect(), ua: (0..r * h).map(|_| rnd.unit()).collect(), ub: (0..ff * r).map(|_| rnd.unit()).collect(), da: (0..r * ff).map(|_| rnd.unit()).collect(), db: (0..h * r).map(|_| rnd.unit()).collect() }).collect();
+        let mut x: Vec<f32> = (0..h).map(|_| rnd.unit()).collect();
+        let dout: Vec<f32> = (0..h).map(|_| rnd.unit()).collect();
+
+        let build = |ads: &[Grads], f: &mut dyn FnMut(&MoeRef) -> f64| -> f64 {
+            let experts: Vec<(usize, Dense, LowRank)> = (0..e).map(|i| (i, Dense { h, ff, gate_up: &dense[i].0, down: &dense[i].1, limit: 10.0 }, LowRank { r, ga: &ads[i].ga, gb: &ads[i].gb, ua: &ads[i].ua, ub: &ads[i].ub, da: &ads[i].da, db: &ads[i].db })).collect();
+            f(&MoeRef { router: &router, shared: &shared, shared_lr: &none, experts: &experts })
+        };
+        let loss = |ads: &[Grads], x: &[f32]| build(ads, &mut |m| moe_forward(m, x, false).0.iter().zip(&dout).map(|(o, g)| (*o as f64) * (*g as f64)).sum());
+        let (idx0, _, _) = route(&router, &x);
+        let (dx, grads) = {
+            let mut res = None;
+            build(&ads, &mut |m| { let (_, s) = moe_forward(m, &x, false); res = Some(moe_backward(m, &s, &dout)); 0.0 });
+            res.unwrap()
+        };
+
+        let eps = 1e-3f32;
+        let check = |analytic: f32, numeric: f32, what: &str| {
+            assert!((numeric - analytic).abs() <= 3e-3 * (1.0 + analytic.abs()), "{what}: numeric {numeric} analytic {analytic}");
+        };
+        for i in 0..h {
+            let base = x[i];
+            x[i] = base + eps;
+            let (idx1, _, _) = route(&router, &x);
+            let plus = loss(&ads, &x);
+            x[i] = base - eps;
+            let (idx2, _, _) = route(&router, &x);
+            let minus = loss(&ads, &x);
+            x[i] = base;
+            assert!(idx1 == idx0 && idx2 == idx0, "the picks must not flip under the step");
+            check(dx[i], ((plus - minus) / (2.0 * eps as f64)) as f32, &format!("dx[{i}]"));
+        }
+        for (e_, g) in &grads {
+            macro_rules! params {
+                ($($f:ident),*) => {$(
+                    for i in (0..g.$f.len()).step_by(3) {
+                        let base = ads[*e_].$f[i];
+                        ads[*e_].$f[i] = base + eps;
+                        let plus = loss(&ads, &x);
+                        ads[*e_].$f[i] = base - eps;
+                        let minus = loss(&ads, &x);
+                        ads[*e_].$f[i] = base;
+                        check(g.$f[i], ((plus - minus) / (2.0 * eps as f64)) as f32, &format!("expert {e_} {}[{i}]", stringify!($f)));
+                    }
+                )*};
+            }
+            params!(ga, gb, ua, ub, da, db);
+        }
+    }
 
     /// The analytic gradient against central differences, quantizers off, at a small shape:
     /// the loss is `⟨dout, out⟩`, so d loss / d p = the backward's gradient for p.

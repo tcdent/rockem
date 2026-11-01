@@ -21,11 +21,10 @@
 //! applied by the MoE layer, which scales `dout` before calling this.
 
 use common::q4::{self, GROUP};
-use common::swiglu::silu;
 use glm_5_3_flash::expert::{Scratch, Weights, DOWN_PARTS, DOWN_ROWS, GU_PARTS, GU_ROWS};
 use glm_5_3_flash::{D_FF, H, SWIGLU_LIMIT};
-use train_common::lowrank;
 use train_common::q4 as q4t;
+use train_common::{lowrank, swiglu};
 
 /// An expert's adapter, f32, rank `r`: `a` is `[r][k]`, `b` is `[m][r]`, for gate and up
 /// (`k = H`, `m = D_FF`) and down (`k = D_FF`, `m = H`). The same shape holds its gradient.
@@ -108,22 +107,16 @@ pub fn forward(w: &Weights, ad: &Adapter, x: &[f32], s: &mut Scratch, saved: &mu
 
 /// Per-token scratch for the backward.
 pub struct Grad {
-    pub dh: Vec<f32>, // D_FF: d out / d ĥ, then reused as d g
+    pub dh: Vec<f32>, // D_FF: d out / d ĥ
+    pub dg: Vec<f32>, // D_FF
     pub du: Vec<f32>, // D_FF
     pub t: Vec<f32>,  // r
 }
 
 impl Grad {
     pub fn new(r: usize) -> Self {
-        Grad { dh: vec![0.0; D_FF], du: vec![0.0; D_FF], t: vec![0.0; r] }
+        Grad { dh: vec![0.0; D_FF], dg: vec![0.0; D_FF], du: vec![0.0; D_FF], t: vec![0.0; r] }
     }
-}
-
-/// d silu(x) / dx.
-#[inline(always)]
-pub fn dsilu(x: f32) -> f32 {
-    let s = 1.0 / (1.0 + common::math::exp(-x));
-    s * (1.0 + x * (1.0 - s))
 }
 
 /// Given `dout` (already scaled by the token's routing weight), accumulate the adapter's
@@ -139,22 +132,17 @@ pub fn backward(w: &Weights, ad: &Adapter, saved: &Saved, dout: &[f32], gr: &mut
     }
     lowrank::up_backward(H, ad.r, &ad.db, &saved.zd, dout, &mut gr.t, &mut grads.db);
     lowrank::down_backward(ad.r, D_FF, &ad.da, &saved.hh, &gr.t, &mut grads.da, &mut gr.dh);
-    // the clamped SwiGLU: d h = d ĥ (straight through); d g, d u on the closed intervals
-    for i in 0..D_FF {
-        let (g, u) = (saved.g[i], saved.u[i]);
-        let gc = if g > SWIGLU_LIMIT { SWIGLU_LIMIT } else { g };
-        let uc = if u > SWIGLU_LIMIT { SWIGLU_LIMIT } else if u < -SWIGLU_LIMIT { -SWIGLU_LIMIT } else { u };
-        let dh = gr.dh[i];
-        gr.du[i] = if u > SWIGLU_LIMIT || u < -SWIGLU_LIMIT { 0.0 } else { dh * silu(gc) };
-        gr.dh[i] = if g > SWIGLU_LIMIT { 0.0 } else { dh * uc * dsilu(gc) };
-    }
+    // the clamped SwiGLU: d h = d ĥ (straight through); d g into `dh`'s place, d u into `du`
+    let dh = core::mem::take(&mut gr.dh);
+    swiglu::clamped_backward(D_FF, &saved.g, &saved.u, SWIGLU_LIMIT, &dh, &mut gr.dg, &mut gr.du);
+    gr.dh = dh;
     // gate and up: d x̂ = Wgᵀ·dg + Wuᵀ·du + Agᵀ·(Bgᵀ·dg) + Auᵀ·(Buᵀ·du)
     for c in 0..GU_PARTS {
         let (gw, uw, gs, us) = w.gu(c);
-        q4t::gemv_t::<H>(GU_ROWS, gw, gs, &gr.dh[c * GU_ROWS..(c + 1) * GU_ROWS], dx);
+        q4t::gemv_t::<H>(GU_ROWS, gw, gs, &gr.dg[c * GU_ROWS..(c + 1) * GU_ROWS], dx);
         q4t::gemv_t::<H>(GU_ROWS, uw, us, &gr.du[c * GU_ROWS..(c + 1) * GU_ROWS], dx);
     }
-    lowrank::up_backward(D_FF, ad.r, &ad.gb, &saved.zg, &gr.dh, &mut gr.t, &mut grads.gb);
+    lowrank::up_backward(D_FF, ad.r, &ad.gb, &saved.zg, &gr.dg, &mut gr.t, &mut grads.gb);
     lowrank::down_backward(ad.r, H, &ad.ga, &saved.xh, &gr.t, &mut grads.ga, dx);
     lowrank::up_backward(D_FF, ad.r, &ad.ub, &saved.zu, &gr.du, &mut gr.t, &mut grads.ub);
     lowrank::down_backward(ad.r, H, &ad.ua, &saved.xh, &gr.t, &mut grads.ua, dx);

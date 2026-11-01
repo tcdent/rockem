@@ -16,9 +16,12 @@
 //! ```text
 //! expert    one routed expert with its adapter: forward saving what the backward
 //!           needs, and the backward — dx and the adapter's gradients
+//! ffn       the MoE half on its normed input: the router's picked rows, the experts
+//!           and their weights, the shared expert — to d xn
 //! ```
-//! The rest of the layer (the MoE's routing weights, the shared expert, the
-//! hyper-connections, KDA, MLA, the head) follows, one op at a time.
+//! The rest of the layer (the norms and hyper-connections, KDA, MLA, the
+//! head) follows, one op at a time.
 
 pub mod expert;
+pub mod ffn;
 pub mod reference;
