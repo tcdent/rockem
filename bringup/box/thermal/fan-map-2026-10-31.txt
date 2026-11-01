@@ -1,0 +1,23 @@
+Terminated
+== pwm2: baseline (12 s)
+   s0=501 s1=581 (tenths C) fan2=885 fan3=820
+   +15s s0=497 s1=583 fan2=1409 fan3=795
+   +30s s0=488 s1=585 fan2=1400 fan3=796
+   +45s s0=478 s1=587 fan2=1409 fan3=773
+   +60s s0=472 s1=590 fan2=1409 fan3=747
+   +75s s0=466 s1=592 fan2=1397 fan3=723
+   +90s s0=462 s1=596 fan2=1394 fan3=725
+   end: s0=460 s1=598  drop s0=41 s1=-17 tenths; handed back (enable=2 start=95)
+   => pwm2 cools SOCKET 0
+   settling 60 s
+== pwm3: baseline (12 s)
+   s0=483 s1=602 (tenths C) fan2=836 fan3=773
+   +15s s0=495 s1=597 fan2=860 fan3=1310
+   +30s s0=498 s1=587 fan2=858 fan3=1308
+   +45s s0=501 s1=578 fan2=883 fan3=1313
+   +60s s0=505 s1=572 fan2=885 fan3=1313
+   +75s s0=507 s1=567 fan2=883 fan3=1313
+   +90s s0=508 s1=563 fan2=886 fan3=1308
+   end: s0=509 s1=560  drop s0=-26 s1=42 tenths; handed back (enable=2 start=95)
+   => pwm3 cools SOCKET 1
+   settling 60 s

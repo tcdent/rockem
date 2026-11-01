@@ -57,11 +57,15 @@ impl CpuFans {
         ok
     }
 
-    pub fn set(&mut self, duty: u8) {
+    /// One duty a cooler: index 0 is pwm2 = CPU_FAN1 = socket 0, index 1 is pwm3 = CPU_FAN2 = socket 1
+    /// (measured 2026-10-31, bringup/box/thermal/fan-map.sh: each channel at 220 for 90 s dropped its
+    /// own socket's die by 4 °C while the other rose).
+    pub fn set(&mut self, duties: [u8; 2]) {
         if !self.taken {
             return;
         }
         for (i, &c) in self.channels.iter().enumerate() {
+            let duty = duties[i];
             if self.last[i].map_or(true, |l| (l as i16 - duty as i16).abs() >= 2) {
                 if write(&self.dir.join(format!("pwm{c}")), &duty.to_string()) {
                     self.last[i] = Some(duty);

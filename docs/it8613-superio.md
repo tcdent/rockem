@@ -29,8 +29,8 @@ rows 51–82), which names the channels:
 
 | Channel | Ctrl / duty / curve base | Live curve (off / start / full °C, start PWM, slope) | BIOS knob block | Tachometer |
 |---|---|---|---|---|
-| pwm2 | 0x16 / 0x6B / 0x68 | 35 / 40 / 80, 95, 4 PWM per °C | CPU_FAN1 or SYS_FAN | fan2 (0x0E/0x19) 0x02E5 → **~910 rpm** (995 at first boot) |
-| pwm3 | 0x17 / 0x73 / 0x70 | same | the other of the two | fan3 (0x0F/0x1A) 0x0320 → **~840 rpm** (915 at first boot) |
+| pwm2 | 0x16 / 0x6B / 0x68 | 35 / 40 / 80, 95, 4 PWM per °C | **CPU_FAN1 = socket 0's cooler** (measured 2026-10-31, `fan-map.sh`) | fan2 (0x0E/0x19) 0x02E5 → **~910 rpm** (995 at first boot) |
+| pwm3 | 0x17 / 0x73 / 0x70 | same | **CPU_FAN2 = socket 1's cooler** (measured) | fan3 (0x0F/0x1A) 0x0320 → **~840 rpm** (915 at first boot) |
 | pwm4 | 0x1E / 0x7B / 0x78 | 16 / 32 / 127, 127, 0.5 PWM per °C | Fan 3 or Fan 4 | fan4 (0x80/0x81) reads 0, tach disabled (0x0C bit 4 clear) |
 | pwm5 | 0x1F / 0xA3 / 0xA0 | same | the other | fan5 (0x82/0x83) reads 0, tach disabled (0x0C bit 5 clear) |
 | pwm1 | 0x15 / 0x63 / 0x60 | factory defaults | — | absent on this chip |

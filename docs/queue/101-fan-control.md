@@ -145,6 +145,16 @@ fans are already turning and 30 when the PMFW has them stopped; the dies fall 9�
 doing: the fan starts from nothing a minute into the pass. `fan_zero_rpm_enable=0` with a floor is the first card
 setting the daemon should hold.
 
+**Headers mapped (17:55, `bringup/box/thermal/fan-map.sh`, box idle):** pwm2 at duty 220 for 90 s took socket 0's die
+from 50.1 to 46.0 °C while socket 1's rose 1.7; pwm3 took socket 1's from 60.2 to 56.0 while socket 0's rose 2.6. So
+**pwm2 = CPU_FAN1 = socket 0, pwm3 = CPU_FAN2 = socket 1**, and the daemon drives each from its own zone (aa6dc0e+).
+
+**Pass 4, `mixed8k-10min`, 17:59–18:09:** 24 requests of 8k + 256, 615 s, 195k prompt tokens. Nothing plateaued: every
+series peaked at the window's end (t_peak 8.4–9.9 min). Tctl 67.1 / **80.2**, VRs **76 / 79**, junctions 78 / 82,
+thermistor 44, BMC inlet 58; rises of 17–26 °C; first-minute falls 10 (dies), 8 (VRs), 4–7 (cards); τ 4.5–9 min as the
+slow mass dominated. At 50 % chassis a longer pass keeps climbing: the VRs' 79 after ten minutes points past 85 by
+thirty. **A 20–30 min pass waits for either the chassis fans up or control mode on**; the guard would stop it at VR 90.
+
 What it says, and it bears on the goal directly:
 
 - **The dies cool in well under a minute no matter what the fans do.** Socket 0's Tctl has a time constant of ~36 s

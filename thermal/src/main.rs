@@ -125,10 +125,10 @@ fn main() {
                 "loaded" => st.loaded, "would" => st.duty, "actual" => opt(actual), "pred_err" => st.pred_err, "mae" => z.mean_abs_err()
             });
         }
-        // the coolers share one duty until the headers are mapped to sockets: the hotter zone's
+        // each cooler from its own socket's zone: pwm2 = socket 0, pwm3 = socket 1 (fan-map.sh)
         if let Some(c) = cpu.as_mut() {
-            if let Some(d) = duties[0].into_iter().chain(duties[1]).fold(None, |m: Option<f64>, d| Some(m.map_or(d, |m| m.max(d)))) {
-                c.set(d.round() as u8);
+            if let (Some(d0), Some(d1)) = (duties[0], duties[1]) {
+                c.set([d0.round() as u8, d1.round() as u8]);
             }
         }
         for (i, c) in cards.iter_mut().enumerate() {
