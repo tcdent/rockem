@@ -63,6 +63,29 @@ with a wider interval — INT8 rounding flips, discontinuities the straight-thro
 see, averaged out over a longer step. A per-parameter check is hopeless here: one adapter entry's
 gradient is ~1e-6, below the noise.
 
+## Measured: a round's time, one core
+
+`cargo run --release --example round_rate` — the random five-layer model (`fixtures`), 16 tokens,
+targets on half, rank 8, one core of the dev box (Zen 1), 2026-11-02:
+
+| per layer kind, ms a token | forward | backward |
+|---|---|---|
+| KDA layer | 27 | 37 |
+| MLA layer (16 positions) | 71 | 73 |
+| MoE half (8 experts + shared) | 30 | 69 |
+| dense FFN | 98 | — |
+| hc half | 0.07 | 0.26 |
+| head, full vocabulary, per target position | 112 | 140 |
+
+Extrapolated to the 45 layers: feed forward ≈ 3.3 s, recompute ≈ 3.3 s, backward ≈ 5.0 s —
+**≈ 11.7 s a session token on one core.** Every op here streams its weights once *per token*
+(the inference CPU path is a one-token path; the node's multi-token forms are the cards' prefill
+kernels), so the round is bound by weight traffic: ≈ 18 GB of weights a token a pass (KDA ≈ 9.4,
+experts 4.2, head 1.3, MLA 1.5, shared 1.0, dense FFN 0.5), three passes, ≈ 54 GB a token — at
+metatron's ~300 GB/s that is ≈ 180 ms a token however many cores run it. The lever is the one
+prefill took: **multi-token forms**, every weight read once a run and applied to the run's tokens,
+after which the round is compute-bound (~30 GFLOP a token over the three passes) and threads pay.
+
 ## Measured
 
 `cargo run --release --example expert_rate` — one expert, one core, cache-hot (one expert is

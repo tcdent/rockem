@@ -175,7 +175,7 @@ impl<'a> Round<'a> {
 mod tests {
     use super::*;
     use crate::expert::tests::random_adapter;
-    use crate::model::tests::{Bufs, Experts};
+    use crate::fixtures::{Bufs, Experts};
     use crate::testing::unit;
     use common::testing::Rng;
     use glm_5_3_flash::{FIRST_K_DENSE_REPLACE, TOP_K};

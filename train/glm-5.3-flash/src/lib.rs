@@ -50,5 +50,6 @@ pub mod model;
 pub mod optim;
 pub mod reference;
 pub mod round;
-#[cfg(test)]
+/// Test and bench support: fixtures without a bundle, the comparison helpers.
 pub mod testing;
+pub mod fixtures;
