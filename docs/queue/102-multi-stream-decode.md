@@ -50,6 +50,27 @@ Projection, if N sequences batch as one sequence's tokens do (the condition is �
 The expert phase below its line would move the four-stream row toward ~150 ms a step (~105 tok/s). These are
 arithmetic; the first measurement is the thing to build (§4).
 
+**Measured 2026-11-02 — the many-token side (branch `102-stepwidth`: main's kernels, the prompt fed in steps of n;
+widths past 4 take the prefill-shaped paths):**
+
+| tokens a step (path) | kda | mla | experts | head + draft | step | ms a token |
+|---|---|---|---|---|---|---|
+| 4 (decode-shaped, same runs) | 19.8 | 5.3 | 34.0 | 11.5 | 72.6 | 18.1 |
+| 8 (prefill-shaped) | 85.0 | 26.2 | 83.3 | 13.9 | 209.3 | 26.2 |
+| 16 (prefill-shaped) | 107.4 | 33.3 | 139.2 | 16.7 | 297.9 | 18.6 |
+| 32 (prefill-shaped) | 122.8 | 38.5 | 213.8 | 20.8 | 397.2 | 12.4 |
+
+The prefill-shaped path is **step ≈ 146 ms + 7.8 ms a token**: a lower marginal cost than the decode path's 10.3
+(its grouped expert phase 5.4 a token at these widths — still far from the 1.35 at 512-token steps, where the
+union saturates) but a fixed cost of ~146 against 27, because its KDA and MLA stages are built for 512-token chunks
+(KDA 85 ms at 8 tokens against 20 on the decode path). The lines cross near **48 tokens a step**: below it the
+decode-shaped kernels win — for 2–4 streams (8–16 tokens) by about 2× (109–192 ms projected against 209–298
+measured). So the multi-stream path is the decode-shaped kernels widened past `SPEC_TOKENS`, not the prefill
+paths. The widened build (branch `102-saturation`, `SPEC_TOKENS` 16) hangs the GPU in `hc_pre`'s first launch of a
+16-token step with no n-bound visible in the kernel's structure — the one open engineering item before the decode
+side of this table can be measured past 4; it is a lab-GPU task with the stats object (a bench hang on the serving
+card resets the box). The 18k cold prompt at 32-token steps took 228 s (~400 ms a step).
+
 ## 2. What assumes one sequence (the inventory, 2026-11-02)
 
 The stack serves one sequence at a time. Steps are multi-token, but every multi-token path assumes the n tokens
@@ -111,10 +132,9 @@ prefill keeps its own path and decode slots pause — a latency policy, not a ke
 
 ## 4. First steps (the past-shaped part)
 
-1. **The measurement before the design:** the step's fixed/marginal split per component under N slots can be
-   measured before any state is per-slot — a bench that runs the existing kernels at n = 8, 12, 16 tokens of ONE
-   sequence through the decode paths (mode forced to decode, the `SPEC_TOKENS` buffers widened) says whether the
-   fixed 27 holds past 4 and where the expert union saturates. One boot, the curve of §1 extended.
+1. **The measurement before the design:** the many-token side is measured (§1); the decode side past 4 waits on the
+   `hc_pre` hang of the widened build — fix it on the lab GPU (`forward-glm --gpu --step 16` with the `kernels-sat16`
+   object and its stats twin), then one boot of `102-saturation` at 8 / 12 / 16 gives the fixed 27's behaviour past 4.
 2. **The seed.** A per-request seed (derived from the request, so the decode fingerprint stays deterministic) is
    needed before two sequences ever run together; it is a one-day change with its own gate.
 3. **Stage 1** as in §3, then **stage 2**, each against §1.
