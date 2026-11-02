@@ -52,7 +52,26 @@ impl States {
             mla: w.layers.iter().map(|l| matches!(l.attn, Attn::Mla(_)).then(|| mla::State::new(max_ctx))).collect(),
         }
     }
+    /// The KDA states as they stand — what a run's recompute needs to start from. The MLA cache
+    /// is not part of it: a recompute rewrites the same rows with the same values.
+    pub fn snapshot(&self) -> KdaSnapshot {
+        KdaSnapshot(self.kda.clone())
+    }
+    pub fn restore(&mut self, snap: &KdaSnapshot) {
+        self.kda.clone_from(&snap.0);
+    }
+    /// A new sequence: every state at zero (the position before the first token).
+    pub fn reset(&mut self) {
+        for st in self.kda.iter_mut().flatten() {
+            st.0.iter_mut().for_each(|v| *v = 0.0);
+            st.1.iter_mut().for_each(|v| *v = 0.0);
+        }
+    }
 }
+
+/// The KDA states at a run boundary (`[layer] (window, mem)`), ~4.1 MB a KDA layer.
+#[derive(Clone)]
+pub struct KdaSnapshot(pub Vec<Option<(Vec<f32>, Vec<f32>)>>);
 
 /// The gradient flowing from a run into the run before it.
 pub struct Carry {
@@ -111,13 +130,17 @@ pub struct RunSaved {
     pub pos0: usize,
     pub n: usize,
     pub layers: Vec<LayerSaved>,
+    /// The run positions whose logits were taken, and the head's saved state for each.
+    pub logits_at: Vec<usize>,
     pub head: Vec<head::Saved>,
 }
 
-/// `tokens` at `pos0..`: the logits of every position (`[n][vocab]`, the first `vocab` rows of
-/// the head), the states advanced, everything the backward needs in `RunSaved`.
+/// `tokens` at `pos0..`: the states advanced, everything the backward needs in `RunSaved`, and
+/// the logits (the first `vocab` rows of the head) at the run positions in `logits_at`, in that
+/// order, into `logits: [logits_at.len()][vocab]` — the head is the one op that streams 1.27 GB a
+/// position, so it runs only where a loss will be taken.
 #[allow(clippy::too_many_arguments)]
-pub fn forward(w: &Weights, stream: &Stream, ad: &Adapters, tokens: &[u32], pos0: usize, vocab: usize, st: &mut States, s: &mut Scratch, logits: &mut [f32]) -> RunSaved {
+pub fn forward(w: &Weights, stream: &Stream, ad: &Adapters, tokens: &[u32], pos0: usize, vocab: usize, logits_at: &[usize], st: &mut States, s: &mut Scratch, logits: &mut [f32]) -> RunSaved {
     let n = tokens.len();
     let r = ad.rank();
     // the embedding into every stream
@@ -188,13 +211,14 @@ pub fn forward(w: &Weights, stream: &Stream, ad: &Adapters, tokens: &[u32], pos0
         }
         layers.push(LayerSaved { s_attn, hc_attn, x_attn, y_attn, attn, s_ffn, hc_ffn, x_ffn, y_ffn: y.clone(), ffn: ffn_saved });
     }
-    let mut hs = Vec::with_capacity(n);
-    for t in 0..n {
+    let mut hs = Vec::with_capacity(logits_at.len());
+    for (i, &t) in logits_at.iter().enumerate() {
+        debug_assert!(t < n);
         let mut saved = head::Saved::new();
-        head::forward(w.norm, w.lm_head, vocab, &streams[t * HC * H..(t + 1) * HC * H], &mut saved, &mut logits[t * vocab..(t + 1) * vocab]);
+        head::forward(w.norm, w.lm_head, vocab, &streams[t * HC * H..(t + 1) * HC * H], &mut saved, &mut logits[i * vocab..(i + 1) * vocab]);
         hs.push(saved);
     }
-    RunSaved { pos0, n, layers, head: hs }
+    RunSaved { pos0, n, layers, logits_at: logits_at.to_vec(), head: hs }
 }
 
 /// The first layer whose FFN is a MoE: the backward stops at its input.
@@ -202,14 +226,15 @@ fn first_moe(w: &Weights) -> usize {
     w.layers.iter().position(|l| matches!(l.ffn, Ffn::Moe(_))).unwrap_or(w.layers.len())
 }
 
-/// Given `dlogits: [n][vocab]`, accumulate the adapters' gradients and the carry; the run after
-/// this one (if any) must have been processed first, its carry in `carry`.
+/// Given `dlogits: [logits_at.len()][vocab]` (one row per position the forward took logits at),
+/// accumulate the adapters' gradients and the carry; the run after this one (if any) must have
+/// been processed first, its carry in `carry`.
 #[allow(clippy::too_many_arguments)]
 pub fn backward(w: &Weights, stream: &Stream, ad: &Adapters, sv: &RunSaved, st: &States, vocab: usize, dlogits: &[f32], s: &mut Scratch, grads: &mut Adapters, carry: &mut Carry) {
     let n = sv.n;
     let mut dstreams = vec![0f32; n * HC * H];
-    for t in 0..n {
-        head::backward(w.norm, w.lm_head, vocab, &sv.head[t], &dlogits[t * vocab..(t + 1) * vocab], &mut dstreams[t * HC * H..(t + 1) * HC * H]);
+    for (i, &t) in sv.logits_at.iter().enumerate() {
+        head::backward(w.norm, w.lm_head, vocab, &sv.head[i], &dlogits[i * vocab..(i + 1) * vocab], &mut dstreams[t * HC * H..(t + 1) * HC * H]);
     }
     let stop = first_moe(w);
     let mut dy = vec![0f32; n * H];
@@ -272,7 +297,7 @@ pub fn backward(w: &Weights, stream: &Stream, ad: &Adapters, sv: &RunSaved, st: 
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::expert::tests::random_adapter;
     use crate::loss::{forward_kl_topk, Teacher};
@@ -286,7 +311,7 @@ mod tests {
 
     /// Random weights in the bundle's formats for one of each layer kind, held so the `Weights`
     /// can borrow them; the dense layers share one KDA and one FFN so the test stays in memory.
-    struct Bufs {
+    pub struct Bufs {
         embed: Vec<u16>,
         norm: Vec<f32>,
         lm_head: Vec<u16>,
@@ -303,7 +328,7 @@ mod tests {
     }
 
     impl Bufs {
-        fn new(vocab: usize, rnd: &mut Rng) -> Self {
+        pub fn new(vocab: usize, rnd: &mut Rng) -> Self {
             let fp = |m, k, sc, rnd: &mut Rng| fp8_record(m, k, sc, rnd);
             Bufs {
                 embed: bf(vocab * H, 1.0, rnd),
@@ -340,7 +365,7 @@ mod tests {
             Ffn::Moe(Moe { router: &self.router, bias: &self.bias, shared_gate: self.shared.0.view(), shared_up: self.shared.1.view(), shared_down: self.shared.2.view() })
         }
         /// Layers 0..FIRST_K_DENSE_REPLACE dense over KDA (one weight set), then an MLA MoE layer and a KDA MoE layer.
-        fn weights(&self) -> Weights<'_> {
+        pub fn weights(&self) -> Weights<'_> {
             let mut layers = Vec::new();
             for _ in 0..FIRST_K_DENSE_REPLACE {
                 layers.push(Layer { input_ln: &self.ln, post_ln: &self.ln, hc_attn: self.hc(), hc_ffn: self.hc(), attn: self.kda(), ffn: self.dense() });
@@ -353,12 +378,12 @@ mod tests {
 
     /// A stream holding experts `0..TOP_K` of the two MoE layers in one block: layer 3's in its
     /// own slots, layer 4's in slots `TOP_K..2·TOP_K` of the same block, the table pointing there.
-    struct Experts {
+    pub struct Experts {
         block: Vec<u32>,
         addr: Vec<u64>,
     }
     impl Experts {
-        fn new(rnd: &mut Rng) -> Self {
+        pub fn new(rnd: &mut Rng) -> Self {
             let mut block = vec![0u32; layout::XBLOCK_BYTES / 4];
             let bytes: &mut [u8] = unsafe { core::slice::from_raw_parts_mut(block.as_mut_ptr() as *mut u8, layout::XBLOCK_BYTES) };
             let mut addr = vec![0u64; layout::MOE_LAYERS * E * ITEMS];
@@ -382,7 +407,7 @@ mod tests {
             let _ = (GU_ITEMS, DOWN_ITEMS);
             Experts { block, addr }
         }
-        fn stream(&self) -> Stream<'_> {
+        pub fn stream(&self) -> Stream<'_> {
             let bytes: &[u8] = unsafe { core::slice::from_raw_parts(self.block.as_ptr() as *const u8, layout::XBLOCK_BYTES) };
             Stream::placed(bytes, self.addr.clone(), vec![0; layout::MOE_LAYERS * E * ITEMS], Vec::new())
         }
@@ -416,7 +441,8 @@ mod tests {
             let mut st = States::new(&w, max_ctx);
             let mut s = Scratch::new(r, max_ctx);
             let mut logits = vec![0f32; n * vocab];
-            let sv = forward(&w, &stream, ad, &tokens, 0, vocab, &mut st, &mut s, &mut logits);
+            let all: Vec<usize> = (0..n).collect();
+            let sv = forward(&w, &stream, ad, &tokens, 0, vocab, &all, &mut st, &mut s, &mut logits);
             let mut dlogits = vec![0f32; n * vocab];
             let mut loss = 0f64;
             for t in 0..n {

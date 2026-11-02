@@ -32,6 +32,11 @@
 //! model     the layers over a run: the embedding to the logits forward, the logits'
 //!           gradient down to the first MoE layer's input backward; runs chain through
 //!           the states and a carry
+//! optim     Adam on an expert's adapter under the per-expert movement cap; the distance
+//!           from the base as the drift instrument
+//! round     a training round: sessions fed as ids with the teacher's targets, forward in
+//!           runs with the states snapshotted at each boundary, the backward recomputing
+//!           each run from its snapshot in reverse; a step per session; the report
 //! ```
 
 pub mod expert;
@@ -42,6 +47,8 @@ pub mod kda;
 pub mod loss;
 pub mod mla;
 pub mod model;
+pub mod optim;
 pub mod reference;
+pub mod round;
 #[cfg(test)]
 pub mod testing;
