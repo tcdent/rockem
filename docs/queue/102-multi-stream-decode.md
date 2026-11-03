@@ -132,10 +132,28 @@ launch: more workgroups, the same latency — the fixed 27 stays fixed); `ix_sel
 visible count a token; the expert phase unions across slots as it unions across tokens today; `pred_step`'s union
 plan likewise. Mode becomes explicit (decode vs prefill) instead of `n > SPEC_TOKENS`.
 
-**Two stages, each measurable.** Stage 1: N sessions resident and stepped round-robin — no kernel change, no
-throughput gain, but the slot machinery (state, store, draft, seed, wire, API) is built and its cost measured. Stage
-2: the batched step — the kernels take (slot, position) a token and N slots' steps become one. The step by width
-(§1) is the reference each stage is read against; the gain of stage 2 is the fixed 27 paid once instead of N times.
+**Two stages, each measurable (refined 2026-11-02 after reading how state reaches the launches).** The
+per-sequence state on the cards is node-side objects whose pointers are launch arguments — `parts: Vec<Part>` a
+layer (the KDA state and its ring), `mlas[l]` (the latent and pool mirrors), `mtp` (the draft cache) — and the
+positions reach the kernels as arguments keyed by absolute position (`lat_owner(p)`, `ix_select`'s `pos`, `visible
+= (pos + n) / KPOOL`). So:
+
+*Stage 1 — a slot a step.* A slot owns its `Part`s, its draft cache, its host `LayerState`s and store region, its
+seed, and a **range of the one latent/pool mirror** `[base, base + budget)` sized at admission from the connection's
+`positions` (the header field that exists; the sum over live slots ≤ `max_ctx`, 1M shared). A step runs one slot's
+tokens: every launch takes that slot's pointers and its positions offset by `base` — the kernels change only where
+position 0 is assumed to be the mirror's start (the indexer scores pools from `base / KPOOL`, not 0; `KEEP`'s dense
+region likewise). The node accepts N connections and interleaves their steps round-robin; the API hands out N
+tokens a node. No throughput gain; the slot machinery built, every slot's state resident, no context swapping
+between steps, measured against §1's one-stream numbers (a slot's step must cost what a sequence's step costs).
+Round-robin without resident per-slot state is not an option: swapping the KDA state and the mirror between steps
+is seconds, not microseconds.
+
+*Stage 2 — slots in a step.* The step carries tokens of several slots: a (slot, position) a token, the KDA step over
+N states in one launch, the attend and select with a base a token, the expert phase's union over the step's tokens
+as today, the prefetch plan grown to N × 24. The fixed 27 paid once — the gain. Mode (decode vs prefill) explicit
+instead of `n > SPEC_TOKENS`; the `SPEC_TOKENS`-sized buffers sized by N × 4; the widened decode kernels (the
+`hc_pre` hang) are this stage's prerequisite.
 
 **Prefill beside decode.** A prompt's prefill is seconds at 512-token steps; in a batched step the other slots'
 decode would wait for it unless prefill runs in small steps interleaved (the 32-token launch width exists), or
