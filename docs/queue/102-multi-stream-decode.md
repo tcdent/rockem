@@ -120,53 +120,65 @@ are single (`:872, :880, :2157`); the resident loader paces one load a decode st
 **API.** `api/rockem/scheduler.py:20` one token a node; `core.py:156` holds the node for the whole request;
 `wire.py:101` one sequence a connection; `replies` (`core.py:97`) remembers the single transcript.
 
-## 3. The shape that falls out (candidates, not decisions)
+## 3. The batched step (the design; tcdent 2026-11-02: kernel changes from the start, no interim)
 
-**Slots.** N resident sequences, each a slot: its own KDA state (host `LayerState` and card `Part` ×N — ~150 MB a
-slot of host state at the snapshot size), its own draft cache, its own store region and session fields, its own
-seed. The latent and pool mirrors are the sizing question: a mirror a slot at 1M is 12.9 GB a card a slot
-([[one-million-context-target]] is a hard constraint) — the mirror stays one and a slot owns a position range of it
-(the 1M shared across the slots, or a slot's budget declared at admission), so `lat_owner`/`ix_select` take a
-per-token base. **A token carries (slot, position).** `kda_step` takes a state pointer a token (N states in one
-launch: more workgroups, the same latency — the fixed 27 stays fixed); `ix_select`/`mla_attend` a base and a
-visible count a token; the expert phase unions across slots as it unions across tokens today; `pred_step`'s union
-plan likewise. Mode becomes explicit (decode vs prefill) instead of `n > SPEC_TOKENS`.
+> We're going to do kernel changes. We want to support this as efficiently as possible, out of the gate … I'm not
+> trying to get multiple requests processing. I'm trying to get parallel token generation — tcdent, 2026-11-02
 
-**Two stages, each measurable (refined 2026-11-02 after reading how state reaches the launches).** The
-per-sequence state on the cards is node-side objects whose pointers are launch arguments — `parts: Vec<Part>` a
-layer (the KDA state and its ring), `mlas[l]` (the latent and pool mirrors), `mtp` (the draft cache) — and the
-positions reach the kernels as arguments keyed by absolute position (`lat_owner(p)`, `ix_select`'s `pos`, `visible
-= (pos + n) / KPOOL`). So:
+**A token is (slot, position).** A step carries the ready tokens of up to N = 4 slots, each contributing its verify
+width 1–4 (the token and its accepted drafts) — n ≤ 16. The step's per-token work is slot-agnostic and already
+multi-token: the residual streams and `x` are rows, `hc_pre`/`hc_post`, the projections, the head's logits rows, the
+expert phase's union over the step's tokens (`plan_run` sorts (token, pick) by expert and streams each expert once).
+What is per sequence takes the slot:
 
-*Stage 1 — a slot a step.* A slot owns its `Part`s, its draft cache, its host `LayerState`s and store region, its
-seed, and a **range of the one latent/pool mirror** `[base, base + budget)` sized at admission from the connection's
-`positions` (the header field that exists; the sum over live slots ≤ `max_ctx`, 1M shared). A step runs one slot's
-tokens: every launch takes that slot's pointers and its positions offset by `base` — the kernels change only where
-position 0 is assumed to be the mirror's start (the indexer scores pools from `base / KPOOL`, not 0; `KEEP`'s dense
-region likewise). The node accepts N connections and interleaves their steps round-robin; the API hands out N
-tokens a node. No throughput gain; the slot machinery built, every slot's state resident, no context swapping
-between steps, measured against §1's one-stream numbers (a slot's step must cost what a sequence's step costs).
-Round-robin without resident per-slot state is not an option: swapping the KDA state and the mirror between steps
-is seconds, not microseconds.
+- **KDA state.** One state a slot (`Part` × N a layer: window, mem, the speculation ring). `kda_step`'s grid becomes
+  heads × slots; a (head, slot) workgroup walks its slot's tokens in order (the recurrence is per slot), the slots in
+  parallel — the same latency as one slot's launch, which is the fixed cost paid once. The rewind is per slot.
+- **The latent and pool mirror, paged.** One mirror (1M positions, the hard constraint) in pages of P positions
+  (~4k: 52 MB of latents, 32 pool keys); a slot owns a page table (≤ 256 entries at 1M), grown a page at a time, and
+  a position resolves to a mirror row through it. The attend already gathers selected latents by index: the
+  indirection is one table read a selected latent. The indexer scores a token against its own slot's pool pages
+  (`ix_score_w` takes a (slot, visible) a token instead of one buffer and one `visible` for the step); `ix_select`
+  takes (slot, position) a token; `lat_upload` writes through the table; `lat_owner` (which card holds a row) is a
+  property of the page. No fragmentation, no compaction, growth without a declared budget, and the NVMe/DRAM tiers
+  later evict and restore pages rather than ranges. The dense region (`KEEP`) is per slot.
+- **The draft.** One draft cache a slot (the MTP layer's MLA, paged the same way); the step drafts every slot's last
+  token (one draft a slot a step).
+- **The sampler.** A seed a slot derived from the request's ids (deterministic for identical requests); draws and
+  the rejection verify per slot at its positions.
+- **The predictor and the prefetch.** The union plan over the step's tokens as today; `PLAN` grows with N (N × 24,
+  or ranked by multiplicity), since four slots' 16 tokens pick ~105 distinct experts; the learned state stays shared.
+- **Mode.** Decode vs prefill explicit in the launch, not `n > SPEC_TOKENS`; the buffers sized by `SPEC_TOKENS`
+  (`mpart`, `pred_keys`, `pred_aux`, the select bound, `LEARN_LDS`) sized by N × 4 = 16 — the widened build on
+  `102-saturation` is this, and its `hc_pre` hang at 16 tokens is the first kernel task.
+- **The node.** N connections, one sequence each (the wire unchanged; the header's `positions` is the slot's declared
+  context, admission denies what the pages cannot hold); a `Slot` holds what `Session` holds today; the step loop
+  gathers every slot with ready input, runs one batched step, and distributes logits, draws and drafts back by slot.
+  The API hands out N tokens a node.
 
-*Stage 2 — slots in a step.* The step carries tokens of several slots: a (slot, position) a token, the KDA step over
-N states in one launch, the attend and select with a base a token, the expert phase's union over the step's tokens
-as today, the prefetch plan grown to N × 24. The fixed 27 paid once — the gain. Mode (decode vs prefill) explicit
-instead of `n > SPEC_TOKENS`; the `SPEC_TOKENS`-sized buffers sized by N × 4; the widened decode kernels (the
-`hc_pre` hang) are this stage's prerequisite.
+**The gate that makes it safe to build:** a slot's arithmetic must not depend on the other tokens in the step —
+true of every per-token kernel, of the KDA step per slot, of the attend per token, and of the expert phase (the
+union streams the same weights; a token's dot products are its own) — so two identical requests on two slots must
+produce the decode fingerprint of one request alone, bit for bit. That is the correctness gate of the whole design,
+beside SCORE and `kernel_diff` on the production kernels.
 
-**Prefill beside decode.** A prompt's prefill is seconds at 512-token steps; in a batched step the other slots'
-decode would wait for it unless prefill runs in small steps interleaved (the 32-token launch width exists), or
-prefill keeps its own path and decode slots pause — a latency policy, not a kernel question.
+**Prefill beside decode — the one fork left.** A new slot's prompt runs in prefill-shaped steps (1024 tokens, ~2 s a
+step at 18k; a 128-token chunk is 1.2 s at the sweep's 9.1 ms a token). In one queue those steps stall the other
+slots' decode by their length. The honest options: (a) prefill chunks interleaved with decode steps, the chunk size
+bounding the stall (64–128 tokens: 0.6–1.2 s a chunk, a 17–25 % prefill penalty from the sweep); (b) the second AQL
+queue, so a prefill chunk's card work overlaps the decode step's — the same structural lever the analog pointed at,
+and the only one that removes the stall rather than bounding it; (c) prefill alone, decode paused (the simplest, the
+worst latency). The design above does not depend on the choice; the kernels are the same.
 
 ## 4. First steps (the past-shaped part)
 
-1. **The measurement before the design:** the many-token side is measured (§1); the decode side past 4 waits on the
-   `hc_pre` hang of the widened build — fix it on the lab GPU (`forward-glm --gpu --step 16` with the `kernels-sat16`
-   object and its stats twin), then one boot of `102-saturation` at 8 / 12 / 16 gives the fixed 27's behaviour past 4.
-2. **The seed.** A per-request seed (derived from the request, so the decode fingerprint stays deterministic) is
-   needed before two sequences ever run together; it is a one-day change with its own gate.
-3. **Stage 1** as in §3, then **stage 2**, each against §1.
+1. **The widened decode kernels (`SPEC_TOKENS` 16) and the `hc_pre` hang** — the prerequisite for everything; bisected on
+   the box in a bench window (there is no other card), then the decode-side curve at 8 / 12 / 16 of one slot.
+2. **The paged mirror and (slot, position) a token** through the indexer, the select, the attend, the uploads, and the
+   KDA step over N states — kernel by kernel, each gated bit-identical at N = 1 against production.
+3. **The node's slots, the batched step loop, the per-slot seed, the API's N tokens** — gated by the two-identical-
+   requests fingerprint.
+4. **The prefill policy** (the fork above), then the measurements of §1's projection against the built thing.
 
 ## 5. Forks for tcdent
 
