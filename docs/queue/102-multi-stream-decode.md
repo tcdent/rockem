@@ -1,7 +1,8 @@
 # 102 — Multi-stream decode: several conversations a step
 
-**Status:** Pitched (2026-11-02). Nothing built; the measurement that bounds the gain exists (the production step by
-width), the inventory of what assumes one sequence is below, the forks are tcdent's.
+**Status:** Decided (tcdent, 2026-11-02): **four streams** as the design constant, two first to prove the slot machinery;
+additional TCP connections, one sequence each, multiplexed by the node into slots. Nothing built; both sides of the
+step-cost curve measured (§1), the inventory of what assumes one sequence is §2.
 **Area:** the node's session model, the step, the KDA/MLA state, the wire and the API's scheduler
 **Gain (arithmetic from the production step at 18k):** a step is 27 ms + 10.3 ms a token today; batching N sequences
 into one step the way one sequence's 1–4 speculative tokens already batch gives ~73 tok/s aggregate at two streams
@@ -70,6 +71,16 @@ paths. The widened build (branch `102-saturation`, `SPEC_TOKENS` 16) hangs the G
 16-token step with no n-bound visible in the kernel's structure — the one open engineering item before the decode
 side of this table can be measured past 4; it is a lab-GPU task with the stats object (a bench hang on the serving
 card resets the box). The 18k cold prompt at 32-token steps took 228 s (~400 ms a step).
+
+The prefill side of this curve was swept on 2026-10-17 (queue 021 / [[batched-prefill]]: 128-token steps 9.1 ms a
+prompt token, 256 → 8.0, 512 → 7.8, then `STEP` 1024; 2048 quantified and shelved as 075) — the 8/16/32 rows above
+are its low end, not a new prefill finding. **The experts across streams** (tcdent, 2026-11-02): every stream adds
+its own experts' bytes — the line above assumes no overlap between streams' picks (8 of 288 an token: ~9 % overlap at
+8 tokens, ~33 % at 32) — and the prefetch plan is `PLAN` = 24 entries a layer a step: four streams' 16 tokens pick
+~105 distinct experts, so a 24-entry plan covers a smaller share than today's at 4 tokens and the expert phase runs
+slower per token than the one-stream line until the plan grows with N (per slot, or N× the entries). The aggregate
+ceiling of the line is ~97 tok/s (1000 / 10.3); only the union's saturation lifts it, which needs ≥ 32 tokens a
+step — a throughput regime distinct from the interactive one this document targets.
 
 ## 2. What assumes one sequence (the inventory, 2026-11-02)
 
@@ -141,7 +152,7 @@ prefill keeps its own path and decode slots pause — a latency policy, not a ke
 
 ## 5. Forks for tcdent
 
-- **N**: design for 2, 3 or 4 streams — the slot count sizes the states and the mirrors' split.
+- **N**: decided — four as the constant, two shipped first (tcdent, 2026-11-02).
 - **Context a slot**: the 1M shared across slots, or a per-slot budget declared at admission (the API knows the
   conversation's length).
 - **Latency a stream**: four streams at ~190 ms a step is ~70 ms an emitted token a stream (today 25 at width 4);
