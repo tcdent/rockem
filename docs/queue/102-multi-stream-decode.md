@@ -162,13 +162,30 @@ union streams the same weights; a token's dot products are its own) — so two i
 produce the decode fingerprint of one request alone, bit for bit. That is the correctness gate of the whole design,
 beside SCORE and `kernel_diff` on the production kernels.
 
-**Prefill beside decode — the one fork left.** A new slot's prompt runs in prefill-shaped steps (1024 tokens, ~2 s a
-step at 18k; a 128-token chunk is 1.2 s at the sweep's 9.1 ms a token). In one queue those steps stall the other
-slots' decode by their length. The honest options: (a) prefill chunks interleaved with decode steps, the chunk size
-bounding the stall (64–128 tokens: 0.6–1.2 s a chunk, a 17–25 % prefill penalty from the sweep); (b) the second AQL
-queue, so a prefill chunk's card work overlaps the decode step's — the same structural lever the analog pointed at,
-and the only one that removes the stall rather than bounding it; (c) prefill alone, decode paused (the simplest, the
-worst latency). The design above does not depend on the choice; the kernels are the same.
+**Prefill beside generation — decided (tcdent, 2026-11-02): a mode state machine.**
+
+> let's go ahead and implement this as the state machine, and then we'll keep it simple for now. But what we'll do in
+> the future is that we'll have some kind of heuristic that allows us to then switch back to a different generation
+> mode early based on the behavior that we're seeing … be able to determine the mode that has the highest demand …
+> we won't switch to prediction if we only have a single stream that's ready to predict. We'll instead work through
+> the three streams of prefill and then switch to prediction at some point — tcdent, 2026-11-02
+
+The node runs in one of two modes a step and switches between them: **prefill** (a chunk of the waiting prompts —
+several slots' chunks batched into one prefill-shaped step, since those kernels are efficient at width; the chunk
+size a constant, ~256–1024 tokens, trading the stall's length against the prompt's cost on the step-width curve) and
+**generation** (one batched decode step over every slot with a ready token). This is Orca's / vLLM's iteration-level
+scheduling; its known cost is the generation stall during a prefill step, bounded here by the chunk. Mixing prompt
+tokens into a generation step (piggybacking) is worse for this system: the expert phase is per token until the union
+saturates, so a small chunk costs the decode slots nearly its full price and advances the prompt slowly — alternating
+whole steps, chunked, is the right granularity; the hardware second AQL queue (the two steps overlapping on the cards
+and the host) is the later upgrade that turns the stall into contention.
+
+**The switch rule is a policy behind one interface**, decided after each step from the slots' states (slots ready to
+generate, prompt tokens waiting a slot, each slot's time since its last step, its time-to-first-token still owed): the
+mechanism is general so the heuristic can be tuned without touching the step. v1 = the simple rule: prefill while
+prompts wait and the generating slots' stall is under its bound, else generate; the first chunk of a new slot first.
+Later: the demand rule tcdent describes — the mode with the most work ready wins, a lone ready slot waits for the
+three prefilling ones — and an early switch on observed behaviour.
 
 ## 4. First steps (the past-shaped part)
 
@@ -178,7 +195,8 @@ worst latency). The design above does not depend on the choice; the kernels are 
    KDA step over N states — kernel by kernel, each gated bit-identical at N = 1 against production.
 3. **The node's slots, the batched step loop, the per-slot seed, the API's N tokens** — gated by the two-identical-
    requests fingerprint.
-4. **The prefill policy** (the fork above), then the measurements of §1's projection against the built thing.
+4. **The scheduler** (the state machine above, the v1 rule, the chunk size and K measured on the box), then the
+   measurements of §1's projection against the built thing.
 
 ## 5. Forks for tcdent
 
