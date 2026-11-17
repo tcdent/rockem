@@ -561,7 +561,7 @@ pub mod gfx11 {
                     });
                 }
             } else {
-                router_rows(0, rows as usize, n, x, ln, router, scores, scores_v, red, t, wave, lane, wg);
+                router_rows(0, rows as usize, n, SPEC_TOKENS + 1, x, ln, router, scores, scores_v, red, t, wave, lane, wg);
             }
             // the router's arrival: this workgroup's scores out over the link; workgroup 0 says so
             fence(Ordering::Release);
@@ -617,7 +617,7 @@ pub mod gfx11 {
             let t = workitem_id_x() as usize;
             let (wave, lane) = (t / 32, (t % 32) as u32);
             let wg = workgroup_id_x() as usize;
-            router_rows(E, ROUTE_ROWS, n as usize, x, ln, router, scores, scores_v, lds::<f32>(), t, wave, lane, wg);
+            router_rows(E, ROUTE_ROWS, n as usize, 8, x, ln, router, scores, scores_v, lds::<f32>(), t, wave, lane, wg);
             fence(Ordering::Release);
             workgroup_sync();
             if t == 0 {
@@ -633,13 +633,19 @@ pub mod gfx11 {
     /// The router's rows `lo..hi` this workgroup takes (`wg + r · PRE_GRID`) over the launch's `n` tokens' block
     /// input `x` normed with `ln`, into `scores` (host memory) and `scores_v` (VRAM), `[n][ROUTE_ROWS]`.
     #[inline(always)]
-    unsafe fn router_rows(lo: usize, hi: usize, n: usize, x: *const f32, ln: *const u16, router: *const u16, scores: *mut f32, scores_v: *mut f32, red: *mut f32, t: usize, wave: usize, lane: u32, wg: usize) {
+    /// `many_from`: the width from which a wave takes a token (the many path) instead of the whole workgroup a (token,
+    /// row) at a time. The many path's unrolled loops cost ~60 VGPRs over the few path's; in `hc_pre`, whose 192
+    /// workgroups must all be resident for its grid barriers, that took the kernel from 128 to 186 VGPRs when
+    /// SPEC_TOKENS went to 16 (the path became live) and hung every first launch (168 of 192 resident, 2026-11-03), so
+    /// `hc_pre` passes a width past every decode-shaped step and keeps the few path there; `hc_route_ahead` has no
+    /// barriers across workgroups and keeps the many path from 8.
+    unsafe fn router_rows(lo: usize, hi: usize, n: usize, many_from: usize, x: *const f32, ln: *const u16, router: *const u16, scores: *mut f32, scores_v: *mut f32, red: *mut f32, t: usize, wave: usize, lane: u32, wg: usize) {
         // the router over every token's normed block input, this workgroup's rows. A few tokens: the
         // 256-thread reduction a (token, row) at a time (two barriers each) — a token at a time
         // keeps every wave busy. Many: a wave a token, the norm and every dot in that same order
         // (thread lane + 32·w over elements 256 apart, each wave's lanes summed, the eight waves in
         // order), so a score's bits are the same either way.
-        if n < 8 {
+        if n < many_from {
             let mut i = 0;
             while i < n {
                 let xt = x.add(i * H);
@@ -697,7 +703,7 @@ pub mod gfx11 {
             }
         }
         let mut i = wave;
-        while i < n && n >= 8 {
+        while i < n && n >= many_from {
             let xt = x.add(i * H);
             let mut tot = 0f32;
             let mut w = 0;

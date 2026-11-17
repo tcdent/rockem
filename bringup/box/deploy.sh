@@ -19,7 +19,9 @@ timeout 180 make publish 2>&1 | /usr/bin/grep -E 'pushed|error|missing'
 (sleep 1; printf 'echo b > /proc/sysrq-trigger\r\n'; sleep 2) | timeout 8 nc 192.168.88.6 23 >/dev/null 2>&1
 echo "rebooted $(date +%H:%M:%S)"
 sleep 60
-until timeout 2 bash -c 'echo > /dev/tcp/192.168.88.6/7332' 2>/dev/null; do sleep 5; done; echo "node up $(date +%H:%M:%S)"
+# bounded: a node that panics during its boot (it is PID 1: a kernel panic, and panic=10 reboots the box) never opens
+# its port, and an unbounded wait here let the box reboot-loop for nine hours (2026-11-02)
+W=0; until timeout 2 bash -c 'echo > /dev/tcp/192.168.88.6/7332' 2>/dev/null; do sleep 5; W=$((W+5)); if /usr/bin/grep -qE "gpu hang|panicked at" $LOG/metatron-console.log || [ $W -ge 900 ]; then echo "no node after $W s — the console's stop lines:"; /usr/bin/grep -E -A1 "gpu hang|panicked at|handoff hang|page fault" $LOG/metatron-console.log | sed -E 's/\[ *[0-9.]+\] //' | cut -c1-200 | head -40; exit 1; fi; done; echo "node up $(date +%H:%M:%S)"
 /usr/bin/grep -E "spec     :|panicked|cmdline|prow" $LOG/metatron-console.log | sed -E 's/.*\] //' | cut -c1-200
 # the API: the Nomad job rockem-api on elsenor (service-net 192.168.88.3:8765, behind https://rockem.a10k.co). rockem.api
 # builds and deploys it (tcdent, 2026-10-25); a node deploy only restarts it, so it rereads the bundle's manifest (a new

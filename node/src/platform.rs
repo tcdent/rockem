@@ -37,7 +37,20 @@ pub fn say(prefix: &str, text: &str) {
 pub fn report() {
     println!("rockem node {} — pid {}", env!("CARGO_PKG_VERSION"), std::process::id());
     println!("kernel   : {}", read("/proc/version"));
-    println!("cmdline  : {}", read("/proc/cmdline"));
+    // in lines of at most ~800 bytes: stdout is /dev/kmsg, which refuses a write past its line limit (EINVAL), and
+    // println! panics on it — the serving cmdline plus one bench key crossed that at ~1 KB (2026-11-03)
+    let mut line = String::new();
+    for w in read("/proc/cmdline").split_whitespace() {
+        if !line.is_empty() && line.len() + 1 + w.len() > 800 {
+            println!("cmdline  : {line}");
+            line.clear();
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(w);
+    }
+    println!("cmdline  : {line}");
     println!("profile  : {}", read("/etc/rockem-profile"));
     let count = |dir: &str, prefix: &str| {
         fs::read_dir(dir)

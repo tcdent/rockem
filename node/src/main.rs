@@ -986,6 +986,9 @@ fn main() {
         let err = std::process::Command::new("/bin/sh").exec();
         eprintln!("exec /bin/sh failed: {err}");
     }
+    if config("rockem.stats").as_deref() == Some("coherent") {
+        kfd::STATS_COHERENT.store(true, std::sync::atomic::Ordering::Relaxed); // a stats object's slab readable during a launch (hang diagnosis)
+    }
     if config("rockem.probe").as_deref() == Some("1") {
         let elf = config("rockem.bundle").map(|b| std::path::Path::new(&b).join("kernels.gfx1100.elf")).filter(|p| p.exists()).map(|p| std::fs::read(p).unwrap());
         probe::run(elf.as_deref());

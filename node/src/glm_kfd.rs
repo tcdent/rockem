@@ -659,10 +659,16 @@ impl Cards {
             })
             .collect();
         assert!(n <= MAX_CARDS, "{n} cards: the handoff words are laid out for {MAX_CARDS}");
-        // hc_pre's workgroups wait for the last of them: the grid must fit the card's LDS at once (64 KB a CU)
+        // hc_pre's workgroups wait for the last of them: the grid must fit the card at once — its LDS (64 KB a CU) and its
+        // registers (1536 VGPRs a lane a SIMD, two SIMDs a CU, 8 waves a workgroup). A kernel past the registers its grid
+        // allows hangs, it does not slow down: 168 of 192 workgroups resident at 186 VGPRs, the first launch's barrier
+        // waited forever (2026-10-20, and again 2026-11-03 when a widened build made a register-hungry path live)
         for c in &cards {
             let per_cu = (PRE_GRID as usize).div_ceil(c.k.cu);
             assert!(per_cu * PRE_LDS as usize <= 64 * 1024, "hc_pre: {PRE_GRID} workgroups at {PRE_LDS} B of LDS are {per_cu} a CU on {} CUs and cannot all be resident", c.k.cu);
+            let waves_per_simd = (PRE_GRID as usize * 8).div_ceil(c.k.cu * 2);
+            let vgprs = c.hc_pre.vgprs as usize;
+            assert!(waves_per_simd * vgprs <= 1536, "hc_pre: {PRE_GRID} workgroups at {vgprs} VGPRs a wave need {waves_per_simd} waves a SIMD ({} VGPRs of 1536) on {} CUs and cannot all be resident — its grid barriers would hang; the many-token router path or the WMMA path grew the kernel (bringup/kernel_report.py says which)", waves_per_simd * vgprs, c.k.cu);
         }
         Kfd::clocks_high();
         // the card-to-card handoffs: each card's receiving buffers and words in its own VRAM, mapped for the peers (001)

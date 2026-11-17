@@ -29,6 +29,12 @@ use std::ffi::c_void;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{fence, AtomicI64, AtomicU32, AtomicU64, Ordering};
 
+/// `rockem.stats=coherent`: a stats code object's slab in fine-grained (uncached, MTYPE UC) host-visible VRAM instead
+/// of plain VRAM, so a kernel's stamps bypass the card's L2 and the host reads them over the BAR while the launch is
+/// still running — the hang detector then prints how far each phase got (a hung launch leaves no stats otherwise:
+/// its stores sit in L2 until the launch's end). Uncached stores cost the stamp, so only for diagnosing a hang.
+pub static STATS_COHERENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 extern "C" {
     fn ioctl(fd: i32, req: u64, arg: *mut c_void) -> i32;
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
@@ -249,6 +255,8 @@ pub struct Kernel {
     object: u64,
     kernarg_size: u32,
     group_segment: u32,
+    /// VGPRs a wave of it holds (the descriptor's granulated count): what bounds its workgroups a CU.
+    pub vgprs: u32,
     pub name: &'static str,
 }
 
@@ -653,10 +661,13 @@ impl Kfd {
             use common::stats::{STAT_RING, STAT_SLOTS, STAT_WAVES};
             // in the card's VRAM: a kernel's stamps must not cross the link (host memory would add the very
             // PCIe writes a phase is being timed against); the host reads it back streamed
-            let slab = self.vram_visible(STAT_RING * STAT_SLOTS * STAT_WAVES * 4);
+            let coherent = STATS_COHERENT.load(Ordering::Relaxed);
+            let size = STAT_RING * STAT_SLOTS * STAT_WAVES * 4;
+            let slab = if coherent { self.alloc(size, MEM_VRAM | MEM_COHERENT | MEM_WRITABLE | MEM_PUBLIC, true, size) } else { self.vram_visible(size) };
+            unsafe { std::ptr::write_bytes(slab.ptr() as *mut u8, 0, slab.size) };
             unsafe { *(self.code.at(va) as *mut u64) = slab.va as u64 };
             self.stats = Some(slab);
-            println!("gpu      : kernel statistics on ({} MB slab)", slab.size >> 20);
+            println!("gpu      : kernel statistics on ({} MB slab{})", slab.size >> 20, if coherent { ", uncached: readable during a launch" } else { "" });
         }
     }
     /// A symbol's address in the code object, if it has one.
@@ -707,7 +718,10 @@ impl Kfd {
                 let kd = self.code.at(va);
                 let (group, private, kernarg) = unsafe { (*(kd as *const u32), *((kd + 4) as *const u32), *((kd + 8) as *const u32)) };
                 assert!(private == 0, "{name}: private segment (scratch) is not supported");
-                return Kernel { object: kd as u64, kernarg_size: kernarg, group_segment: group, name: Box::leak(name.to_string().into_boxed_str()) };
+                // compute_pgm_rsrc1 (kd + 48): GRANULATED_WORKITEM_VGPR_COUNT in bits 0–5, wave32 granule 8
+                let rsrc1 = unsafe { *((kd + 48) as *const u32) };
+                let vgprs = ((rsrc1 & 0x3f) + 1) * 8;
+                return Kernel { object: kd as u64, kernarg_size: kernarg, group_segment: group, vgprs, name: Box::leak(name.to_string().into_boxed_str()) };
             }
         }
         panic!("kernel {name} not in the code object");
@@ -821,6 +835,43 @@ impl Kfd {
                 // the packets from the read index on: the one the queue stopped at first (a fence has no name)
                 let read = unsafe { (*(self.queue.ptr() as *const AmdQueue)).read_dispatch_id.load(Ordering::Relaxed) };
                 let names = self.names.borrow();
+                // one line a packet: the console (kmsg) truncates a long line at ~1 KB, which lost the hung packet's
+                // name once (2026-11-02, a 40-packet list cut at the 39th); one write for all of it — stderr is
+                // unbuffered and kmsg makes a line of every write, so a formatted eprintln! arrived in fragments
+                // a write a line: kmsg refuses a write past its ~1 KB line limit outright (a 40-packet list in one write
+                // printed nothing, 2026-11-03)
+                use std::io::Write;
+                let line = |s: String| {
+                    let _ = std::io::stderr().write_all(s.as_bytes());
+                };
+                for i in read.min(idx)..=idx {
+                    line(format!("gpu hang: gpu {} packet {i}: {}\n", self.gpu_id, names[(i as usize) % RING_PACKETS]));
+                }
+                // the packet the queue stopped at, as the ring holds it: is the dispatch itself well-formed
+                let p = unsafe { std::ptr::read_volatile((self.ring.ptr() as *const Packet).add((read as usize) % RING_PACKETS)) };
+                line(format!("gpu hang: packet {read} header {:#x} setup {} wg {:?} grid {:?} lds {} private {} kernel_object {:#x} kernarg {:#x} signal {:#x}; code object at {:#x}\n", p.header, p.setup, p.workgroup_size, p.grid_size, p.group_segment_size, p.private_segment_size, p.kernel_object, p.kernarg_address, p.completion_signal, self.code.va));
+                // a stats slab the host can read during a launch (`rockem.stats=coherent`): the hung packet's block —
+                // each slot's stamped waves say which phase every wave reached before it stopped
+                if let Some(slab) = &self.stats {
+                    if STATS_COHERENT.load(Ordering::Relaxed) {
+                        use common::stats::{STAT_RING, STAT_SLOTS, STAT_WAVES};
+                        let block = (read as usize) % STAT_RING;
+                        for slot in 0..STAT_SLOTS {
+                            let p = slab.at((block * STAT_SLOTS + slot) * STAT_WAVES * 4) as *const u32;
+                            let (mut n, mut lo, mut hi, mut last) = (0usize, u32::MAX, 0u32, 0usize);
+                            for w in 0..STAT_WAVES {
+                                let v = unsafe { std::ptr::read_volatile(p.add(w)) };
+                                if v != 0 {
+                                    n += 1;
+                                    lo = lo.min(v);
+                                    hi = hi.max(v);
+                                    last = w;
+                                }
+                            }
+                            line(format!("gpu hang: packet {read} stats slot {slot}: {n} waves stamped (last wave index {last}), values {lo:#x}..{hi:#x}\n"));
+                        }
+                    }
+                }
                 let at: Vec<&str> = (read.min(idx)..=idx).map(|i| names[(i as usize) % RING_PACKETS]).collect();
                 panic!("gpu hang: gpu {} packet {idx} never completed (read index {read}, write index {}, {} launched; from the read index: {at:?})", self.gpu_id, unsafe { (*(self.queue.ptr() as *const AmdQueue)).write_dispatch_id.load(Ordering::Relaxed) }, self.write_index.get());
             }
